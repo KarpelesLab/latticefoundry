@@ -135,15 +135,17 @@ pub enum BinOp {
     Sub,
     /// Integer multiplication (wrapping unless `nsw`/`nuw`).
     Mul,
-    /// Unsigned division. Division by zero is **poison**; `exact` and a nonzero
-    /// remainder ⇒ poison.
+    /// Unsigned division. Division by zero is **undefined behavior** (the
+    /// quotient has no defined value); `exact` and a nonzero remainder ⇒ poison.
     UDiv,
-    /// Signed division. Division by zero, or `INT_MIN / -1`, is **poison**;
-    /// `exact` and a nonzero remainder ⇒ poison.
+    /// Signed division. Division by zero, or `INT_MIN / -1` (whose quotient is
+    /// not representable), is **undefined behavior**; `exact` and a nonzero
+    /// remainder ⇒ poison.
     SDiv,
-    /// Unsigned remainder. Division by zero is **poison**.
+    /// Unsigned remainder. Division by zero is **undefined behavior**.
     URem,
-    /// Signed remainder. Division by zero, or `INT_MIN % -1`, is **poison**.
+    /// Signed remainder. Division by zero, or `INT_MIN % -1` (paired with the
+    /// overflowing division), is **undefined behavior**.
     SRem,
     /// Bitwise and.
     And,

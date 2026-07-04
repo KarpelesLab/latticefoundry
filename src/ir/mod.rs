@@ -25,6 +25,7 @@
 
 pub mod builder;
 pub mod inst;
+pub mod semantics;
 pub mod types;
 pub mod value;
 
@@ -32,6 +33,7 @@ pub use inst::{
     BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred, SwitchCase,
     SwitchData, UnaryOp, Use,
 };
+pub use semantics::{EvalOutcome, FoldResult, SemValue, eval, fold};
 pub use types::{FloatKind, FuncType, Layout, Type, TypeContext, TypeId};
 pub use value::{Const, ConstId, ConstPool, FloatBits, Value, ValueDef, ValueId};
 

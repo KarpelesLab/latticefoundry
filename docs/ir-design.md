@@ -179,9 +179,14 @@ break structural sharing or parallel processing (tenets T5/T6).
 - **Integer signedness at the type level.** Keep integers sign-agnostic (signed
   vs unsigned is a property of the *operation*, as in LLVM), which we tentatively
   favor — revisit if the lattice engine (B8) wants signedness in the type.
-- **Undefined behavior surface.** Which operations may trigger *UB* (a
-  refinement escape hatch) versus merely produce *poison*? We want this set as
-  small as possible; enumerate it explicitly with the opcode table.
+- **Undefined behavior surface.** *(decided for the current opcode table.)* The
+  UB set is kept as small as possible: among pure value-producing ops, **only**
+  `udiv`/`sdiv`/`urem`/`srem` by zero and `sdiv`/`srem` of `INT_MIN` by `-1`
+  trigger UB (their result is not representable). Everything else that can "go
+  wrong" — `nsw`/`nuw` overflow, `exact` violation, over-wide shift, out-of-range
+  or NaN float→int casts, fast-math `nnan`/`ninf` violations — yields **poison**,
+  not UB. This is enforced by the reference evaluator (`ir::semantics`) and
+  matched by the opcode prose. Revisit only when memory/stateful ops are added.
 - **Vector poison granularity.** Per-lane poison vs. whole-value poison. Per-lane
   is more precise but complicates the refinement relation; decide with the first
   SIMD target.
