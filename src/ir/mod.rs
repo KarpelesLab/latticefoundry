@@ -23,9 +23,11 @@
 //! [`Module::build`]; it keeps use/def edges consistent and offers the
 //! `struct_field`/`array_elem` offset helpers and `replace_all_uses_with`.
 
+pub mod binary;
 pub mod builder;
 pub mod inst;
 pub mod semantics;
+pub mod text;
 pub mod types;
 pub mod value;
 
