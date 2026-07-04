@@ -6,5 +6,8 @@
 //! (ROADMAP Phase 3), each validated by [`crate::analysis::soundness`].
 
 pub mod constants;
+pub mod known_bits;
+pub mod nullness;
+pub mod ranges;
 
 pub use constants::ConstLattice;
