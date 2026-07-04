@@ -202,6 +202,35 @@ impl Module {
         (fresh, r)
     }
 
+    /// Interprocedural functional-rebuild primitive (tenet T5): like
+    /// [`Module::map_function`], but the `build` closure additionally receives an
+    /// immutable view of **every** function in the module, so a rebuild can *read*
+    /// callee bodies while it reconstructs the caller.
+    ///
+    /// The three borrows are disjoint: `caller` and `funcs` are shared borrows of
+    /// the function arena (the caller is `funcs[id]`), while the
+    /// [`builder::FunctionBuilder`] holds `&mut` of the *fresh* function together
+    /// with the shared type/constant tables. This is what makes the
+    /// [`crate::transform::inline`] pass — which must splice one function's blocks
+    /// into another — borrow-clean without cloning callee bodies into an owned
+    /// form. The module is left untouched; install the result with
+    /// [`Module::replace_function`].
+    pub fn map_function_reading<R>(
+        &mut self,
+        id: FuncId,
+        build: impl FnOnce(&Function, &[Function], &mut builder::FunctionBuilder<'_>) -> R,
+    ) -> (Function, R) {
+        let Module { types, consts, functions, .. } = self;
+        let funcs: &[Function] = functions.as_slice();
+        let caller = &funcs[id.index()];
+        let mut fresh = Function::new(caller.name, caller.sig);
+        let r = {
+            let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts);
+            build(caller, funcs, &mut b)
+        };
+        (fresh, r)
+    }
+
     /// Install `func` as the body of function `id`, replacing whatever was there.
     /// Paired with [`Module::map_function`] to commit a functional rebuild.
     pub fn replace_function(&mut self, id: FuncId, func: Function) {
