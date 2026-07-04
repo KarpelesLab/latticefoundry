@@ -74,14 +74,14 @@ fn run(args: &[String]) -> Result<(), String> {
     let module = load(&opts.input, in_fmt, &mut syms)?;
 
     // Verify (Structural tier) unless suppressed.
-    if opts.verify {
-        if let Err(diags) = verify::verify_module(&module) {
-            for d in &diags {
-                eprintln!("{}", render(d));
-            }
-            let errs = diags.iter().filter(|d| d.severity == Severity::Error).count();
-            return Err(format!("verification failed ({errs} error(s))"));
+    if opts.verify
+        && let Err(diags) = verify::verify_module(&module)
+    {
+        for d in &diags {
+            eprintln!("{}", render(d));
         }
+        let errs = diags.iter().filter(|d| d.severity == Severity::Error).count();
+        return Err(format!("verification failed ({errs} error(s))"));
     }
 
     // Emit in the requested encoding.
