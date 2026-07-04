@@ -22,13 +22,19 @@
 //! (and its analysis-invalidation) by [`FunctionTransformPass`].
 
 pub mod dce;
+pub mod licm;
 pub mod mem2reg;
+pub mod sccp;
+pub mod simplify_cfg;
 
 #[cfg(test)]
 mod tests;
 
 pub use dce::Dce;
+pub use licm::Licm;
 pub use mem2reg::Mem2Reg;
+pub use sccp::Sccp;
+pub use simplify_cfg::SimplifyCfg;
 
 use crate::ir::builder::FunctionBuilder;
 use crate::ir::inst::InstKind;
