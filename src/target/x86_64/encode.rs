@@ -1,0 +1,747 @@
+//! The x86-64 machine-code encoder and the compile entry points (ROADMAP
+//! Phase 7).
+//!
+//! After instruction selection ([`super::isel`]) and register allocation
+//! ([`crate::codegen::regalloc`]) a [`MachineFunction`] holds only physical
+//! registers and [`X86Op`] opcodes. This module:
+//!
+//! 1. lays out the stack frame ([`layout_frame`]) — which callee-saved registers
+//!    the allocation used, the rbp-relative offset of every spill/`alloca` slot,
+//!    and the `sub rsp` amount that keeps the stack 16-byte aligned at `call`s;
+//! 2. splices in the prologue/epilogue as ordinary [`X86Op`] instructions
+//!    ([`insert_prologue_epilogue`]);
+//! 3. encodes each instruction to bytes ([`encode_function`]) — building the
+//!    `REX` prefix, `ModRM`, `SIB`, displacements, and immediates by hand from
+//!    the Intel/AMD encoding rules, resolving intra-function branches through the
+//!    [`Emitter`]'s label mechanism and turning `call`/global references into
+//!    relocations;
+//! 4. assembles the functions of a module into an [`ObjectModule`]
+//!    ([`compile_module`]) and, via [`crate::mc::elf`], an ELF64 object.
+//!
+//! The encoding tables are implemented from the published x86-64 instruction-set
+//! reference (tenet T1), not copied from any assembler.
+
+use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, StackSlot};
+use crate::codegen::regalloc;
+use crate::ir::Module;
+use crate::mc::emit::{Emitted, Emitter, Ref};
+use crate::mc::object::{
+    ObjectModule, Section, SectionKind, Symbol, SymbolBinding, SymbolType,
+};
+use crate::support::StrInterner;
+
+use super::isel::{X86Op, X86_64Target};
+use super::regs::{self, RBP, RSP};
+
+// ===========================================================================
+// Low-level byte builders (REX / ModRM / SIB and the instruction forms)
+// ===========================================================================
+
+/// Build a `REX` prefix byte from its four bits.
+#[inline]
+pub(crate) fn rex(w: bool, r: bool, x: bool, b: bool) -> u8 {
+    0x40 | ((w as u8) << 3) | ((r as u8) << 2) | ((x as u8) << 1) | (b as u8)
+}
+
+/// Build a `ModRM` byte.
+#[inline]
+pub(crate) fn modrm(md: u8, reg: u8, rm: u8) -> u8 {
+    (md << 6) | ((reg & 7) << 3) | (rm & 7)
+}
+
+/// Build a `SIB` byte.
+#[inline]
+pub(crate) fn sib(scale: u8, index: u8, base: u8) -> u8 {
+    (scale << 6) | ((index & 7) << 3) | (base & 7)
+}
+
+/// Emit a register-to-register ALU form `op r/m, r` (destination is the r/m
+/// operand, source the reg operand): `add`, `sub`, `and`, `or`, `xor`, `mov`,
+/// `cmp`, `test` all share this shape and differ only in the opcode byte.
+pub(crate) fn alu_rr(e: &mut Emitter, opcode: u8, dst: u8, src: u8, w: bool) {
+    if w || src >= 8 || dst >= 8 {
+        e.u8(rex(w, src >= 8, false, dst >= 8));
+    }
+    e.u8(opcode);
+    e.u8(modrm(3, src, dst));
+}
+
+/// Emit `mov dst, src` (64-bit register copy).
+pub(crate) fn mov_rr(e: &mut Emitter, dst: u8, src: u8, w: bool) {
+    alu_rr(e, 0x89, dst, src, w);
+}
+
+/// Emit `imul dst, src` (`0F AF /r`; destination is the reg operand).
+pub(crate) fn imul_rr(e: &mut Emitter, dst: u8, src: u8, w: bool) {
+    if w || dst >= 8 || src >= 8 {
+        e.u8(rex(w, dst >= 8, false, src >= 8));
+    }
+    e.u8(0x0F);
+    e.u8(0xAF);
+    e.u8(modrm(3, dst, src));
+}
+
+/// Emit `neg r` (`F7 /3`).
+pub(crate) fn neg_r(e: &mut Emitter, r: u8, w: bool) {
+    if w || r >= 8 {
+        e.u8(rex(w, false, false, r >= 8));
+    }
+    e.u8(0xF7);
+    e.u8(modrm(3, 3, r));
+}
+
+/// Emit a `mov r, imm` — `B8+r id` (zero-extending) when the value fits in 32
+/// bits, else `REX.W B8+r io` (`movabs`).
+pub(crate) fn mov_ri(e: &mut Emitter, dst: u8, value: u64) {
+    if value <= u64::from(u32::MAX) {
+        if dst >= 8 {
+            e.u8(rex(false, false, false, true));
+        }
+        e.u8(0xB8 + (dst & 7));
+        e.u32(value as u32);
+    } else {
+        e.u8(rex(true, false, false, dst >= 8));
+        e.u8(0xB8 + (dst & 7));
+        e.u64(value);
+    }
+}
+
+/// Emit a memory-operand instruction `opcode reg_field, [base + disp]`, choosing
+/// the `ModRM.mod`/displacement size and inserting a `SIB` for `rsp`/`r12` and a
+/// forced `disp8` for `rbp`/`r13`.
+pub(crate) fn mem(
+    e: &mut Emitter,
+    opcode: &[u8],
+    reg_field: u8,
+    base: u8,
+    disp: i32,
+    w: bool,
+    force_rex: bool,
+) {
+    let rexr = reg_field >= 8;
+    let rexb = base >= 8;
+    if w || rexr || rexb || force_rex {
+        e.u8(rex(w, rexr, false, rexb));
+    }
+    e.bytes(opcode);
+    let base3 = base & 7;
+    let is_bp = base3 == 5; // rbp / r13: mod=00 would mean rip-relative
+    let is_sp = base3 == 4; // rsp / r12: needs a SIB byte
+    let (md, dsz) = if disp == 0 && !is_bp {
+        (0u8, 0)
+    } else if (-128..=127).contains(&disp) {
+        (1u8, 1)
+    } else {
+        (2u8, 4)
+    };
+    e.u8(modrm(md, reg_field, base3));
+    if is_sp {
+        e.u8(sib(0, 4, base3));
+    }
+    match dsz {
+        1 => e.u8(disp as u8),
+        4 => e.u32(disp as u32),
+        _ => {}
+    }
+}
+
+/// Emit a `shift r/m, imm8` (`C1 /ext ib`); `ext` selects shl(4)/shr(5)/sar(7).
+pub(crate) fn shift_imm(e: &mut Emitter, ext: u8, dst: u8, count: u8, w: bool) {
+    if w || dst >= 8 {
+        e.u8(rex(w, false, false, dst >= 8));
+    }
+    e.u8(0xC1);
+    e.u8(modrm(3, ext, dst));
+    e.u8(count);
+}
+
+/// Emit a `shift r/m, cl` (`D3 /ext`).
+pub(crate) fn shift_cl(e: &mut Emitter, ext: u8, dst: u8, w: bool) {
+    if w || dst >= 8 {
+        e.u8(rex(w, false, false, dst >= 8));
+    }
+    e.u8(0xD3);
+    e.u8(modrm(3, ext, dst));
+}
+
+/// Emit `setcc r/m8` (`0F 90+cc /0`), forcing a `REX` so `spl`/`bpl`/`sil`/`dil`
+/// and `r8b..r15b` are addressable.
+pub(crate) fn setcc(e: &mut Emitter, cc: u8, reg: u8) {
+    if reg >= 4 {
+        e.u8(rex(false, false, false, reg >= 8));
+    }
+    e.u8(0x0F);
+    e.u8(0x90 + cc);
+    e.u8(modrm(3, 0, reg));
+}
+
+/// Emit `movzx r32, r8` on the same register (`0F B6 /r`).
+pub(crate) fn movzx_byte(e: &mut Emitter, reg: u8) {
+    if reg >= 8 {
+        e.u8(rex(false, true, false, true));
+    } else if reg >= 4 {
+        e.u8(0x40);
+    }
+    e.u8(0x0F);
+    e.u8(0xB6);
+    e.u8(modrm(3, reg, reg));
+}
+
+/// Emit `cmovcc dst, src` (`0F 40+cc /r`; destination is the reg operand).
+pub(crate) fn cmov_rr(e: &mut Emitter, cc: u8, dst: u8, src: u8, w: bool) {
+    if w || dst >= 8 || src >= 8 {
+        e.u8(rex(w, dst >= 8, false, src >= 8));
+    }
+    e.u8(0x0F);
+    e.u8(0x40 + cc);
+    e.u8(modrm(3, dst, src));
+}
+
+/// Emit `idiv`/`div r/m` (`F7 /ext`); `ext` is 7 for idiv, 6 for div.
+pub(crate) fn divide(e: &mut Emitter, ext: u8, r: u8, w: bool) {
+    if w || r >= 8 {
+        e.u8(rex(w, false, false, r >= 8));
+    }
+    e.u8(0xF7);
+    e.u8(modrm(3, ext, r));
+}
+
+/// Emit `push r` (`50+r`, with `REX.B` for the extended registers).
+pub(crate) fn push_r(e: &mut Emitter, r: u8) {
+    if r >= 8 {
+        e.u8(0x41);
+    }
+    e.u8(0x50 + (r & 7));
+}
+
+/// Emit `pop r` (`58+r`).
+pub(crate) fn pop_r(e: &mut Emitter, r: u8) {
+    if r >= 8 {
+        e.u8(0x41);
+    }
+    e.u8(0x58 + (r & 7));
+}
+
+/// Emit `cmp r, imm32` (`REX.W 81 /7 id`).
+fn cmp_ri(e: &mut Emitter, reg: u8, value: i32, w: bool) {
+    if w || reg >= 8 {
+        e.u8(rex(w, false, false, reg >= 8));
+    }
+    e.u8(0x81);
+    e.u8(modrm(3, 7, reg));
+    e.u32(value as u32);
+}
+
+// ===========================================================================
+// Frame layout + prologue/epilogue
+// ===========================================================================
+
+/// The stack-frame layout of one function, computed after allocation.
+#[derive(Clone, Debug)]
+pub struct FrameLayout {
+    /// rbp-relative displacement of each stack slot (by slot index).
+    slot_off: Vec<i32>,
+    /// The callee-saved registers the allocation used, in push order.
+    cs_regs: Vec<u8>,
+    /// Bytes occupied by the pushed callee-saved registers (`8 * cs_regs.len()`).
+    cs_bytes: i32,
+    /// The `sub rsp` amount that follows the callee-saved pushes.
+    sub_size: i32,
+}
+
+/// Round `value` up to a multiple of `align` (a power of two ≥ 1).
+fn align_up(value: i64, align: i64) -> i64 {
+    (value + align - 1) / align * align
+}
+
+/// Compute the frame layout of an allocated machine function.
+pub fn layout_frame(mf: &MachineFunction, target: &X86_64Target) -> FrameLayout {
+    use crate::codegen::target::MachineTarget;
+    let callee: Vec<u8> = target.callee_saved().iter().map(|p| p.num as u8).collect();
+
+    // Which callee-saved registers does the allocation actually define?
+    let mut used = [false; 16];
+    for bid in mf.block_ids() {
+        for inst in &mf.block(bid).insts {
+            for d in inst.defs() {
+                if let Reg::Physical(p) = d {
+                    used[p.num as usize] = true;
+                }
+            }
+        }
+    }
+    let cs_regs: Vec<u8> = callee.into_iter().filter(|&r| used[r as usize]).collect();
+    let cs_bytes = (cs_regs.len() * 8) as i32;
+
+    // Slot offsets grow downward from just below the callee-saved region.
+    let mut off = 0i64;
+    let mut slot_off = vec![0i32; mf.frame().len()];
+    for (i, off_slot) in slot_off.iter_mut().enumerate() {
+        let info = mf.frame().slot(StackSlot::from_index(i));
+        off += info.size as i64;
+        off = align_up(off, (info.align.max(1)) as i64);
+        *off_slot = -((cs_bytes as i64) + off) as i32;
+    }
+    let locals = off;
+    let total = cs_bytes as i64 + locals;
+    let padded = align_up(total, 16);
+    let sub_size = (padded - cs_bytes as i64) as i32;
+
+    FrameLayout { slot_off, cs_regs, cs_bytes, sub_size }
+}
+
+fn phys(r: u16) -> MachineOperand {
+    MachineOperand::Def(Reg::Physical(regs::gpr(r)))
+}
+fn phys_use(r: u16) -> MachineOperand {
+    MachineOperand::Use(Reg::Physical(regs::gpr(r)))
+}
+fn imm_op(v: u64) -> MachineOperand {
+    MachineOperand::Imm(puremp::Int::from_u64(v))
+}
+
+/// Splice the prologue into the entry block and an epilogue before every `ret`.
+pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) {
+    let entry = mf.entry().expect("a function being compiled has an entry block");
+
+    // --- prologue: push rbp; mov rbp,rsp; push callee-saved; sub rsp,frame ---
+    let mut prologue = vec![
+        MachineInst::new(X86Op::Push.opcode(), vec![phys_use(RBP)]),
+        MachineInst::new(X86Op::MovRbpRsp.opcode(), Vec::new()),
+    ];
+    for &cs in &layout.cs_regs {
+        prologue.push(MachineInst::new(X86Op::Push.opcode(), vec![phys_use(u16::from(cs))]));
+    }
+    if layout.sub_size > 0 {
+        prologue
+            .push(MachineInst::new(X86Op::SubRsp.opcode(), vec![imm_op(layout.sub_size as u64)]));
+    }
+    let old = std::mem::take(&mut mf.block_mut(entry).insts);
+    prologue.extend(old);
+    mf.block_mut(entry).insts = prologue;
+
+    // --- epilogue before each Ret: lea rsp,[rbp-cs]; pop callee-saved; pop rbp ---
+    let block_ids: Vec<_> = mf.block_ids().collect();
+    for bid in block_ids {
+        let old = std::mem::take(&mut mf.block_mut(bid).insts);
+        let mut new_insts = Vec::with_capacity(old.len());
+        for inst in old {
+            if X86Op::decode(inst.opcode) == X86Op::Ret {
+                new_insts.push(MachineInst::new(
+                    X86Op::LeaRspRbp.opcode(),
+                    vec![imm_op(layout.cs_bytes as u64)],
+                ));
+                for &cs in layout.cs_regs.iter().rev() {
+                    new_insts.push(MachineInst::new(X86Op::Pop.opcode(), vec![phys(u16::from(cs))]));
+                }
+                new_insts.push(MachineInst::new(X86Op::Pop.opcode(), vec![phys(RBP)]));
+            }
+            new_insts.push(inst);
+        }
+        mf.block_mut(bid).insts = new_insts;
+    }
+}
+
+// ===========================================================================
+// Instruction encoding
+// ===========================================================================
+
+fn rnum(op: &MachineOperand) -> u8 {
+    match op {
+        MachineOperand::Def(Reg::Physical(p)) | MachineOperand::Use(Reg::Physical(p)) => {
+            p.num as u8
+        }
+        other => panic!("expected a physical register operand, found {other:?}"),
+    }
+}
+
+fn iimm(op: &MachineOperand) -> i64 {
+    match op {
+        MachineOperand::Imm(v) => v.to_i64().unwrap_or(0),
+        other => panic!("expected an immediate operand, found {other:?}"),
+    }
+}
+
+fn uimm(op: &MachineOperand) -> u64 {
+    match op {
+        MachineOperand::Imm(v) => v.to_u64().or_else(|| v.to_i64().map(|i| i as u64)).unwrap_or(0),
+        other => panic!("expected an immediate operand, found {other:?}"),
+    }
+}
+
+/// What the encoder needs to resolve non-local references while emitting.
+struct EncodeCtx<'a> {
+    labels: &'a [crate::mc::emit::Label],
+    layout: &'a FrameLayout,
+    func_name: &'a dyn Fn(u32) -> String,
+    global_name: &'a dyn Fn(u32) -> String,
+}
+
+/// The two-address expansion of a commutative ALU op `d = a OP b`.
+fn bin_commutative(e: &mut Emitter, opcode: u8, d: u8, a: u8, b: u8, w: bool) {
+    if d == a {
+        alu_rr(e, opcode, d, b, w);
+    } else if d == b {
+        alu_rr(e, opcode, d, a, w);
+    } else {
+        mov_rr(e, d, a, w);
+        alu_rr(e, opcode, d, b, w);
+    }
+}
+
+/// The two-address expansion of `d = a * b` (imul, commutative).
+fn bin_imul(e: &mut Emitter, d: u8, a: u8, b: u8, w: bool) {
+    if d == a {
+        imul_rr(e, d, b, w);
+    } else if d == b {
+        imul_rr(e, d, a, w);
+    } else {
+        mov_rr(e, d, a, w);
+        imul_rr(e, d, b, w);
+    }
+}
+
+/// The two-address expansion of `d = a - b` (sub, non-commutative).
+fn bin_sub(e: &mut Emitter, d: u8, a: u8, b: u8, w: bool) {
+    if d == a {
+        alu_rr(e, 0x29, d, b, w);
+    } else if d == b {
+        // d holds b: `sub d, a` gives b - a, `neg d` flips to a - b.
+        alu_rr(e, 0x29, d, a, w);
+        neg_r(e, d, w);
+    } else {
+        mov_rr(e, d, a, w);
+        alu_rr(e, 0x29, d, b, w);
+    }
+}
+
+fn shift(e: &mut Emitter, ext: u8, ops: &[MachineOperand], cl: bool) {
+    let d = rnum(&ops[0]);
+    let a = rnum(&ops[1]);
+    let w = iimm(ops.last().unwrap()) == 64;
+    if d != a {
+        mov_rr(e, d, a, w);
+    }
+    if cl {
+        shift_cl(e, ext, d, w);
+    } else {
+        let count = uimm(&ops[2]) as u8;
+        shift_imm(e, ext, d, count, w);
+    }
+}
+
+fn encode_load(e: &mut Emitter, ops: &[MachineOperand]) {
+    let d = rnum(&ops[0]);
+    let ptr = rnum(&ops[1]);
+    let size = uimm(&ops[2]);
+    match size {
+        1 => mem(e, &[0x0F, 0xB6], d, ptr, 0, false, false),
+        2 => mem(e, &[0x0F, 0xB7], d, ptr, 0, false, false),
+        4 => mem(e, &[0x8B], d, ptr, 0, false, false),
+        _ => mem(e, &[0x8B], d, ptr, 0, true, false),
+    }
+}
+
+fn encode_store(e: &mut Emitter, ops: &[MachineOperand]) {
+    let ptr = rnum(&ops[0]);
+    let val = rnum(&ops[1]);
+    let size = uimm(&ops[2]);
+    match size {
+        1 => mem(e, &[0x88], val, ptr, 0, false, val >= 4),
+        2 => {
+            e.u8(0x66);
+            mem(e, &[0x89], val, ptr, 0, false, false);
+        }
+        4 => mem(e, &[0x89], val, ptr, 0, false, false),
+        _ => mem(e, &[0x89], val, ptr, 0, true, false),
+    }
+}
+
+/// Encode one machine instruction into `e`.
+fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
+    let ops = &inst.operands;
+    match X86Op::decode(inst.opcode) {
+        X86Op::MovRR => {
+            let d = rnum(&ops[0]);
+            let s = rnum(&ops[1]);
+            if d != s {
+                mov_rr(e, d, s, true);
+            }
+        }
+        X86Op::MovRI => mov_ri(e, rnum(&ops[0]), uimm(&ops[1])),
+        X86Op::Add => {
+            let w = iimm(&ops[3]) == 64;
+            bin_commutative(e, 0x01, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), w);
+        }
+        X86Op::Sub => {
+            let w = iimm(&ops[3]) == 64;
+            bin_sub(e, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), w);
+        }
+        X86Op::And => {
+            let w = iimm(&ops[3]) == 64;
+            bin_commutative(e, 0x21, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), w);
+        }
+        X86Op::Or => {
+            let w = iimm(&ops[3]) == 64;
+            bin_commutative(e, 0x09, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), w);
+        }
+        X86Op::Xor => {
+            let w = iimm(&ops[3]) == 64;
+            bin_commutative(e, 0x31, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), w);
+        }
+        X86Op::Imul => {
+            let w = iimm(&ops[3]) == 64;
+            bin_imul(e, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), w);
+        }
+        X86Op::ShlI => shift(e, 4, ops, false),
+        X86Op::ShrI => shift(e, 5, ops, false),
+        X86Op::SarI => shift(e, 7, ops, false),
+        X86Op::ShlCl => shift(e, 4, ops, true),
+        X86Op::ShrCl => shift(e, 5, ops, true),
+        X86Op::SarCl => shift(e, 7, ops, true),
+        X86Op::Cqo => {
+            if iimm(&ops[2]) == 64 {
+                e.u8(0x48);
+            }
+            e.u8(0x99);
+        }
+        X86Op::ZeroRdx => alu_rr(e, 0x31, regs::RDX as u8, regs::RDX as u8, false),
+        X86Op::Idiv => divide(e, 7, rnum(&ops[4]), iimm(&ops[5]) == 64),
+        X86Op::Div => divide(e, 6, rnum(&ops[4]), iimm(&ops[5]) == 64),
+        X86Op::SetccCmp => {
+            let d = rnum(&ops[0]);
+            let a = rnum(&ops[1]);
+            let b = rnum(&ops[2]);
+            let cc = uimm(&ops[3]) as u8;
+            let w = iimm(&ops[4]) == 64;
+            alu_rr(e, 0x39, a, b, w); // cmp a, b
+            setcc(e, cc, d);
+            movzx_byte(e, d);
+        }
+        X86Op::Test => {
+            let r = rnum(&ops[0]);
+            alu_rr(e, 0x85, r, r, false);
+        }
+        X86Op::Cmovne => {
+            let d = rnum(&ops[0]);
+            let d2 = rnum(&ops[1]);
+            let t = rnum(&ops[2]);
+            if d != d2 {
+                mov_rr(e, d, d2, true);
+            }
+            cmov_rr(e, 0x5, d, t, true);
+        }
+        X86Op::Load => encode_load(e, ops),
+        X86Op::Store => encode_store(e, ops),
+        X86Op::LeaFrame => {
+            let d = rnum(&ops[0]);
+            let slot = slot_index(&ops[1]);
+            mem(e, &[0x8D], d, RBP as u8, ctx.layout.slot_off[slot], true, false);
+        }
+        X86Op::StoreFrame => {
+            let src = rnum(&ops[0]);
+            let slot = slot_index(&ops[1]);
+            mem(e, &[0x89], src, RBP as u8, ctx.layout.slot_off[slot], true, false);
+        }
+        X86Op::LoadFrame => {
+            let dst = rnum(&ops[0]);
+            let slot = slot_index(&ops[1]);
+            mem(e, &[0x8B], dst, RBP as u8, ctx.layout.slot_off[slot], true, false);
+        }
+        X86Op::GlobalAddr => {
+            let d = rnum(&ops[0]);
+            let g = match ops[1] {
+                MachineOperand::Global(g) => g,
+                _ => panic!("GlobalAddr expects a global operand"),
+            };
+            // lea d, [rip + disp32]  with a PC32 relocation to the global.
+            e.u8(rex(true, d >= 8, false, false));
+            e.u8(0x8D);
+            e.u8(modrm(0, d, 5));
+            e.pcrel32(Ref::Symbol((ctx.global_name)(g)), 0);
+        }
+        X86Op::Call => match &ops[0] {
+            MachineOperand::Func(idx) => {
+                e.u8(0xE8);
+                e.plt32(Ref::Symbol((ctx.func_name)(*idx)), 0);
+            }
+            MachineOperand::Use(Reg::Physical(p)) => {
+                let r = p.num as u8;
+                if r >= 8 {
+                    e.u8(0x41);
+                }
+                e.u8(0xFF);
+                e.u8(modrm(3, 2, r));
+            }
+            other => panic!("Call expects a Func or register operand, found {other:?}"),
+        },
+        X86Op::Ret => e.u8(0xC3),
+        X86Op::Jmp => {
+            let t = label_index(&ops[0]);
+            e.u8(0xE9);
+            e.pcrel32(Ref::Label(ctx.labels[t]), 0);
+        }
+        X86Op::BrCond => {
+            let cond = rnum(&ops[0]);
+            let t = label_index(&ops[1]);
+            let f = label_index(&ops[2]);
+            alu_rr(e, 0x85, cond, cond, false); // test cond, cond
+            e.u8(0x0F);
+            e.u8(0x85); // jne t
+            e.pcrel32(Ref::Label(ctx.labels[t]), 0);
+            e.u8(0xE9); // jmp f
+            e.pcrel32(Ref::Label(ctx.labels[f]), 0);
+        }
+        X86Op::Switch => {
+            let cond = rnum(&ops[0]);
+            let default = label_index(&ops[1]);
+            let mut i = 2;
+            while i + 1 < ops.len() {
+                let value = iimm(&ops[i]) as i32;
+                let case = label_index(&ops[i + 1]);
+                cmp_ri(e, cond, value, true);
+                e.u8(0x0F);
+                e.u8(0x84); // je case
+                e.pcrel32(Ref::Label(ctx.labels[case]), 0);
+                i += 2;
+            }
+            e.u8(0xE9);
+            e.pcrel32(Ref::Label(ctx.labels[default]), 0);
+        }
+        X86Op::Unreachable => {
+            e.u8(0x0F);
+            e.u8(0x0B); // ud2
+        }
+        X86Op::Push => push_r(e, rnum(&ops[0])),
+        X86Op::Pop => pop_r(e, rnum(&ops[0])),
+        X86Op::MovRbpRsp => mov_rr(e, RBP as u8, RSP as u8, true),
+        X86Op::SubRsp => {
+            e.u8(0x48);
+            e.u8(0x81);
+            e.u8(modrm(3, 5, RSP as u8));
+            e.u32(uimm(&ops[0]) as u32);
+        }
+        X86Op::LeaRspRbp => {
+            let k = uimm(&ops[0]) as i64;
+            mem(e, &[0x8D], RSP as u8, RBP as u8, (-k) as i32, true, false);
+        }
+    }
+}
+
+fn slot_index(op: &MachineOperand) -> usize {
+    match op {
+        MachineOperand::Frame(s) => s.index(),
+        other => panic!("expected a frame operand, found {other:?}"),
+    }
+}
+
+fn label_index(op: &MachineOperand) -> usize {
+    match op {
+        MachineOperand::Label(b) => b.index(),
+        other => panic!("expected a label operand, found {other:?}"),
+    }
+}
+
+// ===========================================================================
+// Function + module drivers
+// ===========================================================================
+
+/// Encode an allocated, prologue-inserted machine function into bytes and the
+/// relocations its external references produced.
+pub fn encode_function(
+    mf: &MachineFunction,
+    layout: &FrameLayout,
+    func_name: &dyn Fn(u32) -> String,
+    global_name: &dyn Fn(u32) -> String,
+) -> Emitted {
+    let mut e = Emitter::new();
+    let labels: Vec<_> = (0..mf.num_blocks()).map(|_| e.create_label()).collect();
+    let ctx = EncodeCtx { labels: &labels, layout, func_name, global_name };
+
+    // Emit the entry block first (so the function symbol at offset 0 is the
+    // entry), then the remaining blocks in arena order.
+    let entry = mf.entry().expect("a function being compiled has an entry block");
+    let mut order = vec![entry];
+    for bid in mf.block_ids() {
+        if bid != entry {
+            order.push(bid);
+        }
+    }
+    for bid in order {
+        e.bind_label(labels[bid.index()]);
+        for inst in &mf.block(bid).insts {
+            encode_inst(&mut e, inst, &ctx);
+        }
+    }
+    e.finish().expect("intra-function branch resolution never overflows")
+}
+
+/// Compile one function of `module` to its encoded bytes and relocations. Runs
+/// isel → register allocation → frame layout → prologue/epilogue → encoding.
+pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
+    let target = X86_64Target::new();
+    let mut mf = target.select(module, func);
+    regalloc::allocate(&mut mf, &target);
+    let layout = layout_frame(&mf, &target);
+    insert_prologue_epilogue(&mut mf, &layout);
+    let func_name = |idx: u32| -> String {
+        syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
+    };
+    let global_name = |idx: u32| -> String {
+        syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
+    };
+    encode_function(&mf, &layout, &func_name, &global_name)
+}
+
+/// Compile every defined function of `module` into a relocatable
+/// [`ObjectModule`]: a single `.text` section with one global function symbol
+/// per definition, and the call/global relocations wired to (undefined-if-new)
+/// symbols. `syms` resolves the interned function/global names.
+pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
+    let mut obj = ObjectModule::new(module.name.clone());
+    let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));
+
+    for (i, f) in module.functions().enumerate() {
+        if f.is_declaration() {
+            continue;
+        }
+        let fid = crate::ir::FuncId::from_index(i);
+        let emitted = compile_function(module, fid, syms);
+        // 16-align this function's start within .text.
+        {
+            let sec = obj.section_mut(text);
+            while !sec.bytes.len().is_multiple_of(16) {
+                sec.bytes.push(0x90); // nop padding
+            }
+        }
+        let off = obj.section(text).bytes.len() as u64;
+        let len = emitted.bytes.len() as u64;
+        obj.section_mut(text).bytes.extend_from_slice(&emitted.bytes);
+
+        let name = syms.resolve(f.name).to_owned();
+        obj.add_symbol(Symbol::defined(
+            name,
+            SymbolBinding::Global,
+            SymbolType::Func,
+            text,
+            off,
+            len,
+        ));
+        for r in &emitted.relocations {
+            let sym = obj.reference_symbol(&r.symbol);
+            obj.add_relocation(crate::mc::object::Relocation {
+                section: text,
+                offset: off + r.offset,
+                symbol: sym,
+                kind: r.kind,
+                addend: r.addend,
+            });
+        }
+    }
+    obj
+}
+
+/// Compile `module` to a complete ELF64 relocatable object image.
+pub fn compile_to_elf(module: &Module, syms: &StrInterner) -> Vec<u8> {
+    crate::mc::elf::write(&compile_module(module, syms))
+}
