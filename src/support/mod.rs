@@ -5,6 +5,17 @@
 
 use std::collections::HashMap;
 
+pub mod arena;
+pub mod diagnostics;
+pub mod hash;
+
+#[doc(inline)]
+pub use arena::{Arena, Id};
+#[doc(inline)]
+pub use diagnostics::{Diagnostic, Diagnostics, FileId, Note, Severity, Span};
+#[doc(inline)]
+pub use hash::{DetHashMap, DetHashSet, FxBuildHasher, FxHasher};
+
 /// The project-wide arbitrary-precision numeric core.
 ///
 /// Wide integer and rational IR constants are represented with our own
