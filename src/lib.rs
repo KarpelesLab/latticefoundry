@@ -33,6 +33,7 @@ pub mod mc;
 pub mod pass;
 pub mod support;
 pub mod target;
+pub mod transform;
 pub mod verify;
 
 pub use ir::Module;

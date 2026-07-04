@@ -171,6 +171,42 @@ impl Module {
         let Module { types, consts, functions, .. } = self;
         builder::FunctionBuilder::new(&mut functions[func.index()], types, consts)
     }
+
+    /// The number of functions declared in this module.
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+
+    /// Functional-rebuild primitive (tenet T5): construct a **fresh** function
+    /// that shares this module's interning tables, hand `build` an immutable view
+    /// of the *old* function alongside a [`builder::FunctionBuilder`] over the
+    /// fresh one, and return the freshly built function together with `build`'s
+    /// own return value. The module is left untouched — the caller decides
+    /// whether to install the result with [`Module::replace_function`].
+    ///
+    /// This is the backbone of the [`crate::transform`] layer: transforms read
+    /// the old body and reconstruct it, rather than performing fragile in-place
+    /// surgery on the arena.
+    pub fn map_function<R>(
+        &mut self,
+        id: FuncId,
+        build: impl FnOnce(&Function, &mut builder::FunctionBuilder<'_>) -> R,
+    ) -> (Function, R) {
+        let Module { types, consts, functions, .. } = self;
+        let old = &functions[id.index()];
+        let mut fresh = Function::new(old.name, old.sig);
+        let r = {
+            let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts);
+            build(old, &mut b)
+        };
+        (fresh, r)
+    }
+
+    /// Install `func` as the body of function `id`, replacing whatever was there.
+    /// Paired with [`Module::map_function`] to commit a functional rebuild.
+    pub fn replace_function(&mut self, id: FuncId, func: Function) {
+        self.functions[id.index()] = func;
+    }
 }
 
 /// A function definition or declaration.

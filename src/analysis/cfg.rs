@@ -161,6 +161,15 @@ impl Dominators {
         self.reachable.get(b).copied().unwrap_or(false)
     }
 
+    /// The immediate dominator of block `b` — the entry is its own immediate
+    /// dominator; an unreachable or out-of-range block has `None`. This is the
+    /// hook the dominance-frontier computation ([`crate::analysis::domfrontier`])
+    /// climbs.
+    #[inline]
+    pub fn idom(&self, b: usize) -> Option<usize> {
+        self.idom.get(b).copied().flatten()
+    }
+
     /// Whether block `h` is a loop header (the target of a back edge).
     #[inline]
     pub fn is_loop_header(&self, h: usize) -> bool {

@@ -17,7 +17,7 @@ use crate::ir::inst::{
     UnaryOp, Use,
 };
 use crate::ir::types::{Type, TypeContext, TypeId};
-use crate::ir::value::{Const, ConstPool, FloatBits, ValueDef, ValueId};
+use crate::ir::value::{Const, ConstId, ConstPool, FloatBits, ValueDef, ValueId};
 use crate::ir::{BlockId, Block, FuncId, Function, GlobalId};
 
 /// A builder with an insertion point over one [`Function`].
@@ -129,6 +129,15 @@ impl<'a> FunctionBuilder<'a> {
     /// A poison constant of any type.
     pub fn poison(&mut self, ty: TypeId) -> ValueId {
         let c = self.consts.intern(Const::Poison(ty));
+        self.func.get_or_make_value(ValueDef::Const(c), ty)
+    }
+
+    /// Materialize an already-interned constant as a value in this function,
+    /// deduplicated. Used by transforms that copy operands referencing a
+    /// [`ConstId`] from another function body (`docs/ir-design.md` §9: constants
+    /// are shared module-wide).
+    pub fn use_const(&mut self, c: ConstId) -> ValueId {
+        let ty = self.consts.type_of(c);
         self.func.get_or_make_value(ValueDef::Const(c), ty)
     }
 
@@ -366,6 +375,27 @@ impl<'a> FunctionBuilder<'a> {
     /// Mark the current block's control flow as unreachable.
     pub fn unreachable(&mut self) {
         self.emit(InstKind::Unreachable, Vec::new(), Flags::NONE, None);
+    }
+
+    // --- generic instruction copying (for transforms) ---------------------
+
+    /// Append an instruction from raw parts — opcode payload, already-remapped
+    /// value `operands`, `flags`, and result type — to the current block. This is
+    /// the low-level primitive a functional-rebuild transform uses to copy an
+    /// instruction it is not editing (`docs/design-tenets.md` T5): the typed
+    /// helpers above are front-end conveniences, this is the escape hatch.
+    ///
+    /// Terminators route to the block's terminator slot; value-producing opcodes
+    /// receive a fresh result value of `result_ty`. Returns the new result value,
+    /// if any. `result_ty` must be `Some` exactly when the opcode defines a value.
+    pub fn append_inst(
+        &mut self,
+        kind: InstKind,
+        operands: Vec<ValueId>,
+        flags: Flags,
+        result_ty: Option<TypeId>,
+    ) -> Option<ValueId> {
+        self.emit(kind, operands, flags, result_ty)
     }
 
     // --- rewriting ---------------------------------------------------------

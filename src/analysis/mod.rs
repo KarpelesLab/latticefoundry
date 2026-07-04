@@ -23,12 +23,14 @@
 
 pub mod cfg;
 pub mod domain;
+pub mod domfrontier;
 pub mod domains;
 pub mod manager;
 pub mod soundness;
 pub mod solver;
 
 pub use domain::{AbstractDomain, DomainCtx, EdgeGuard};
+pub use domfrontier::DominanceFrontiers;
 pub use domains::ConstLattice;
 pub use manager::{AnalysisCache, ConstantPropagation, FunctionAnalysis};
 pub use solver::{FixpointResult, solve};
