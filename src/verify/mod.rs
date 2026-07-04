@@ -27,11 +27,14 @@
 //! through their phase.
 //!
 //! The **`Refinement` tier** (per-opcode poison/UB refinement obligations
-//! discharged by `z3rs`) is a separate, later task; it will build on the
-//! invariants established here. The `z3rs` re-export in [`smt`] is the seam it
-//! plugs into. This module only *reads* the IR — it never mutates a module.
+//! discharged by `z3rs`) lives in [`refinement`]: it encodes a single-block,
+//! pure-integer rewrite `src ⇒ tgt` into QF_BV and proves `tgt ⊑ src`. It builds
+//! on the invariants established here, and the `z3rs` re-export in [`smt`] is the
+//! seam it plugs into. This module only *reads* the IR — it never mutates a
+//! module.
 
 mod cfg;
+pub mod refinement;
 mod structural;
 
 #[cfg(test)]
@@ -40,6 +43,7 @@ mod tests;
 use crate::ir::{FuncId, Module};
 use crate::support::diagnostics::{Diagnostic, Diagnostics};
 
+pub use refinement::{RefinementResult, RefinementTier, check_refinement};
 pub use structural::verify_function;
 
 /// Verify the structural + semantic invariants of every function in `module`.
