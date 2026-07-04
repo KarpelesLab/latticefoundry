@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/latticefoundry",
+    "crates/z3rs",
+    "bin/lf",
+    "bin/lf-ld",
+    "bin/lf-as",
+    "bin/lf-opt",
+    "bin/lf-dis",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Mark Karpeles <admin@echelle.co.jp>"]
+repository = "https://github.com/echelle/latticefoundry"
+description = "A clean-room compiler construction framework in pure Rust"
+
+# Every crate in the tree may only depend on other crates from this tree.
+# No third-party dependencies: LatticeFoundry is a clean-room implementation.
+[workspace.dependencies]
+latticefoundry = { path = "crates/latticefoundry" }
+z3rs = { path = "crates/z3rs" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Optimize release builds for the codegen-heavy workloads this framework runs.
+[profile.release]
+lto = "thin"
+codegen-units = 1
