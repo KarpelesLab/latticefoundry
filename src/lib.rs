@@ -25,6 +25,7 @@
 //! The current state is an early scaffold; see `ROADMAP.md` for the phased
 //! build-out plan. Each module documents the roadmap phase that fills it in.
 
+pub mod analysis;
 pub mod codegen;
 pub mod ir;
 pub mod link;
