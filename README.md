@@ -57,6 +57,19 @@ latticefoundry/
 └── ROADMAP.md
 ```
 
+## Design
+
+What makes LatticeFoundry more than a re-implementation is written down:
+
+- [`docs/design-tenets.md`](docs/design-tenets.md) — the opinionated
+  commitments (semantics-first, correctness-by-verified-refinement, one lattice
+  engine for analysis, content-addressed core), the verification tiers, and the
+  bets register (*committed / staged / moonshot*).
+- [`docs/ir-design.md`](docs/ir-design.md) — the concrete IR decisions (block
+  arguments over φ-nodes, poison + freeze with no `undef`, opaque pointers with
+  explicit offset addressing, a unified flag model, machine-checkable opcode
+  semantics).
+
 ## Status
 
 Early scaffold. The container hierarchy, type system, and tool skeletons exist

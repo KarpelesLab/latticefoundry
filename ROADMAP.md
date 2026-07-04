@@ -55,6 +55,26 @@ LatticeFoundry is a **single Cargo package**, not a workspace: one library
 (`src/lib.rs`) and several binaries auto-discovered from `src/bin/`. The `lf-`
 tools are binaries of this one package, not separate member crates.
 
+### 2.2 Design tenets & bets
+
+What makes LatticeFoundry more than a re-implementation lives in two companion
+documents, and the *committed* bets below are threaded into the phases:
+
+- [`docs/design-tenets.md`](docs/design-tenets.md) — the opinionated
+  commitments (semantics-first, correctness-by-verified-refinement, one lattice
+  engine, content-addressed core), the verification tiers, and the full bets
+  register (*committed / staged / moonshot*).
+- [`docs/ir-design.md`](docs/ir-design.md) — the concrete IR decisions (block
+  arguments over φ-nodes, poison + freeze with no `undef`, opaque pointers with
+  explicit offset addressing, a unified flag model, machine-checkable opcode
+  semantics).
+
+The two *committed* bets on the critical path are **B1** (the opcode table is a
+formal semantics) and **B8** (a single sound abstract-interpretation engine);
+**B2** (every optimization is a checked refinement) begins at Phase 2. Staged
+and moonshot bets (region form, e-graphs, superoptimization, verified lowering,
+provenance types) are scheduled but deliberately off the M5 critical path.
+
 ## 3. Architecture overview
 
 The compilation pipeline, and the module of the library that owns each stage:
@@ -152,63 +172,87 @@ Bring up the package and the low-level support layer.
 *Next in this phase:* a general arena allocator, a deterministic hash map, and a
 diagnostics type with source spans.
 
-### **Phase 1 — Core IR**
+### **Phase 1 — Core IR**  *(carries bets B1, T5)*
 
-The typed SSA data model and the programmatic builder.
+The typed SSA data model and the programmatic builder — designed *semantics-first*
+(see [ir-design](docs/ir-design.md)).
 
-- Complete type system: integers, floats, pointers (opaque), arrays, structs,
-  vectors, function types.
-- Full value model: instruction results, block/function arguments, constants
-  (wide integers via `puremp`), global values, φ-nodes.
-- Complete opcode table: arithmetic/bitwise, comparisons, memory
-  (`load`/`store`/`alloca`/`getelementptr`-equivalent), control flow
-  (`br`/`switch`/`ret`/`unreachable`), casts, `call`, `select`.
-- `IrBuilder` with SSA construction helpers; use/def tracking and value
-  replacement.
+- Complete type system: integers, floats, opaque pointers, arrays, structs,
+  vectors, function types (interned/hash-consed from day one, T5).
+- Full value model: instruction results, **block parameters** (block arguments,
+  not φ-nodes), constants (wide integers via `puremp`), global values.
+- **Poison + freeze value semantics, no `undef`** — decided before the opcode
+  table, so every op has a poison rule (B1).
+- Complete opcode table, each op authored **as a machine-checkable reference
+  semantics** (B1): arithmetic/bitwise, comparisons, memory (`load`/`store`/
+  `alloca`/`ptr_add`), control flow (`br`/`switch`/`ret`/`unreachable`), casts,
+  `call`, `select`, `freeze`. Unified flag model (`nsw`/`nuw`/`exact`/fast-math),
+  flag violation ⇒ poison.
+- `IrBuilder` with SSA construction helpers (incl. `struct_field`/`array_elem`
+  offset helpers); use/def tracking and value replacement.
+- Content-addressed substrate: id/arena-based, no interior pointers, pure nodes
+  hash-consable (T5) so B6/B7 can be turned on later.
 
 *Exit:* build non-trivial functions in memory (loops, calls, branches);
-use/def lists are consistent under mutation; covered by unit tests.
+use/def lists are consistent under mutation; each opcode has a semantics that
+`z3rs` can consume; covered by unit tests.
 
-### **Phase 2 — Textual & binary format, and the verifier**
+### **Phase 2 — Textual & binary format, and the verifier**  *(carries bet B2, first cut)*
 
 Make IR persistable and checkable.
 
-- `.lf` textual **printer** and **parser** (our own grammar) with round-trip
-  fidelity.
-- `.lfb` binary format (compact, versioned) with round-trip fidelity.
-- Verifier: single terminator per block, dominance of uses by defs, type
-  agreement on operands and calls, entry-block/φ rules, well-typed constants.
-- Wire the format + verifier into `lf-opt` (load → verify → print).
+- `.lf` textual **printer** and **parser** (our own grammar, block parameters
+  explicit) with round-trip fidelity.
+- `.lfb` binary format (compact, versioned, content-addressed friendly) with
+  round-trip fidelity.
+- Verifier — **structural + semantic**: single terminator per block, dominance
+  of uses by defs, type agreement, block-argument arity/typing, well-typed
+  constants (`Structural` tier), **plus** the first `Refinement`-tier check: a
+  single rewrite emits a B2 refinement obligation discharged by `z3rs`.
+- Wire the format + verifier + tier selection into `lf-opt` (load → verify →
+  optionally check-refinement → print).
 
 *Exit:* golden-file tests for the printer; `parse(print(m)) == m` and
 `read(write(m)) == m` for a corpus; verifier rejects a suite of malformed
-modules with precise diagnostics.
+modules with precise diagnostics; one rewrite is `Refinement`-checked end to end.
 
-### Phase 3 — Pass & analysis infrastructure
+### Phase 3 — Analysis: one lattice engine  *(is bet B8; carries B7 substrate)*
 
-The framework that optimizations plug into.
+The analysis layer **is** a single abstract-interpretation engine, not a drawer
+of bespoke analyses (tenet T4).
 
-- Pass manager with module/function granularity and a textual pipeline spec
-  (e.g. `-p mem2reg,dce,gvn`).
-- Analysis manager with dependency tracking, caching, and invalidation.
-- Core analyses: CFG, dominator/post-dominator trees, dominance frontier,
-  natural loops, use-def/def-use, simple alias analysis.
+- A generic monotone fixpoint solver (sparse over SSA def-use) parameterized by
+  an `AbstractDomain` trait (⊥, ⊑, join, widening, concretization γ).
+- Domains implemented against that engine: constants, integer ranges,
+  known-bits, nullness, simple alias/points-to. Each domain's transfer functions
+  are **`z3rs`-checked for soundness** against the B1 opcode semantics.
+- Structural analyses the engine and passes need: CFG, dominator/post-dominator
+  trees, dominance frontier, natural loops, use-def/def-use.
+- Pass manager (module/function granularity, textual pipeline spec) and analysis
+  manager with dependency tracking, caching, and invalidation — designed for
+  parallel/incremental operation (T6) on the content-addressed core (B7).
 
-*Exit:* analyses validated against brute-force oracles on random CFGs;
+*Exit:* the fixpoint engine reproduces each domain's results and matches a
+brute-force oracle on random CFGs; transfer-function soundness checks pass;
 invalidation verified (a mutating pass forces recomputation).
 
-### Phase 4 — Optimizations
+### Phase 4 — Optimizations  *(grows bets B4, B9 on B2)*
 
-A useful baseline optimization pipeline over the IR.
+A useful baseline of optimizations, verified by construction.
 
-- `mem2reg` (promote memory to SSA registers using dominance frontiers).
-- Dead-code / dead-store elimination, aggressive DCE.
-- Constant folding & propagation, instruction combining / peephole.
-- CSE / global value numbering, control-flow simplification.
-- Function inlining with a cost model; loop-invariant code motion.
+- Structural transforms: `mem2reg` (promote memory to SSA via dominance
+  frontiers), aggressive/dead-store DCE, control-flow simplification, inlining
+  with a cost model, loop-invariant code motion.
+- **Local/algebraic optimization via equality saturation (B4):** constant
+  folding, strength reduction, GVN/CSE, and peepholes expressed as **B2-verified
+  rewrite rules** over an e-graph, with best-program extraction under a **cost
+  lattice (B9)** — sidestepping phase ordering for this class.
+- Every rewrite (structural or e-graph) carries a `Refinement`-tier obligation
+  and stays valid under the verifier.
 
-*Exit:* each pass has before/after golden tests and preserves verifier
-validity; an `-O1`/`-O2` pipeline measurably shrinks a benchmark corpus.
+*Exit:* each transform has before/after golden tests, is `Refinement`-checked,
+and preserves verifier validity; an `-O1`/`-O2` pipeline measurably shrinks a
+benchmark corpus; the e-graph rule set is `z3rs`-verified.
 
 ### **Phase 5 — Target-independent code generation**
 
@@ -258,17 +302,20 @@ Produce a runnable program.
 
 *Exit:* end-to-end tests compile → link → execute across the Phase 7 targets.
 
-### Phase 9 — SMT-backed verification (via `z3rs`)
+### Phase 9 — Certified tier: proof-carrying IR  *(is bet B3)*
 
-Put the external solver to work (`z3rs` is developed separately; we integrate,
+Deepen the verification story from "checked in CI" (B2, already in use since
+Phase 2) to "certificate-checked" (`z3rs` is developed separately; we integrate,
 not build it).
 
-- Integrate `z3rs` into `verify` for discharging side conditions (no-overflow,
-  bounds, refinement) and into passes for correctness-guarded rewrites.
-- Translation validation: prove selected optimization runs semantics-preserving.
+- Modules carry **certificates** of the transformations applied; a small trusted
+  checker + `z3rs` re-validates a whole pipeline without trusting the optimizer
+  (the `Certified` tier).
+- Whole-run translation validation over an optimization pipeline; certificate
+  caching so release builds check rather than re-prove.
 
-*Exit:* at least one optimization is guarded by SMT-checked rewrites; a suite of
-verification conditions is discharged through `z3rs`.
+*Exit:* a pipeline run emits certificates that the checker validates; the
+trusted computing base is reduced to the checker plus `z3rs`.
 
 ### Phase 10 — Beyond the core
 
@@ -308,8 +355,8 @@ programs.
 | M0        | Package builds; drivers run                              | 0     |
 | M1        | Build & verify SSA IR in memory                          | 1–2   |
 | M2        | Parse/print/round-trip `.lf`; verifier rejects bad IR    | 2     |
-| M3        | `-O2` pipeline optimizes a corpus, stays valid           | 3–4   |
+| M3        | `-O2` pipeline optimizes a corpus, refinement-checked    | 3–4   |
 | M4        | Emit assembled objects for x86-64                        | 5–7   |
 | **M5**    | **Compile `.lf` → native executable that runs**          | 8     |
-| M6        | SMT-guarded verification/optimization                    | 9     |
+| M6        | Certified tier: proof-carrying pipeline                  | 9     |
 | M7        | JIT, debug info, LTO                                     | 10    |
