@@ -27,25 +27,33 @@ These are hard constraints, not aspirations. They shape every phase.
 
 1. **Clean room.** Every artifact is designed and written from first
    principles. We do **not** copy, transliterate, or line-by-line "translate"
-   source code, textual IR grammars, encoding tables, or file-format layouts
-   from any existing compiler, assembler, linker, or solver. Published
-   *standards* that we must interoperate with (e.g. the ELF specification, an
-   instruction-set manual, the IEEE-754 standard) may be implemented from the
-   spec — that is interoperability, not derivation. General computer-science
-   knowledge (SSA, dominance, graph coloring, DPLL) is used freely.
-2. **No third-party code.** The dependency graph contains only crates from this
-   workspace. No crates.io dependencies, vendored or otherwise. Utilities we
-   would normally pull from the ecosystem (bit-vectors, hashing, arena
-   allocators, arg parsing) are written here.
+   source, textual IR grammars, encoding tables, or file-format layouts from
+   any third-party compiler, assembler, linker, or solver. Published
+   *standards* we must interoperate with (the ELF specification, an
+   instruction-set manual, IEEE-754) may be implemented from the spec — that is
+   interoperability, not derivation. General computer-science knowledge (SSA,
+   dominance, graph coloring, DPLL) is used freely.
+2. **Only our own crates.** The dependency graph contains only our own focused,
+   clean-room library crates — nothing from third parties, no `-sys` crates, no
+   C. See §3.1 for the current set. Utilities we would normally pull from the
+   ecosystem (bit-vectors, hashing, arena allocators, arg parsing) are either
+   provided by one of our crates or written here.
 3. **Pure, safe Rust.** `unsafe` is a `warn` lint. It is permitted only where a
    safety invariant genuinely cannot be expressed in the type system, and every
    use is documented with the invariant it upholds.
-4. **Design our own formats.** Our textual IR (`.lf`), binary IR / bitcode, and
-   object format (`.lfo`) are our designs. Where we emit or read a *standard*
-   external format (ELF, DWARF), we implement it against its public spec.
+4. **Design our own formats.** Our textual IR (`.lf`), binary IR (`.lfb`), and
+   native object format (`.lfo`) are our designs. Where we emit or read a
+   *standard* external format (ELF, DWARF), we implement it against its public
+   spec.
 5. **Test as we build.** Every phase ships with unit tests; from Phase 2 onward
    we maintain golden-file and round-trip tests, and from Phase 5 onward,
    execution tests that actually run generated code.
+
+### 2.1 Not a workspace
+
+LatticeFoundry is a **single Cargo package**, not a workspace: one library
+(`src/lib.rs`) and several binaries auto-discovered from `src/bin/`. The `lf-`
+tools are binaries of this one package, not separate member crates.
 
 ## 3. Architecture overview
 
@@ -71,24 +79,23 @@ The compilation pipeline, and the module of the library that owns each stage:
    .lfo/ELF │  link          symbol resolution, relocation, layout      │
             └──────────────────────────────────────────────────────────┘
 
-drivers:  lf (umbrella)   lf-opt   lf-as   lf-dis   lf-ld
+binaries: lf (umbrella)   lf-opt   lf-as   lf-dis   lf-ld
 ```
 
-### Crate map
+### Module map (all within the one `latticefoundry` library)
 
-| Crate / module            | Responsibility                                          |
+| Module                    | Responsibility                                          |
 | ------------------------- | ------------------------------------------------------- |
-| `latticefoundry::support` | interning, arenas, bit-vectors, small ADTs              |
-| `latticefoundry::ir`      | IR data model, type system, builder, text/binary format |
-| `latticefoundry::verify`  | well-formedness checking; SMT-backed condition checks   |
-| `latticefoundry::pass`    | pass manager, analysis caching, pipeline description     |
-| `latticefoundry::codegen` | target-independent lowering to machine IR               |
-| `latticefoundry::mc`      | machine-code encoding and object emission               |
-| `latticefoundry::target`  | target registry and per-target tables                   |
-| `latticefoundry::link`    | linker core                                             |
-| `z3rs`                    | clean-room SMT solver (bit-vectors, LIA, arrays)        |
+| `support`                 | interning, arenas, small ADTs; numeric core (`puremp`)  |
+| `ir`                      | IR data model, type system, builder, text/binary format |
+| `verify`                  | well-formedness checking; SMT-backed condition checks   |
+| `pass`                    | pass manager, analysis caching, pipeline description     |
+| `codegen`                 | target-independent lowering to machine IR               |
+| `mc`                      | machine-code encoding and object emission               |
+| `target`                  | target registry and per-target tables                   |
+| `link`                    | linker core                                             |
 
-### Binaries
+### Binaries (`src/bin/`)
 
 | Binary   | Role                                             |
 | -------- | ------------------------------------------------ |
@@ -97,6 +104,24 @@ drivers:  lf (umbrella)   lf-opt   lf-as   lf-dis   lf-ld
 | `lf-as`  | assembler: target assembly → relocatable object   |
 | `lf-dis` | disassembler: machine code → assembly             |
 | `lf-ld`  | linker: objects/archives → executable / shared obj |
+
+### 3.1 Dependencies — our own crates only
+
+LatticeFoundry reuses focused, clean-room library crates from our own
+ecosystem. It does **not** reinvent them:
+
+| Crate                                                    | Used for                                                   |
+| -------------------------------------------------------- | ---------------------------------------------------------- |
+| [`puremp`](https://github.com/KarpelesLab/puremp)        | arbitrary-precision integers/rationals/floats for IR constants and codegen constant math |
+| [`z3rs`](https://github.com/KarpelesLab/z3rs)            | SMT solving for the verifier and correctness-guarded rewrites (Phase 9) |
+
+Additional own-crates may be adopted as later phases need them, e.g.
+[`compcol`](https://github.com/KarpelesLab/compcol) for compressing binary IR /
+objects. **Broad tools are not taken as dependencies:** code from wide own-tools
+such as [`univdreams`](https://github.com/KarpelesLab/univdreams) (a
+decompiler/compiler/emulator that round-trips ELF/PE/Mach-O) may be *adapted
+into this tree* for object-format handling, but that crate — being an
+emulator/decompiler — is not pulled in as a dependency.
 
 ### Naming conventions
 
@@ -108,23 +133,24 @@ drivers:  lf (umbrella)   lf-opt   lf-as   lf-dis   lf-ld
 ## 4. Phased plan
 
 Phases are ordered by dependency, not by calendar. Each lists deliverables and
-the exit criteria that define completion. **Bold** phases below are the
-critical path to "compile a function to a running native executable" (the first
-end-to-end milestone, Phase 8).
+the exit criteria that define completion. **Bold** phases are the critical path
+to "compile a function to a running native executable" (the first end-to-end
+milestone, Phase 8).
 
 ### Phase 0 — Foundations & scaffolding  ✅ *in progress*
 
-Bring up the workspace and the low-level support layer.
+Bring up the package and the low-level support layer.
 
-- Cargo workspace, edition 2024, zero third-party deps, shared lints.
-- `support`: string interner, typed-index/arena primitives.
+- Single-package layout (lib + `src/bin/` tools), edition 2024, only-our-crates
+  policy, shared lints.
+- `support`: string interner, typed-index/arena primitives; the `puremp`
+  numeric core wired in (we do **not** write a bespoke bignum).
 - Driver skeletons for all five binaries (`--version`/`--help`).
-- CI-friendly `build` / `test` / `clippy` all green.
+- `build` / `test` / `clippy` all green.
 
-*Exit:* `cargo build/test/clippy --workspace` clean; every binary runs.
-*Next in this phase:* arbitrary-width integer (`ApInt`) and bit-vector types,
-a general arena allocator, a deterministic hash map, and a diagnostics type
-with source spans.
+*Exit:* `cargo build/test/clippy` clean; every binary runs.
+*Next in this phase:* a general arena allocator, a deterministic hash map, and a
+diagnostics type with source spans.
 
 ### **Phase 1 — Core IR**
 
@@ -132,8 +158,8 @@ The typed SSA data model and the programmatic builder.
 
 - Complete type system: integers, floats, pointers (opaque), arrays, structs,
   vectors, function types.
-- Full value model: instruction results, block/function arguments, constants,
-  global values, φ-nodes.
+- Full value model: instruction results, block/function arguments, constants
+  (wide integers via `puremp`), global values, φ-nodes.
 - Complete opcode table: arithmetic/bitwise, comparisons, memory
   (`load`/`store`/`alloca`/`getelementptr`-equivalent), control flow
   (`br`/`switch`/`ret`/`unreachable`), casts, `call`, `select`.
@@ -203,6 +229,8 @@ Turn instructions into bytes and objects.
 - Instruction encoder/decoder framework (drives `lf-as` and `lf-dis`).
 - Relocations, sections, symbols; our `.lfo` relocatable object format.
 - ELF64 relocatable **writer** implemented from the ELF spec (for interop).
+  Object-format plumbing may adapt code from our own `univdreams` (kept
+  in-tree, not a dependency); compression of `.lfb`/`.lfo` may use `compcol`.
 
 *Exit:* `lf-as` assembles to `.lfo`/ELF; `lf-dis` round-trips encode∘decode on
 a fuzzed instruction corpus; objects are consumable by Phase 8.
@@ -230,18 +258,17 @@ Produce a runnable program.
 
 *Exit:* end-to-end tests compile → link → execute across the Phase 7 targets.
 
-### Phase 9 — z3rs (SMT solver) & verification
+### Phase 9 — SMT-backed verification (via `z3rs`)
 
-Bring the solver up and put it to work.
+Put the external solver to work (`z3rs` is developed separately; we integrate,
+not build it).
 
-- DPLL(T) core; theory solvers for fixed-width bit-vectors, linear integer
-  arithmetic, and arrays; a small textual query format.
-- Integrate into `verify` for discharging side conditions (no-overflow, bounds,
-  refinement) and into passes for correctness-guarded rewrites.
+- Integrate `z3rs` into `verify` for discharging side conditions (no-overflow,
+  bounds, refinement) and into passes for correctness-guarded rewrites.
 - Translation validation: prove selected optimization runs semantics-preserving.
 
-*Exit:* solver decides a benchmark suite of bit-vector/LIA queries correctly;
-at least one optimization is guarded by SMT-checked rewrites.
+*Exit:* at least one optimization is guarded by SMT-checked rewrites; a suite of
+verification conditions is discharged through `z3rs`.
 
 ### Phase 10 — Beyond the core
 
@@ -264,7 +291,6 @@ programs.
 - **Property/oracle tests** for analyses (compare against brute force on random
   graphs) and for the encoder (`decode(encode(i)) == i`).
 - **Execution tests** from Phase 5/8: compile and run, check observable output.
-- **Differential tests** for `z3rs` against its own naive/bit-blasting path.
 
 ## 6. Non-goals (for now)
 
@@ -279,7 +305,7 @@ programs.
 
 | Milestone | Meaning                                                 | Phase |
 | --------- | ------------------------------------------------------- | ----- |
-| M0        | Workspace builds; drivers run                            | 0     |
+| M0        | Package builds; drivers run                              | 0     |
 | M1        | Build & verify SSA IR in memory                          | 1–2   |
 | M2        | Parse/print/round-trip `.lf`; verifier rejects bad IR    | 2     |
 | M3        | `-O2` pipeline optimizes a corpus, stays valid           | 3–4   |

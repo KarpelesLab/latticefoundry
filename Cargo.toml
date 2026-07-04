@@ -1,39 +1,35 @@
-[workspace]
-resolver = "3"
-members = [
-    "crates/latticefoundry",
-    "crates/z3rs",
-    "bin/lf",
-    "bin/lf-ld",
-    "bin/lf-as",
-    "bin/lf-opt",
-    "bin/lf-dis",
-]
-
-[workspace.package]
+[package]
+name = "latticefoundry"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Mark Karpeles <admin@echelle.co.jp>"]
-repository = "https://github.com/echelle/latticefoundry"
+repository = "https://github.com/KarpelesLab/latticefoundry"
 description = "A clean-room compiler construction framework in pure Rust"
 
-# Every crate in the tree may only depend on other crates from this tree.
-# No third-party dependencies: LatticeFoundry is a clean-room implementation.
-[workspace.dependencies]
-latticefoundry = { path = "crates/latticefoundry" }
-z3rs = { path = "crates/z3rs" }
+# This is a single package, NOT a Cargo workspace: one library
+# (`src/lib.rs`) plus several binaries auto-discovered from `src/bin/`
+# (`lf`, `lf-ld`, `lf-as`, `lf-opt`, `lf-dis`).
+[lib]
+name = "latticefoundry"
+path = "src/lib.rs"
 
-[workspace.lints.rust]
+# Dependencies are only our own focused, clean-room library crates. No foreign
+# or third-party code. `z3rs` is our pure-Rust SMT solver; `puremp` is our
+# arbitrary-precision numeric core (and z3rs's own dependency).
+[dependencies]
+z3rs = "0.0.4"
+puremp = "0.2"
+
+[lints.rust]
 unsafe_code = "warn"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 
-[workspace.lints.clippy]
+[lints.clippy]
 all = { level = "warn", priority = -1 }
 
-# Optimize release builds for the codegen-heavy workloads this framework runs.
 [profile.release]
 lto = "thin"
 codegen-units = 1

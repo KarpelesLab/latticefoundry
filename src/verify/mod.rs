@@ -21,8 +21,11 @@ pub fn verify_module(_module: &Module) -> Result<(), Vec<VerifyError>> {
     Ok(())
 }
 
-/// Bridge to the [`z3rs`] SMT solver for discharging verification conditions
-/// (bounds, overflow, and refinement checks). See ROADMAP Phase 9.
+/// Bridge to the external [`z3rs`] SMT solver, used to discharge verification
+/// conditions (bounds, overflow, and refinement checks). `z3rs` is a separate
+/// clean-room crate; it is re-exported here so verifier code has a single
+/// canonical path to it. See ROADMAP Phase 9.
 pub mod smt {
-    pub use z3rs::Solver;
+    #[doc(inline)]
+    pub use z3rs;
 }

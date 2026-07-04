@@ -1,9 +1,17 @@
-//! Foundational support utilities: interning and small ADTs.
+//! Foundational support utilities: interning, small ADTs, and the numeric core.
 //!
 //! These are the low-level building blocks the rest of the framework relies
 //! on. See ROADMAP Phase 0.
 
 use std::collections::HashMap;
+
+/// The project-wide arbitrary-precision numeric core.
+///
+/// Wide integer and rational IR constants are represented with our own
+/// [`puremp`] crate rather than a bespoke bignum; it is re-exported here as
+/// the canonical path for the rest of the framework. See ROADMAP Phase 1.
+#[doc(inline)]
+pub use puremp;
 
 /// A cheap, copyable handle into an interning table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]

@@ -7,16 +7,18 @@
 //! pipeline, target-independent code generation, a machine-code / object-file
 //! layer, pluggable targets, and a linker core.
 //!
-//! It is delivered as a single library ([`latticefoundry`](crate)) plus a
-//! family of driver binaries (`lf`, `lf-ld`, `lf-as`, `lf-opt`, `lf-dis`).
+//! It is delivered as a single package: one library ([`latticefoundry`](crate))
+//! plus a family of driver binaries (`lf`, `lf-ld`, `lf-as`, `lf-opt`,
+//! `lf-dis`) under `src/bin/`. This is **not** a Cargo workspace.
 //!
 //! ## Principles
 //!
 //! - **Clean room.** Every line is written from first principles. No source,
-//!   text format, or table is copied or transliterated from any existing
+//!   text format, or table is copied or transliterated from any third-party
 //!   compiler or toolchain.
-//! - **No third-party code.** The only dependencies are other crates in this
-//!   workspace (for example [`z3rs`], our own SMT solver).
+//! - **Only our own crates.** The dependencies are only our own focused,
+//!   clean-room library crates — `z3rs` (SMT solver) and `puremp`
+//!   (arbitrary-precision numerics). Nothing third-party, no C.
 //! - **Pure, safe Rust.** `unsafe` is a `warn`-level lint and used only where
 //!   an invariant genuinely cannot be expressed in the type system.
 //!

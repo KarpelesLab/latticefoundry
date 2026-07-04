@@ -12,28 +12,49 @@ machine-code / object-file layer, pluggable targets, and a linker core.
 
 - **Clean room.** Everything is designed and written from first principles. No
   source code, text format, encoding table, or algorithm transliteration is
-  taken from any existing compiler or toolchain. General computer-science
-  concepts (SSA, dominator trees, register allocation) are fair game;
-  another project's implementation is not.
-- **No third-party code.** The only dependencies are other crates in this
-  workspace — for example [`z3rs`](crates/z3rs), our own SMT solver. No crates
-  from crates.io.
+  taken from any third-party compiler or toolchain. General computer-science
+  concepts (SSA, dominator trees, register allocation) are fair game; another
+  project's implementation is not. Where we must interoperate with a published
+  standard (ELF, DWARF, an ISA manual, IEEE-754), we implement it from the spec.
+- **Only our own crates.** The dependency graph contains only our own focused,
+  clean-room library crates. Nothing third-party, no `-sys` crates, no C.
+  Currently:
+  - [`z3rs`](https://github.com/KarpelesLab/z3rs) — pure-Rust SMT solver, used
+    by the verifier.
+  - [`puremp`](https://github.com/KarpelesLab/puremp) — arbitrary-precision
+    numeric core, used for wide IR constants (and `z3rs`'s own dependency).
 - **Pure, safe Rust.** `unsafe` is a `warn`-level lint, used only where an
   invariant genuinely cannot be expressed in the type system.
 
+Code from our broader own-tools (e.g. object-format handling in
+[`univdreams`](https://github.com/KarpelesLab/univdreams)) may be *adapted into
+this tree* where useful, but such wide tools are **not** taken as dependencies.
+
 ## Layout
+
+This is a single package (**not** a Cargo workspace): one library plus the
+binaries under `src/bin/`.
 
 ```
 latticefoundry/
-├── crates/
-│   ├── latticefoundry/   the framework library (ir, verify, pass, codegen, mc, target, link)
-│   └── z3rs/             a clean-room SMT solver, used by the verifier
-└── bin/
-    ├── lf/               compiler driver (umbrella front end)
-    ├── lf-ld/            linker
-    ├── lf-as/            assembler
-    ├── lf-opt/           IR optimizer driver
-    └── lf-dis/           disassembler
+├── Cargo.toml
+├── src/
+│   ├── lib.rs            the framework library
+│   ├── support/         interning, small ADTs, numeric core (puremp)
+│   ├── ir/              typed SSA IR + type system
+│   ├── verify/          well-formedness checks; SMT bridge to z3rs
+│   ├── pass/            pass & analysis manager
+│   ├── codegen/         IR → machine IR lowering
+│   ├── mc/              machine-code encoding + object formats
+│   ├── target/          per-architecture description tables
+│   ├── link/            linker core
+│   └── bin/
+│       ├── lf.rs        compiler driver (umbrella front end)
+│       ├── lf-ld.rs     linker
+│       ├── lf-as.rs     assembler
+│       ├── lf-opt.rs    IR optimizer driver
+│       └── lf-dis.rs    disassembler
+└── ROADMAP.md
 ```
 
 ## Status
@@ -45,12 +66,12 @@ and build; the engines behind them are filled in phase by phase. See
 ## Building
 
 ```sh
-cargo build --workspace
-cargo test  --workspace
-cargo clippy --workspace --all-targets
+cargo build
+cargo test
+cargo clippy --all-targets
 ```
 
-Requires a Rust toolchain supporting the 2024 edition (1.85+).
+Requires a Rust toolchain supporting the 2024 edition (1.88+, per `z3rs`).
 
 ## License
 
