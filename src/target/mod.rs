@@ -4,6 +4,7 @@
 //! encodings, and lowering rules. Targets register themselves here so drivers
 //! can select one by triple.
 
+pub mod aarch64;
 pub mod x86_64;
 
 /// A supported target architecture.

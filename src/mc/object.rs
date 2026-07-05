@@ -241,6 +241,15 @@ pub enum RelocKind {
     Plt32,
     /// PC-relative 32-bit reference to the symbol's global-offset-table entry.
     GotPcRel,
+    /// AArch64 `R_AARCH64_CALL26`: a `bl`/`b` `imm26` branch field to `S + A`,
+    /// scaled by 4. Patched into bits `[25:0]` of the 32-bit instruction word.
+    Aarch64Call26,
+    /// AArch64 `R_AARCH64_ADR_PREL_PG_HI21`: the page-relative high 21 bits of
+    /// `S + A` for an `adrp`, split across the `immhi`/`immlo` fields.
+    Aarch64AdrPrelPgHi21,
+    /// AArch64 `R_AARCH64_ADD_ABS_LO12_NC`: the low 12 bits of `S + A` for the
+    /// `add` that completes an `adrp`+`add` address materialization.
+    Aarch64AddAbsLo12Nc,
 }
 
 impl RelocKind {
@@ -253,7 +262,11 @@ impl RelocKind {
             | RelocKind::Abs32S
             | RelocKind::Pc32
             | RelocKind::Plt32
-            | RelocKind::GotPcRel => 4,
+            | RelocKind::GotPcRel
+            // The AArch64 kinds patch a bitfield inside a 4-byte instruction word.
+            | RelocKind::Aarch64Call26
+            | RelocKind::Aarch64AdrPrelPgHi21
+            | RelocKind::Aarch64AddAbsLo12Nc => 4,
         }
     }
 
@@ -263,7 +276,12 @@ impl RelocKind {
     pub fn is_pcrel(self) -> bool {
         matches!(
             self,
-            RelocKind::Pc32 | RelocKind::Pc64 | RelocKind::Plt32 | RelocKind::GotPcRel
+            RelocKind::Pc32
+                | RelocKind::Pc64
+                | RelocKind::Plt32
+                | RelocKind::GotPcRel
+                | RelocKind::Aarch64Call26
+                | RelocKind::Aarch64AdrPrelPgHi21
         )
     }
 }

@@ -424,7 +424,12 @@ pub fn link_executable(
                     }
                     put(&mut buf, file_off, &(v as i32).to_le_bytes());
                 }
-                RelocKind::GotPcRel => return Err(LinkError::UnsupportedReloc(r.kind)),
+                RelocKind::GotPcRel
+                | RelocKind::Aarch64Call26
+                | RelocKind::Aarch64AdrPrelPgHi21
+                | RelocKind::Aarch64AddAbsLo12Nc => {
+                    return Err(LinkError::UnsupportedReloc(r.kind));
+                }
             }
         }
     }

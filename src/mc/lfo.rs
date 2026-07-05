@@ -311,6 +311,9 @@ fn reloc_kind_code(k: RelocKind) -> u8 {
         RelocKind::Pc64 => 4,
         RelocKind::Plt32 => 5,
         RelocKind::GotPcRel => 6,
+        RelocKind::Aarch64Call26 => 7,
+        RelocKind::Aarch64AdrPrelPgHi21 => 8,
+        RelocKind::Aarch64AddAbsLo12Nc => 9,
     }
 }
 
@@ -323,6 +326,9 @@ fn reloc_kind_from(c: u8) -> Result<RelocKind, DecodeError> {
         4 => RelocKind::Pc64,
         5 => RelocKind::Plt32,
         6 => RelocKind::GotPcRel,
+        7 => RelocKind::Aarch64Call26,
+        8 => RelocKind::Aarch64AdrPrelPgHi21,
+        9 => RelocKind::Aarch64AddAbsLo12Nc,
         _ => return Err(DecodeError::InvalidTag { what: "reloc-kind", tag: u32::from(c) }),
     })
 }

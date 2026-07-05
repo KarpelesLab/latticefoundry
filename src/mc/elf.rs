@@ -95,6 +95,13 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         RelocKind::Pc64 => R_X86_64_PC64,
         RelocKind::Plt32 => R_X86_64_PLT32,
         RelocKind::GotPcRel => R_X86_64_GOTPCREL,
+        // AArch64 relocation kinds never appear in an x86-64 ELF object (the
+        // AArch64 backend does not emit through this writer).
+        RelocKind::Aarch64Call26
+        | RelocKind::Aarch64AdrPrelPgHi21
+        | RelocKind::Aarch64AddAbsLo12Nc => {
+            unreachable!("AArch64 relocation kind {kind:?} in an x86-64 ELF object")
+        }
     }
 }
 
