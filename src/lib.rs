@@ -28,6 +28,7 @@
 pub mod analysis;
 pub mod codegen;
 pub mod ir;
+pub mod jit;
 pub mod link;
 pub mod mc;
 pub mod pass;

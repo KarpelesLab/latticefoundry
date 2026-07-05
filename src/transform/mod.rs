@@ -28,6 +28,7 @@ pub mod licm;
 pub mod mem2reg;
 pub mod sccp;
 pub mod simplify_cfg;
+pub mod superopt;
 
 #[cfg(test)]
 mod tests;
