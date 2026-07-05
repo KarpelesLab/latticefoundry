@@ -193,4 +193,11 @@ impl ConstPool {
     pub fn is_empty(&self) -> bool {
         self.consts.is_empty()
     }
+
+    /// Iterate the interned constants in id order (id `0`, `1`, ...). The `n`-th
+    /// item is the constant of [`ConstId`] `n` — used to rebuild an old→new id map
+    /// by position when merging modules for LTO.
+    pub fn iter(&self) -> impl Iterator<Item = &Const> {
+        self.consts.iter()
+    }
 }

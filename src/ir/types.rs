@@ -176,6 +176,13 @@ impl TypeContext {
         self.types.is_empty()
     }
 
+    /// Iterate the interned types in id order (id `0`, `1`, ...). The `n`-th item
+    /// is the type of [`TypeId`] `n`, which is what lets a consumer rebuild an
+    /// old→new id map by position (used when merging modules for LTO).
+    pub fn iter(&self) -> impl Iterator<Item = &Type> {
+        self.types.iter()
+    }
+
     // --- convenience constructors -------------------------------------------
 
     /// The `void` type.

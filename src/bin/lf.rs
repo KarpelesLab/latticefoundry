@@ -9,10 +9,11 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use latticefoundry::ir::{Module, binary, text};
+use latticefoundry::ir::{Module, binary, merge_modules, text};
 use latticefoundry::link::{self, ImageOptions};
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::{Diagnostic, FileId, Severity};
+use latticefoundry::transform::pipeline::{self, OptLevel};
 use latticefoundry::{target, verify};
 
 fn main() -> ExitCode {
@@ -43,36 +44,63 @@ fn main() -> ExitCode {
 fn print_usage() {
     println!("lf — LatticeFoundry compiler driver\n");
     println!("usage:");
-    println!("  lf build <input.lf|input.lfb> [-o <out>] [--entry <name>] [-g] [--no-verify]");
+    println!(
+        "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3] [--entry <name>] [-g] [--lto] [--no-verify]"
+    );
     println!("  lf --version | --help\n");
+    println!("  -O0..-O3       optimization level (default: -O0)");
     println!("  -g / --debug   emit DWARF debug info (source lines, symbols)");
-    println!("`lf build` compiles an IR module to a static native executable.");
+    println!("  --lto          link-time optimize across inputs (implied by 2+ inputs)");
+    println!("`lf build` compiles one or more IR modules to a static native executable.");
+    println!("With several inputs (or --lto), the modules are IR-linked into one, the");
+    println!("-O pipeline runs over the whole program (cross-module inlining), then codegen.");
 }
 
 struct BuildOptions {
-    input: String,
+    inputs: Vec<String>,
     output: Option<String>,
     entry: Option<String>,
     verify: bool,
     debug: bool,
+    opt: OptLevel,
+    lto: bool,
 }
 
 fn build(args: &[String]) -> Result<(), String> {
     let opts = parse_build(args)?;
 
-    // Parse the IR module in whichever encoding the extension names.
+    // Parse every input in whichever encoding its extension names, threading one
+    // interner so symbol names compare across modules (required for IR linking).
     let mut syms = StrInterner::new();
-    let module = load(&opts.input, &mut syms)?;
+    let mut modules = Vec::with_capacity(opts.inputs.len());
+    for input in &opts.inputs {
+        modules.push(load(input, &mut syms)?);
+    }
+
+    // Combine into one module. Multiple inputs (or --lto) are IR-linked so the
+    // optimizer sees the whole program; a single input needs no merge.
+    let mut module = if modules.len() == 1 && !opts.lto {
+        modules.into_iter().next().expect("one module")
+    } else {
+        merge_modules(modules, "lto").map_err(|e| {
+            let name = syms.resolve(e.symbol());
+            let kind = match e {
+                latticefoundry::ir::MergeError::DuplicateFunction(_) => "function",
+                latticefoundry::ir::MergeError::DuplicateGlobal(_) => "global",
+            };
+            format!("link (LTO) error: duplicate definition of {kind} '{name}'")
+        })?
+    };
 
     // Verify (Structural tier) unless suppressed.
-    if opts.verify
-        && let Err(diags) = verify::verify_module(&module)
-    {
-        for d in &diags {
-            eprintln!("{}", render(d));
-        }
-        let errs = diags.iter().filter(|d| d.severity == Severity::Error).count();
-        return Err(format!("verification failed ({errs} error(s))"));
+    if opts.verify {
+        verify_or_err(&module, "input")?;
+    }
+
+    // Run the optimization pipeline, then re-verify (a pass must preserve validity).
+    pipeline::optimize(&mut module, opts.opt);
+    if opts.verify && opts.opt != OptLevel::O0 {
+        verify_or_err(&module, "optimized")?;
     }
 
     // Lower to a relocatable object, then link into a static executable. With
@@ -83,7 +111,8 @@ fn build(args: &[String]) -> Result<(), String> {
             .ok()
             .and_then(|p| p.to_str().map(str::to_owned))
             .unwrap_or_default();
-        let source = target::x86_64::DebugSource { file_name: opts.input.clone(), comp_dir };
+        let file_name = opts.inputs.first().cloned().unwrap_or_default();
+        let source = target::x86_64::DebugSource { file_name, comp_dir };
         target::x86_64::compile_module_debug(&module, &syms, &source)
     } else {
         target::x86_64::compile_module(&module, &syms)
@@ -96,17 +125,35 @@ fn build(args: &[String]) -> Result<(), String> {
     let image =
         link::link_executable(vec![obj], &image_opts).map_err(|e| format!("link error: {e}"))?;
 
-    let output = opts.output.unwrap_or_else(|| default_output(&opts.input));
+    let output = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output(&opts.inputs[0]));
     link::write_executable(&output, &image)?;
     Ok(())
 }
 
+/// Verify `module`, rendering any error diagnostics and returning a driver error
+/// naming the `stage` (`"input"` / `"optimized"`).
+fn verify_or_err(module: &Module, stage: &str) -> Result<(), String> {
+    if let Err(diags) = verify::verify_module(module) {
+        for d in &diags {
+            eprintln!("{}", render(d));
+        }
+        let errs = diags.iter().filter(|d| d.severity == Severity::Error).count();
+        return Err(format!("{stage} verification failed ({errs} error(s))"));
+    }
+    Ok(())
+}
+
 fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
-    let mut input: Option<String> = None;
+    let mut inputs: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut entry: Option<String> = None;
     let mut verify = true;
     let mut debug = false;
+    let mut opt = OptLevel::O0;
+    let mut lto = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -115,24 +162,22 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "--entry" | "-e" => entry = Some(it.next().ok_or("--entry requires a name")?.clone()),
             "--no-verify" => verify = false,
             "-g" | "--debug" => debug = true,
+            "--lto" => lto = true,
+            tok if OptLevel::parse_flag(tok).is_some() => {
+                opt = OptLevel::parse_flag(tok).expect("checked");
+            }
             flag if flag.starts_with('-') && flag != "-" => {
                 return Err(format!("unrecognized option '{flag}'"));
             }
-            positional => {
-                if input.replace(positional.to_owned()).is_some() {
-                    return Err("more than one input file given".to_owned());
-                }
-            }
+            positional => inputs.push(positional.to_owned()),
         }
     }
 
-    Ok(BuildOptions {
-        input: input.ok_or("no input file (see `lf --help`)")?,
-        output,
-        entry,
-        verify,
-        debug,
-    })
+    if inputs.is_empty() {
+        return Err("no input file (see `lf --help`)".to_owned());
+    }
+
+    Ok(BuildOptions { inputs, output, entry, verify, debug, opt, lto })
 }
 
 /// The default output path: the input with any extension stripped, or `a.out`.

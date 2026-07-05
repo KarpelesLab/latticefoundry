@@ -26,6 +26,7 @@
 pub mod binary;
 pub mod builder;
 pub mod inst;
+pub mod merge;
 pub mod semantics;
 pub mod text;
 pub mod types;
@@ -35,6 +36,7 @@ pub use inst::{
     BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred, SwitchCase,
     SwitchData, UnaryOp, Use,
 };
+pub use merge::{MergeError, merge_modules};
 pub use semantics::{EvalOutcome, FoldResult, SemValue, eval, fold};
 pub use types::{FloatKind, FuncType, Layout, Type, TypeContext, TypeId};
 pub use value::{Const, ConstId, ConstPool, FloatBits, Value, ValueDef, ValueId};

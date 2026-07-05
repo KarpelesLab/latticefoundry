@@ -26,6 +26,7 @@ pub mod egraph;
 pub mod inline;
 pub mod licm;
 pub mod mem2reg;
+pub mod pipeline;
 pub mod sccp;
 pub mod simplify_cfg;
 pub mod superopt;
@@ -38,6 +39,7 @@ pub use egraph::EqSat;
 pub use inline::Inline;
 pub use licm::Licm;
 pub use mem2reg::Mem2Reg;
+pub use pipeline::{OptLevel, optimize, pass_by_name, pipeline_description, pipeline_for};
 pub use sccp::Sccp;
 pub use simplify_cfg::SimplifyCfg;
 

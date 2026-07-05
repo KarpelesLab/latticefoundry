@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use latticefoundry::ir::{Module, binary, text};
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::{Diagnostic, FileId, Severity};
+use latticefoundry::transform::pipeline::{self, OptLevel};
 use latticefoundry::verify;
 
 /// Output (and, when not otherwise determined, input) IR encoding.
@@ -51,11 +52,15 @@ fn print_usage() {
     println!("lf-opt — LatticeFoundry IR tool\n");
     println!("usage: lf-opt [options] <input.lf|input.lfb>\n");
     println!("options:");
+    println!("  -O0|-O1|-O2|-O3    run the optimization pipeline at this level");
+    println!("  -p <p1,p2,...>     run an explicit comma-separated pass list");
     println!("  -o <path>          write output to <path> (default: stdout)");
     println!("  --emit <lf|lfb>    output encoding (default: inferred from -o, else lf)");
     println!("  --no-verify        skip structural verification");
     println!("  -V, --version      print version and exit");
-    println!("  -h, --help         print this help and exit");
+    println!("  -h, --help         print this help and exit\n");
+    println!("passes: mem2reg, sccp, simplify_cfg, dce, egraph, licm, inline");
+    println!("With neither -O nor -p, lf-opt just verifies and re-emits the module.");
 }
 
 struct Options {
@@ -63,6 +68,10 @@ struct Options {
     output: Option<String>,
     emit: Option<Format>,
     verify: bool,
+    /// The optimization level to run, if `-O<n>` was given.
+    opt: Option<OptLevel>,
+    /// An explicit pass list from `-p`, if given (overrides `-O`).
+    passes: Option<Vec<String>>,
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -74,14 +83,26 @@ fn run(args: &[String]) -> Result<(), String> {
     let module = load(&opts.input, in_fmt, &mut syms)?;
 
     // Verify (Structural tier) unless suppressed.
-    if opts.verify
-        && let Err(diags) = verify::verify_module(&module)
-    {
-        for d in &diags {
-            eprintln!("{}", render(d));
+    if opts.verify {
+        verify_or_err(&module, "input")?;
+    }
+
+    // Optimize: an explicit `-p` pass list takes precedence over `-O<n>`.
+    let mut module = module;
+    if let Some(names) = &opts.passes {
+        let mut passes = Vec::with_capacity(names.len());
+        for n in names {
+            let p = pipeline::pass_by_name(n).ok_or_else(|| format!("unknown pass '{n}'"))?;
+            passes.push(p);
         }
-        let errs = diags.iter().filter(|d| d.severity == Severity::Error).count();
-        return Err(format!("verification failed ({errs} error(s))"));
+        pipeline::run_passes(&mut module, passes);
+    } else if let Some(level) = opts.opt {
+        pipeline::optimize(&mut module, level);
+    }
+
+    // Re-verify after transforming (a transform must preserve validity).
+    if opts.verify && (opts.passes.is_some() || opts.opt.is_some()) {
+        verify_or_err(&module, "optimized")?;
     }
 
     // Emit in the requested encoding.
@@ -97,6 +118,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut output: Option<String> = None;
     let mut emit: Option<Format> = None;
     let mut verify = true;
+    let mut opt: Option<OptLevel> = None;
+    let mut passes: Option<Vec<String>> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -111,7 +134,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     other => return Err(format!("--emit expects lf|lfb, got {other:?}")),
                 });
             }
+            "-p" => {
+                let list = it.next().ok_or("-p requires a comma-separated pass list")?;
+                passes = Some(list.split(',').map(str::trim).map(str::to_owned).collect());
+            }
             "--no-verify" => verify = false,
+            tok if OptLevel::parse_flag(tok).is_some() => {
+                opt = OptLevel::parse_flag(tok);
+            }
             flag if flag.starts_with('-') && flag != "-" => {
                 return Err(format!("unrecognized option '{flag}'"));
             }
@@ -128,7 +158,22 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         output,
         emit,
         verify,
+        opt,
+        passes,
     })
+}
+
+/// Verify `module`, turning any error diagnostics into a driver-level error whose
+/// message names the `stage` (e.g. `"input"` or `"optimized"`).
+fn verify_or_err(module: &Module, stage: &str) -> Result<(), String> {
+    if let Err(diags) = verify::verify_module(module) {
+        for d in &diags {
+            eprintln!("{}", render(d));
+        }
+        let errs = diags.iter().filter(|d| d.severity == Severity::Error).count();
+        return Err(format!("{stage} verification failed ({errs} error(s))"));
+    }
+    Ok(())
 }
 
 /// Infer the encoding from a path's extension; default to text.
