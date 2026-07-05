@@ -126,6 +126,7 @@ fn simplify(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
         if let Term::Br(c, args) = &eff[b]
             && *c != b
             && args.iter().all(|&a| forward_safe(old, b, a))
+            && params_confined_to_block(old, b)
         {
             is_forwarder[b] = true;
         }
@@ -259,6 +260,23 @@ fn simplify(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
     }
 
     Changed::Yes
+}
+
+/// Whether every parameter of block `b` is used only inside `b` itself (by `b`'s
+/// terminator). A bypassed forwarder vanishes, and its parameters are substituted
+/// only in its own outgoing edge arguments; but a block parameter is in scope in
+/// every *dominated* block too (block-argument SSA). If such a parameter — a real
+/// merge of distinct predecessor values — is consumed by a dominated block rather
+/// than merely forwarded on `b`'s edge, bypassing `b` would orphan that use into
+/// `poison`. So a block with a parameter used outside itself must NOT be treated
+/// as a transparent forwarder (the single-predecessor merge handles it instead).
+fn params_confined_to_block(old: &Function, b: usize) -> bool {
+    let bb = BlockId::from_index(b);
+    let term = old.block(bb).terminator();
+    old.block(bb)
+        .params()
+        .iter()
+        .all(|&p| old.uses_of(p).iter().all(|u| Some(u.inst) == term))
 }
 
 /// Whether value `a`, used as a branch argument of block `b`, is safe to
@@ -756,9 +774,73 @@ mod tests {
         (m, f)
     }
 
+    /// entry: `cond_br c, ^case, ^merge(0)` ; ^case: `br ^merge(1)` ;
+    /// ^merge(%r): `br ^tail` ; ^tail: `ret %r`. `^merge` is an empty forwarding
+    /// block, but its parameter `%r` (a real merge of 0/1) is consumed *downstream*
+    /// in `^tail`, not on `^merge`'s own edge — so it must NOT be bypassed.
+    fn build_downstream_merge() -> (Module, FuncId) {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("scfg-downstream-merge");
+        let i1 = m.types_mut().bool();
+        let i32t = m.types_mut().int(32);
+        let sig = m.types_mut().func(vec![i1], i32t, false);
+        let f = m.declare_function(syms.intern("f"), sig);
+        {
+            let mut b = m.build(f);
+            let entry = b.create_entry_block();
+            let case = b.create_block(&[]);
+            let merge = b.create_block(&[i32t]);
+            let tail = b.create_block(&[]);
+            let c = b.param(entry, 0);
+            b.switch_to(entry);
+            let zero = b.const_i64(i32t, 0);
+            b.cond_br(c, case, &[], merge, &[zero]);
+            b.switch_to(case);
+            let one = b.const_i64(i32t, 1);
+            b.br(merge, &[one]);
+            b.switch_to(merge);
+            b.br(tail, &[]);
+            b.switch_to(tail);
+            let r = b.param(merge, 0);
+            b.ret(Some(r));
+        }
+        (m, f)
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn does_not_bypass_forwarder_whose_param_is_used_downstream() {
+        // Regression: an empty forwarding block whose parameter is a real SSA
+        // merge consumed by a *dominated* block was bypassed, orphaning the
+        // parameter into `ret poison` at -O2. (Surfaced by lf-cc's switch
+        // fall-through lowering; -O0 was correct, -O2 returned 0.)
+        let (mut m, f) = build_downstream_merge();
+        assert!(verify_module(&m).is_ok());
+        run_simplify(&mut m, f);
+        assert!(verify_module(&m).is_ok(), "output must verify");
+        let func = m.function(f);
+        let t = func
+            .blocks()
+            .find_map(|(_, blk)| {
+                blk.terminator().filter(|&t| matches!(func.inst(t).kind, InstKind::Ret))
+            })
+            .expect("a value-returning ret");
+        let v = *func.inst(t).operands().first().expect("ret value");
+        // The returned value must still be the merge parameter — never poison.
+        if let crate::ir::value::ValueDef::Const(c) = func.value(v).def {
+            assert!(
+                !matches!(m.consts().get(c), Const::Poison(_)),
+                "ret operand became poison — the merge parameter was dropped"
+            );
+        }
+        assert!(
+            func.blocks().any(|(_, blk)| !blk.params().is_empty()),
+            "the merge block parameter must be preserved"
+        );
+    }
 
     #[test]
     fn removes_unreachable_block() {
