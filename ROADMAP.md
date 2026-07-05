@@ -18,8 +18,11 @@ the exit criteria are what "done" means for each phase.
 > saturation optimizer), **B5** (z3rs superoptimizer), **B8** (one lattice engine
 > + four sound domains), **B9** (cost model). ~324 tests, every commit green
 > (build/test/clippy clean; `unsafe` only in the JIT's `exec_mem`; only our own
-> crates). Remaining Phase 10 breadth: a second target (AArch64/RISC-V), DWARF
-> debug info, LTO, sanitizers — additive, beyond the working compiler.
+> crates). A second target — **AArch64** — is implemented (60/60 instructions
+> match `llvm-mc`; validated by an A64-MIR interpreter since the host can't
+> execute ARM), proving the framework is genuinely retargetable. Remaining Phase
+> 10 breadth: DWARF debug info, LTO, RISC-V, sanitizers — additive, beyond the
+> working compiler.
 
 ---
 
