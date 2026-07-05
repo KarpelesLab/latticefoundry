@@ -20,9 +20,12 @@ the exit criteria are what "done" means for each phase.
 > (build/test/clippy clean; `unsafe` only in the JIT's `exec_mem`; only our own
 > crates). A second target — **AArch64** — is implemented (60/60 instructions
 > match `llvm-mc`; validated by an A64-MIR interpreter since the host can't
-> execute ARM), proving the framework is genuinely retargetable. Remaining Phase
-> 10 breadth: DWARF debug info, LTO, RISC-V, sanitizers — additive, beyond the
-> working compiler.
+> execute ARM), proving the framework is genuinely retargetable. **DWARF debug
+> info** (`lf build -g`; gdb loads the binary and maps addresses to `.lf` source),
+> an **`-O0..-O3` pipeline**, and **LTO** (merge multiple modules → whole-program
+> optimization with cross-module inlining) are all done. ~366 tests. Remaining
+> Phase 10 breadth: RISC-V target, sanitizers, and the deferred bets (B6 region
+> form, B7 full content-addressing, B10 provenance types, B11 verified lowering).
 
 ---
 
