@@ -8,17 +8,18 @@ deliverables and exit criteria for each phase.
 The roadmap is a living document: phases are refined as earlier ones land, and
 the exit criteria are what "done" means for each phase.
 
-> **Status.** Phases **0–8 are complete** and milestone **M5 is reached**:
-> `lf build foo.lf -o foo` compiles a LatticeFoundry IR module to a static ELF64
-> executable that runs on the bare Linux x86-64 kernel — no libc, no system
-> linker, 100% LatticeFoundry code. The committed bets are live: **B1**
-> (semantics-first opcode table), **B2** (z3rs-checked refinement, used by SCCP
-> and the e-graph), **B8** (one lattice engine + four sound domains), **B4**
-> (equality-saturation optimizer), and **B9** (cost model). ~293 tests, every
-> commit green (build/test/clippy clean, no `unsafe`, only our own crates).
-> Remaining: Phase 9 (Certified tier / proof-carrying IR, **B3**) and Phase 10
-> (JIT, DWARF, LTO, more targets, superoptimization) — depth beyond the M5
-> critical path.
+> **Status.** Phases **0–9 are complete** (milestone **M5** reached) and Phase
+> **10 is in progress**. `lf build foo.lf -o foo` compiles a LatticeFoundry IR
+> module to a static ELF64 executable that runs on the bare Linux x86-64 kernel —
+> no libc, no system linker, 100% LatticeFoundry code — and a **JIT** runs the
+> same code in-process. The verification bets are all live and interlocking:
+> **B1** (semantics-first opcodes), **B2** (z3rs-checked refinement, used by SCCP
+> and the e-graph), **B3** (proof-carrying certificates), **B4** (equality-
+> saturation optimizer), **B5** (z3rs superoptimizer), **B8** (one lattice engine
+> + four sound domains), **B9** (cost model). ~324 tests, every commit green
+> (build/test/clippy clean; `unsafe` only in the JIT's `exec_mem`; only our own
+> crates). Remaining Phase 10 breadth: a second target (AArch64/RISC-V), DWARF
+> debug info, LTO, sanitizers — additive, beyond the working compiler.
 
 ---
 
@@ -370,5 +371,5 @@ programs.
 | M3        | Optimization pipeline, refinement-checked                | 3–4   | ✅ done |
 | M4        | Emit assembled objects for x86-64                        | 5–7   | ✅ done |
 | **M5**    | **Compile `.lf` → native executable that runs**          | 8     | ✅ **done** |
-| M6        | Certified tier: proof-carrying pipeline                  | 9     | ⬜ next |
-| M7        | JIT, debug info, LTO                                     | 10    | ⬜      |
+| M6        | Certified tier: proof-carrying pipeline                  | 9     | ✅ done |
+| M7        | JIT, debug info, LTO                                     | 10    | 🔶 JIT + superopt done; DWARF/LTO/more targets pending |
