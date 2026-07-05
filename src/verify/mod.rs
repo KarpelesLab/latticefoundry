@@ -33,6 +33,7 @@
 //! seam it plugs into. This module only *reads* the IR — it never mutates a
 //! module.
 
+pub mod certificate;
 mod cfg;
 pub mod refinement;
 mod structural;
@@ -43,6 +44,11 @@ mod tests;
 use crate::ir::{FuncId, Module};
 use crate::support::diagnostics::{Diagnostic, Diagnostics};
 
+pub use certificate::{
+    CertRejection, PipelineCertificate, PipelineRejection, RefinementCertificate, StructHash,
+    Verdict, VerificationTier, certify_pair, check_certificate, check_pipeline, fingerprint,
+    is_certified, run_certified, run_pipeline_certified,
+};
 pub use refinement::{RefinementResult, RefinementTier, check_refinement};
 pub use structural::verify_function;
 
