@@ -8,6 +8,18 @@ deliverables and exit criteria for each phase.
 The roadmap is a living document: phases are refined as earlier ones land, and
 the exit criteria are what "done" means for each phase.
 
+> **Status.** Phases **0–8 are complete** and milestone **M5 is reached**:
+> `lf build foo.lf -o foo` compiles a LatticeFoundry IR module to a static ELF64
+> executable that runs on the bare Linux x86-64 kernel — no libc, no system
+> linker, 100% LatticeFoundry code. The committed bets are live: **B1**
+> (semantics-first opcode table), **B2** (z3rs-checked refinement, used by SCCP
+> and the e-graph), **B8** (one lattice engine + four sound domains), **B4**
+> (equality-saturation optimizer), and **B9** (cost model). ~293 tests, every
+> commit green (build/test/clippy clean, no `unsafe`, only our own crates).
+> Remaining: Phase 9 (Certified tier / proof-carrying IR, **B3**) and Phase 10
+> (JIT, DWARF, LTO, more targets, superoptimization) — depth beyond the M5
+> critical path.
+
 ---
 
 ## 1. Vision
@@ -350,13 +362,13 @@ programs.
 
 ## 7. Milestone summary
 
-| Milestone | Meaning                                                 | Phase |
-| --------- | ------------------------------------------------------- | ----- |
-| M0        | Package builds; drivers run                              | 0     |
-| M1        | Build & verify SSA IR in memory                          | 1–2   |
-| M2        | Parse/print/round-trip `.lf`; verifier rejects bad IR    | 2     |
-| M3        | `-O2` pipeline optimizes a corpus, refinement-checked    | 3–4   |
-| M4        | Emit assembled objects for x86-64                        | 5–7   |
-| **M5**    | **Compile `.lf` → native executable that runs**          | 8     |
-| M6        | Certified tier: proof-carrying pipeline                  | 9     |
-| M7        | JIT, debug info, LTO                                     | 10    |
+| Milestone | Meaning                                                 | Phase | Status |
+| --------- | ------------------------------------------------------- | ----- | ------ |
+| M0        | Package builds; drivers run                              | 0     | ✅ done |
+| M1        | Build & verify SSA IR in memory                          | 1–2   | ✅ done |
+| M2        | Parse/print/round-trip `.lf`; verifier rejects bad IR    | 2     | ✅ done |
+| M3        | Optimization pipeline, refinement-checked                | 3–4   | ✅ done |
+| M4        | Emit assembled objects for x86-64                        | 5–7   | ✅ done |
+| **M5**    | **Compile `.lf` → native executable that runs**          | 8     | ✅ **done** |
+| M6        | Certified tier: proof-carrying pipeline                  | 9     | ⬜ next |
+| M7        | JIT, debug info, LTO                                     | 10    | ⬜      |
