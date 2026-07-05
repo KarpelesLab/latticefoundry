@@ -83,6 +83,14 @@ pub enum Keyword {
     Continue,
     /// `sizeof`
     Sizeof,
+    /// `struct`
+    Struct,
+    /// `union`
+    Union,
+    /// `enum`
+    Enum,
+    /// `typedef`
+    Typedef,
     /// `restrict` (C99; accepted as a type qualifier and ignored)
     Restrict,
     /// `inline` (C99; accepted as a function specifier and ignored)
@@ -172,6 +180,10 @@ fn keyword_from(word: &str) -> Option<Keyword> {
         "break" => Keyword::Break,
         "continue" => Keyword::Continue,
         "sizeof" => Keyword::Sizeof,
+        "struct" => Keyword::Struct,
+        "union" => Keyword::Union,
+        "enum" => Keyword::Enum,
+        "typedef" => Keyword::Typedef,
         _ => return None,
     })
 }

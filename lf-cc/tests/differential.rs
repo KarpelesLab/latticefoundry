@@ -103,6 +103,85 @@ fn programs() -> Vec<(&'static str, &'static str)> {
             "#define SQ(x) ((x)*(x))\n#define SUMSQ(a,b) (SQ(a)+SQ(b))\n\
              int main(){ return SUMSQ(3,4) - 3; }",
         ),
+        // --- aggregate types (enum / struct / union / typedef / arrays) -----
+        // enum with auto and explicit values, used in arithmetic and as an
+        // array size, plus sizeof of the array.
+        (
+            "enum_vals",
+            "enum E{A,B=10,C,D=C+5}; \
+             int main(){ int t[D]; return A+B+C+D+(int)(sizeof(t)/sizeof(t[0])); }",
+        ),
+        // A struct read/written through a local and through a `struct*`.
+        (
+            "struct_ptr",
+            "struct P{int x,y;}; int viaptr(struct P*p){return p->x*p->y;} \
+             int main(){ struct P s; s.x=6; s.y=7; struct P*p=&s; p->x+=0; return viaptr(&s); }",
+        ),
+        // The classic linked list: nodes as stack locals, traversed to sum.
+        (
+            "linked_list",
+            "struct N{int v; struct N* next;}; \
+             int main(){ struct N c={3,0}; struct N b={2,&c}; struct N a={1,&b}; \
+             int s=0; for(struct N*p=&a;p;p=p->next) s+=p->v; return s*7; }",
+        ),
+        // Union aliasing: write bytes, read the (little-endian) integer.
+        (
+            "union_alias",
+            "union U{int i; unsigned char b[4];}; \
+             int main(){ union U u; u.i=0; u.b[0]=200; u.b[1]=1; return u.i; }",
+        ),
+        // typedef of a struct and of a base type, with a typedef-name shadowed
+        // by a local variable in an inner scope.
+        (
+            "typedef_shadow",
+            "typedef struct{int a,b;} Pair; typedef unsigned long U; \
+             int main(){ Pair p={20,22}; U T=100; { int Pair=5; return p.a+p.b+(int)T-Pair-95; } }",
+        ),
+        // An array decaying to a pointer passed to a summing function.
+        (
+            "array_decay",
+            "int sum(int*a,int n){int s=0;for(int i=0;i<n;i++)s+=a[i];return s;} \
+             int main(){ int a[6]={1,2,3,4,5,6}; return sum(a,6)+(int)(sizeof(a)/sizeof(a[0])); }",
+        ),
+        // A 2-D array indexed in a nested loop.
+        (
+            "array_2d",
+            "int main(){ int m[3][3]; \
+             for(int i=0;i<3;i++)for(int j=0;j<3;j++)m[i][j]=(i+1)*(j+1); \
+             int s=0; for(int i=0;i<3;i++)for(int j=0;j<3;j++)s+=m[i][j]; return s; }",
+        ),
+        // Aggregate initializer with omitted (zero-filled) trailing elements.
+        (
+            "agg_init",
+            "struct S{int a,b,c;}; \
+             int main(){ struct S s={1,2}; int a[5]={9,8}; \
+             return s.a+s.b+s.c+a[0]+a[1]+a[2]+a[3]+a[4]+22; }",
+        ),
+        // Designated initializers (a C99 feature; the default gnu17 enables it).
+        (
+            "desig_init",
+            "struct S{int x,y,z;}; \
+             int main(){ struct S s={.z=3,.x=1}; int a[6]={[5]=6,[0]=10}; \
+             return s.x+s.y+s.z+a[0]+a[5]+22; }",
+        ),
+        // A char[] initialized from a string literal, plus indexing a literal.
+        (
+            "string_literal",
+            "int main(){ char s[]=\"hello\"; int n=0; for(int i=0;s[i];i++)n++; \
+             return n + (\"abc\"[1]=='b') + 36; }",
+        ),
+        // Taking the address of a struct member and modifying through it.
+        (
+            "addr_field",
+            "struct S{int x,y;}; \
+             int main(){ struct S s; s.x=1; s.y=2; int*p=&s.y; *p=40; return s.x+s.y; }",
+        ),
+        // Whole-struct assignment (memberwise copy).
+        (
+            "struct_copy",
+            "struct S{int a,b,c;}; \
+             int main(){ struct S x={1,2,3}; struct S y; y=x; y.b=40; return y.a+y.b+y.c-x.b; }",
+        ),
     ]
 }
 

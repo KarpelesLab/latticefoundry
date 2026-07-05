@@ -1476,6 +1476,10 @@ fn base_keyword(word: &str) -> Option<Keyword> {
         "break" => Keyword::Break,
         "continue" => Keyword::Continue,
         "sizeof" => Keyword::Sizeof,
+        "struct" => Keyword::Struct,
+        "union" => Keyword::Union,
+        "enum" => Keyword::Enum,
+        "typedef" => Keyword::Typedef,
         _ => return None,
     })
 }

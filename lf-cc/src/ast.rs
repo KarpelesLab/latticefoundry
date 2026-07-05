@@ -9,11 +9,12 @@ use std::fmt;
 
 use latticefoundry::support::diagnostics::Span;
 
-/// A C scalar type in the freestanding subset: `void`, `_Bool`, the integer
-/// types (tracked as an explicit width plus signedness), and pointers.
+/// A C type in the subset: `void`, `_Bool`, the integer types (tracked as an
+/// explicit width plus signedness), pointers, arrays, and aggregates
+/// (`struct`/`union`, referenced by index into a shared [`Records`] registry).
 ///
-/// Aggregates (structs, arrays) and floating-point are out of the v1 subset.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// Floating-point remains out of the subset.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum CType {
     /// `void`.
     Void,
@@ -23,16 +24,78 @@ pub enum CType {
     Int(IntTy),
     /// `T *` — a pointer to `T`.
     Pointer(Box<CType>),
+    /// `T[N]` — a fixed-length array of `N` elements of `T`. `N == 0` marks an
+    /// incomplete array (`T a[]`) whose length is deduced from its initializer.
+    Array(Box<CType>, u64),
+    /// A `struct` or `union` type, identified by its [`RecordId`] in the shared
+    /// [`Records`] registry (so a record can refer to itself through a pointer).
+    Record(RecordId),
 }
 
 /// The (width, signedness) of a C integer type. Width is in bits: 8 (`char`),
 /// 16 (`short`), 32 (`int`), 64 (`long`/`long long`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct IntTy {
     /// Width in bits.
     pub width: u16,
     /// Whether the type is signed.
     pub signed: bool,
+}
+
+/// An index into a [`Records`] registry, naming one `struct`/`union` definition.
+pub type RecordId = usize;
+
+/// Whether a record is a `struct` (fields laid out sequentially) or a `union`
+/// (all members overlaid at offset 0).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RecordKind {
+    /// A `struct`.
+    Struct,
+    /// A `union`.
+    Union,
+}
+
+/// One member of a record.
+#[derive(Clone, Debug)]
+pub struct Field {
+    /// The member name.
+    pub name: String,
+    /// The member type.
+    pub ty: CType,
+}
+
+/// A `struct`/`union` definition. A forward declaration (`struct T;`) or a use
+/// before definition is `complete == false` with empty `fields`.
+#[derive(Clone, Debug)]
+pub struct RecordDef {
+    /// Whether this is a `struct` or a `union`.
+    pub kind: RecordKind,
+    /// The tag name, if the record is tagged.
+    pub tag: Option<String>,
+    /// The members in declaration order (empty while incomplete).
+    pub fields: Vec<Field>,
+    /// Whether a full definition (a member list) has been seen.
+    pub complete: bool,
+}
+
+/// The registry of every `struct`/`union` definition in a translation unit,
+/// shared by the parser (which populates it), sema, and lowering.
+#[derive(Clone, Debug, Default)]
+pub struct Records {
+    /// Definitions, indexed by [`RecordId`].
+    pub defs: Vec<RecordDef>,
+}
+
+impl Records {
+    /// Borrow the definition of a record.
+    pub fn get(&self, id: RecordId) -> &RecordDef {
+        &self.defs[id]
+    }
+
+    /// Look up a member by name, returning its field index and definition.
+    pub fn field(&self, id: RecordId, name: &str) -> Option<(usize, &Field)> {
+        self.defs[id].fields.iter().enumerate().find(|(_, f)| f.name == name)
+    }
 }
 
 impl CType {
@@ -66,6 +129,21 @@ impl CType {
         matches!(self, CType::Pointer(_))
     }
 
+    /// Whether this is an array type.
+    pub fn is_array(&self) -> bool {
+        matches!(self, CType::Array(..))
+    }
+
+    /// Whether this is a `struct`/`union` type.
+    pub fn is_record(&self) -> bool {
+        matches!(self, CType::Record(_))
+    }
+
+    /// Whether this is an aggregate (array or record) type.
+    pub fn is_aggregate(&self) -> bool {
+        self.is_array() || self.is_record()
+    }
+
     /// Whether this is a scalar type usable in a condition (integer or pointer).
     pub fn is_scalar(&self) -> bool {
         self.is_integer() || self.is_pointer()
@@ -75,6 +153,22 @@ impl CType {
     pub fn pointee(&self) -> Option<&CType> {
         match self {
             CType::Pointer(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// The element type of an array, if this is one.
+    pub fn array_elem(&self) -> Option<&CType> {
+        match self {
+            CType::Array(inner, _) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// If this is an array type, the pointer-to-element type it decays to.
+    pub fn decayed(&self) -> Option<CType> {
+        match self {
+            CType::Array(elem, _) => Some(CType::ptr_to((**elem).clone())),
             _ => None,
         }
     }
@@ -126,6 +220,8 @@ impl fmt::Display for CType {
                 write!(f, "{base}")
             }
             CType::Pointer(inner) => write!(f, "{inner} *"),
+            CType::Array(elem, n) => write!(f, "{elem}[{n}]"),
+            CType::Record(_) => write!(f, "struct/union"),
         }
     }
 }
@@ -231,6 +327,43 @@ pub enum ExprKind {
     SizeofExpr(Box<Expr>),
     /// `sizeof(T)`.
     SizeofType(CType),
+    /// A string literal's decoded bytes (already NUL-terminated is *not*
+    /// assumed; sema appends the terminator).
+    StrLit(Vec<u8>),
+    /// Array subscript `base[index]`.
+    Index(Box<Expr>, Box<Expr>),
+    /// Member access: `base.name` (`arrow == false`) or `base->name`
+    /// (`arrow == true`).
+    Member(Box<Expr>, String, bool),
+}
+
+/// A C initializer: either a single expression or a brace-enclosed list whose
+/// items may carry designators (`.field` / `[index]`).
+#[derive(Clone, Debug)]
+pub enum Init {
+    /// A scalar (or full-aggregate string) initializer expression.
+    Expr(Expr),
+    /// A brace-enclosed initializer list.
+    List(Vec<InitItem>),
+}
+
+/// One entry of a brace initializer list: an optional designator chain and the
+/// initializer applied at that position.
+#[derive(Clone, Debug)]
+pub struct InitItem {
+    /// The designator chain (`.field` / `[index]`), empty for positional items.
+    pub designators: Vec<Designator>,
+    /// The initializer value at this position.
+    pub init: Init,
+}
+
+/// A single designator in a designated initializer.
+#[derive(Clone, Debug)]
+pub enum Designator {
+    /// `.field`.
+    Field(String),
+    /// `[index]` (a constant expression).
+    Index(i128),
 }
 
 /// A statement node: a [`StmtKind`] plus its source span.
@@ -274,8 +407,8 @@ pub struct VarDecl {
     pub name: String,
     /// The declared type.
     pub ty: CType,
-    /// The initializer expression, if any.
-    pub init: Option<Expr>,
+    /// The initializer, if any.
+    pub init: Option<Init>,
     /// The source span of the declarator.
     pub span: Span,
 }
@@ -332,9 +465,15 @@ pub enum TopLevel {
     Global(VarDecl),
 }
 
-/// A whole translation unit: the ordered top-level declarations of one file.
+/// A whole translation unit: the ordered top-level declarations of one file,
+/// plus the shared `struct`/`union` registry and the enum-constant table the
+/// parser accumulated.
 #[derive(Clone, Debug, Default)]
 pub struct TranslationUnit {
     /// The top-level items in source order.
     pub items: Vec<TopLevel>,
+    /// Every `struct`/`union` definition, referenced by [`CType::Record`].
+    pub records: Records,
+    /// Enumerator constants (`name`, value), in declaration order.
+    pub enum_consts: Vec<(String, i128)>,
 }

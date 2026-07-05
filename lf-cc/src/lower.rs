@@ -8,6 +8,8 @@
 //! `&&`/`||`, the ternary, and lvalue handling are lowered to explicit blocks
 //! and block arguments.
 
+use std::collections::HashMap;
+
 use latticefoundry::ir::builder::FunctionBuilder;
 use latticefoundry::ir::inst::{BinOp, CastOp, Flags, IntPred};
 use latticefoundry::ir::types::TypeId;
@@ -16,7 +18,8 @@ use latticefoundry::ir::{BlockId, Const, FuncId, GlobalId, Global, Module};
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::puremp;
 
-use crate::ast::{BinaryOp, CType};
+use crate::ast::{BinaryOp, CType, Records};
+use crate::layout;
 use crate::sema::{LocalInfo, Program, TExpr, TExprKind, TFunc, TStmt};
 
 /// A precomputed set of the small, fixed set of IR types the frontend needs.
@@ -42,12 +45,15 @@ impl Tys {
         }
     }
 
+    /// The IR type of a scalar/pointer C type (aggregates are resolved through
+    /// the precomputed [`FnLower::agg_types`] map, since they need interning).
     fn of(&self, ty: &CType) -> TypeId {
         match ty {
             CType::Void => self.void,
             CType::Bool => self.i8,
             CType::Int(i) => self.for_int(i.width),
             CType::Pointer(_) => self.ptr,
+            CType::Array(..) | CType::Record(_) => self.ptr,
         }
     }
 }
@@ -106,17 +112,37 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
         func_ids.push(module.declare_function(name, ft));
     }
 
-    // Add globals.
+    // Add globals. Their storage bytes are emitted by the driver's
+    // `emit_globals`; the IR init here exists only so each global is well-typed.
     let mut global_ids: Vec<GlobalId> = Vec::with_capacity(program.globals.len());
     for g in &program.globals {
-        let ty = tys.of(&g.ty);
+        let ty = layout::ir_type(module.types_mut(), &program.records, &g.ty);
         let init = if g.ty.is_pointer() {
             module.intern_const(Const::Null(ty))
+        } else if g.ty.is_scalar() {
+            let value = decode_le(&g.bytes);
+            module.intern_const(Const::Int { ty, value: puremp::Int::from_i64(value) })
         } else {
-            module.intern_const(Const::Int { ty, value: puremp::Int::from_i64(g.init as i64) })
+            module.intern_const(Const::Poison(ty))
         };
         let name = syms.intern(&g.name);
         global_ids.push(module.add_global(Global { name, ty, init: Some(init) }));
+    }
+
+    // Precompute the interned IR type of every local/parameter aggregate, so the
+    // per-function builder (which cannot re-borrow the type context) can size its
+    // `alloca`s.
+    let mut agg_types: HashMap<CType, TypeId> = HashMap::new();
+    {
+        let cx = module.types_mut();
+        for f in &program.funcs {
+            for local in &f.locals {
+                if local.ty.is_aggregate() {
+                    let id = layout::ir_type(cx, &program.records, &local.ty);
+                    agg_types.insert(local.ty.clone(), id);
+                }
+            }
+        }
     }
 
     // Build each defined function's body.
@@ -133,6 +159,8 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             global_ids: &global_ids,
             locals: &f.locals,
             tys,
+            agg_types: &agg_types,
+            records: &program.records,
             debug,
             linemap: &linemap,
         };
@@ -140,6 +168,15 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
     }
 
     (module, syms)
+}
+
+/// Decode up to 8 little-endian bytes into an `i64` (for scalar global inits).
+fn decode_le(bytes: &[u8]) -> i64 {
+    let mut buf = [0u8; 8];
+    for (i, b) in bytes.iter().take(8).enumerate() {
+        buf[i] = *b;
+    }
+    i64::from_le_bytes(buf)
 }
 
 /// Per-function lowering state.
@@ -154,6 +191,10 @@ struct FnLower<'a> {
     global_ids: &'a [GlobalId],
     locals: &'a [LocalInfo],
     tys: Tys,
+    /// Interned IR types of aggregate local/parameter types (for `alloca`).
+    agg_types: &'a HashMap<CType, TypeId>,
+    /// The struct/union registry, for layout queries during lowering.
+    records: &'a Records,
     debug: bool,
     linemap: &'a LineMap,
 }
@@ -169,7 +210,7 @@ impl FnLower<'_> {
         // Allocate storage for every object up front (in the entry block).
         self.slots = Vec::with_capacity(self.locals.len());
         for local in self.locals {
-            let ty = self.tys.of(&local.ty);
+            let ty = self.ir_of(&local.ty);
             let slot = self.b.alloca(ty);
             self.slots.push(slot);
         }
@@ -206,6 +247,19 @@ impl FnLower<'_> {
         self.terminated = false;
     }
 
+    /// The IR type of a C type (aggregates via the precomputed map).
+    fn ir_of(&self, ty: &CType) -> TypeId {
+        if ty.is_aggregate() { self.agg_types[ty] } else { self.tys.of(ty) }
+    }
+
+    /// The size in bytes of a pointer's pointee (`1` if not a pointer).
+    fn pointee_size(&self, ty: &CType) -> u64 {
+        match ty.pointee() {
+            Some(p) => layout::size_of(self.records, p),
+            None => 1,
+        }
+    }
+
     fn set_line(&mut self, span: latticefoundry::support::diagnostics::Span) {
         if self.debug {
             self.b.set_line(self.linemap.line(span.start));
@@ -237,6 +291,18 @@ impl FnLower<'_> {
                 let align = align_of(&self.locals[*id].ty);
                 let slot = self.slots[*id];
                 self.b.store(ty, slot, val, align);
+            }
+            TStmt::InitAggregate { obj, size, stores } => {
+                let base = self.slots[*obj];
+                self.zero_fill(base, *size);
+                for (offset, value) in stores {
+                    self.set_line(value.span);
+                    let val = self.lower_rvalue(value);
+                    let addr = self.offset_ptr(base, *offset);
+                    let ty = self.tys.of(&value.ty);
+                    let align = align_of(&value.ty);
+                    self.b.store(ty, addr, val, align);
+                }
             }
             TStmt::If(cond, then, els) => self.lower_if(cond, then, els.as_deref()),
             TStmt::While(cond, body) => self.lower_while(cond, body),
@@ -394,7 +460,56 @@ impl FnLower<'_> {
             TExprKind::Obj(id) => self.slots[*id],
             TExprKind::Global(idx) => self.b.global_ref(self.global_ids[*idx]),
             TExprKind::Deref(inner) => self.lower_rvalue(inner),
+            TExprKind::Field { base, offset } => {
+                let a = self.lower_lvalue(base);
+                self.offset_ptr(a, *offset)
+            }
             _ => unreachable!("lower_lvalue on a non-lvalue expression"),
+        }
+    }
+
+    /// Displace a pointer by a constant byte offset (in-bounds).
+    fn offset_ptr(&mut self, base: ValueId, offset: u64) -> ValueId {
+        if offset == 0 {
+            return base;
+        }
+        let off = self.b.const_i64(self.tys.i64, offset as i64);
+        self.b.ptr_add(base, off, true)
+    }
+
+    /// Zero `size` bytes starting at `base` (8-byte then 1-byte stores).
+    fn zero_fill(&mut self, base: ValueId, size: u64) {
+        let mut o = 0u64;
+        while o + 8 <= size {
+            let addr = self.offset_ptr(base, o);
+            let z = self.b.const_i64(self.tys.i64, 0);
+            self.b.store(self.tys.i64, addr, z, 1);
+            o += 8;
+        }
+        while o < size {
+            let addr = self.offset_ptr(base, o);
+            let z = self.b.const_i64(self.tys.i8, 0);
+            self.b.store(self.tys.i8, addr, z, 1);
+            o += 1;
+        }
+    }
+
+    /// Copy `size` bytes from `src` to `dst` (8-byte then 1-byte load/stores).
+    fn copy_bytes(&mut self, dst: ValueId, src: ValueId, size: u64) {
+        let mut o = 0u64;
+        while o + 8 <= size {
+            let s = self.offset_ptr(src, o);
+            let d = self.offset_ptr(dst, o);
+            let v = self.b.load(self.tys.i64, s, 1);
+            self.b.store(self.tys.i64, d, v, 1);
+            o += 8;
+        }
+        while o < size {
+            let s = self.offset_ptr(src, o);
+            let d = self.offset_ptr(dst, o);
+            let v = self.b.load(self.tys.i8, s, 1);
+            self.b.store(self.tys.i8, d, v, 1);
+            o += 1;
         }
     }
 
@@ -411,11 +526,21 @@ impl FnLower<'_> {
                     self.b.const_i64(ty, *v as i64)
                 }
             }
-            TExprKind::Obj(_) | TExprKind::Global(_) | TExprKind::Deref(_) => {
+            TExprKind::Obj(_)
+            | TExprKind::Global(_)
+            | TExprKind::Deref(_)
+            | TExprKind::Field { .. } => {
                 let addr = self.lower_lvalue(e);
                 let ty = self.tys.of(&e.ty);
                 let align = align_of(&e.ty);
                 self.b.load(ty, addr, align)
+            }
+            TExprKind::Decay(inner) => self.lower_lvalue(inner),
+            TExprKind::CopyAssign { dst, src, size } => {
+                let d = self.lower_lvalue(dst);
+                let s = self.lower_lvalue(src);
+                self.copy_bytes(d, s, *size);
+                d
             }
             TExprKind::Convert(inner) => {
                 let v = self.lower_rvalue(inner);
@@ -572,7 +697,8 @@ impl FnLower<'_> {
             let idx0 = self.lower_rvalue(rhs);
             let idx = self.convert(idx0, &rhs.ty, &CType::long());
             let elem = self.tys.i64;
-            let scale = self.b.const_i64(elem, pointee_size(&lvalue.ty) as i64);
+            let psize = self.pointee_size(&lvalue.ty);
+            let scale = self.b.const_i64(elem, psize as i64);
             let mut off = self.b.mul(idx, scale, Flags::NONE);
             if op == BinaryOp::Sub {
                 let zero = self.b.const_i64(elem, 0);
@@ -774,19 +900,14 @@ fn width_of(ty: &CType) -> u16 {
     }
 }
 
-/// The alignment in bytes to attach to a load/store of this type.
+/// The alignment in bytes to attach to a load/store of this type. Only scalar
+/// types reach `load`/`store`; aggregates are copied byte-wise.
 fn align_of(ty: &CType) -> u32 {
     match ty {
-        CType::Void => 1,
-        CType::Bool => 1,
+        CType::Void | CType::Bool => 1,
         CType::Int(i) => (i.width / 8) as u32,
         CType::Pointer(_) => 8,
+        CType::Array(..) | CType::Record(_) => 1,
     }
 }
 
-fn pointee_size(ty: &CType) -> u64 {
-    match ty.pointee() {
-        Some(p) => crate::sema::size_of(p),
-        None => 1,
-    }
-}

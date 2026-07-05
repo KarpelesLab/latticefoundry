@@ -7,13 +7,17 @@
 //! Errors are reported as [`Diagnostic`]s with the offending token's span; the
 //! parser bails on the first error.
 
+use std::collections::HashMap;
+
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CType, Expr, ExprKind, FuncDef, FuncProto, IntTy, Param, Stmt, StmtKind, TopLevel,
-    TranslationUnit, UnaryOp, VarDecl,
+    BinaryOp, CType, Designator, Expr, ExprKind, Field, FuncDef, FuncProto, Init, InitItem, IntTy,
+    Param, RecordDef, RecordId, RecordKind, Records, Stmt, StmtKind, TopLevel, TranslationUnit,
+    UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
+use crate::layout;
 use crate::lex::{Keyword, Punct, Token, TokenKind};
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -21,17 +25,50 @@ type PResult<T> = Result<T, Diagnostic>;
 /// Parse a token stream into a [`TranslationUnit`], gating language features by
 /// the selected `std`.
 pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagnostic>> {
-    let mut parser = Parser { tokens, pos: 0, std };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        std,
+        records: Records::default(),
+        tags: HashMap::new(),
+        enum_map: HashMap::new(),
+        enum_consts: Vec::new(),
+        scopes: vec![HashMap::new()],
+    };
     match parser.parse_unit() {
-        Ok(unit) => Ok(unit),
+        Ok(items) => Ok(TranslationUnit {
+            items,
+            records: parser.records,
+            enum_consts: parser.enum_consts,
+        }),
         Err(d) => Err(vec![d]),
     }
+}
+
+/// How a name is bound in a parser scope, for the typedef-name disambiguation.
+#[derive(Clone, Debug)]
+enum NameKind {
+    /// A `typedef` name resolving to a type.
+    Typedef(CType),
+    /// An ordinary identifier (variable/parameter/function), which shadows any
+    /// outer `typedef` of the same name.
+    Ordinary,
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     std: CStd,
+    /// The `struct`/`union` registry being populated.
+    records: Records,
+    /// Tag name → record id (a single translation-unit-wide tag namespace).
+    tags: HashMap<String, RecordId>,
+    /// Enumerator name → value, for constant-expression evaluation.
+    enum_map: HashMap<String, i128>,
+    /// Enumerator constants in declaration order, handed to sema.
+    enum_consts: Vec<(String, i128)>,
+    /// Scoped name bindings for typedef-name disambiguation.
+    scopes: Vec<HashMap<String, NameKind>>,
 }
 
 impl Parser {
@@ -108,9 +145,66 @@ impl Parser {
         }
     }
 
+    // --- scopes & typedef names --------------------------------------------
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn declare_ordinary(&mut self, name: &str) {
+        self.scopes.last_mut().unwrap().insert(name.to_owned(), NameKind::Ordinary);
+    }
+
+    fn declare_typedef(&mut self, name: &str, ty: CType) {
+        self.scopes.last_mut().unwrap().insert(name.to_owned(), NameKind::Typedef(ty));
+    }
+
+    /// The type a name resolves to if the innermost binding is a `typedef`.
+    fn typedef_type(&self, name: &str) -> Option<CType> {
+        for scope in self.scopes.iter().rev() {
+            match scope.get(name) {
+                Some(NameKind::Typedef(ty)) => return Some(ty.clone()),
+                Some(NameKind::Ordinary) => return None,
+                None => {}
+            }
+        }
+        None
+    }
+
+    fn is_typedef_name(&self, name: &str) -> bool {
+        self.typedef_type(name).is_some()
+    }
+
+    // --- records (struct/union) & enums ------------------------------------
+
+    fn tag_record(&mut self, tag: &str, kind: RecordKind) -> RecordId {
+        if let Some(&id) = self.tags.get(tag) {
+            return id;
+        }
+        let id = self.records.defs.len();
+        self.records.defs.push(RecordDef {
+            kind,
+            tag: Some(tag.to_owned()),
+            fields: Vec::new(),
+            complete: false,
+        });
+        self.tags.insert(tag.to_owned(), id);
+        id
+    }
+
+    fn anon_record(&mut self, kind: RecordKind) -> RecordId {
+        let id = self.records.defs.len();
+        self.records.defs.push(RecordDef { kind, tag: None, fields: Vec::new(), complete: false });
+        id
+    }
+
     // --- top level ---------------------------------------------------------
 
-    fn parse_unit(&mut self) -> PResult<TranslationUnit> {
+    fn parse_unit(&mut self) -> PResult<Vec<TopLevel>> {
         let mut items = Vec::new();
         while !self.at_eof() {
             // A file-scope `_Static_assert` is a declaration with no external
@@ -119,9 +213,9 @@ impl Parser {
                 self.parse_static_assert()?;
                 continue;
             }
-            items.push(self.parse_top_level()?);
+            items.extend(self.parse_top_level()?);
         }
-        Ok(TranslationUnit { items })
+        Ok(items)
     }
 
     /// Parse and discard a `_Static_assert ( expr [, "msg"] ) ;` declaration.
@@ -142,48 +236,117 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_top_level(&mut self) -> PResult<TopLevel> {
+    fn parse_top_level(&mut self) -> PResult<Vec<TopLevel>> {
+        if self.eat_kw(Keyword::Typedef) {
+            return self.parse_typedef();
+        }
         // Storage-class specifiers (extern/static) are consumed and ignored for
         // linkage purposes in this single-TU subset.
         self.consume_storage();
+        if self.eat_kw(Keyword::Typedef) {
+            return self.parse_typedef();
+        }
         let base = self.parse_decl_specs()?;
         self.consume_storage();
 
-        // A declarator: pointers, then a name, then either function params or a
-        // variable initializer.
-        let ty = self.parse_pointers(base.clone());
+        // A bare `struct S { ... };` / `enum E { ... };` declares only a type.
+        if self.eat_punct(Punct::Semi) {
+            return Ok(Vec::new());
+        }
+
+        // First declarator: pointers, then a name.
+        let ty0 = self.parse_pointers(base.clone());
         let (name, name_span) = self.expect_ident()?;
+        self.declare_ordinary(&name);
 
         if self.is_punct(Punct::LParen) {
+            self.push_scope();
             let (params, variadic) = self.parse_param_list()?;
+            for p in &params {
+                if let Some(n) = &p.name {
+                    self.declare_ordinary(n);
+                }
+            }
             if self.is_punct(Punct::LBrace) {
                 let body = self.parse_block_stmts()?;
-                return Ok(TopLevel::Func(FuncDef { name, ret: ty, params, body, span: name_span }));
+                self.pop_scope();
+                return Ok(vec![TopLevel::Func(FuncDef {
+                    name,
+                    ret: ty0,
+                    params,
+                    body,
+                    span: name_span,
+                })]);
             }
+            self.pop_scope();
             self.expect_punct(Punct::Semi, "';' or function body after prototype")?;
-            return Ok(TopLevel::Proto(FuncProto {
+            return Ok(vec![TopLevel::Proto(FuncProto {
                 name,
-                ret: ty,
+                ret: ty0,
                 params,
                 variadic,
                 span: name_span,
-            }));
+            })]);
         }
 
-        // A global variable (possibly with an initializer). Only the first
-        // declarator is kept per item; commas start a fresh VarDecl below.
-        let init = if self.eat_punct(Punct::Assign) { Some(self.parse_assign()?) } else { None };
-        let decl = VarDecl { name, ty, init, span: name_span };
-        // Additional comma-separated globals reuse the base type.
-        if self.is_punct(Punct::Comma) {
-            // Emit the first as its own item by returning it; but to keep one
-            // item per declarator we only support a single global per statement
-            // here for simplicity. Chain the rest by recursion is awkward, so
-            // require a semicolon.
-            return self.err("multiple declarators in one global declaration are not supported");
+        // One or more global variables (each may have an initializer).
+        let mut items = Vec::new();
+        let ty = self.parse_array_suffix(ty0)?;
+        let init = if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
+        items.push(TopLevel::Global(VarDecl { name, ty, init, span: name_span }));
+        while self.eat_punct(Punct::Comma) {
+            let ty = self.parse_pointers(base.clone());
+            let (name, span) = self.expect_ident()?;
+            self.declare_ordinary(&name);
+            let ty = self.parse_array_suffix(ty)?;
+            let init =
+                if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
+            items.push(TopLevel::Global(VarDecl { name, ty, init, span }));
         }
         self.expect_punct(Punct::Semi, "';' after global declaration")?;
-        Ok(TopLevel::Global(decl))
+        Ok(items)
+    }
+
+    /// Parse the declarators of a `typedef` (the `typedef` keyword already
+    /// consumed), registering each name as a typedef in the current scope.
+    fn parse_typedef(&mut self) -> PResult<Vec<TopLevel>> {
+        let base = self.parse_decl_specs()?;
+        loop {
+            let ty = self.parse_pointers(base.clone());
+            let (name, _span) = self.expect_ident()?;
+            let ty = self.parse_array_suffix(ty)?;
+            self.declare_typedef(&name, ty);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::Semi, "';' after typedef")?;
+        Ok(Vec::new())
+    }
+
+    /// Parse zero or more `[const-expr]` / `[]` array suffixes onto `base`,
+    /// building the C array type (`base[A][B]` is array-A-of-array-B-of-base).
+    /// An empty `[]` yields an incomplete array (length `0`, deduced later).
+    fn parse_array_suffix(&mut self, base: CType) -> PResult<CType> {
+        let mut dims = Vec::new();
+        while self.is_punct(Punct::LBracket) {
+            self.bump();
+            if self.is_punct(Punct::RBracket) {
+                dims.push(0u64);
+            } else {
+                let n = self.parse_const_expr()?;
+                if n < 0 {
+                    return self.err("array size must be non-negative");
+                }
+                dims.push(n as u64);
+            }
+            self.expect_punct(Punct::RBracket, "']' after array size")?;
+        }
+        let mut ty = base;
+        for &d in dims.iter().rev() {
+            ty = CType::Array(Box::new(ty), d);
+        }
+        Ok(ty)
     }
 
     fn consume_storage(&mut self) {
@@ -223,6 +386,9 @@ impl Parser {
                 }
                 _ => (None, self.peek_span()),
             };
+            // A parameter of array type decays to a pointer to its element.
+            let ty = self.parse_array_suffix(ty)?;
+            let ty = ty.decayed().unwrap_or(ty);
             params.push(Param { name, ty, span });
             if !self.eat_punct(Punct::Comma) {
                 break;
@@ -235,28 +401,33 @@ impl Parser {
     // --- types -------------------------------------------------------------
 
     /// Whether the current token begins a declaration (a type or storage
-    /// specifier keyword).
+    /// specifier keyword, or a typedef-name identifier).
     fn at_type_specifier(&self) -> bool {
-        matches!(
-            self.peek(),
+        match self.peek() {
             TokenKind::Keyword(
                 Keyword::Void
-                    | Keyword::Bool
-                    | Keyword::Char
-                    | Keyword::Short
-                    | Keyword::Int
-                    | Keyword::Long
-                    | Keyword::Signed
-                    | Keyword::Unsigned
-                    | Keyword::Const
-                    | Keyword::Volatile
-                    | Keyword::Restrict
-                    | Keyword::Inline
-                    | Keyword::Noreturn
-                    | Keyword::Extern
-                    | Keyword::Static
-            )
-        )
+                | Keyword::Bool
+                | Keyword::Char
+                | Keyword::Short
+                | Keyword::Int
+                | Keyword::Long
+                | Keyword::Signed
+                | Keyword::Unsigned
+                | Keyword::Const
+                | Keyword::Volatile
+                | Keyword::Restrict
+                | Keyword::Inline
+                | Keyword::Noreturn
+                | Keyword::Extern
+                | Keyword::Static
+                | Keyword::Struct
+                | Keyword::Union
+                | Keyword::Enum
+                | Keyword::Typedef,
+            ) => true,
+            TokenKind::Ident(name) => self.is_typedef_name(name),
+            _ => false,
+        }
     }
 
     fn parse_decl_specs(&mut self) -> PResult<CType> {
@@ -269,8 +440,47 @@ impl Parser {
         let mut has_bool = false;
         let mut signed_spec: Option<bool> = None;
         let mut saw_any = false;
+        let mut explicit: Option<CType> = None;
 
         loop {
+            // A `struct`/`union`/`enum` specifier, or a typedef-name, supplies the
+            // whole type; it may not combine with the numeric specifiers.
+            let numeric_seen = has_void
+                || has_bool
+                || has_char
+                || has_short
+                || has_int
+                || longs > 0
+                || signed_spec.is_some();
+            match self.peek() {
+                TokenKind::Keyword(Keyword::Struct) if explicit.is_none() && !numeric_seen => {
+                    explicit = Some(self.parse_record(RecordKind::Struct)?);
+                    saw_any = true;
+                    continue;
+                }
+                TokenKind::Keyword(Keyword::Union) if explicit.is_none() && !numeric_seen => {
+                    explicit = Some(self.parse_record(RecordKind::Union)?);
+                    saw_any = true;
+                    continue;
+                }
+                TokenKind::Keyword(Keyword::Enum) if explicit.is_none() && !numeric_seen => {
+                    explicit = Some(self.parse_enum()?);
+                    saw_any = true;
+                    continue;
+                }
+                TokenKind::Ident(name) if explicit.is_none() && !numeric_seen => {
+                    match self.typedef_type(name) {
+                        Some(ty) => {
+                            explicit = Some(ty);
+                            saw_any = true;
+                            self.bump();
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                _ => {}
+            }
             match self.peek() {
                 TokenKind::Keyword(
                     Keyword::Const
@@ -328,6 +538,9 @@ impl Parser {
         if !saw_any {
             return Err(Diagnostic::error("expected a type").with_span(start));
         }
+        if let Some(ty) = explicit {
+            return Ok(ty);
+        }
         if longs >= 2 && !self.std.has_long_long() {
             return Err(Diagnostic::error(
                 "`long long` is a C99 feature (use -std=c99 or later)",
@@ -374,16 +587,134 @@ impl Parser {
     }
 
     /// Parse a type-name (used in casts and `sizeof`): specifiers plus an
-    /// abstract declarator (pointer levels only in this subset).
+    /// abstract declarator (pointer levels and array suffixes in this subset).
     fn parse_type_name(&mut self) -> PResult<CType> {
         let base = self.parse_decl_specs()?;
-        Ok(self.parse_pointers(base))
+        let ty = self.parse_pointers(base);
+        self.parse_array_suffix(ty)
+    }
+
+    /// Parse a `struct`/`union` specifier (the keyword at the cursor), returning
+    /// the record type. A body `{ ... }` completes the record's definition.
+    fn parse_record(&mut self, kind: RecordKind) -> PResult<CType> {
+        self.bump(); // struct / union
+        let tag = match self.peek().clone() {
+            TokenKind::Ident(name) => {
+                self.bump();
+                Some(name)
+            }
+            _ => None,
+        };
+        let has_body = self.is_punct(Punct::LBrace);
+        if tag.is_none() && !has_body {
+            return self.err("expected a tag name or '{' after struct/union");
+        }
+        let id = match &tag {
+            Some(t) => self.tag_record(t, kind),
+            None => self.anon_record(kind),
+        };
+        if has_body {
+            self.parse_record_body(id)?;
+        }
+        Ok(CType::Record(id))
+    }
+
+    fn parse_record_body(&mut self, id: RecordId) -> PResult<()> {
+        self.expect_punct(Punct::LBrace, "'{' to open struct/union body")?;
+        let mut fields = Vec::new();
+        while !self.is_punct(Punct::RBrace) && !self.at_eof() {
+            let base = self.parse_decl_specs()?;
+            loop {
+                let ty = self.parse_pointers(base.clone());
+                let (name, _span) = self.expect_ident()?;
+                if self.is_punct(Punct::Colon) {
+                    return self.err("bit-fields are not supported in this C subset");
+                }
+                let ty = self.parse_array_suffix(ty)?;
+                fields.push(Field { name, ty });
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::Semi, "';' after struct/union member")?;
+        }
+        self.expect_punct(Punct::RBrace, "'}' to close struct/union body")?;
+        self.records.defs[id].fields = fields;
+        self.records.defs[id].complete = true;
+        Ok(())
+    }
+
+    /// Parse an `enum` specifier. An `enum` has type `int`; a body registers its
+    /// enumerator constants (auto-incrementing, or explicit `= const-expr`).
+    fn parse_enum(&mut self) -> PResult<CType> {
+        self.bump(); // enum
+        if let TokenKind::Ident(_) = self.peek() {
+            self.bump(); // tag (ignored; an enum is an int)
+        }
+        if self.eat_punct(Punct::LBrace) {
+            let mut next = 0i128;
+            while !self.is_punct(Punct::RBrace) && !self.at_eof() {
+                let (name, _span) = self.expect_ident()?;
+                if self.eat_punct(Punct::Assign) {
+                    next = self.parse_const_expr()?;
+                }
+                self.enum_map.insert(name.clone(), next);
+                self.enum_consts.push((name, next));
+                next += 1;
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::RBrace, "'}' to close enum body")?;
+        }
+        Ok(CType::int())
+    }
+
+    /// Parse a constant expression (a conditional-expression) and fold it to an
+    /// integer, resolving enumerator constants and `sizeof`.
+    fn parse_const_expr(&mut self) -> PResult<i128> {
+        let span = self.peek_span();
+        let e = self.parse_conditional()?;
+        self.eval_const_expr(&e)
+            .ok_or_else(|| Diagnostic::error("expected a constant integer expression").with_span(span))
+    }
+
+    /// Fold a parsed expression to a constant integer, or `None` if it is not a
+    /// constant expression the parser can evaluate.
+    fn eval_const_expr(&self, e: &Expr) -> Option<i128> {
+        match &e.kind {
+            ExprKind::IntLit(v, _) => Some(*v),
+            ExprKind::Ident(name) => self.enum_map.get(name).copied(),
+            ExprKind::Unary(op, inner) => {
+                let v = self.eval_const_expr(inner)?;
+                match op {
+                    UnaryOp::Neg => Some(-v),
+                    UnaryOp::Plus => Some(v),
+                    UnaryOp::BitNot => Some(!v),
+                    UnaryOp::LNot => Some(i128::from(v == 0)),
+                    _ => None,
+                }
+            }
+            ExprKind::Binary(op, l, r) => {
+                let a = self.eval_const_expr(l)?;
+                let b = self.eval_const_expr(r)?;
+                eval_binop(*op, a, b)
+            }
+            ExprKind::Cond(c, t, f) => {
+                let cv = self.eval_const_expr(c)?;
+                if cv != 0 { self.eval_const_expr(t) } else { self.eval_const_expr(f) }
+            }
+            ExprKind::Cast(_, inner) => self.eval_const_expr(inner),
+            ExprKind::SizeofType(ty) => Some(layout::size_of(&self.records, ty) as i128),
+            _ => None,
+        }
     }
 
     // --- statements --------------------------------------------------------
 
     fn parse_block_stmts(&mut self) -> PResult<Vec<Stmt>> {
         self.expect_punct(Punct::LBrace, "'{'")?;
+        self.push_scope();
         let mut stmts = Vec::new();
         let mut seen_stmt = false;
         while !self.is_punct(Punct::RBrace) && !self.at_eof() {
@@ -394,6 +725,7 @@ impl Parser {
             }
             let is_decl = self.at_type_specifier();
             if is_decl && seen_stmt && !self.std.mixed_declarations() {
+                self.pop_scope();
                 return self.err(
                     "declarations after statements are a C99 feature (use -std=c99 or later)",
                 );
@@ -401,8 +733,15 @@ impl Parser {
             if !is_decl {
                 seen_stmt = true;
             }
-            stmts.push(self.parse_stmt()?);
+            match self.parse_stmt() {
+                Ok(s) => stmts.push(s),
+                Err(e) => {
+                    self.pop_scope();
+                    return Err(e);
+                }
+            }
         }
+        self.pop_scope();
         self.expect_punct(Punct::RBrace, "'}' to close block")?;
         Ok(stmts)
     }
@@ -451,13 +790,30 @@ impl Parser {
 
     fn parse_local_decl(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
+        if self.eat_kw(Keyword::Typedef) {
+            self.parse_typedef()?;
+            return Ok(self.stmt(StmtKind::Expr(None), start));
+        }
         self.consume_storage();
+        if self.eat_kw(Keyword::Typedef) {
+            self.parse_typedef()?;
+            return Ok(self.stmt(StmtKind::Expr(None), start));
+        }
         let base = self.parse_decl_specs()?;
+        self.consume_storage();
+        // A bare `struct S { ... };` at block scope declares only a type.
+        if self.is_punct(Punct::Semi) {
+            let end = self.bump().span;
+            return Ok(self.stmt(StmtKind::Expr(None), start.merge(end)));
+        }
         let mut decls = Vec::new();
         loop {
             let ty = self.parse_pointers(base.clone());
             let (name, name_span) = self.expect_ident()?;
-            let init = if self.eat_punct(Punct::Assign) { Some(self.parse_assign()?) } else { None };
+            let ty = self.parse_array_suffix(ty)?;
+            self.declare_ordinary(&name);
+            let init =
+                if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
             decls.push(VarDecl { name, ty, init, span: name_span });
             if !self.eat_punct(Punct::Comma) {
                 break;
@@ -655,22 +1011,26 @@ impl Parser {
     /// Whether a `(` at the cursor is followed by a type-name (so this is a cast
     /// or a `sizeof(type)` rather than a parenthesized expression).
     fn type_name_follows_lparen(&self) -> bool {
-        matches!(
-            self.peek_at(1),
+        match self.peek_at(1) {
             TokenKind::Keyword(
                 Keyword::Void
-                    | Keyword::Bool
-                    | Keyword::Char
-                    | Keyword::Short
-                    | Keyword::Int
-                    | Keyword::Long
-                    | Keyword::Signed
-                    | Keyword::Unsigned
-                    | Keyword::Const
-                    | Keyword::Volatile
-                    | Keyword::Restrict
-            )
-        )
+                | Keyword::Bool
+                | Keyword::Char
+                | Keyword::Short
+                | Keyword::Int
+                | Keyword::Long
+                | Keyword::Signed
+                | Keyword::Unsigned
+                | Keyword::Const
+                | Keyword::Volatile
+                | Keyword::Restrict
+                | Keyword::Struct
+                | Keyword::Union
+                | Keyword::Enum,
+            ) => true,
+            TokenKind::Ident(name) => self.is_typedef_name(name),
+            _ => false,
+        }
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
@@ -752,6 +1112,18 @@ impl Parser {
                 let end = self.expect_punct(Punct::RParen, "')' to close call")?;
                 let span = expr.span.merge(end);
                 expr = Expr { kind: ExprKind::Call(Box::new(expr), args), span };
+            } else if self.is_punct(Punct::LBracket) {
+                self.bump();
+                let index = self.parse_expr()?;
+                let end = self.expect_punct(Punct::RBracket, "']' to close subscript")?;
+                let span = expr.span.merge(end);
+                expr = Expr { kind: ExprKind::Index(Box::new(expr), Box::new(index)), span };
+            } else if self.is_punct(Punct::Dot) || self.is_punct(Punct::Arrow) {
+                let arrow = self.is_punct(Punct::Arrow);
+                self.bump();
+                let (name, end) = self.expect_ident()?;
+                let span = expr.span.merge(end);
+                expr = Expr { kind: ExprKind::Member(Box::new(expr), name, arrow), span };
             } else if self.is_punct(Punct::PlusPlus) || self.is_punct(Punct::MinusMinus) {
                 let is_inc = self.is_punct(Punct::PlusPlus);
                 let end = self.bump().span;
@@ -785,11 +1157,100 @@ impl Parser {
                 self.expect_punct(Punct::RParen, "')' to close parenthesized expression")?;
                 Ok(inner)
             }
-            TokenKind::Str(_) => self.err("string literals are out of scope in this C subset"),
+            TokenKind::Str(_) => {
+                // Adjacent string literals concatenate into one literal.
+                let mut bytes = Vec::new();
+                let mut span = self.peek_span();
+                while let TokenKind::Str(s) = self.peek().clone() {
+                    bytes.extend_from_slice(s.as_bytes());
+                    span = span.merge(self.bump().span);
+                }
+                Ok(Expr { kind: ExprKind::StrLit(bytes), span })
+            }
             TokenKind::Keyword(Keyword::Generic) => {
                 self.err("`_Generic` is not supported in this C subset")
             }
             _ => self.err("expected an expression"),
         }
     }
+
+    // --- initializers ------------------------------------------------------
+
+    /// Parse an initializer: either a brace-enclosed list or an assignment
+    /// expression.
+    fn parse_initializer(&mut self) -> PResult<Init> {
+        if self.is_punct(Punct::LBrace) {
+            self.parse_init_list()
+        } else {
+            Ok(Init::Expr(self.parse_assign()?))
+        }
+    }
+
+    fn parse_init_list(&mut self) -> PResult<Init> {
+        self.expect_punct(Punct::LBrace, "'{' to open initializer list")?;
+        let mut items = Vec::new();
+        while !self.is_punct(Punct::RBrace) && !self.at_eof() {
+            let designators = self.parse_designators()?;
+            let init = self.parse_initializer()?;
+            items.push(InitItem { designators, init });
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBrace, "'}' to close initializer list")?;
+        Ok(Init::List(items))
+    }
+
+    /// Parse an optional designator chain (`.field` / `[index]` ... `=`).
+    fn parse_designators(&mut self) -> PResult<Vec<Designator>> {
+        if !self.is_punct(Punct::Dot) && !self.is_punct(Punct::LBracket) {
+            return Ok(Vec::new());
+        }
+        if !self.std.for_loop_decls() {
+            // `for_loop_decls` tracks C99; designated initializers are also C99.
+            return self
+                .err("designated initializers are a C99 feature (use -std=c99 or later)");
+        }
+        let mut chain = Vec::new();
+        loop {
+            if self.eat_punct(Punct::Dot) {
+                let (name, _span) = self.expect_ident()?;
+                chain.push(Designator::Field(name));
+            } else if self.eat_punct(Punct::LBracket) {
+                let idx = self.parse_const_expr()?;
+                self.expect_punct(Punct::RBracket, "']' after array designator")?;
+                chain.push(Designator::Index(idx));
+            } else {
+                break;
+            }
+        }
+        self.expect_punct(Punct::Assign, "'=' after designator")?;
+        Ok(chain)
+    }
+}
+
+/// Fold a binary operator over two constant integers (constant-expression
+/// evaluation for array sizes, enum values, and designators).
+fn eval_binop(op: BinaryOp, a: i128, b: i128) -> Option<i128> {
+    Some(match op {
+        BinaryOp::Add => a + b,
+        BinaryOp::Sub => a - b,
+        BinaryOp::Mul => a * b,
+        BinaryOp::Div if b != 0 => a / b,
+        BinaryOp::Rem if b != 0 => a % b,
+        BinaryOp::BitAnd => a & b,
+        BinaryOp::BitOr => a | b,
+        BinaryOp::BitXor => a ^ b,
+        BinaryOp::Shl => a << b,
+        BinaryOp::Shr => a >> b,
+        BinaryOp::Eq => i128::from(a == b),
+        BinaryOp::Ne => i128::from(a != b),
+        BinaryOp::Lt => i128::from(a < b),
+        BinaryOp::Le => i128::from(a <= b),
+        BinaryOp::Gt => i128::from(a > b),
+        BinaryOp::Ge => i128::from(a >= b),
+        BinaryOp::LAnd => i128::from(a != 0 && b != 0),
+        BinaryOp::LOr => i128::from(a != 0 || b != 0),
+        _ => return None,
+    })
 }

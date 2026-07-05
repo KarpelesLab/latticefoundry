@@ -12,6 +12,7 @@
 
 pub mod ast;
 pub mod cstd;
+pub mod layout;
 pub mod lex;
 pub mod lower;
 pub mod parse;
@@ -24,7 +25,7 @@ pub use preprocess::{MacroOp, PpOptions};
 use latticefoundry::ir::Module;
 use latticefoundry::link::{self, ImageOptions};
 use latticefoundry::mc::object::{
-    ObjectModule, Section, SectionKind, Symbol, SymbolBinding, SymbolType,
+    ObjectModule, Section, SectionId, SectionKind, Symbol, SymbolBinding, SymbolType,
 };
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::Diagnostic;
@@ -143,35 +144,52 @@ fn verify_or(module: &Module, stage: &str) -> Result<(), BuildError> {
     })
 }
 
-/// Emit the module's global variables into a `.data` section of the object,
-/// defining a symbol for each (the backend's `compile_module` emits only code,
-/// so global storage is contributed here). Little-endian initializer bytes are
-/// laid down for the declared width.
+/// Emit the module's global variables into the object, defining a symbol for
+/// each (the backend's `compile_module` emits only code, so global storage is
+/// contributed here). Writable globals go in `.data`; read-only objects (string
+/// literals) in `.rodata`. Each global's fully-materialized initializer image is
+/// copied verbatim.
 fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal]) {
     if globals.is_empty() {
         return;
     }
-    let data = obj.add_section(Section::new(".data", SectionKind::Data, 8));
-    let mut bytes: Vec<u8> = Vec::new();
+    let mut data: Option<SectionId> = None;
+    let mut rodata: Option<SectionId> = None;
+    let mut data_bytes: Vec<u8> = Vec::new();
+    let mut rodata_bytes: Vec<u8> = Vec::new();
+
     for g in globals {
-        let size = sema::size_of(&g.ty) as usize;
-        let align = size.max(1);
+        let size = g.bytes.len().max(1);
+        let align = size.next_power_of_two().clamp(1, 8);
+        let (sec, bytes) = if g.readonly {
+            let sec = *rodata
+                .get_or_insert_with(|| obj.add_section(Section::new(".rodata", SectionKind::Rodata, 8)));
+            (sec, &mut rodata_bytes)
+        } else {
+            let sec = *data
+                .get_or_insert_with(|| obj.add_section(Section::new(".data", SectionKind::Data, 8)));
+            (sec, &mut data_bytes)
+        };
         while !bytes.len().is_multiple_of(align) {
             bytes.push(0);
         }
         let off = bytes.len() as u64;
-        let le = g.init.to_le_bytes();
-        bytes.extend_from_slice(&le[..size.min(le.len())]);
+        bytes.extend_from_slice(&g.bytes);
         obj.add_symbol(Symbol::defined(
             g.name.clone(),
             SymbolBinding::Global,
             SymbolType::Object,
-            data,
+            sec,
             off,
-            size as u64,
+            g.bytes.len() as u64,
         ));
     }
-    obj.section_mut(data).bytes = bytes;
+    if let Some(sec) = data {
+        obj.section_mut(sec).bytes = data_bytes;
+    }
+    if let Some(sec) = rodata {
+        obj.section_mut(sec).bytes = rodata_bytes;
+    }
 }
 
 #[cfg(test)]

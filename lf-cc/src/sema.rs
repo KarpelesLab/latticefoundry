@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CType, Expr, ExprKind, IntTy, Stmt, StmtKind, TopLevel, TranslationUnit, UnaryOp,
-    VarDecl,
+    BinaryOp, CType, Designator, Expr, ExprKind, Init, IntTy, RecordId, Records, Stmt, StmtKind,
+    TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
+use crate::layout;
 
 /// A function-local object with storage (a parameter or a local variable),
 /// addressed by an [`ObjId`] within its function.
@@ -27,8 +28,24 @@ pub struct Program {
     pub funcs: Vec<TFunc>,
     /// Every function signature (definitions and prototypes), used for calls.
     pub sigs: Vec<FuncSig>,
-    /// Global variables.
+    /// Global variables (including anonymous read-only string literals).
     pub globals: Vec<TGlobal>,
+    /// The `struct`/`union` registry, needed by lowering for layout.
+    pub records: Records,
+}
+
+/// The plain `char` type on this target (signed 8-bit), used for string data.
+pub fn char_ty() -> CType {
+    CType::Int(IntTy { width: 8, signed: true })
+}
+
+/// The result of checking a variable's initializer: a single scalar value, or a
+/// list of `(byte offset, value)` scalar stores for an aggregate.
+enum InitBuilt {
+    /// A scalar/pointer initializer already converted to the variable's type.
+    Scalar(TExpr),
+    /// Aggregate stores (offsets relative to the object's base).
+    Aggregate(Vec<(u64, TExpr)>),
 }
 
 /// A function signature (a definition or a prototype).
@@ -46,15 +63,19 @@ pub struct FuncSig {
     pub defined: bool,
 }
 
-/// A global variable.
+/// A global variable (or an anonymous string-literal object). Its initializer is
+/// fully materialized to a little-endian byte image, zero-padded to the type's
+/// size; emitting it is a byte copy into a `.data`/`.rodata` section.
 #[derive(Clone, Debug)]
 pub struct TGlobal {
     /// The global's name.
     pub name: String,
     /// The global's type.
     pub ty: CType,
-    /// The constant initializer value (zero if none).
-    pub init: i128,
+    /// The initializer image (already the full size of the object).
+    pub bytes: Vec<u8>,
+    /// Whether the object belongs in read-only data (string literals).
+    pub readonly: bool,
 }
 
 /// A defined function with a typed body.
@@ -106,8 +127,18 @@ pub enum TStmt {
     Break,
     /// `continue`.
     Continue,
-    /// Initialize a local object with a value already converted to its type.
+    /// Initialize a scalar local object with a value already converted to its type.
     InitLocal(ObjId, TExpr),
+    /// Initialize an aggregate local object: zero its `size` bytes, then perform
+    /// each scalar `(byte offset, value)` store.
+    InitAggregate {
+        /// The object being initialized.
+        obj: ObjId,
+        /// The object's size in bytes (the region to zero first).
+        size: u64,
+        /// The scalar stores, each already converted to its field/element type.
+        stores: Vec<(u64, TExpr)>,
+    },
 }
 
 /// A typed expression: a [`TExprKind`], its C type, and its source span.
@@ -170,6 +201,13 @@ pub enum TExprKind {
     PtrDiff { lhs: Box<TExpr>, rhs: Box<TExpr>, elem_size: u64 },
     /// `++`/`--`; `inc` selects direction, `post` selects old-vs-new result.
     IncDec { target: Box<TExpr>, inc: bool, post: bool, scale: u64 },
+    /// A member lvalue: `base` (an aggregate lvalue) displaced by `offset` bytes.
+    Field { base: Box<TExpr>, offset: u64 },
+    /// Array-to-pointer decay: yield the address of `inner` (an array lvalue) as
+    /// a pointer to its first element.
+    Decay(Box<TExpr>),
+    /// A whole-aggregate copy `dst = src` (both lvalues), copying `size` bytes.
+    CopyAssign { dst: Box<TExpr>, src: Box<TExpr>, size: u64 },
 }
 
 impl TExpr {
@@ -179,17 +217,10 @@ impl TExpr {
 
     /// Whether this typed expression designates an lvalue (has storage).
     pub fn is_lvalue(&self) -> bool {
-        matches!(self.kind, TExprKind::Obj(_) | TExprKind::Global(_) | TExprKind::Deref(_))
-    }
-}
-
-/// The size in bytes of a C type under the target data layout.
-pub fn size_of(ty: &CType) -> u64 {
-    match ty {
-        CType::Void => 1,
-        CType::Bool => 1,
-        CType::Int(i) => u64::from(i.width) / 8,
-        CType::Pointer(_) => 8,
+        matches!(
+            self.kind,
+            TExprKind::Obj(_) | TExprKind::Global(_) | TExprKind::Deref(_) | TExprKind::Field { .. }
+        )
     }
 }
 
@@ -230,10 +261,19 @@ fn usual_arith(a: &CType, b: &CType) -> CType {
 
 /// Type-check a translation unit, producing a typed [`Program`] or diagnostics.
 pub fn check(unit: &TranslationUnit) -> Result<Program, Vec<Diagnostic>> {
-    let mut checker = Checker::default();
+    let mut checker = Checker {
+        records: unit.records.clone(),
+        enum_consts: unit.enum_consts.iter().cloned().collect(),
+        ..Checker::default()
+    };
     checker.run(unit);
     if checker.diags.is_empty() {
-        Ok(Program { funcs: checker.funcs, sigs: checker.sigs, globals: checker.globals })
+        Ok(Program {
+            funcs: checker.funcs,
+            sigs: checker.sigs,
+            globals: checker.globals,
+            records: checker.records,
+        })
     } else {
         Err(checker.diags)
     }
@@ -247,11 +287,37 @@ struct Checker {
     global_index: HashMap<String, usize>,
     funcs: Vec<TFunc>,
     diags: Vec<Diagnostic>,
+    /// The `struct`/`union` registry (from the parser).
+    records: Records,
+    /// Enumerator constants resolvable as integer constant expressions.
+    enum_consts: HashMap<String, i128>,
+    /// Deduplicated string-literal objects: bytes → global index.
+    string_pool: HashMap<Vec<u8>, usize>,
 }
 
 impl Checker {
     fn error(&mut self, span: Span, msg: impl Into<String>) {
         self.diags.push(Diagnostic::error(msg).with_span(span));
+    }
+
+    /// The size in bytes of a C type under the target layout.
+    fn size_of(&self, ty: &CType) -> u64 {
+        layout::size_of(&self.records, ty)
+    }
+
+    /// Intern a string literal as an anonymous read-only global, returning its
+    /// index in [`Program::globals`]. Identical literals are deduplicated.
+    fn intern_string(&mut self, mut bytes: Vec<u8>) -> usize {
+        bytes.push(0); // NUL terminator
+        if let Some(&idx) = self.string_pool.get(&bytes) {
+            return idx;
+        }
+        let idx = self.globals.len();
+        let name = format!(".Lstr.{idx}");
+        let ty = CType::Array(Box::new(char_ty()), bytes.len() as u64);
+        self.string_pool.insert(bytes.clone(), idx);
+        self.globals.push(TGlobal { name, ty, bytes, readonly: true });
+        idx
     }
 
     fn run(&mut self, unit: &TranslationUnit) {
@@ -301,6 +367,18 @@ impl Checker {
             }
             return;
         }
+        if ret.is_record() {
+            self.error(
+                span,
+                "returning a struct/union by value is not supported in this subset; return a pointer",
+            );
+        }
+        if params.iter().any(CType::is_record) {
+            self.error(
+                span,
+                "passing a struct/union by value is not supported in this subset; pass a pointer",
+            );
+        }
         let idx = self.sigs.len();
         self.sigs.push(FuncSig { name: name.to_owned(), ret, params, variadic, defined });
         self.sig_index.insert(name.to_owned(), idx);
@@ -315,22 +393,131 @@ impl Checker {
             self.error(g.span, "global cannot have type 'void'");
             return;
         }
-        let init = match &g.init {
-            Some(e) => self.const_eval_init(e, &g.ty),
-            None => 0,
-        };
+        let mut ty = g.ty.clone();
+        if let Some(init) = &g.init {
+            ty = self.deduce_array_len(&ty, init);
+        }
+        let size = self.size_of(&ty) as usize;
+        let mut bytes = vec![0u8; size];
+        if let Some(init) = &g.init {
+            self.build_global_bytes(&ty, init, 0, &mut bytes, g.span);
+        }
         let idx = self.globals.len();
         self.global_index.insert(g.name.clone(), idx);
-        self.globals.push(TGlobal { name: g.name.clone(), ty: g.ty.clone(), init });
+        self.globals.push(TGlobal { name: g.name.clone(), ty, bytes, readonly: false });
     }
 
-    fn const_eval_init(&mut self, e: &Expr, _ty: &CType) -> i128 {
-        match const_eval(e) {
-            Some(v) => v,
-            None => {
-                self.error(e.span, "global initializer must be a constant expression");
-                0
+    /// Evaluate a constant integer expression, resolving enumerators.
+    fn const_eval(&self, e: &Expr) -> Option<i128> {
+        const_eval_with(e, &self.enum_consts, &self.records)
+    }
+
+    /// Materialize an initializer to little-endian bytes at `off` within `bytes`
+    /// (globals must have constant initializers).
+    fn build_global_bytes(&mut self, ty: &CType, init: &Init, off: u64, bytes: &mut [u8], span: Span) {
+        match ty {
+            CType::Array(elem, n) => {
+                // `char[] = "..."` writes the literal bytes directly.
+                if let Init::Expr(e) = init
+                    && let ExprKind::StrLit(s) = &e.kind
+                    && matches!(**elem, CType::Int(IntTy { width: 8, .. }))
+                {
+                    write_string_bytes(bytes, off, s, *n);
+                    return;
+                }
+                let stride = layout::stride_of(&self.records, elem);
+                let items = match init {
+                    Init::List(items) => items,
+                    Init::Expr(_) => {
+                        self.error(span, "array initializer must be a brace-enclosed list");
+                        return;
+                    }
+                };
+                let mut idx = 0u64;
+                for item in items {
+                    idx = apply_index_designators(&item.designators, idx);
+                    if idx < *n {
+                        self.build_global_bytes(elem, &item.init, off + idx * stride, bytes, span);
+                    }
+                    idx += 1;
+                }
             }
+            CType::Record(id) => {
+                let id = *id;
+                let items = match init {
+                    Init::List(items) => items,
+                    Init::Expr(_) => {
+                        self.error(span, "struct/union initializer must be a brace-enclosed list");
+                        return;
+                    }
+                };
+                let mut field_idx = 0usize;
+                for item in items {
+                    field_idx = self.apply_field_designators(id, &item.designators, field_idx);
+                    let nfields = self.records.get(id).fields.len();
+                    if field_idx < nfields {
+                        let fty = self.records.get(id).fields[field_idx].ty.clone();
+                        let foff = layout::field_offset(&self.records, id, field_idx);
+                        self.build_global_bytes(&fty, &item.init, off + foff, bytes, span);
+                    }
+                    field_idx += 1;
+                }
+            }
+            _ => {
+                // Scalar: a bare expression, or a single-element brace list.
+                let e = match init {
+                    Init::Expr(e) => e,
+                    Init::List(items) if items.len() == 1 => match &items[0].init {
+                        Init::Expr(e) => e,
+                        Init::List(_) => {
+                            self.error(span, "invalid scalar initializer");
+                            return;
+                        }
+                    },
+                    Init::List(_) => {
+                        self.error(span, "invalid scalar initializer");
+                        return;
+                    }
+                };
+                match self.const_eval(e) {
+                    Some(v) => write_int_bytes(bytes, off, v, self.size_of(ty)),
+                    None => self.error(e.span, "global initializer must be a constant expression"),
+                }
+            }
+        }
+    }
+
+    /// Deduce the length of an incomplete array type (`T a[]`) from its
+    /// initializer, or return `ty` unchanged.
+    fn deduce_array_len(&self, ty: &CType, init: &Init) -> CType {
+        if let CType::Array(elem, 0) = ty {
+            let n = match init {
+                Init::Expr(e) => match &e.kind {
+                    ExprKind::StrLit(s) => s.len() as u64 + 1,
+                    _ => 1,
+                },
+                Init::List(items) => {
+                    let mut idx = 0u64;
+                    let mut max = 0u64;
+                    for item in items {
+                        idx = apply_index_designators(&item.designators, idx);
+                        max = max.max(idx + 1);
+                        idx += 1;
+                    }
+                    max
+                }
+            };
+            return CType::Array(elem.clone(), n.max(1));
+        }
+        ty.clone()
+    }
+
+    fn apply_field_designators(&self, id: RecordId, desigs: &[Designator], cur: usize) -> usize {
+        match desigs.first() {
+            Some(Designator::Field(name)) => {
+                self.records.field(id, name).map(|(i, _)| i).unwrap_or(cur)
+            }
+            _ => cur,
         }
     }
 
@@ -447,7 +634,7 @@ impl Checker {
                 Some(TStmt::Return(None))
             }
             StmtKind::Return(Some(e)) => {
-                let te = self.check_expr(ctx, e)?;
+                let te = self.check_rvalue(ctx, e)?;
                 if matches!(ctx.ret_ty, CType::Void) {
                     self.error(stmt.span, "return with a value in a function returning void");
                     return Some(TStmt::Return(None));
@@ -483,22 +670,36 @@ impl Checker {
                 self.error(d.span, "variable cannot have type 'void'");
                 continue;
             }
-            let init_val = match &d.init {
-                Some(e) => {
-                    let te = self.check_expr(ctx, e)?;
-                    Some(self.convert(te, &d.ty))
-                }
+            // Deduce an incomplete array length from its initializer.
+            let mut ty = d.ty.clone();
+            if let Some(init) = &d.init {
+                ty = self.deduce_array_len(&ty, init);
+            }
+            if matches!(ty, CType::Array(_, 0)) {
+                self.error(d.span, "array size is required (variable-length arrays are unsupported)");
+            }
+            if let CType::Record(id) = &ty
+                && !self.records.get(*id).complete
+            {
+                self.error(d.span, "variable has incomplete struct/union type");
+            }
+            // Check the initializer *before* the name is in scope (C scoping).
+            let init_built = match &d.init {
+                Some(init) => self.build_init(ctx, &ty, init, d.span),
                 None => None,
             };
-            // Declaring the object *after* checking the initializer matches C
-            // scoping (the initializer cannot see the new name).
             if ctx.scopes.last().unwrap().contains_key(&d.name) {
                 self.error(d.span, format!("redeclaration of '{}'", d.name));
             }
-            let id = ctx.add_object(&d.name, d.ty.clone());
+            let id = ctx.add_object(&d.name, ty.clone());
             ctx.scopes.last_mut().unwrap().insert(d.name.clone(), id);
-            if let Some(v) = init_val {
-                out.push(TStmt::InitLocal(id, v));
+            match init_built {
+                Some(InitBuilt::Scalar(v)) => out.push(TStmt::InitLocal(id, v)),
+                Some(InitBuilt::Aggregate(stores)) => {
+                    let size = self.size_of(&ty);
+                    out.push(TStmt::InitAggregate { obj: id, size, stores });
+                }
+                None => {}
             }
         }
         // Wrap the (possibly several) initializers in a block-free sequence.
@@ -509,9 +710,149 @@ impl Checker {
         }
     }
 
+    /// Check an initializer against `ty`, producing either a single scalar value
+    /// or a flat list of `(offset, value)` aggregate stores.
+    fn build_init(
+        &mut self,
+        ctx: &mut FnCtx,
+        ty: &CType,
+        init: &Init,
+        span: Span,
+    ) -> Option<InitBuilt> {
+        if ty.is_aggregate() {
+            let mut stores = Vec::new();
+            self.build_agg_stores(ctx, ty, init, 0, &mut stores, span)?;
+            Some(InitBuilt::Aggregate(stores))
+        } else {
+            Some(InitBuilt::Scalar(self.build_scalar_init(ctx, ty, init, span)?))
+        }
+    }
+
+    /// Check a scalar initializer (a bare expression, or a single-element brace
+    /// list), converting it to the target type.
+    fn build_scalar_init(
+        &mut self,
+        ctx: &mut FnCtx,
+        ty: &CType,
+        init: &Init,
+        span: Span,
+    ) -> Option<TExpr> {
+        let e = match init {
+            Init::Expr(e) => e,
+            Init::List(items) if items.len() == 1 && items[0].designators.is_empty() => {
+                match &items[0].init {
+                    Init::Expr(e) => e,
+                    Init::List(_) => {
+                        self.error(span, "too many braces around a scalar initializer");
+                        return None;
+                    }
+                }
+            }
+            Init::List(_) => {
+                self.error(span, "invalid brace initializer for a scalar");
+                return None;
+            }
+        };
+        let te = self.check_rvalue(ctx, e)?;
+        Some(self.convert(te, ty))
+    }
+
+    /// Accumulate the scalar stores for an aggregate initializer.
+    fn build_agg_stores(
+        &mut self,
+        ctx: &mut FnCtx,
+        ty: &CType,
+        init: &Init,
+        base: u64,
+        out: &mut Vec<(u64, TExpr)>,
+        span: Span,
+    ) -> Option<()> {
+        match ty {
+            CType::Array(elem, n) => {
+                // `char[]` initialized from a string literal.
+                if let Init::Expr(e) = init
+                    && let ExprKind::StrLit(s) = &e.kind
+                    && matches!(**elem, CType::Int(IntTy { width: 8, .. }))
+                {
+                    for (i, &b) in s.iter().enumerate() {
+                        if (i as u64) < *n {
+                            out.push((base + i as u64, self.char_const(i128::from(b), elem, span)));
+                        }
+                    }
+                    return Some(());
+                }
+                let items = match init {
+                    Init::List(items) => items,
+                    Init::Expr(_) => {
+                        self.error(span, "array initializer must be a brace-enclosed list");
+                        return None;
+                    }
+                };
+                let stride = layout::stride_of(&self.records, elem);
+                let mut idx = 0u64;
+                for item in items {
+                    idx = apply_index_designators(&item.designators, idx);
+                    if idx < *n {
+                        self.build_member_init(ctx, elem, &item.init, base + idx * stride, out, span)?;
+                    }
+                    idx += 1;
+                }
+                Some(())
+            }
+            CType::Record(id) => {
+                let id = *id;
+                let items = match init {
+                    Init::List(items) => items,
+                    Init::Expr(_) => {
+                        self.error(span, "struct/union initializer must be a brace-enclosed list");
+                        return None;
+                    }
+                };
+                let mut field_idx = 0usize;
+                for item in items {
+                    field_idx = self.apply_field_designators(id, &item.designators, field_idx);
+                    let nfields = self.records.get(id).fields.len();
+                    if field_idx < nfields {
+                        let fty = self.records.get(id).fields[field_idx].ty.clone();
+                        let foff = layout::field_offset(&self.records, id, field_idx);
+                        self.build_member_init(ctx, &fty, &item.init, base + foff, out, span)?;
+                    }
+                    field_idx += 1;
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Initialize one array element or struct member (a scalar store, or a
+    /// nested aggregate).
+    fn build_member_init(
+        &mut self,
+        ctx: &mut FnCtx,
+        ty: &CType,
+        init: &Init,
+        base: u64,
+        out: &mut Vec<(u64, TExpr)>,
+        span: Span,
+    ) -> Option<()> {
+        if ty.is_aggregate() {
+            self.build_agg_stores(ctx, ty, init, base, out, span)
+        } else {
+            let v = self.build_scalar_init(ctx, ty, init, span)?;
+            out.push((base, v));
+            Some(())
+        }
+    }
+
+    /// A character constant of type `ty` (used for string-literal element stores).
+    fn char_const(&self, value: i128, ty: &CType, span: Span) -> TExpr {
+        TExpr::new(TExprKind::Const(value), ty.clone(), span)
+    }
+
     /// Check a condition expression (must be scalar).
     fn check_cond(&mut self, ctx: &mut FnCtx, e: &Expr) -> Option<TExpr> {
-        let te = self.check_expr(ctx, e)?;
+        let te = self.check_rvalue(ctx, e)?;
         if !te.ty.is_scalar() {
             self.error(e.span, format!("condition must be a scalar, found '{}'", te.ty));
         }
@@ -533,7 +874,7 @@ impl Checker {
             ExprKind::Cond(c, t, f) => self.check_ternary(ctx, c, t, f, span),
             ExprKind::Comma(a, b) => {
                 let ta = self.check_expr(ctx, a)?;
-                let tb = self.check_expr(ctx, b)?;
+                let tb = self.check_rvalue(ctx, b)?;
                 let ty = tb.ty.clone();
                 Some(TExpr::new(TExprKind::Comma(Box::new(ta), Box::new(tb)), ty, span))
             }
@@ -543,20 +884,138 @@ impl Checker {
             ExprKind::PostDec(inner) => self.check_incdec(ctx, inner, false, true, span),
             ExprKind::SizeofExpr(inner) => {
                 let te = self.check_expr(ctx, inner)?;
-                let sz = size_of(&te.ty) as i128;
+                let sz = self.size_of(&te.ty) as i128;
                 Some(TExpr::new(TExprKind::Const(sz), size_t(), span))
             }
             ExprKind::SizeofType(ty) => {
-                let sz = size_of(ty) as i128;
+                let sz = self.size_of(ty) as i128;
                 Some(TExpr::new(TExprKind::Const(sz), size_t(), span))
             }
+            ExprKind::StrLit(bytes) => {
+                let idx = self.intern_string(bytes.clone());
+                let ty = self.globals[idx].ty.clone();
+                // A string literal is an lvalue array object (it decays elsewhere).
+                Some(TExpr::new(TExprKind::Global(idx), ty, span))
+            }
+            ExprKind::Index(base, index) => self.check_index(ctx, base, index, span),
+            ExprKind::Member(base, name, arrow) => {
+                self.check_member(ctx, base, name, *arrow, span)
+            }
         }
+    }
+
+    /// Check an expression and apply array-to-pointer decay (the "value of" an
+    /// array is a pointer to its first element).
+    fn check_rvalue(&mut self, ctx: &mut FnCtx, e: &Expr) -> Option<TExpr> {
+        let te = self.check_expr(ctx, e)?;
+        Some(self.decay(te))
+    }
+
+    /// Decay an array-typed lvalue to a pointer to its first element.
+    fn decay(&mut self, te: TExpr) -> TExpr {
+        match te.ty.decayed() {
+            Some(ptr_ty) => {
+                let span = te.span;
+                TExpr::new(TExprKind::Decay(Box::new(te)), ptr_ty, span)
+            }
+            None => te,
+        }
+    }
+
+    fn check_index(
+        &mut self,
+        ctx: &mut FnCtx,
+        base: &Expr,
+        index: &Expr,
+        span: Span,
+    ) -> Option<TExpr> {
+        // `a[i]` is `*(a + i)`, where either operand may be the pointer.
+        let a = self.check_rvalue(ctx, base)?;
+        let b = self.check_rvalue(ctx, index)?;
+        let (ptr, idx) = if a.ty.is_pointer() { (a, b) } else { (b, a) };
+        if !ptr.ty.is_pointer() || !idx.ty.is_integer() {
+            self.error(span, "invalid subscript: need a pointer/array and an integer");
+            return None;
+        }
+        let elem = ptr.ty.pointee().cloned().unwrap();
+        if matches!(elem, CType::Void) {
+            self.error(span, "cannot subscript a pointer to 'void'");
+            return None;
+        }
+        let elem_size = self.size_of(&elem);
+        let ptr_ty = ptr.ty.clone();
+        let idx_c = self.convert(idx, &CType::long());
+        let addr = TExpr::new(
+            TExprKind::PtrArith {
+                ptr: Box::new(ptr),
+                index: Box::new(idx_c),
+                elem_size,
+                sub: false,
+            },
+            ptr_ty,
+            span,
+        );
+        Some(TExpr::new(TExprKind::Deref(Box::new(addr)), elem, span))
+    }
+
+    fn check_member(
+        &mut self,
+        ctx: &mut FnCtx,
+        base: &Expr,
+        name: &str,
+        arrow: bool,
+        span: Span,
+    ) -> Option<TExpr> {
+        // `s.m`: `s` is a record lvalue. `p->m`: `p` is a pointer to a record;
+        // form the `*p` lvalue first.
+        let record_lvalue = if arrow {
+            let bt = self.check_rvalue(ctx, base)?;
+            let inner = match bt.ty.pointee().cloned() {
+                Some(t) => t,
+                None => {
+                    self.error(span, "'->' requires a pointer to a struct/union");
+                    return None;
+                }
+            };
+            if !inner.is_record() {
+                self.error(span, "'->' requires a pointer to a struct/union");
+                return None;
+            }
+            TExpr::new(TExprKind::Deref(Box::new(bt)), inner, span)
+        } else {
+            let bt = self.check_expr(ctx, base)?;
+            if !bt.ty.is_record() {
+                self.error(span, "'.' requires a struct/union operand");
+                return None;
+            }
+            if !bt.is_lvalue() {
+                self.error(span, "'.' requires an lvalue struct/union");
+                return None;
+            }
+            bt
+        };
+        let CType::Record(id) = &record_lvalue.ty else { unreachable!() };
+        let id = *id;
+        let Some((idx, field)) = self.records.field(id, name) else {
+            self.error(span, format!("no member named '{name}' in the struct/union"));
+            return None;
+        };
+        let fty = field.ty.clone();
+        let offset = layout::field_offset(&self.records, id, idx);
+        Some(TExpr::new(
+            TExprKind::Field { base: Box::new(record_lvalue), offset },
+            fty,
+            span,
+        ))
     }
 
     fn check_ident(&mut self, ctx: &mut FnCtx, name: &str, span: Span) -> Option<TExpr> {
         if let Some(id) = ctx.lookup(name) {
             let ty = ctx.locals[id].ty.clone();
             return Some(TExpr::new(TExprKind::Obj(id), ty, span));
+        }
+        if let Some(&value) = self.enum_consts.get(name) {
+            return Some(TExpr::new(TExprKind::Const(value), CType::int(), span));
         }
         if let Some(&idx) = self.global_index.get(name) {
             let ty = self.globals[idx].ty.clone();
@@ -579,7 +1038,7 @@ impl Checker {
     ) -> Option<TExpr> {
         match op {
             UnaryOp::Plus => {
-                let te = self.check_expr(ctx, inner)?;
+                let te = self.check_rvalue(ctx, inner)?;
                 if !te.ty.is_integer() {
                     self.error(span, "unary '+' requires an integer operand");
                     return None;
@@ -588,7 +1047,7 @@ impl Checker {
                 Some(self.convert(te, &pt))
             }
             UnaryOp::Neg => {
-                let te = self.check_expr(ctx, inner)?;
+                let te = self.check_rvalue(ctx, inner)?;
                 if !te.ty.is_integer() {
                     self.error(span, "unary '-' requires an integer operand");
                     return None;
@@ -598,7 +1057,7 @@ impl Checker {
                 Some(TExpr::new(TExprKind::Neg(Box::new(c)), pt, span))
             }
             UnaryOp::BitNot => {
-                let te = self.check_expr(ctx, inner)?;
+                let te = self.check_rvalue(ctx, inner)?;
                 if !te.ty.is_integer() {
                     self.error(span, "unary '~' requires an integer operand");
                     return None;
@@ -608,7 +1067,7 @@ impl Checker {
                 Some(TExpr::new(TExprKind::BitNot(Box::new(c)), pt, span))
             }
             UnaryOp::LNot => {
-                let te = self.check_expr(ctx, inner)?;
+                let te = self.check_rvalue(ctx, inner)?;
                 if !te.ty.is_scalar() {
                     self.error(span, "unary '!' requires a scalar operand");
                     return None;
@@ -616,7 +1075,7 @@ impl Checker {
                 Some(TExpr::new(TExprKind::LogNot(Box::new(te)), CType::int(), span))
             }
             UnaryOp::Deref => {
-                let te = self.check_expr(ctx, inner)?;
+                let te = self.check_rvalue(ctx, inner)?;
                 match te.ty.pointee().cloned() {
                     Some(CType::Void) => {
                         self.error(span, "cannot dereference a 'void *'");
@@ -653,8 +1112,8 @@ impl Checker {
     ) -> Option<TExpr> {
         // Logical operators short-circuit and produce int 0/1.
         if matches!(op, BinaryOp::LAnd | BinaryOp::LOr) {
-            let lt = self.check_expr(ctx, l)?;
-            let rt = self.check_expr(ctx, r)?;
+            let lt = self.check_rvalue(ctx, l)?;
+            let rt = self.check_rvalue(ctx, r)?;
             if !lt.ty.is_scalar() || !rt.ty.is_scalar() {
                 self.error(span, "logical operator requires scalar operands");
             }
@@ -666,8 +1125,8 @@ impl Checker {
             return Some(TExpr::new(kind, CType::int(), span));
         }
 
-        let lt = self.check_expr(ctx, l)?;
-        let rt = self.check_expr(ctx, r)?;
+        let lt = self.check_rvalue(ctx, l)?;
+        let rt = self.check_rvalue(ctx, r)?;
 
         // Pointer arithmetic and comparisons.
         if lt.ty.is_pointer() || rt.ty.is_pointer() {
@@ -724,7 +1183,7 @@ impl Checker {
                     self.error(span, "invalid operands to pointer addition");
                     return None;
                 }
-                let elem_size = size_of(ptr.ty.pointee().unwrap());
+                let elem_size = self.size_of(ptr.ty.pointee().unwrap());
                 let ptr_ty = ptr.ty.clone();
                 let idx_c = self.convert(idx, &CType::long());
                 Some(TExpr::new(
@@ -739,7 +1198,7 @@ impl Checker {
                 ))
             }
             BinaryOp::Sub if lt.ty.is_pointer() && rt.ty.is_pointer() => {
-                let elem_size = size_of(lt.ty.pointee().unwrap());
+                let elem_size = self.size_of(lt.ty.pointee().unwrap());
                 Some(TExpr::new(
                     TExprKind::PtrDiff {
                         lhs: Box::new(lt),
@@ -756,7 +1215,7 @@ impl Checker {
                     self.error(span, "invalid operands to pointer subtraction");
                     return None;
                 }
-                let elem_size = size_of(lt.ty.pointee().unwrap());
+                let elem_size = self.size_of(lt.ty.pointee().unwrap());
                 let ptr_ty = lt.ty.clone();
                 let idx_c = self.convert(rt, &CType::long());
                 Some(TExpr::new(
@@ -798,8 +1257,26 @@ impl Checker {
             self.error(l.span, "expression is not assignable (not an lvalue)");
             return None;
         }
-        let rt = self.check_expr(ctx, r)?;
+        if lt.ty.is_array() {
+            self.error(l.span, "an array is not assignable");
+            return None;
+        }
         let target_ty = lt.ty.clone();
+        // Whole struct/union assignment copies the object's bytes.
+        if compound.is_none() && target_ty.is_record() {
+            let rt = self.check_expr(ctx, r)?;
+            if rt.ty != target_ty || !rt.is_lvalue() {
+                self.error(span, "incompatible struct/union assignment");
+                return None;
+            }
+            let size = self.size_of(&target_ty);
+            return Some(TExpr::new(
+                TExprKind::CopyAssign { dst: Box::new(lt), src: Box::new(rt), size },
+                target_ty,
+                span,
+            ));
+        }
+        let rt = self.check_rvalue(ctx, r)?;
         match compound {
             None => {
                 let rc = self.convert(rt, &target_ty);
@@ -863,7 +1340,7 @@ impl Checker {
         }
         let mut targs = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            let ta = self.check_expr(ctx, a)?;
+            let ta = self.check_rvalue(ctx, a)?;
             let conv = if i < sig.params.len() {
                 self.convert(ta, &sig.params[i])
             } else {
@@ -884,7 +1361,7 @@ impl Checker {
         inner: &Expr,
         span: Span,
     ) -> Option<TExpr> {
-        let te = self.check_expr(ctx, inner)?;
+        let te = self.check_rvalue(ctx, inner)?;
         if matches!(ty, CType::Void) {
             // Cast to void: evaluate for effect; result is void.
             return Some(TExpr::new(TExprKind::Convert(Box::new(te)), CType::Void, span));
@@ -905,8 +1382,8 @@ impl Checker {
         span: Span,
     ) -> Option<TExpr> {
         let cond = self.check_cond(ctx, c)?;
-        let tt = self.check_expr(ctx, t)?;
-        let ft = self.check_expr(ctx, f)?;
+        let tt = self.check_rvalue(ctx, t)?;
+        let ft = self.check_rvalue(ctx, f)?;
         let result_ty = if tt.ty.is_integer() && ft.ty.is_integer() {
             usual_arith(&tt.ty, &ft.ty)
         } else if tt.ty.is_pointer() {
@@ -943,7 +1420,7 @@ impl Checker {
             return None;
         }
         let scale = match te.ty.pointee() {
-            Some(p) => size_of(p),
+            Some(p) => self.size_of(p),
             None => 1,
         };
         let ty = te.ty.clone();
@@ -1004,12 +1481,15 @@ impl FnCtx {
     }
 }
 
-/// A small constant evaluator over the untyped AST for global initializers.
-fn const_eval(e: &Expr) -> Option<i128> {
+/// A constant evaluator over the untyped AST for global initializers, resolving
+/// enumerator constants and `sizeof`.
+fn const_eval_with(e: &Expr, enums: &HashMap<String, i128>, recs: &Records) -> Option<i128> {
+    let rec = |x: &Expr| const_eval_with(x, enums, recs);
     match &e.kind {
         ExprKind::IntLit(v, _) => Some(*v),
+        ExprKind::Ident(name) => enums.get(name).copied(),
         ExprKind::Unary(op, inner) => {
-            let v = const_eval(inner)?;
+            let v = rec(inner)?;
             match op {
                 UnaryOp::Neg => Some(-v),
                 UnaryOp::Plus => Some(v),
@@ -1019,8 +1499,8 @@ fn const_eval(e: &Expr) -> Option<i128> {
             }
         }
         ExprKind::Binary(op, l, r) => {
-            let a = const_eval(l)?;
-            let b = const_eval(r)?;
+            let a = rec(l)?;
+            let b = rec(r)?;
             match op {
                 BinaryOp::Add => Some(a + b),
                 BinaryOp::Sub => Some(a - b),
@@ -1035,7 +1515,42 @@ fn const_eval(e: &Expr) -> Option<i128> {
                 _ => None,
             }
         }
-        ExprKind::Cast(_, inner) => const_eval(inner),
+        ExprKind::Cond(c, t, f) => {
+            if rec(c)? != 0 { rec(t) } else { rec(f) }
+        }
+        ExprKind::Cast(_, inner) => rec(inner),
+        ExprKind::SizeofType(ty) => Some(layout::size_of(recs, ty) as i128),
         _ => None,
+    }
+}
+
+/// The array index selected by an initializer item's designator chain (its first
+/// `[index]` designator), or the running `cur` for a positional item.
+fn apply_index_designators(desigs: &[Designator], cur: u64) -> u64 {
+    match desigs.first() {
+        Some(Designator::Index(i)) => *i as u64,
+        _ => cur,
+    }
+}
+
+/// Write the low `size` bytes (little-endian) of `v` into `bytes` at `off`.
+fn write_int_bytes(bytes: &mut [u8], off: u64, v: i128, size: u64) {
+    let le = v.to_le_bytes();
+    for i in 0..size as usize {
+        if let (Some(dst), Some(src)) = (bytes.get_mut(off as usize + i), le.get(i)) {
+            *dst = *src;
+        }
+    }
+}
+
+/// Write string bytes into `bytes` at `off`, truncated to `n` (the NUL and any
+/// remaining bytes are already zero from the caller's zero-fill).
+fn write_string_bytes(bytes: &mut [u8], off: u64, s: &[u8], n: u64) {
+    for (i, &b) in s.iter().enumerate() {
+        if (i as u64) < n
+            && let Some(dst) = bytes.get_mut(off as usize + i)
+        {
+            *dst = b;
+        }
     }
 }

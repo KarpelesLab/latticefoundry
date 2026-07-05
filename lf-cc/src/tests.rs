@@ -2,7 +2,7 @@
 
 use crate::ast::{CType, IntTy};
 use crate::sema::{TExprKind, TStmt};
-use crate::{check_source, compile_to_ir};
+use crate::{CStd, check_source, compile_to_ir};
 
 use latticefoundry::verify::verify_module;
 
@@ -149,4 +149,101 @@ fn lower_all_operators_verifies() {
          return (r + (int)u) ? ~a : -b;\n\
          }",
     );
+}
+
+// --- aggregate-type tests -------------------------------------------------
+
+use crate::check_source_with;
+use crate::preprocess::PpOptions;
+
+fn check_std(src: &str, std: CStd) -> Result<crate::sema::Program, Vec<latticefoundry::support::diagnostics::Diagnostic>> {
+    check_source_with(src, &PpOptions { std, ..PpOptions::default() })
+}
+
+#[test]
+fn struct_member_typechecks_and_lowers() {
+    lower_ok("struct S { int x; int y; }; int main(){ struct S s; s.x=1; s.y=2; return s.x+s.y; }");
+}
+
+#[test]
+fn union_all_members_at_offset_zero() {
+    // A union's size is the max member; a `struct*`-style layout is not implied.
+    lower_ok("union U { int i; char c; }; int main(){ union U u; u.i=0; u.c=7; return u.i; }");
+}
+
+#[test]
+fn enum_constants_are_integer_constants() {
+    let prog = check_source("enum E { A, B=5, C }; int f(){ int a[C]; return B; }").unwrap();
+    assert_eq!(prog.funcs.len(), 1);
+}
+
+#[test]
+fn typedef_is_recognized_as_a_type() {
+    lower_ok("typedef int myint; myint f(myint x){ return x + 1; } int main(){ return f(41); }");
+}
+
+#[test]
+fn typedef_name_shadowed_by_local() {
+    // `T` names an int type, then a local `T` shadows it as a variable.
+    lower_ok("typedef int T; int main(){ T x = 1; int T = 41; return x + T; }");
+}
+
+#[test]
+fn array_and_pointer_decay() {
+    lower_ok("int sum(int *p, int n){ int s=0; for(int i=0;i<n;i++) s+=p[i]; return s; } \
+              int main(){ int a[3] = {1,2,3}; return sum(a, 3); }");
+}
+
+#[test]
+fn sizeof_array_is_n_times_element() {
+    let prog = check_source("int f(){ int a[10]; return sizeof(a); }").unwrap();
+    let ret = prog.funcs[0]
+        .body
+        .iter()
+        .find_map(|s| if let TStmt::Return(Some(e)) = s { Some(e) } else { None })
+        .expect("a return statement");
+    // sizeof(int[10]) == 40 (constant-folded), possibly wrapped in a Convert.
+    let inner = match &ret.kind {
+        TExprKind::Convert(inner) => &inner.kind,
+        k => k,
+    };
+    assert!(matches!(inner, TExprKind::Const(40)), "got {inner:?}");
+}
+
+#[test]
+fn string_literal_creates_readonly_global() {
+    let prog = check_source("int main(){ return \"abc\"[0]; }").unwrap();
+    assert!(prog.globals.iter().any(|g| g.readonly && g.bytes == b"abc\0"));
+}
+
+#[test]
+fn designated_initializer_rejected_in_c89() {
+    let err = check_std("int f(){ int a[3] = { [1] = 5 }; return a[1]; }", CStd::C89).unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("designated initializers are a C99 feature")));
+}
+
+#[test]
+fn designated_initializer_accepted_in_c99() {
+    check_std("int f(){ int a[3] = { [1] = 5 }; return a[1]; }", CStd::C99)
+        .expect("designated initializers type-check under c99");
+}
+
+#[test]
+fn struct_by_value_return_is_rejected() {
+    let err = check_source("struct S { int a; }; struct S f(){ struct S s; s.a=1; return s; }")
+        .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("returning a struct/union by value")));
+}
+
+#[test]
+fn member_of_non_struct_is_an_error() {
+    let err = check_source("int main(){ int x = 0; return x.y; }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("requires a struct/union")));
+}
+
+#[test]
+fn self_referential_struct_lowers() {
+    // A linked-list node referring to itself through a pointer.
+    lower_ok("struct N { int v; struct N* next; }; \
+              int main(){ struct N a; a.v=1; a.next=0; return a.v; }");
 }
