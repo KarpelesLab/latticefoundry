@@ -16,7 +16,12 @@ fn main() -> ExitCode {
         }
         None | Some("--help" | "-h") => {
             println!("lf-ld — LatticeFoundry linker\n");
-            println!("usage: lf-ld [-o output] <inputs...>");
+            println!("usage: lf-ld [-o output] [-e entry] <inputs...>\n");
+            println!("options:");
+            println!("  -o <path>   output executable path (default: a.out)");
+            println!("  -e <name>   entry symbol _start calls (default: main)");
+            println!("Inputs are `.lfo` relocatable objects; the result is a static ELF64");
+            println!("executable. See ROADMAP Phase 8.");
             return ExitCode::SUCCESS;
         }
         _ => {}
@@ -33,13 +38,19 @@ fn main() -> ExitCode {
 }
 
 fn parse(args: &[String]) -> LinkOptions {
-    let mut options = LinkOptions { output: "a.out".to_owned(), inputs: Vec::new() };
+    let mut options =
+        LinkOptions { output: "a.out".to_owned(), inputs: Vec::new(), entry: None };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-o" => {
                 if let Some(out) = it.next() {
                     options.output = out.clone();
+                }
+            }
+            "-e" => {
+                if let Some(entry) = it.next() {
+                    options.entry = Some(entry.clone());
                 }
             }
             input => options.inputs.push(input.to_owned()),
