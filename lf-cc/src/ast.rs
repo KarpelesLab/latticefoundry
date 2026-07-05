@@ -30,6 +30,22 @@ pub enum CType {
     /// A `struct` or `union` type, identified by its [`RecordId`] in the shared
     /// [`Records`] registry (so a record can refer to itself through a pointer).
     Record(RecordId),
+    /// A function type (return type, parameter types, variadic flag). A function
+    /// *designator* has this type; used as a value it decays to `Pointer(Func)`
+    /// (a function pointer), which is the only form that reaches storage.
+    Func(Box<FuncType>),
+}
+
+/// The type of a function: its return type, parameter types, and whether it is
+/// variadic. A function pointer is `CType::Pointer(Box::new(CType::Func(..)))`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct FuncType {
+    /// The return type.
+    pub ret: CType,
+    /// The parameter types (already adjusted: arrays/functions decayed).
+    pub params: Vec<CType>,
+    /// Whether the function is variadic (`...`).
+    pub variadic: bool,
 }
 
 /// The (width, signedness) of a C integer type. Width is in bits: 8 (`char`),
@@ -139,6 +155,11 @@ impl CType {
         matches!(self, CType::Record(_))
     }
 
+    /// Whether this is a function type (a function designator's type).
+    pub fn is_function(&self) -> bool {
+        matches!(self, CType::Func(_))
+    }
+
     /// Whether this is an aggregate (array or record) type.
     pub fn is_aggregate(&self) -> bool {
         self.is_array() || self.is_record()
@@ -165,10 +186,12 @@ impl CType {
         }
     }
 
-    /// If this is an array type, the pointer-to-element type it decays to.
+    /// If this is an array or function type, the pointer type it decays to (an
+    /// array decays to a pointer-to-element; a function to a pointer-to-function).
     pub fn decayed(&self) -> Option<CType> {
         match self {
             CType::Array(elem, _) => Some(CType::ptr_to((**elem).clone())),
+            CType::Func(_) => Some(CType::ptr_to(self.clone())),
             _ => None,
         }
     }
@@ -222,6 +245,19 @@ impl fmt::Display for CType {
             CType::Pointer(inner) => write!(f, "{inner} *"),
             CType::Array(elem, n) => write!(f, "{elem}[{n}]"),
             CType::Record(_) => write!(f, "struct/union"),
+            CType::Func(ft) => {
+                write!(f, "{} (", ft.ret)?;
+                for (i, p) in ft.params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                if ft.variadic {
+                    write!(f, ", ...")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -398,6 +434,16 @@ pub enum StmtKind {
     Break,
     /// `continue;`.
     Continue,
+    /// `switch (expr) body`.
+    Switch(Expr, Box<Stmt>),
+    /// `case const-expr: stmt` — the constant is folded at parse time.
+    Case(i128, Box<Stmt>),
+    /// `default: stmt`.
+    Default(Box<Stmt>),
+    /// `label: stmt` — a named label (function-scoped, in its own namespace).
+    Label(String, Box<Stmt>),
+    /// `goto label;`.
+    Goto(String),
 }
 
 /// A single declared variable (in a local declaration or a global).

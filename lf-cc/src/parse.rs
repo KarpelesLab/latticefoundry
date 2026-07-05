@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CType, Designator, Expr, ExprKind, Field, FuncDef, FuncProto, Init, InitItem, IntTy,
-    Param, RecordDef, RecordId, RecordKind, Records, Stmt, StmtKind, TopLevel, TranslationUnit,
-    UnaryOp, VarDecl,
+    BinaryOp, CType, Designator, Expr, ExprKind, Field, FuncDef, FuncProto, FuncType, Init,
+    InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt, StmtKind, TopLevel,
+    TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
 use crate::layout;
@@ -256,6 +256,31 @@ impl Parser {
 
         // First declarator: pointers, then a name.
         let ty0 = self.parse_pointers(base.clone());
+
+        // A grouped declarator (`ret (*name)(...)` or `ret (*name[N])(...)`) is
+        // always an object declaration — never a function definition — so parse
+        // it (and any comma-separated siblings) as globals.
+        if self.is_punct(Punct::LParen) {
+            let mut items = Vec::new();
+            let (name, ty, span) = self.parse_named_declarator(ty0)?;
+            self.declare_ordinary(&name);
+            let init =
+                if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
+            items.push(TopLevel::Global(VarDecl { name, ty, init, span }));
+            while self.eat_punct(Punct::Comma) {
+                let (name, ty, span) = self.parse_named_declarator(base.clone())?;
+                self.declare_ordinary(&name);
+                let init = if self.eat_punct(Punct::Assign) {
+                    Some(self.parse_initializer()?)
+                } else {
+                    None
+                };
+                items.push(TopLevel::Global(VarDecl { name, ty, init, span }));
+            }
+            self.expect_punct(Punct::Semi, "';' after global declaration")?;
+            return Ok(items);
+        }
+
         let (name, name_span) = self.expect_ident()?;
         self.declare_ordinary(&name);
 
@@ -295,10 +320,8 @@ impl Parser {
         let init = if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
         items.push(TopLevel::Global(VarDecl { name, ty, init, span: name_span }));
         while self.eat_punct(Punct::Comma) {
-            let ty = self.parse_pointers(base.clone());
-            let (name, span) = self.expect_ident()?;
+            let (name, ty, span) = self.parse_named_declarator(base.clone())?;
             self.declare_ordinary(&name);
-            let ty = self.parse_array_suffix(ty)?;
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
             items.push(TopLevel::Global(VarDecl { name, ty, init, span }));
@@ -312,9 +335,7 @@ impl Parser {
     fn parse_typedef(&mut self) -> PResult<Vec<TopLevel>> {
         let base = self.parse_decl_specs()?;
         loop {
-            let ty = self.parse_pointers(base.clone());
-            let (name, _span) = self.expect_ident()?;
-            let ty = self.parse_array_suffix(ty)?;
+            let (name, ty, _span) = self.parse_named_declarator(base.clone())?;
             self.declare_typedef(&name, ty);
             if !self.eat_punct(Punct::Comma) {
                 break;
@@ -378,16 +399,8 @@ impl Parser {
                 break;
             }
             let base = self.parse_decl_specs()?;
-            let ty = self.parse_pointers(base);
-            let (name, span) = match self.peek().clone() {
-                TokenKind::Ident(n) => {
-                    let sp = self.bump().span;
-                    (Some(n), sp)
-                }
-                _ => (None, self.peek_span()),
-            };
-            // A parameter of array type decays to a pointer to its element.
-            let ty = self.parse_array_suffix(ty)?;
+            let (name, ty, span) = self.declarator(base)?;
+            // A parameter of array or function type decays to a pointer.
             let ty = ty.decayed().unwrap_or(ty);
             params.push(Param { name, ty, span });
             if !self.eat_punct(Punct::Comma) {
@@ -587,11 +600,105 @@ impl Parser {
     }
 
     /// Parse a type-name (used in casts and `sizeof`): specifiers plus an
-    /// abstract declarator (pointer levels and array suffixes in this subset).
+    /// abstract declarator (pointer levels, array/function suffixes, and grouped
+    /// declarators such as `(*)(int)`).
     fn parse_type_name(&mut self) -> PResult<CType> {
         let base = self.parse_decl_specs()?;
-        let ty = self.parse_pointers(base);
-        self.parse_array_suffix(ty)
+        let (_name, ty, _span) = self.declarator(base)?;
+        Ok(ty)
+    }
+
+    // --- declarators -------------------------------------------------------
+
+    /// Parse a concrete declarator (must name something), returning the declared
+    /// name, its full type built from `base`, and the name's span.
+    fn parse_named_declarator(&mut self, base: CType) -> PResult<(String, CType, Span)> {
+        let (name, ty, span) = self.declarator(base)?;
+        match name {
+            Some(n) => Ok((n, ty, span)),
+            None => Err(Diagnostic::error("expected a name in this declarator").with_span(span)),
+        }
+    }
+
+    /// The core recursive declarator parser. Handles leading pointers, grouped
+    /// (parenthesized) declarators — including the `(*name)` function-pointer and
+    /// `(*name[N])` array-of-pointer forms — and trailing array/function suffixes.
+    /// Returns `(name?, type, name-span)`; `name` is `None` for an abstract
+    /// declarator (a parameter or type-name with no identifier).
+    fn declarator(&mut self, base: CType) -> PResult<(Option<String>, CType, Span)> {
+        // Leading pointers wrap the type the inner declarator ultimately builds on.
+        let base = self.parse_pointers(base);
+        if self.is_punct(Punct::LParen) && self.grouped_declarator_ahead() {
+            self.bump(); // '('
+            let inner_start = self.pos;
+            // First pass: skip the inner declarator to find its matching ')'.
+            self.skip_grouped_declarator()?;
+            self.expect_punct(Punct::RParen, "')' in declarator")?;
+            // Apply the suffixes that follow the group to `base`, forming the type
+            // the inner declarator derives from.
+            let outer = self.declarator_suffixes(base)?;
+            let resume = self.pos;
+            // Second pass: re-parse the inner declarator with the correct base.
+            self.pos = inner_start;
+            let (name, ty, span) = self.declarator(outer)?;
+            self.pos = resume;
+            Ok((name, ty, span))
+        } else {
+            let (name, span) = match self.peek().clone() {
+                TokenKind::Ident(n) => {
+                    let sp = self.bump().span;
+                    (Some(n), sp)
+                }
+                _ => (None, self.peek_span()),
+            };
+            let ty = self.declarator_suffixes(base)?;
+            Ok((name, ty, span))
+        }
+    }
+
+    /// Parse trailing declarator suffixes: a function parameter list (yielding a
+    /// [`CType::Func`]) or array dimensions.
+    fn declarator_suffixes(&mut self, base: CType) -> PResult<CType> {
+        if self.is_punct(Punct::LParen) {
+            let (params, variadic) = self.parse_param_list()?;
+            let param_tys: Vec<CType> = params.into_iter().map(|p| p.ty).collect();
+            return Ok(CType::Func(Box::new(FuncType { ret: base, params: param_tys, variadic })));
+        }
+        self.parse_array_suffix(base)
+    }
+
+    /// Whether the `(` at the cursor opens a nested (grouped) declarator rather
+    /// than a function parameter list: it does when it is followed by `*`, another
+    /// `(`, or an identifier that is not a typedef-name (the declared name).
+    fn grouped_declarator_ahead(&self) -> bool {
+        match self.peek_at(1) {
+            TokenKind::Punct(Punct::Star | Punct::LParen) => true,
+            TokenKind::Ident(name) => !self.is_typedef_name(name),
+            _ => false,
+        }
+    }
+
+    /// Skip over the tokens of a grouped declarator's inner declarator, stopping
+    /// at the `)` that closes the group (tracking nested `()`/`[]`).
+    fn skip_grouped_declarator(&mut self) -> PResult<()> {
+        let mut paren = 0u32;
+        let mut bracket = 0u32;
+        loop {
+            match self.peek() {
+                TokenKind::Punct(Punct::LParen) => paren += 1,
+                TokenKind::Punct(Punct::RParen) => {
+                    if paren == 0 && bracket == 0 {
+                        return Ok(());
+                    }
+                    paren = paren.saturating_sub(1);
+                }
+                TokenKind::Punct(Punct::LBracket) => bracket += 1,
+                TokenKind::Punct(Punct::RBracket) => bracket = bracket.saturating_sub(1),
+                TokenKind::Eof => return self.err("unterminated declarator"),
+                _ => {}
+            }
+            self.bump();
+        }
     }
 
     /// Parse a `struct`/`union` specifier (the keyword at the cursor), returning
@@ -625,12 +732,10 @@ impl Parser {
         while !self.is_punct(Punct::RBrace) && !self.at_eof() {
             let base = self.parse_decl_specs()?;
             loop {
-                let ty = self.parse_pointers(base.clone());
-                let (name, _span) = self.expect_ident()?;
+                let (name, ty, _span) = self.parse_named_declarator(base.clone())?;
                 if self.is_punct(Punct::Colon) {
                     return self.err("bit-fields are not supported in this C subset");
                 }
-                let ty = self.parse_array_suffix(ty)?;
                 fields.push(Field { name, ty });
                 if !self.eat_punct(Punct::Comma) {
                     break;
@@ -723,7 +828,9 @@ impl Parser {
                 self.parse_static_assert()?;
                 continue;
             }
-            let is_decl = self.at_type_specifier();
+            // A label (`ident :`) is a statement even when its name is a
+            // typedef-name, so it must not be mistaken for a declaration.
+            let is_decl = self.at_type_specifier() && !self.label_ahead();
             if is_decl && seen_stmt && !self.std.mixed_declarations() {
                 self.pop_scope();
                 return self.err(
@@ -748,6 +855,15 @@ impl Parser {
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
+        // A named label `ident :` (its own namespace; may shadow a typedef name).
+        if self.label_ahead() {
+            let TokenKind::Ident(name) = self.peek().clone() else { unreachable!() };
+            self.bump(); // ident
+            self.bump(); // ':'
+            let body = Box::new(self.parse_labeled_body()?);
+            let span = start.merge(body.span);
+            return Ok(self.stmt(StmtKind::Label(name, body), span));
+        }
         if self.is_punct(Punct::LBrace) {
             let stmts = self.parse_block_stmts()?;
             return Ok(self.stmt(StmtKind::Block(stmts), start));
@@ -760,6 +876,28 @@ impl Parser {
             TokenKind::Keyword(Keyword::While) => self.parse_while(),
             TokenKind::Keyword(Keyword::Do) => self.parse_do_while(),
             TokenKind::Keyword(Keyword::For) => self.parse_for(),
+            TokenKind::Keyword(Keyword::Switch) => self.parse_switch(),
+            TokenKind::Keyword(Keyword::Case) => {
+                self.bump();
+                let value = self.parse_const_expr()?;
+                self.expect_punct(Punct::Colon, "':' after case label")?;
+                let body = Box::new(self.parse_labeled_body()?);
+                let span = start.merge(body.span);
+                Ok(self.stmt(StmtKind::Case(value, body), span))
+            }
+            TokenKind::Keyword(Keyword::Default) => {
+                self.bump();
+                self.expect_punct(Punct::Colon, "':' after default label")?;
+                let body = Box::new(self.parse_labeled_body()?);
+                let span = start.merge(body.span);
+                Ok(self.stmt(StmtKind::Default(body), span))
+            }
+            TokenKind::Keyword(Keyword::Goto) => {
+                self.bump();
+                let (name, _) = self.expect_ident()?;
+                let end = self.expect_punct(Punct::Semi, "';' after goto")?;
+                Ok(self.stmt(StmtKind::Goto(name), start.merge(end)))
+            }
             TokenKind::Keyword(Keyword::Return) => {
                 self.bump();
                 let value = if self.is_punct(Punct::Semi) { None } else { Some(self.parse_expr()?) };
@@ -808,9 +946,7 @@ impl Parser {
         }
         let mut decls = Vec::new();
         loop {
-            let ty = self.parse_pointers(base.clone());
-            let (name, name_span) = self.expect_ident()?;
-            let ty = self.parse_array_suffix(ty)?;
+            let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
             self.declare_ordinary(&name);
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
@@ -821,6 +957,32 @@ impl Parser {
         }
         let end = self.expect_punct(Punct::Semi, "';' after declaration")?;
         Ok(self.stmt(StmtKind::Decl(decls), start.merge(end)))
+    }
+
+    /// Whether the cursor is at a named label: an identifier followed by `:`.
+    fn label_ahead(&self) -> bool {
+        matches!(self.peek(), TokenKind::Ident(_))
+            && matches!(self.peek_at(1), TokenKind::Punct(Punct::Colon))
+    }
+
+    /// Parse the statement a label prefixes. A label directly before the block's
+    /// closing `}` is treated as prefixing an empty statement.
+    fn parse_labeled_body(&mut self) -> PResult<Stmt> {
+        if self.is_punct(Punct::RBrace) {
+            return Ok(self.stmt(StmtKind::Expr(None), self.peek_span()));
+        }
+        self.parse_stmt()
+    }
+
+    fn parse_switch(&mut self) -> PResult<Stmt> {
+        let start = self.peek_span();
+        self.bump(); // switch
+        self.expect_punct(Punct::LParen, "'(' after switch")?;
+        let cond = self.parse_expr()?;
+        self.expect_punct(Punct::RParen, "')' after switch condition")?;
+        let body = Box::new(self.parse_stmt()?);
+        let span = start.merge(body.span);
+        Ok(self.stmt(StmtKind::Switch(cond, body), span))
     }
 
     fn parse_if(&mut self) -> PResult<Stmt> {

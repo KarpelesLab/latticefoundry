@@ -28,6 +28,9 @@ pub fn size_of(recs: &Records, ty: &CType) -> u64 {
         CType::Pointer(_) => 8,
         CType::Array(elem, n) => stride_of(recs, elem) * *n,
         CType::Record(id) => record_size(recs, *id),
+        // `sizeof` a function designator is 1 (a GCC extension); function
+        // pointers are `Pointer` and take the pointer size above.
+        CType::Func(_) => 1,
     }
 }
 
@@ -39,6 +42,7 @@ pub fn align_of(recs: &Records, ty: &CType) -> u64 {
         CType::Pointer(_) => 8,
         CType::Array(elem, _) => align_of(recs, elem),
         CType::Record(id) => record_align(recs, *id),
+        CType::Func(_) => 1,
     }
 }
 
@@ -113,6 +117,8 @@ pub fn ir_type(cx: &mut TypeContext, recs: &Records, ty: &CType) -> TypeId {
             cx.array(e, *n)
         }
         CType::Record(id) => ir_record(cx, recs, *id),
+        // A function type only ever appears behind a pointer in lowered code.
+        CType::Func(_) => cx.ptr(),
     }
 }
 

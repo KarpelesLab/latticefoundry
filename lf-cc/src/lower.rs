@@ -54,6 +54,7 @@ impl Tys {
             CType::Int(i) => self.for_int(i.width),
             CType::Pointer(_) => self.ptr,
             CType::Array(..) | CType::Record(_) => self.ptr,
+            CType::Func(_) => self.ptr,
         }
     }
 }
@@ -129,6 +130,20 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
         global_ids.push(module.add_global(Global { name, ty, init: Some(init) }));
     }
 
+    // For each function, an externally-defined ("init: None") global aliasing its
+    // symbol name. Taking a function's address (`FuncPtr`) materializes through
+    // this global's `global_ref` (a RIP-relative `lea` relocated to the function
+    // symbol), because the backend materializes a bare `func_ref` *value* as zero
+    // — it only honours `func_ref` as a direct call target. The synthetic global
+    // is never emitted as data (it is not in `program.globals`), so at link time
+    // the reference resolves to the function definition of the same name.
+    let ptr_ty = tys.ptr;
+    let mut func_addr_globals: Vec<GlobalId> = Vec::with_capacity(program.sigs.len());
+    for sig in &program.sigs {
+        let name = syms.intern(&sig.name);
+        func_addr_globals.push(module.add_global(Global { name, ty: ptr_ty, init: None }));
+    }
+
     // Precompute the interned IR type of every local/parameter aggregate, so the
     // per-function builder (which cannot re-borrow the type context) can size its
     // `alloca`s.
@@ -153,10 +168,14 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
         let mut fl = FnLower {
             b: builder,
             slots: Vec::new(),
-            loops: Vec::new(),
+            break_targets: Vec::new(),
+            continue_targets: Vec::new(),
+            switch_blocks: Vec::new(),
+            label_blocks: vec![None; f.n_labels as usize],
             terminated: false,
             func_ids: &func_ids,
             global_ids: &global_ids,
+            func_addr_globals: &func_addr_globals,
             locals: &f.locals,
             tys,
             agg_types: &agg_types,
@@ -184,11 +203,19 @@ struct FnLower<'a> {
     b: FunctionBuilder<'a>,
     /// `slots[obj]` is the `alloca` pointer for object `obj`.
     slots: Vec<ValueId>,
-    /// Stack of `(continue target, break target)` for the enclosing loops.
-    loops: Vec<(BlockId, BlockId)>,
+    /// Stack of `break` targets (pushed by loops and switches).
+    break_targets: Vec<BlockId>,
+    /// Stack of `continue` targets (pushed by loops only).
+    continue_targets: Vec<BlockId>,
+    /// Stack of per-switch block tables (mark id → block), innermost last.
+    switch_blocks: Vec<Vec<BlockId>>,
+    /// Blocks for named labels (label id → block), created lazily.
+    label_blocks: Vec<Option<BlockId>>,
     terminated: bool,
     func_ids: &'a [FuncId],
     global_ids: &'a [GlobalId],
+    /// External aliases (one per function) for materializing function addresses.
+    func_addr_globals: &'a [GlobalId],
     locals: &'a [LocalInfo],
     tys: Tys,
     /// Interned IR types of aggregate local/parameter types (for `alloca`).
@@ -269,15 +296,33 @@ impl FnLower<'_> {
     // --- statements --------------------------------------------------------
 
     fn lower_block(&mut self, stmts: &[TStmt]) {
+        // Statements are not skipped when the block is already terminated: a later
+        // `case`/`default`/label is a jump target that must still be lowered even
+        // if the code textually before it is unreachable. Straight-line dead code
+        // is redirected into a fresh unreachable block by `ensure_live`.
         for s in stmts {
-            if self.terminated {
-                break;
-            }
             self.lower_stmt(s);
         }
     }
 
+    /// Ensure there is a live (non-terminated) current block to emit into. Called
+    /// before lowering any statement that emits directly; if control has already
+    /// terminated (dead code), start a fresh unreachable block so later labels
+    /// remain reachable and the dead code stays well-formed.
+    fn ensure_live(&mut self) {
+        if self.terminated {
+            let bb = self.b.create_block(&[]);
+            self.switch(bb);
+        }
+    }
+
     fn lower_stmt(&mut self, s: &TStmt) {
+        // Blocks and label markers don't emit at entry (blocks recurse; markers
+        // switch to their own block), so they must not force a fresh dead block.
+        match s {
+            TStmt::Block(_) | TStmt::CaseMark(_) | TStmt::Labeled(..) => {}
+            _ => self.ensure_live(),
+        }
         match s {
             TStmt::Expr(None) => {}
             TStmt::Expr(Some(e)) => {
@@ -322,18 +367,94 @@ impl FnLower<'_> {
                 self.terminated = true;
             }
             TStmt::Break => {
-                if let Some(&(_, brk)) = self.loops.last() {
+                if let Some(&brk) = self.break_targets.last() {
                     self.b.br(brk, &[]);
                     self.terminated = true;
                 }
             }
             TStmt::Continue => {
-                if let Some(&(cont, _)) = self.loops.last() {
+                if let Some(&cont) = self.continue_targets.last() {
                     self.b.br(cont, &[]);
                     self.terminated = true;
                 }
             }
+            TStmt::Switch { value, cases, default, nmarks, body } => {
+                self.lower_switch(value, cases, *default, *nmarks, body);
+            }
+            TStmt::CaseMark(id) => {
+                let bb = self.switch_blocks.last().expect("case mark outside a switch")
+                    [*id as usize];
+                if !self.terminated {
+                    self.b.br(bb, &[]);
+                }
+                self.switch(bb);
+            }
+            TStmt::Labeled(id, inner) => {
+                let bb = self.label_block(*id);
+                if !self.terminated {
+                    self.b.br(bb, &[]);
+                }
+                self.switch(bb);
+                self.lower_stmt(inner);
+            }
+            TStmt::Goto(id) => {
+                let bb = self.label_block(*id);
+                self.b.br(bb, &[]);
+                self.terminated = true;
+            }
         }
+    }
+
+    /// The IR block for a named label (created on first reference so forward
+    /// `goto`s and the label itself share one block).
+    fn label_block(&mut self, id: u32) -> BlockId {
+        match self.label_blocks[id as usize] {
+            Some(bb) => bb,
+            None => {
+                let bb = self.b.create_block(&[]);
+                self.label_blocks[id as usize] = Some(bb);
+                bb
+            }
+        }
+    }
+
+    /// Lower a `switch`: emit the multi-way branch (jump table / value→block map)
+    /// with the default edge, then lower the body. Case/`default` marks in the
+    /// body (possibly nested) start each arm's block; falling out of one arm into
+    /// the next case's block is C's fall-through. `break` targets the exit block.
+    fn lower_switch(
+        &mut self,
+        value: &TExpr,
+        cases: &[(i128, u32)],
+        default: Option<u32>,
+        nmarks: u32,
+        body: &TStmt,
+    ) {
+        let vv = self.lower_rvalue(value);
+        let blocks: Vec<BlockId> = (0..nmarks).map(|_| self.b.create_block(&[])).collect();
+        let exit = self.b.create_block(&[]);
+        let default_bb = match default {
+            Some(id) => blocks[id as usize],
+            None => exit,
+        };
+        let case_list: Vec<(puremp::Int, BlockId, Vec<ValueId>)> = cases
+            .iter()
+            .map(|(v, id)| (puremp::Int::from_i64(*v as i64), blocks[*id as usize], Vec::new()))
+            .collect();
+        self.b.switch(vv, default_bb, &[], case_list);
+        // The body is entered only through case/default marks (jump targets), not
+        // by falling into it, so mark control terminated; any code before the
+        // first mark is unreachable and `ensure_live` isolates it.
+        self.terminated = true;
+        self.switch_blocks.push(blocks);
+        self.break_targets.push(exit);
+        self.lower_stmt(body);
+        if !self.terminated {
+            self.b.br(exit, &[]);
+        }
+        self.switch_blocks.pop();
+        self.break_targets.pop();
+        self.switch(exit);
     }
 
     fn lower_if(&mut self, cond: &TExpr, then: &TStmt, els: Option<&TStmt>) {
@@ -368,12 +489,14 @@ impl FnLower<'_> {
         let c = self.truth_of(cond);
         self.b.cond_br(c, body_bb, &[], exit, &[]);
         self.switch(body_bb);
-        self.loops.push((head, exit));
+        self.continue_targets.push(head);
+        self.break_targets.push(exit);
         self.lower_stmt(body);
         if !self.terminated {
             self.b.br(head, &[]);
         }
-        self.loops.pop();
+        self.continue_targets.pop();
+        self.break_targets.pop();
         self.switch(exit);
     }
 
@@ -383,12 +506,14 @@ impl FnLower<'_> {
         let exit = self.b.create_block(&[]);
         self.b.br(body_bb, &[]);
         self.switch(body_bb);
-        self.loops.push((cond_bb, exit));
+        self.continue_targets.push(cond_bb);
+        self.break_targets.push(exit);
         self.lower_stmt(body);
         if !self.terminated {
             self.b.br(cond_bb, &[]);
         }
-        self.loops.pop();
+        self.continue_targets.pop();
+        self.break_targets.pop();
         self.switch(cond_bb);
         let c = self.truth_of(cond);
         self.b.cond_br(c, body_bb, &[], exit, &[]);
@@ -419,12 +544,14 @@ impl FnLower<'_> {
             None => self.b.br(body_bb, &[]),
         }
         self.switch(body_bb);
-        self.loops.push((step_bb, exit));
+        self.continue_targets.push(step_bb);
+        self.break_targets.push(exit);
         self.lower_stmt(body);
         if !self.terminated {
             self.b.br(step_bb, &[]);
         }
-        self.loops.pop();
+        self.continue_targets.pop();
+        self.break_targets.pop();
         self.switch(step_bb);
         if let Some(s) = step {
             self.lower_effect(s);
@@ -634,7 +761,10 @@ impl FnLower<'_> {
             TExprKind::IncDec { target, inc, post, scale } => {
                 self.lower_incdec(target, *inc, *post, *scale)
             }
-            TExprKind::FuncRef(_) => unreachable!("function reference used as a value"),
+            TExprKind::FuncPtr(idx) => self.b.global_ref(self.func_addr_globals[*idx]),
+            TExprKind::FuncRef(_) => {
+                unreachable!("function designator not decayed to a function pointer")
+            }
         }
     }
 
@@ -756,13 +886,16 @@ impl FnLower<'_> {
     }
 
     fn lower_call(&mut self, callee: &TExpr, args: &[TExpr], call: &TExpr) -> Option<ValueId> {
-        let TExprKind::FuncRef(idx) = &callee.kind else {
-            unreachable!("callee is not a function reference");
+        // A bare function designator (`FuncPtr`) as the callee is a *direct* call,
+        // lowered to `func_ref` (which the backend encodes as a direct call). Any
+        // other callee is an indirect call through the loaded pointer value.
+        let callee_val = match &callee.kind {
+            TExprKind::FuncPtr(idx) => self.b.func_ref(self.func_ids[*idx]),
+            _ => self.lower_rvalue(callee),
         };
-        let fref = self.b.func_ref(self.func_ids[*idx]);
         let arg_vals: Vec<ValueId> = args.iter().map(|a| self.lower_rvalue(a)).collect();
         let ret_ty = self.tys.of(&call.ty);
-        self.b.call(fref, &arg_vals, ret_ty)
+        self.b.call(callee_val, &arg_vals, ret_ty)
     }
 
     /// Evaluate a scalar expression and reduce it to an `i1` truth value.
@@ -908,6 +1041,7 @@ fn align_of(ty: &CType) -> u32 {
         CType::Int(i) => (i.width / 8) as u32,
         CType::Pointer(_) => 8,
         CType::Array(..) | CType::Record(_) => 1,
+        CType::Func(_) => 1,
     }
 }
 

@@ -247,3 +247,107 @@ fn self_referential_struct_lowers() {
     lower_ok("struct N { int v; struct N* next; }; \
               int main(){ struct N a; a.v=1; a.next=0; return a.v; }");
 }
+
+// --- switch / goto / function-pointer tests --------------------------------
+
+#[test]
+fn switch_with_fallthrough_lowers() {
+    lower_ok(
+        "int f(int n){ int s=0; switch(n){ case 1: s+=1; case 2: s+=2; break; default: s+=9; } \
+         return s; } int main(){ return f(1); }",
+    );
+}
+
+#[test]
+fn switch_over_enum_lowers() {
+    lower_ok(
+        "enum E{A,B=5,C}; int f(enum E e){ switch(e){ case A: return 1; case B: return 2; \
+         case C: return 3; } return 0; } int main(){ return f(C); }",
+    );
+}
+
+#[test]
+fn goto_forward_and_backward_lowers() {
+    lower_ok(
+        "int main(){ int i=0,s=0; loop: if(i<5){ s+=i; i++; goto loop; } \
+         if(s>0) goto done; s=99; done: return s; }",
+    );
+}
+
+#[test]
+fn goto_to_undefined_label_is_an_error() {
+    let err = check_source("int main(){ goto missing; return 0; }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("undeclared label")));
+    assert!(err[0].span.is_some(), "diagnostic should carry a span");
+}
+
+#[test]
+fn duplicate_case_is_an_error() {
+    let err = check_source("int f(int n){ switch(n){ case 1: return 1; case 1: return 2; } return 0; }")
+        .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("duplicate case")));
+}
+
+#[test]
+fn duplicate_label_is_an_error() {
+    let err = check_source("int main(){ a: ; a: ; return 0; }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("duplicate label")));
+}
+
+#[test]
+fn multiple_default_is_an_error() {
+    let err = check_source("int f(int n){ switch(n){ default: return 1; default: return 2; } }")
+        .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("default")));
+}
+
+#[test]
+fn break_in_switch_is_allowed() {
+    // `break` is valid inside a switch even outside any loop.
+    check_source("int f(int n){ switch(n){ case 1: break; } return 0; }")
+        .expect("break in switch type-checks");
+}
+
+#[test]
+fn label_may_share_a_typedef_name() {
+    // Labels have their own namespace, so a label named like a typedef is fine.
+    lower_ok("typedef int T; int main(){ int x=0; T: x++; if(x<3) goto T; return x; }");
+}
+
+#[test]
+fn function_pointer_call_lowers() {
+    lower_ok(
+        "int inc(int x){ return x+1; } \
+         int main(){ int (*fp)(int)=&inc; return fp(41)+(*fp)(0); }",
+    );
+}
+
+#[test]
+fn function_pointer_designator_decays() {
+    // A bare function name used as a value decays to a function pointer.
+    let prog = check_source("int f(int x){ return x; } int main(){ int (*p)(int)=f; return p(1); }")
+        .unwrap();
+    assert_eq!(prog.funcs.len(), 2);
+}
+
+#[test]
+fn array_of_function_pointers_lowers() {
+    lower_ok(
+        "int a(int x,int y){return x+y;} int s(int x,int y){return x-y;} \
+         int main(){ int (*ops[2])(int,int)={a,s}; return ops[0](3,4)+ops[1](10,1); }",
+    );
+}
+
+#[test]
+fn function_pointer_typedef_and_callback_lowers() {
+    lower_ok(
+        "typedef int (*Fn)(int); int inc(int x){return x+1;} \
+         int apply(Fn g,int v){ return g(v); } int main(){ return apply(inc,41); }",
+    );
+}
+
+#[test]
+fn calling_a_non_function_is_an_error() {
+    let err = check_source("int main(){ int x=0; return x(1); }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("not a function")));
+}

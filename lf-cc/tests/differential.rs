@@ -182,6 +182,79 @@ fn programs() -> Vec<(&'static str, &'static str)> {
             "struct S{int a,b,c;}; \
              int main(){ struct S x={1,2,3}; struct S y; y=x; y.b=40; return y.a+y.b+y.c-x.b; }",
         ),
+        // --- switch / case / default / fall-through -------------------------
+        // A Duff-ish accumulation relying on fall-through between cases, with a
+        // `break` before the `default` arm.
+        (
+            "switch_fallthrough",
+            "int f(int n){ int s=0; switch(n){ \
+             case 5: s+=5; case 4: s+=4; case 3: s+=3; case 2: s+=2; case 1: s+=1; break; \
+             default: s+=100; } \
+             return s; } \
+             int main(){ return f(3)+f(1)+f(5)+f(0)+f(2); }",
+        ),
+        // A switch where every arm breaks (no fall-through), plus default.
+        (
+            "switch_break",
+            "int classify(int x){ switch(x){ \
+             case 0: return 100; case 1: case 2: return 20; case 3: return 30; default: return 7; } } \
+             int main(){ return classify(0)+classify(1)+classify(2)+classify(3)+classify(9); }",
+        ),
+        // A switch over an enum (enumerators as case constants).
+        (
+            "switch_enum",
+            "enum Op{ADD,SUB=10,MUL,DIV=20}; \
+             int ev(enum Op o,int a,int b){ switch(o){ \
+             case ADD: return a+b; case SUB: return a-b; case MUL: return a*b; case DIV: return a/b; } \
+             return 0; } \
+             int main(){ return ev(ADD,3,4)+ev(SUB,10,3)+ev(MUL,5,6)+ev(DIV,40,8); }",
+        ),
+        // --- goto -----------------------------------------------------------
+        // A backward goto forming a loop.
+        (
+            "goto_loop",
+            "int main(){ int i=0,s=0; \
+             again: if(i<=10){ s+=i; i++; goto again; } return s; }",
+        ),
+        // A forward `goto cleanup` error-handling idiom skipping code.
+        (
+            "goto_cleanup",
+            "int main(){ int acc=0; int fail=1; \
+             acc+=10; if(fail) goto cleanup; acc+=1000; \
+             cleanup: acc+=5; return acc; }",
+        ),
+        // A loop nested inside a switch: `continue` targets the loop, `break`
+        // targets the switch (each hit exactly once here).
+        (
+            "switch_loop_break_continue",
+            "int f(int sel){ int s=0; switch(sel){ \
+             case 1: for(int i=0;i<10;i++){ if(i==3) continue; if(i==7) break; s+=i; } break; \
+             default: s=999; } return s; } \
+             int main(){ return f(1); }",
+        ),
+        // --- function pointers ----------------------------------------------
+        // Assign `&f`, then call via `fp(x)` and `(*fp)(x)`: same result.
+        (
+            "fnptr_basic",
+            "int dbl(int x){ return x*2; } \
+             int main(){ int (*fp)(int)=&dbl; return fp(20)+(*fp)(1); }",
+        ),
+        // An array of function pointers used as a dispatch table.
+        (
+            "fnptr_table",
+            "int add(int a,int b){return a+b;} int sub(int a,int b){return a-b;} \
+             int mul(int a,int b){return a*b;} int dvd(int a,int b){return a/b;} \
+             int main(){ int (*ops[4])(int,int)={add,sub,mul,dvd}; \
+             int r=0; for(int i=0;i<4;i++) r+=ops[i](12,3); return r; }",
+        ),
+        // A function-pointer typedef and a callback parameter.
+        (
+            "fnptr_callback",
+            "typedef int (*IntFn)(int); \
+             int inc(int x){return x+1;} int neg(int x){return -x;} \
+             int apply(IntFn g,int v){ return g(v); } \
+             int main(){ IntFn f=inc; return apply(f,41)+apply(neg,-1)+(apply(inc,0)); }",
+        ),
     ]
 }
 

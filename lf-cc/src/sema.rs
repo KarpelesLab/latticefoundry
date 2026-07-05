@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CType, Designator, Expr, ExprKind, Init, IntTy, RecordId, Records, Stmt, StmtKind,
-    TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records, Stmt,
+    StmtKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::layout;
 
@@ -93,6 +93,8 @@ pub struct TFunc {
     pub params: Vec<ObjId>,
     /// The typed statement body.
     pub body: Vec<TStmt>,
+    /// The number of named labels in the function (one IR block per label id).
+    pub n_labels: u32,
     /// The 1-based declaration line (for debug info).
     pub decl_line: u32,
 }
@@ -127,6 +129,30 @@ pub enum TStmt {
     Break,
     /// `continue`.
     Continue,
+    /// `switch (value) body`. `value` is the controlling expression already
+    /// converted to its integer-promoted type. `cases` maps each (converted)
+    /// case constant to a mark id; `default` is the default mark id if present;
+    /// `nmarks` is the number of case/default marks (the block-table size). The
+    /// `body` contains [`TStmt::CaseMark`]s (possibly nested) marking each label.
+    Switch {
+        /// The controlling value (already integer-promoted).
+        value: TExpr,
+        /// `(case constant in the promoted type, mark id)` pairs, unique by value.
+        cases: Vec<(i128, u32)>,
+        /// The `default:` mark id, if the switch has one.
+        default: Option<u32>,
+        /// The number of case/default marks (the per-switch block-table size).
+        nmarks: u32,
+        /// The switch body.
+        body: Box<TStmt>,
+    },
+    /// A `case`/`default` label marker with its per-switch mark id: lowering
+    /// starts (or falls through into) the mark's block here.
+    CaseMark(u32),
+    /// A named label with its function-wide label id, prefixing `body`.
+    Labeled(u32, Box<TStmt>),
+    /// `goto` to a named label (its function-wide label id).
+    Goto(u32),
     /// Initialize a scalar local object with a value already converted to its type.
     InitLocal(ObjId, TExpr),
     /// Initialize an aggregate local object: zero its `size` bytes, then perform
@@ -161,8 +187,12 @@ pub enum TExprKind {
     Obj(ObjId),
     /// An lvalue reference to a global (index into [`Program::globals`]).
     Global(usize),
-    /// A reference to a function (index into [`Program::sigs`]); used as a callee.
+    /// A function *designator* (index into [`Program::sigs`]); its C type is
+    /// [`CType::Func`]. Used as a value it decays to [`TExprKind::FuncPtr`].
     FuncRef(usize),
+    /// A function pointer value: the address of the function at the given
+    /// [`Program::sigs`] index (typed `Pointer(Func)`). Lowers to `func_ref`.
+    FuncPtr(usize),
     /// Convert the inner value to this node's type.
     Convert(Box<TExpr>),
     /// Arithmetic/bitwise op on same-typed operands (`+ - * / % & | ^`).
@@ -524,12 +554,23 @@ impl Checker {
     fn check_func(&mut self, f: &crate::ast::FuncDef) {
         let sig_index = self.sig_index[&f.name];
         let ret = f.ret.clone();
+        // Collect every label in the function up front so `goto` may reference a
+        // label that appears later (forward references); labels have function
+        // scope, not block scope. Duplicate labels are diagnosed here.
+        let mut labels = HashMap::new();
+        for stmt in &f.body {
+            self.collect_labels(stmt, &mut labels);
+        }
+        let n_labels = labels.len() as u32;
         let mut ctx = FnCtx {
             locals: Vec::new(),
             params: Vec::new(),
             scopes: vec![HashMap::new()],
             ret_ty: ret.clone(),
             loop_depth: 0,
+            switch_depth: 0,
+            switches: Vec::new(),
+            labels,
         };
         // Parameters become objects with storage in the outermost scope.
         for p in &f.params {
@@ -557,8 +598,46 @@ impl Checker {
             locals: ctx.locals,
             params: ctx.params,
             body,
+            n_labels,
             decl_line,
         });
+    }
+
+    /// Recursively register the labels declared anywhere within `stmt` into
+    /// `labels`, assigning each a fresh id and diagnosing duplicates.
+    fn collect_labels(&mut self, stmt: &Stmt, labels: &mut HashMap<String, u32>) {
+        match &stmt.kind {
+            StmtKind::Label(name, body) => {
+                let next = labels.len() as u32;
+                if labels.insert(name.clone(), next).is_some() {
+                    self.error(stmt.span, format!("duplicate label '{name}'"));
+                }
+                self.collect_labels(body, labels);
+            }
+            StmtKind::Block(stmts) => {
+                for s in stmts {
+                    self.collect_labels(s, labels);
+                }
+            }
+            StmtKind::If(_, then, els) => {
+                self.collect_labels(then, labels);
+                if let Some(e) = els {
+                    self.collect_labels(e, labels);
+                }
+            }
+            StmtKind::While(_, body)
+            | StmtKind::DoWhile(body, _)
+            | StmtKind::Switch(_, body)
+            | StmtKind::Case(_, body)
+            | StmtKind::Default(body) => self.collect_labels(body, labels),
+            StmtKind::For(init, _, _, body) => {
+                if let Some(i) = init {
+                    self.collect_labels(i, labels);
+                }
+                self.collect_labels(body, labels);
+            }
+            _ => {}
+        }
     }
 
     // --- statements --------------------------------------------------------
@@ -644,8 +723,8 @@ impl Checker {
                 Some(TStmt::Return(Some(conv)))
             }
             StmtKind::Break => {
-                if ctx.loop_depth == 0 {
-                    self.error(stmt.span, "'break' outside of a loop");
+                if ctx.loop_depth == 0 && ctx.switch_depth == 0 {
+                    self.error(stmt.span, "'break' outside of a loop or switch");
                 }
                 Some(TStmt::Break)
             }
@@ -655,7 +734,89 @@ impl Checker {
                 }
                 Some(TStmt::Continue)
             }
+            StmtKind::Switch(expr, body) => self.check_switch(ctx, expr, body),
+            StmtKind::Case(value, body) => self.check_case(ctx, *value, body, stmt.span),
+            StmtKind::Default(body) => self.check_default(ctx, body, stmt.span),
+            StmtKind::Label(name, body) => {
+                // The id was assigned during the function-wide label pre-scan.
+                let id = ctx.labels[name];
+                let b = self.check_stmt(ctx, body)?;
+                Some(TStmt::Labeled(id, Box::new(b)))
+            }
+            StmtKind::Goto(name) => match ctx.labels.get(name) {
+                Some(&id) => Some(TStmt::Goto(id)),
+                None => {
+                    self.error(stmt.span, format!("use of undeclared label '{name}'"));
+                    None
+                }
+            },
         }
+    }
+
+    /// Check a `switch`: the controlling expression is integer-promoted, and its
+    /// body's `case`/`default` labels are collected (with duplicate detection).
+    fn check_switch(&mut self, ctx: &mut FnCtx, expr: &Expr, body: &Stmt) -> Option<TStmt> {
+        let ce = self.check_rvalue(ctx, expr)?;
+        if !ce.ty.is_integer() {
+            self.error(expr.span, format!("switch quantity must be an integer, found '{}'", ce.ty));
+        }
+        let prom = promote(&ce.ty);
+        let value = self.convert(ce, &prom);
+        ctx.switches.push(SwitchCollector { prom, cases: Vec::new(), default: None, nmarks: 0 });
+        ctx.switch_depth += 1;
+        let tbody = self.check_stmt(ctx, body);
+        ctx.switch_depth -= 1;
+        let coll = ctx.switches.pop().unwrap();
+        Some(TStmt::Switch {
+            value,
+            cases: coll.cases,
+            default: coll.default,
+            nmarks: coll.nmarks,
+            body: Box::new(tbody?),
+        })
+    }
+
+    fn check_case(&mut self, ctx: &mut FnCtx, value: i128, body: &Stmt, span: Span) -> Option<TStmt> {
+        let id = match ctx.switches.last_mut() {
+            Some(coll) => {
+                let canon = convert_case(value, &coll.prom);
+                if coll.cases.iter().any(|(v, _)| *v == canon) {
+                    self.error(span, format!("duplicate case value '{value}'"));
+                }
+                let id = coll.nmarks;
+                coll.nmarks += 1;
+                coll.cases.push((canon, id));
+                id
+            }
+            None => {
+                self.error(span, "'case' label not within a switch");
+                let b = self.check_stmt(ctx, body)?;
+                return Some(b);
+            }
+        };
+        let b = self.check_stmt(ctx, body)?;
+        Some(TStmt::Block(vec![TStmt::CaseMark(id), b]))
+    }
+
+    fn check_default(&mut self, ctx: &mut FnCtx, body: &Stmt, span: Span) -> Option<TStmt> {
+        let id = match ctx.switches.last_mut() {
+            Some(coll) => {
+                if coll.default.is_some() {
+                    self.error(span, "multiple 'default' labels in one switch");
+                }
+                let id = coll.nmarks;
+                coll.nmarks += 1;
+                coll.default = Some(id);
+                id
+            }
+            None => {
+                self.error(span, "'default' label not within a switch");
+                let b = self.check_stmt(ctx, body)?;
+                return Some(b);
+            }
+        };
+        let b = self.check_stmt(ctx, body)?;
+        Some(TStmt::Block(vec![TStmt::CaseMark(id), b]))
     }
 
     fn check_local_decls(
@@ -911,8 +1072,19 @@ impl Checker {
         Some(self.decay(te))
     }
 
-    /// Decay an array-typed lvalue to a pointer to its first element.
+    /// Decay an array-typed lvalue to a pointer to its first element, or a
+    /// function designator to a function pointer.
     fn decay(&mut self, te: TExpr) -> TExpr {
+        if matches!(te.ty, CType::Func(_)) {
+            let TExpr { kind, ty, span } = te;
+            return match kind {
+                // `f` → &f (a function pointer).
+                TExprKind::FuncRef(idx) => TExpr::new(TExprKind::FuncPtr(idx), CType::ptr_to(ty), span),
+                // `*fp` (a dereferenced function pointer) → the pointer itself.
+                TExprKind::Deref(inner) => *inner,
+                other => TExpr { kind: other, ty, span },
+            };
+        }
         match te.ty.decayed() {
             Some(ptr_ty) => {
                 let span = te.span;
@@ -1022,8 +1194,15 @@ impl Checker {
             return Some(TExpr::new(TExprKind::Global(idx), ty, span));
         }
         if let Some(&idx) = self.sig_index.get(name) {
-            // A function designator used outside a call: represent as its ref.
-            return Some(TExpr::new(TExprKind::FuncRef(idx), CType::Void, span));
+            // A function designator: its type is the function type. Used as a
+            // value it decays to a function pointer (see `decay`).
+            let sig = &self.sigs[idx];
+            let fty = CType::Func(Box::new(FuncType {
+                ret: sig.ret.clone(),
+                params: sig.params.clone(),
+                variadic: sig.variadic,
+            }));
+            return Some(TExpr::new(TExprKind::FuncRef(idx), fty, span));
         }
         self.error(span, format!("use of undeclared identifier '{name}'"));
         None
@@ -1092,6 +1271,18 @@ impl Checker {
             }
             UnaryOp::AddrOf => {
                 let te = self.check_expr(ctx, inner)?;
+                // `&function` yields a function pointer (same value the designator
+                // decays to); `&(*fp)` folds back to the pointer `fp`.
+                if matches!(te.ty, CType::Func(_)) {
+                    let TExpr { kind, ty, span: sp } = te;
+                    return match kind {
+                        TExprKind::FuncRef(idx) => {
+                            Some(TExpr::new(TExprKind::FuncPtr(idx), CType::ptr_to(ty), sp))
+                        }
+                        TExprKind::Deref(inner) => Some(*inner),
+                        other => Some(TExpr { kind: other, ty, span: sp }),
+                    };
+                }
                 if !te.is_lvalue() {
                     self.error(span, "cannot take the address of a non-lvalue");
                     return None;
@@ -1318,31 +1509,33 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> Option<TExpr> {
-        // Only direct calls to named functions are supported.
-        let ExprKind::Ident(name) = &callee.kind else {
-            self.error(callee.span, "only calls to named functions are supported");
-            return None;
+        // The callee decays to a function pointer: a bare function designator
+        // (direct call) or any pointer-to-function value (indirect call).
+        let ct = self.check_rvalue(ctx, callee)?;
+        let ft = match &ct.ty {
+            CType::Pointer(inner) => match &**inner {
+                CType::Func(ft) => ft.clone(),
+                _ => {
+                    self.error(callee.span, "called object is not a function or function pointer");
+                    return None;
+                }
+            },
+            _ => {
+                self.error(callee.span, "called object is not a function or function pointer");
+                return None;
+            }
         };
-        let Some(&idx) = self.sig_index.get(name) else {
-            self.error(callee.span, format!("call to undeclared function '{name}'"));
-            return None;
-        };
-        let sig = self.sigs[idx].clone();
-        if args.len() < sig.params.len() || (!sig.variadic && args.len() != sig.params.len()) {
+        if args.len() < ft.params.len() || (!ft.variadic && args.len() != ft.params.len()) {
             self.error(
                 span,
-                format!(
-                    "function '{name}' expects {} argument(s), found {}",
-                    sig.params.len(),
-                    args.len()
-                ),
+                format!("function expects {} argument(s), found {}", ft.params.len(), args.len()),
             );
         }
         let mut targs = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let ta = self.check_rvalue(ctx, a)?;
-            let conv = if i < sig.params.len() {
-                self.convert(ta, &sig.params[i])
+            let conv = if i < ft.params.len() {
+                self.convert(ta, &ft.params[i])
             } else {
                 // Variadic argument: default argument promotions.
                 let pt = promote(&ta.ty);
@@ -1350,8 +1543,7 @@ impl Checker {
             };
             targs.push(conv);
         }
-        let callee_t = TExpr::new(TExprKind::FuncRef(idx), CType::Void, callee.span);
-        Some(TExpr::new(TExprKind::Call(Box::new(callee_t), targs), sig.ret.clone(), span))
+        Some(TExpr::new(TExprKind::Call(Box::new(ct), targs), ft.ret.clone(), span))
     }
 
     fn check_cast(
@@ -1447,6 +1639,35 @@ fn size_t() -> CType {
     CType::Int(IntTy { width: 64, signed: false })
 }
 
+/// Convert a case constant to the switch's promoted controlling type, yielding
+/// the canonical in-range value used for duplicate detection and matching (the
+/// low `width` bits interpreted with the type's signedness).
+fn convert_case(v: i128, ty: &CType) -> i128 {
+    let width = ty.int_width().unwrap_or(32);
+    if width >= 128 {
+        return v;
+    }
+    let masked = v & ((1i128 << width) - 1);
+    if ty.is_signed() && masked & (1i128 << (width - 1)) != 0 {
+        masked - (1i128 << width)
+    } else {
+        masked
+    }
+}
+
+/// A switch being checked: its promoted controlling type and the case/default
+/// marks collected from the body (which may be nested arbitrarily deep).
+struct SwitchCollector {
+    /// The integer-promoted type of the controlling expression.
+    prom: CType,
+    /// `(converted case constant, mark id)` pairs, in source order.
+    cases: Vec<(i128, u32)>,
+    /// The `default:` mark id, once seen.
+    default: Option<u32>,
+    /// The number of marks allocated so far (the next mark id).
+    nmarks: u32,
+}
+
 /// The per-function checking context: scopes and the object table.
 struct FnCtx {
     locals: Vec<LocalInfo>,
@@ -1454,6 +1675,12 @@ struct FnCtx {
     scopes: Vec<HashMap<String, ObjId>>,
     ret_ty: CType,
     loop_depth: u32,
+    /// Nesting depth of enclosing `switch` statements (for `break` validity).
+    switch_depth: u32,
+    /// The stack of enclosing switches; the innermost collects `case`/`default`.
+    switches: Vec<SwitchCollector>,
+    /// Function-wide label names → label id (labels have their own namespace).
+    labels: HashMap<String, u32>,
 }
 
 impl FnCtx {

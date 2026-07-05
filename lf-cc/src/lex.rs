@@ -81,6 +81,14 @@ pub enum Keyword {
     Break,
     /// `continue`
     Continue,
+    /// `switch`
+    Switch,
+    /// `case`
+    Case,
+    /// `default`
+    Default,
+    /// `goto`
+    Goto,
     /// `sizeof`
     Sizeof,
     /// `struct`
@@ -179,6 +187,10 @@ fn keyword_from(word: &str) -> Option<Keyword> {
         "return" => Keyword::Return,
         "break" => Keyword::Break,
         "continue" => Keyword::Continue,
+        "switch" => Keyword::Switch,
+        "case" => Keyword::Case,
+        "default" => Keyword::Default,
+        "goto" => Keyword::Goto,
         "sizeof" => Keyword::Sizeof,
         "struct" => Keyword::Struct,
         "union" => Keyword::Union,
