@@ -713,6 +713,32 @@ struct Tok {
     span: Span,
 }
 
+/// Maps a byte offset into the source to its 1-based line number, for attaching
+/// source-line debug provenance to parsed IR. Built once per parse.
+#[derive(Clone, Debug, Default)]
+struct LineIndex {
+    /// Byte offset at which each line starts (`line_starts[0] == 0`).
+    line_starts: Vec<u32>,
+}
+
+impl LineIndex {
+    fn new(src: &str) -> LineIndex {
+        let mut line_starts = vec![0u32];
+        for (i, b) in src.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push((i + 1) as u32);
+            }
+        }
+        LineIndex { line_starts }
+    }
+
+    /// The 1-based line number containing byte `offset`.
+    fn line_of(&self, offset: u32) -> u32 {
+        // The last line start that is `<= offset`; its index + 1 is the line.
+        self.line_starts.partition_point(|&s| s <= offset) as u32
+    }
+}
+
 fn lex(src: &str, file: FileId) -> Result<Vec<Tok>, Diagnostic> {
     let b = src.as_bytes();
     let n = b.len();
@@ -962,13 +988,14 @@ pub fn parse_module(
     syms: &mut StrInterner,
 ) -> Result<Module, Vec<Diagnostic>> {
     let toks = lex(src, file).map_err(|d| vec![d])?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser { toks, pos: 0, lines: LineIndex::new(src) };
     p.parse_module(syms).map_err(|d| vec![d])
 }
 
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    lines: LineIndex,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -1124,7 +1151,7 @@ impl Parser {
 
         let mut func_names: HashMap<String, FuncId> = HashMap::new();
         let mut global_names: HashMap<String, GlobalId> = HashMap::new();
-        let mut pending: Vec<(FuncId, BodyAst)> = Vec::new();
+        let mut pending: Vec<(FuncId, BodyAst, u32)> = Vec::new();
 
         loop {
             match self.peek_kind() {
@@ -1133,9 +1160,10 @@ impl Parser {
                     self.parse_global(&mut module, syms, &mut global_names)?;
                 }
                 TokKind::Ident(id) if id == "func" => {
-                    let (fid, body) = self.parse_func(&mut module, syms, &mut func_names)?;
+                    let (fid, body, decl_line) =
+                        self.parse_func(&mut module, syms, &mut func_names)?;
                     if let Some(body) = body {
-                        pending.push((fid, body));
+                        pending.push((fid, body, decl_line));
                     }
                 }
                 _ => {
@@ -1145,8 +1173,8 @@ impl Parser {
             }
         }
 
-        for (fid, body) in pending {
-            lower_body(&mut module, fid, &body, &func_names, &global_names)?;
+        for (fid, body, decl_line) in pending {
+            lower_body(&mut module, fid, &body, decl_line, &self.lines, &func_names, &global_names)?;
         }
         Ok(module)
     }
@@ -1174,8 +1202,9 @@ impl Parser {
         module: &mut Module,
         syms: &mut StrInterner,
         func_names: &mut HashMap<String, FuncId>,
-    ) -> PResult<(FuncId, Option<BodyAst>)> {
-        self.expect_ident("func")?;
+    ) -> PResult<(FuncId, Option<BodyAst>, u32)> {
+        let func_kw = self.expect_ident("func")?;
+        let decl_line = self.lines.line_of(func_kw.start);
         let name = self.parse_name()?;
         let (params, ret, variadic) = self.parse_fn_sig(module)?;
         let sig = module.types_mut().func(params, ret, variadic);
@@ -1188,7 +1217,7 @@ impl Parser {
         } else {
             None
         };
-        Ok((fid, body))
+        Ok((fid, body, decl_line))
     }
 
     fn parse_fn_sig(&mut self, module: &mut Module) -> PResult<(Vec<TypeId>, TypeId, bool)> {
@@ -1671,10 +1700,13 @@ impl Parser {
 // Lowering (AST -> IR via the builder)
 // ===========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn lower_body(
     module: &mut Module,
     fid: FuncId,
     body: &BodyAst,
+    decl_line: u32,
+    lines: &LineIndex,
     func_names: &HashMap<String, FuncId>,
     global_names: &HashMap<String, GlobalId>,
 ) -> PResult<()> {
@@ -1693,6 +1725,7 @@ fn lower_body(
     }
 
     let mut b = module.build(fid);
+    b.set_decl_line(decl_line);
     let mut label_to_block: HashMap<u32, BlockId> = HashMap::new();
     let mut names: HashMap<String, ValueId> = HashMap::new();
 
@@ -1728,6 +1761,7 @@ fn lower_body(
         let bid = label_to_block[&blk.label];
         b.switch_to(bid);
         for inst in &blk.insts {
+            b.set_line(lines.line_of(inst.span.start));
             let result =
                 emit_inst(&mut b, inst, &names, &label_to_block, func_names, global_names)?;
             if let Some(rname) = &inst.result {

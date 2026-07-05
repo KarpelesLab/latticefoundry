@@ -25,6 +25,7 @@
 //! Everything here is deterministic (tenet T5): the same inputs always produce
 //! byte-identical output.
 
+pub mod dwarf;
 pub mod elf;
 pub mod emit;
 pub mod lfo;

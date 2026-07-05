@@ -250,10 +250,19 @@ pub struct Function {
     pub name: Sym,
     /// The function's signature: a [`Type::Func`] type id.
     pub sig: TypeId,
+    /// The 1-based source line the function is declared on, if known (debug
+    /// info, tenet: optional so non-debug builds are unaffected). `None` when the
+    /// function was not built from a source with line provenance.
+    pub decl_line: Option<u32>,
     values: Vec<Value>,
     /// `uses[v]` is the def→use list of value `v` (parallel to `values`).
     uses: Vec<Vec<Use>>,
     insts: Vec<InstData>,
+    /// Optional per-instruction source-line side table, parallel to `insts`.
+    /// Entry `0` means "no line recorded". Populated only when building with
+    /// debug info (e.g. the `.lf` parser under `lf build -g`); empty otherwise,
+    /// so ordinary builds carry no overhead.
+    inst_lines: Vec<u32>,
     blocks: Vec<Block>,
     entry: Option<BlockId>,
     /// Dedup table for value-less-identity values (constants, global and
@@ -267,9 +276,11 @@ impl Function {
         Self {
             name,
             sig,
+            decl_line: None,
             values: Vec::new(),
             uses: Vec::new(),
             insts: Vec::new(),
+            inst_lines: Vec::new(),
             blocks: Vec::new(),
             entry: None,
             value_cache: std::collections::HashMap::new(),
@@ -304,6 +315,16 @@ impl Function {
     /// Borrow an instruction by handle.
     pub fn inst(&self, id: InstId) -> &InstData {
         &self.insts[id.index()]
+    }
+
+    /// The recorded 1-based source line of an instruction, if debug provenance
+    /// was attached when the function was built. Returns `None` when no line was
+    /// recorded (a non-debug build, or an instruction the builder synthesized).
+    pub fn inst_line(&self, id: InstId) -> Option<u32> {
+        match self.inst_lines.get(id.index()).copied() {
+            Some(0) | None => None,
+            Some(line) => Some(line),
+        }
     }
 
     /// Number of instructions in the arena.

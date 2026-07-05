@@ -111,6 +111,8 @@ fn section_flags_type(kind: SectionKind) -> (u64, u32) {
         SectionKind::Data => (SHF_ALLOC | SHF_WRITE, SHT_PROGBITS),
         SectionKind::Rodata => (SHF_ALLOC, SHT_PROGBITS),
         SectionKind::Bss => (SHF_ALLOC | SHF_WRITE, SHT_NOBITS),
+        // Debug sections are present in the file but not allocated at run time.
+        SectionKind::Debug => (0, SHT_PROGBITS),
     }
 }
 

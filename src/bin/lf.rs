@@ -43,8 +43,9 @@ fn main() -> ExitCode {
 fn print_usage() {
     println!("lf — LatticeFoundry compiler driver\n");
     println!("usage:");
-    println!("  lf build <input.lf|input.lfb> [-o <out>] [--entry <name>] [--no-verify]");
+    println!("  lf build <input.lf|input.lfb> [-o <out>] [--entry <name>] [-g] [--no-verify]");
     println!("  lf --version | --help\n");
+    println!("  -g / --debug   emit DWARF debug info (source lines, symbols)");
     println!("`lf build` compiles an IR module to a static native executable.");
 }
 
@@ -53,6 +54,7 @@ struct BuildOptions {
     output: Option<String>,
     entry: Option<String>,
     verify: bool,
+    debug: bool,
 }
 
 fn build(args: &[String]) -> Result<(), String> {
@@ -73,12 +75,24 @@ fn build(args: &[String]) -> Result<(), String> {
         return Err(format!("verification failed ({errs} error(s))"));
     }
 
-    // Lower to a relocatable object, then link into a static executable.
-    let obj = target::x86_64::compile_module(&module, &syms);
-    let mut image_opts = ImageOptions::default();
-    if let Some(entry) = &opts.entry {
-        image_opts.entry = entry.clone();
-    }
+    // Lower to a relocatable object, then link into a static executable. With
+    // `-g`, also emit DWARF debug info and a debuggable image (section headers +
+    // symbol table + `.debug_*`).
+    let obj = if opts.debug {
+        let comp_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_default();
+        let source = target::x86_64::DebugSource { file_name: opts.input.clone(), comp_dir };
+        target::x86_64::compile_module_debug(&module, &syms, &source)
+    } else {
+        target::x86_64::compile_module(&module, &syms)
+    };
+    let image_opts = ImageOptions {
+        debug: opts.debug,
+        entry: opts.entry.clone().unwrap_or_else(|| ImageOptions::default().entry),
+        ..ImageOptions::default()
+    };
     let image =
         link::link_executable(vec![obj], &image_opts).map_err(|e| format!("link error: {e}"))?;
 
@@ -92,6 +106,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut output: Option<String> = None;
     let mut entry: Option<String> = None;
     let mut verify = true;
+    let mut debug = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -99,6 +114,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "-o" => output = Some(it.next().ok_or("-o requires a path")?.clone()),
             "--entry" | "-e" => entry = Some(it.next().ok_or("--entry requires a name")?.clone()),
             "--no-verify" => verify = false,
+            "-g" | "--debug" => debug = true,
             flag if flag.starts_with('-') && flag != "-" => {
                 return Err(format!("unrecognized option '{flag}'"));
             }
@@ -115,6 +131,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         output,
         entry,
         verify,
+        debug,
     })
 }
 

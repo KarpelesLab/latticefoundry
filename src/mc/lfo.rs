@@ -253,6 +253,7 @@ fn section_kind_code(k: SectionKind) -> u8 {
         SectionKind::Data => 1,
         SectionKind::Rodata => 2,
         SectionKind::Bss => 3,
+        SectionKind::Debug => 4,
     }
 }
 
@@ -262,6 +263,7 @@ fn section_kind_from(c: u8) -> Result<SectionKind, DecodeError> {
         1 => SectionKind::Data,
         2 => SectionKind::Rodata,
         3 => SectionKind::Bss,
+        4 => SectionKind::Debug,
         _ => return Err(DecodeError::InvalidTag { what: "section-kind", tag: u32::from(c) }),
     })
 }

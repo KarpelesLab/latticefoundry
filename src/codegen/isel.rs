@@ -87,6 +87,9 @@ pub struct Lower<'a, T: TargetIsel> {
     materialized: DetHashMap<(usize, usize), VReg>,
     /// The current insertion block.
     cur: MBlockId,
+    /// Source line of the IR instruction currently being lowered (`0` = none),
+    /// stamped onto every [`MachineInst`] emitted for it (debug info).
+    cur_line: u32,
 }
 
 /// Map an IR type to the register class that holds it.
@@ -126,7 +129,17 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             mf.set_entry(block_map[e.index()]);
             mf.set_num_params(func.block(e).params().len());
         }
-        Lower { target, module, func, mf, block_map, value_reg, materialized: DetHashMap::default(), cur: entry }
+        Lower {
+            target,
+            module,
+            func,
+            mf,
+            block_map,
+            value_reg,
+            materialized: DetHashMap::default(),
+            cur: entry,
+            cur_line: 0,
+        }
     }
 
     // --- accessors the target rules use ------------------------------------
@@ -196,8 +209,13 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
         self.value_reg[r.index()].expect("result vreg was pre-created")
     }
 
-    /// Emit an instruction into the current block.
-    pub fn emit(&mut self, inst: MachineInst) {
+    /// Emit an instruction into the current block. Instructions that do not
+    /// already carry a source line inherit the line of the IR instruction being
+    /// lowered, so the encoder can build a `.debug_line` table.
+    pub fn emit(&mut self, mut inst: MachineInst) {
+        if inst.line == 0 {
+            inst.line = self.cur_line;
+        }
         self.mf.block_mut(self.cur).insts.push(inst);
     }
 
@@ -335,11 +353,14 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
                 self.prologue(t);
             }
             for &iid in block.insts() {
+                self.cur_line = f.inst_line(iid).unwrap_or(0);
                 t.lower_inst(self, f.inst(iid));
             }
             if let Some(tid) = block.terminator() {
+                self.cur_line = f.inst_line(tid).unwrap_or(0);
                 t.lower_term(self, f.inst(tid));
             }
+            self.cur_line = 0;
         }
     }
 

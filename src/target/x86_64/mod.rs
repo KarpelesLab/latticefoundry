@@ -27,5 +27,7 @@ pub(crate) mod regs;
 #[cfg(test)]
 mod tests;
 
-pub use encode::{compile_function, compile_module, compile_to_elf};
+pub use encode::{
+    DebugSource, compile_function, compile_module, compile_module_debug, compile_to_elf,
+};
 pub use isel::{X86Op, X86_64Target};

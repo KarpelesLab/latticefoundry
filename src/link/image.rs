@@ -58,6 +58,24 @@ const PF_X: u32 = 0x1;
 const PF_W: u32 = 0x2;
 const PF_R: u32 = 0x4;
 
+// Section-header constants (used only when emitting debug info).
+const SHDR_SIZE: u64 = 64;
+const SYM_SIZE: u64 = 24;
+const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_NOBITS: u32 = 8;
+const SHF_WRITE: u64 = 0x1;
+const SHF_ALLOC: u64 = 0x2;
+const SHF_EXECINSTR: u64 = 0x4;
+const STB_LOCAL: u8 = 0;
+const STB_GLOBAL: u8 = 1;
+const STB_WEAK: u8 = 2;
+const STT_FUNC: u8 = 2;
+const STT_OBJECT: u8 = 1;
+const STT_NOTYPE: u8 = 0;
+const SHN_UNDEF: u16 = 0;
+
 /// Options controlling how an executable image is built.
 #[derive(Clone, Debug)]
 pub struct ImageOptions {
@@ -66,11 +84,16 @@ pub struct ImageOptions {
     pub entry: String,
     /// The virtual base address of the image.
     pub base: u64,
+    /// Emit a section-header table, a `.symtab`/`.strtab`, and carry any
+    /// non-alloc `.debug_*` sections into the file so a debugger can read the
+    /// image. Off by default — a plain runnable image omits all of this. Enabling
+    /// it never changes the loadable layout, `e_entry`, or the program headers.
+    pub debug: bool,
 }
 
 impl Default for ImageOptions {
     fn default() -> Self {
-        ImageOptions { entry: "main".to_owned(), base: BASE_DEFAULT }
+        ImageOptions { entry: "main".to_owned(), base: BASE_DEFAULT, debug: false }
     }
 }
 
@@ -391,9 +414,14 @@ pub fn link_executable(
         });
     }
 
-    // 4. Apply relocations now that every section has an address.
+    // 4. Apply relocations now that every section has an address. Relocations
+    //    inside non-loadable debug sections are handled later (their sections
+    //    have no virtual address / placement).
     for (oi, obj) in objects.iter().enumerate() {
         for r in obj.relocations() {
+            if obj.sections()[r.section.index()].kind == SectionKind::Debug {
+                continue;
+            }
             let sec_vaddr = placement[&(oi, r.section.index())];
             let p = sec_vaddr + r.offset;
             let file_off = (p - base) as usize;
@@ -441,14 +469,386 @@ pub fn link_executable(
         .map(|def| def_address(&objects, &placement, def))
         .ok_or_else(|| LinkError::MissingEntry("_start".to_owned()))?;
 
-    // 6. Write the ELF header and program headers into the reserved prefix.
-    write_headers(&mut buf, entry, &segments);
+    // 6. Optionally emit debug data: carry the non-loadable `.debug_*` sections
+    //    into the file, apply their relocations, and append a section-header
+    //    table with a `.symtab`/`.strtab`. This all lives *after* the loadable
+    //    segments, so the runnable layout, entry point, and program headers are
+    //    untouched (the kernel ignores section headers when it execs the image).
+    let sections = if opts.debug {
+        Some(emit_debug_and_sections(&mut buf, &objects, &placement, &globals, &segments)?)
+    } else {
+        None
+    };
+
+    // 7. Write the ELF header and program headers into the reserved prefix.
+    write_headers(&mut buf, entry, &segments, sections);
 
     Ok(buf)
 }
 
+/// The section-header table location once debug data has been appended.
+struct SectionTable {
+    shoff: u64,
+    shnum: u16,
+    shstrndx: u16,
+}
+
+/// Append the non-loadable debug sections, apply their relocations, and build a
+/// section-header table (with `.symtab`/`.strtab`/`.shstrtab`). Returns where the
+/// table lives so the ELF header can point at it.
+fn emit_debug_and_sections(
+    buf: &mut Vec<u8>,
+    objects: &[ObjectModule],
+    placement: &Placement,
+    globals: &DetHashMap<String, GlobalDef>,
+    segments: &[Segment],
+) -> Result<SectionTable, LinkError> {
+    // --- 6a. Place each debug section in the file, recording its offset. ---
+    let debug_group = group(objects, SectionKind::Debug);
+    let mut debug_off: DetHashMap<(usize, usize), u64> = DetHashMap::default();
+    for &(oi, si) in &debug_group {
+        let s = &objects[oi].sections()[si];
+        let aligned = align_up(buf.len() as u64, s.align.max(1));
+        buf.resize(aligned as usize, 0);
+        debug_off.insert((oi, si), buf.len() as u64);
+        buf.extend_from_slice(&s.bytes);
+    }
+
+    // --- 6b. Apply relocations that live inside the debug sections. ---
+    for (oi, obj) in objects.iter().enumerate() {
+        for r in obj.relocations() {
+            if obj.sections()[r.section.index()].kind != SectionKind::Debug {
+                continue;
+            }
+            let field = debug_off[&(oi, r.section.index())] + r.offset;
+            let s = symbol_address(objects, placement, globals, oi, r.symbol)?;
+            let a = r.addend;
+            let name = || obj.symbol(r.symbol).name.clone();
+            match r.kind {
+                RelocKind::Abs64 => put(buf, field as usize, &s.wrapping_add(a as u64).to_le_bytes()),
+                RelocKind::Abs32 | RelocKind::Abs32S => {
+                    let v = (s as i64).wrapping_add(a);
+                    if v < i32::MIN as i64 || v > u32::MAX as i64 {
+                        return Err(LinkError::RelocOverflow { symbol: name(), at: field });
+                    }
+                    put(buf, field as usize, &(v as u32).to_le_bytes());
+                }
+                other => return Err(LinkError::UnsupportedReloc(other)),
+            }
+        }
+    }
+
+    // --- 6c. Build the symbol table (function/object symbols) and strings. ---
+    // Section-header indices: 0=null, then one per loadable segment, then debug.
+    let mut shstrtab: Vec<u8> = vec![0];
+    let add_shstr = |s: &str, t: &mut Vec<u8>| -> u32 {
+        let off = t.len() as u32;
+        t.extend_from_slice(s.as_bytes());
+        t.push(0);
+        off
+    };
+
+    // Loadable section headers, derived from the segments (one name each).
+    struct ShdrRec {
+        name_off: u32,
+        kind: u32,
+        flags: u64,
+        addr: u64,
+        offset: u64,
+        size: u64,
+        link: u32,
+        info: u32,
+        align: u64,
+        entsize: u64,
+    }
+    let mut shdrs: Vec<ShdrRec> = Vec::new();
+    // Map a segment's flags to a canonical section name + kind + section index.
+    // Segment 0 is always the text load. Track the shndx assigned to the text
+    // segment so function symbols reference it.
+    let mut text_shndx: u16 = 0;
+    let mut rodata_shndx: u16 = 0;
+    let mut data_shndx: u16 = 0;
+    let mut bss_shndx: u16 = 0;
+    for seg in segments {
+        let idx = (shdrs.len() + 1) as u16; // +1 for the null header at 0
+        if seg.flags & PF_X != 0 {
+            let n = add_shstr(".text", &mut shstrtab);
+            shdrs.push(ShdrRec {
+                name_off: n,
+                kind: SHT_PROGBITS,
+                flags: SHF_ALLOC | SHF_EXECINSTR,
+                addr: seg.vaddr,
+                offset: seg.offset,
+                size: seg.filesz,
+                link: 0,
+                info: 0,
+                align: PAGE,
+                entsize: 0,
+            });
+            text_shndx = idx;
+        } else if seg.flags & PF_W != 0 {
+            let n = add_shstr(".data", &mut shstrtab);
+            shdrs.push(ShdrRec {
+                name_off: n,
+                kind: SHT_PROGBITS,
+                flags: SHF_ALLOC | SHF_WRITE,
+                addr: seg.vaddr,
+                offset: seg.offset,
+                size: seg.filesz,
+                link: 0,
+                info: 0,
+                align: PAGE,
+                entsize: 0,
+            });
+            data_shndx = idx;
+            // A `.bss` tail (memsz > filesz) gets its own NOBITS header.
+            if seg.memsz > seg.filesz {
+                let bn = add_shstr(".bss", &mut shstrtab);
+                bss_shndx = (shdrs.len() + 1) as u16;
+                shdrs.push(ShdrRec {
+                    name_off: bn,
+                    kind: SHT_NOBITS,
+                    flags: SHF_ALLOC | SHF_WRITE,
+                    addr: seg.vaddr + seg.filesz,
+                    offset: seg.offset + seg.filesz,
+                    size: seg.memsz - seg.filesz,
+                    link: 0,
+                    info: 0,
+                    align: 16,
+                    entsize: 0,
+                });
+            }
+        } else {
+            let n = add_shstr(".rodata", &mut shstrtab);
+            shdrs.push(ShdrRec {
+                name_off: n,
+                kind: SHT_PROGBITS,
+                flags: SHF_ALLOC,
+                addr: seg.vaddr,
+                offset: seg.offset,
+                size: seg.filesz,
+                link: 0,
+                info: 0,
+                align: PAGE,
+                entsize: 0,
+            });
+            rodata_shndx = idx;
+        }
+    }
+
+    // Debug section headers (non-alloc PROGBITS), preserving encounter order.
+    for &(oi, si) in &debug_group {
+        let s = &objects[oi].sections()[si];
+        let n = add_shstr(&s.name, &mut shstrtab);
+        shdrs.push(ShdrRec {
+            name_off: n,
+            kind: SHT_PROGBITS,
+            flags: 0,
+            addr: 0,
+            offset: debug_off[&(oi, si)],
+            size: s.bytes.len() as u64,
+            link: 0,
+            info: 0,
+            align: s.align.max(1),
+            entsize: 0,
+        });
+    }
+
+    // Section index a defined symbol lives at, by its section's kind.
+    let shndx_of = |kind: SectionKind| -> u16 {
+        match kind {
+            SectionKind::Text => text_shndx,
+            SectionKind::Rodata => rodata_shndx,
+            SectionKind::Data => data_shndx,
+            SectionKind::Bss => bss_shndx,
+            SectionKind::Debug => SHN_UNDEF,
+        }
+    };
+
+    // Collect defined symbols (locals first, then globals/weaks) for `.symtab`.
+    let mut strtab: Vec<u8> = vec![0];
+    let add_str = |s: &str, t: &mut Vec<u8>| -> u32 {
+        if s.is_empty() {
+            return 0;
+        }
+        let off = t.len() as u32;
+        t.extend_from_slice(s.as_bytes());
+        t.push(0);
+        off
+    };
+    struct SymRec {
+        name_off: u32,
+        info: u8,
+        shndx: u16,
+        value: u64,
+        size: u64,
+    }
+    let mut locals: Vec<SymRec> = Vec::new();
+    let mut globals_syms: Vec<SymRec> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for sym in obj.symbols() {
+            let SymbolValue::Defined { section, offset } = sym.value else { continue };
+            let kind = obj.sections()[section.index()].kind;
+            if matches!(kind, SectionKind::Debug) {
+                continue;
+            }
+            // A global/weak name is emitted once (its winning definition).
+            if !matches!(sym.binding, SymbolBinding::Local) {
+                if seen.contains(&sym.name) {
+                    continue;
+                }
+                seen.insert(sym.name.clone());
+            }
+            let value = placement[&(oi, section.index())] + offset;
+            let st_type = match sym.kind {
+                SymbolType::Func => STT_FUNC,
+                SymbolType::Object => STT_OBJECT,
+                _ => STT_NOTYPE,
+            };
+            let (bind, is_local) = match sym.binding {
+                SymbolBinding::Local => (STB_LOCAL, true),
+                SymbolBinding::Global => (STB_GLOBAL, false),
+                SymbolBinding::Weak => (STB_WEAK, false),
+            };
+            let rec = SymRec {
+                name_off: add_str(&sym.name, &mut strtab),
+                info: (bind << 4) | st_type,
+                shndx: shndx_of(kind),
+                value,
+                size: sym.size,
+            };
+            if is_local {
+                locals.push(rec);
+            } else {
+                globals_syms.push(rec);
+            }
+        }
+    }
+
+    // --- 6d. Serialize `.symtab`, `.strtab`, `.shstrtab` into the file. ---
+    let mut symtab: Vec<u8> = Vec::new();
+    write_sym(&mut symtab, 0, 0, SHN_UNDEF, 0, 0); // null symbol
+    for s in locals.iter().chain(globals_syms.iter()) {
+        write_sym(&mut symtab, s.name_off, s.info, s.shndx, s.value, s.size);
+    }
+    let first_global = (1 + locals.len()) as u32;
+
+    // Names for the trailing metadata sections.
+    let symtab_name = add_shstr(".symtab", &mut shstrtab);
+    let strtab_name = add_shstr(".strtab", &mut shstrtab);
+    let shstrtab_name = add_shstr(".shstrtab", &mut shstrtab);
+
+    let align8 = |b: &mut Vec<u8>| {
+        let a = align_up(b.len() as u64, 8);
+        b.resize(a as usize, 0);
+    };
+    align8(buf);
+    let symtab_off = buf.len() as u64;
+    buf.extend_from_slice(&symtab);
+    let strtab_off = buf.len() as u64;
+    buf.extend_from_slice(&strtab);
+    let shstrtab_off = buf.len() as u64;
+    buf.extend_from_slice(&shstrtab);
+
+    // Index bookkeeping: null + loadable/debug shdrs + symtab + strtab + shstrtab.
+    let symtab_idx = (1 + shdrs.len()) as u32;
+    let strtab_idx = symtab_idx + 1;
+    let shstrndx = strtab_idx + 1;
+
+    // Append the trailing metadata headers.
+    shdrs.push(ShdrRec {
+        name_off: symtab_name,
+        kind: SHT_SYMTAB,
+        flags: 0,
+        addr: 0,
+        offset: symtab_off,
+        size: symtab.len() as u64,
+        link: strtab_idx,
+        info: first_global,
+        align: 8,
+        entsize: SYM_SIZE,
+    });
+    shdrs.push(ShdrRec {
+        name_off: strtab_name,
+        kind: SHT_STRTAB,
+        flags: 0,
+        addr: 0,
+        offset: strtab_off,
+        size: strtab.len() as u64,
+        link: 0,
+        info: 0,
+        align: 1,
+        entsize: 0,
+    });
+    shdrs.push(ShdrRec {
+        name_off: shstrtab_name,
+        kind: SHT_STRTAB,
+        flags: 0,
+        addr: 0,
+        offset: shstrtab_off,
+        size: shstrtab.len() as u64,
+        link: 0,
+        info: 0,
+        align: 1,
+        entsize: 0,
+    });
+
+    // --- 6e. Write the section-header table (null header first). ---
+    align8(buf);
+    let shoff = buf.len() as u64;
+    write_shdr_bytes(buf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); // null
+    for s in &shdrs {
+        write_shdr_bytes(
+            buf, s.name_off, s.kind, s.flags, s.addr, s.offset, s.size, s.link, s.info, s.align,
+            s.entsize,
+        );
+    }
+
+    Ok(SectionTable { shoff, shnum: (1 + shdrs.len()) as u16, shstrndx: shstrndx as u16 })
+}
+
+/// Write one `Elf64_Sym` (24 bytes).
+fn write_sym(buf: &mut Vec<u8>, name: u32, info: u8, shndx: u16, value: u64, size: u64) {
+    buf.extend_from_slice(&name.to_le_bytes());
+    buf.push(info);
+    buf.push(0); // st_other
+    buf.extend_from_slice(&shndx.to_le_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
+    buf.extend_from_slice(&size.to_le_bytes());
+}
+
+/// Write one `Elf64_Shdr` (64 bytes).
+#[allow(clippy::too_many_arguments)]
+fn write_shdr_bytes(
+    buf: &mut Vec<u8>,
+    name: u32,
+    kind: u32,
+    flags: u64,
+    addr: u64,
+    offset: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    addralign: u64,
+    entsize: u64,
+) {
+    buf.extend_from_slice(&name.to_le_bytes());
+    buf.extend_from_slice(&kind.to_le_bytes());
+    buf.extend_from_slice(&flags.to_le_bytes());
+    buf.extend_from_slice(&addr.to_le_bytes());
+    buf.extend_from_slice(&offset.to_le_bytes());
+    buf.extend_from_slice(&size.to_le_bytes());
+    buf.extend_from_slice(&link.to_le_bytes());
+    buf.extend_from_slice(&info.to_le_bytes());
+    buf.extend_from_slice(&addralign.to_le_bytes());
+    buf.extend_from_slice(&entsize.to_le_bytes());
+}
+
 /// Fill `buf`'s reserved prefix with the `Elf64_Ehdr` and the program headers.
-fn write_headers(buf: &mut [u8], entry: u64, segments: &[Segment]) {
+/// When `sections` is `Some`, the header points at the appended section-header
+/// table; otherwise `e_shoff`/`e_shnum`/`e_shstrndx` are zero (no sections).
+fn write_headers(buf: &mut [u8], entry: u64, segments: &[Segment], sections: Option<SectionTable>) {
     // e_ident.
     put(buf, 0, &ELFMAG);
     buf[4] = ELFCLASS64;
@@ -463,14 +863,19 @@ fn write_headers(buf: &mut [u8], entry: u64, segments: &[Segment]) {
     put(buf, 20, &1u32.to_le_bytes()); // e_version
     put(buf, 24, &entry.to_le_bytes()); // e_entry
     put(buf, 32, &EHDR_SIZE.to_le_bytes()); // e_phoff
-    put(buf, 40, &0u64.to_le_bytes()); // e_shoff (no section headers)
+    // Section-header table: present only when debug data was appended.
+    let (shoff, shentsize, shnum, shstrndx) = match sections {
+        Some(t) => (t.shoff, SHDR_SIZE as u16, t.shnum, t.shstrndx),
+        None => (0, 0, 0, 0),
+    };
+    put(buf, 40, &shoff.to_le_bytes()); // e_shoff
     put(buf, 48, &0u32.to_le_bytes()); // e_flags
     put(buf, 52, &(EHDR_SIZE as u16).to_le_bytes()); // e_ehsize
     put(buf, 54, &(PHDR_SIZE as u16).to_le_bytes()); // e_phentsize
     put(buf, 56, &phnum.to_le_bytes()); // e_phnum
-    put(buf, 58, &0u16.to_le_bytes()); // e_shentsize
-    put(buf, 60, &0u16.to_le_bytes()); // e_shnum
-    put(buf, 62, &0u16.to_le_bytes()); // e_shstrndx
+    put(buf, 58, &shentsize.to_le_bytes()); // e_shentsize
+    put(buf, 60, &shnum.to_le_bytes()); // e_shnum
+    put(buf, 62, &shstrndx.to_le_bytes()); // e_shstrndx
 
     for (i, seg) in segments.iter().enumerate() {
         let o = (EHDR_SIZE + i as u64 * PHDR_SIZE) as usize;

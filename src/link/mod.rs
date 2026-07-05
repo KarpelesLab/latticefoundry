@@ -320,3 +320,173 @@ entry ^0:
         assert_eq!(a, b);
     }
 }
+
+// ===========================================================================
+// Phase 10 DWARF debug-info end-to-end tests: compile a `.lf` program with the
+// debug pipeline into a debuggable static executable, then (a) structurally
+// assert the image gained a section-header table + `.symtab` + `.debug_*`
+// without breaking execution, and (b), when the external tools are present,
+// have llvm-dwarfdump / readelf / gdb actually parse it and agree.
+// ===========================================================================
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod dwarf_e2e {
+    use super::*;
+    use crate::support::StrInterner;
+    use crate::support::diagnostics::FileId;
+    use crate::target::x86_64::{DebugSource, compile_module_debug};
+
+    /// A two-function `.lf` program with several statements per function.
+    const PROG: &str = "\
+module \"prog\"
+func @helper() -> i64 {
+entry ^0:
+  %a = add i64 40, i64 0 : i64
+  ret %a
+}
+func @main() -> i64 {
+entry ^0:
+  %h = call @helper() : i64
+  %r = add %h, i64 2 : i64
+  ret %r
+}
+";
+
+    /// Parse `PROG`, compile it with debug info, and link a debuggable image.
+    fn build_debug_image() -> Vec<u8> {
+        let mut syms = StrInterner::new();
+        let module = crate::ir::text::parse_module(PROG, FileId::new(0), &mut syms)
+            .expect("parse .lf");
+        let source =
+            DebugSource { file_name: "prog.lf".to_owned(), comp_dir: "/lf".to_owned() };
+        let obj = compile_module_debug(&module, &syms, &source);
+        let opts = ImageOptions { debug: true, ..ImageOptions::default() };
+        link_executable(vec![obj], &opts).expect("link debug image")
+    }
+
+    fn rd_u16(b: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([b[o], b[o + 1]])
+    }
+    fn rd_u64(b: &[u8], o: usize) -> u64 {
+        u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn debug_image_has_section_headers_and_is_deterministic() {
+        let img = build_debug_image();
+        // A section-header table is now present (unlike a plain image).
+        let shoff = rd_u64(&img, 40);
+        let shnum = rd_u16(&img, 60);
+        let shstrndx = rd_u16(&img, 62);
+        assert!(shoff > 0, "e_shoff must be set");
+        assert!(shnum >= 8, "expected .text + 4 debug + symtab/strtab/shstrtab");
+        assert!((shstrndx as usize) < shnum as usize);
+        // e_entry and the first PT_LOAD are unchanged from a plain image (the
+        // loadable layout must not move when debug data is appended).
+        assert!(rd_u64(&img, 24) >= 0x40_0000, "entry inside the image");
+        // Determinism.
+        assert_eq!(img, build_debug_image());
+    }
+
+    #[test]
+    fn debug_image_still_runs() {
+        let img = build_debug_image();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("lf_dwarf_run_{}", std::process::id()));
+        let path_str = path.to_str().unwrap().to_owned();
+        write_executable(&path_str, &img).expect("write");
+        let status = loop {
+            match std::process::Command::new(&path).status() {
+                Ok(s) => break s,
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("exec debug binary: {e}"),
+            }
+        };
+        let _ = std::fs::remove_file(&path);
+        // helper() = 40, main = helper() + 2 = 42.
+        assert_eq!(status.code(), Some(42), "the -g binary must still run correctly");
+    }
+
+    fn tool_available(cmd: &str) -> bool {
+        std::process::Command::new(cmd)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn write_temp_image(tag: &str) -> std::path::PathBuf {
+        let img = build_debug_image();
+        let path = std::env::temp_dir().join(format!("lf_dwarf_{tag}_{}", std::process::id()));
+        std::fs::write(&path, &img).expect("write temp image");
+        path
+    }
+
+    #[test]
+    fn llvm_dwarfdump_parses_debug_info() {
+        if !tool_available("llvm-dwarfdump") {
+            eprintln!("skipping: llvm-dwarfdump not available");
+            return;
+        }
+        let path = write_temp_image("dd");
+        let out = std::process::Command::new("llvm-dwarfdump")
+            .arg("--debug-info")
+            .arg("--debug-line")
+            .arg(&path)
+            .output()
+            .expect("run llvm-dwarfdump");
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("DW_TAG_compile_unit"), "no compile unit:\n{s}");
+        assert!(s.contains("LatticeFoundry"), "no producer:\n{s}");
+        assert!(s.contains("DW_TAG_subprogram"), "no subprograms:\n{s}");
+        assert!(s.contains("\"helper\"") && s.contains("\"main\""), "no fn names:\n{s}");
+        assert!(s.contains("DW_AT_low_pc") && s.contains("DW_AT_high_pc"), "no pc range:\n{s}");
+        assert!(s.contains(".debug_line contents") || s.contains("Line table"), "no line table:\n{s}");
+    }
+
+    #[test]
+    fn readelf_shows_sections_and_symbols() {
+        if !tool_available("readelf") {
+            eprintln!("skipping: readelf not available");
+            return;
+        }
+        let path = write_temp_image("re");
+        let sections = std::process::Command::new("readelf").arg("-S").arg(&path).output().unwrap();
+        let symbols = std::process::Command::new("readelf").arg("-s").arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let sec = String::from_utf8_lossy(&sections.stdout);
+        let sym = String::from_utf8_lossy(&symbols.stdout);
+        assert!(sec.contains(".debug_info") && sec.contains(".debug_line"), "missing debug sections:\n{sec}");
+        assert!(sec.contains(".symtab") && sec.contains(".text"), "missing sections:\n{sec}");
+        assert!(sym.contains("main") && sym.contains("helper"), "missing function symbols:\n{sym}");
+        assert!(sym.contains("FUNC"), "no FUNC-typed symbol:\n{sym}");
+    }
+
+    #[test]
+    fn gdb_understands_debug_info() {
+        if !tool_available("gdb") {
+            eprintln!("skipping: gdb not available");
+            return;
+        }
+        let path = write_temp_image("gdb");
+        let out = std::process::Command::new("gdb")
+            .args(["-batch", "-nx", "-ex", "info functions", "-ex", "info line main"])
+            .arg(&path)
+            .output()
+            .expect("run gdb");
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&out.stdout);
+        // gdb resolves the functions to the `.lf` source and can locate `main`.
+        assert!(s.contains("prog.lf"), "gdb did not read the .lf source:\n{s}");
+        assert!(s.contains("main") && s.contains("helper"), "gdb missing functions:\n{s}");
+        assert!(
+            s.contains("Line 7") && s.contains("<main>"),
+            "gdb could not map main to its source line:\n{s}"
+        );
+    }
+}

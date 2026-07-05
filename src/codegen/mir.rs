@@ -198,13 +198,24 @@ pub struct MachineInst {
     pub opcode: Opcode,
     /// The operands, in target-defined order.
     pub operands: Vec<MachineOperand>,
+    /// The 1-based source line this instruction lowers from (`0` = none). Only
+    /// populated when building with debug info; carried through so the encoder
+    /// can build a `.debug_line` table. Default `0` for synthesized code.
+    pub line: u32,
 }
 
 impl MachineInst {
-    /// Build an instruction from an opcode and operands.
+    /// Build an instruction from an opcode and operands (no source line).
     #[inline]
     pub fn new(opcode: Opcode, operands: Vec<MachineOperand>) -> MachineInst {
-        MachineInst { opcode, operands }
+        MachineInst { opcode, operands, line: 0 }
+    }
+
+    /// Attach a 1-based source `line` to this instruction (builder style).
+    #[inline]
+    pub fn with_line(mut self, line: u32) -> MachineInst {
+        self.line = line;
+        self
     }
 
     /// The registers this instruction defines, in operand order.

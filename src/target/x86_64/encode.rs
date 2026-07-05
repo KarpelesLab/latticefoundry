@@ -654,6 +654,32 @@ pub fn encode_function(
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
 ) -> Emitted {
+    encode_function_inner(mf, layout, func_name, global_name, None)
+}
+
+/// Like [`encode_function`], but also collects the `(function-relative offset,
+/// source line)` statement rows for a `.debug_line` program. A row is recorded
+/// at the start of each machine instruction whose source line differs from the
+/// previous row's; instructions with no line (synthesized prologue/moves) are
+/// skipped.
+pub fn encode_function_lines(
+    mf: &MachineFunction,
+    layout: &FrameLayout,
+    func_name: &dyn Fn(u32) -> String,
+    global_name: &dyn Fn(u32) -> String,
+) -> (Emitted, Vec<(u64, u32)>) {
+    let mut rows = Vec::new();
+    let emitted = encode_function_inner(mf, layout, func_name, global_name, Some(&mut rows));
+    (emitted, rows)
+}
+
+fn encode_function_inner(
+    mf: &MachineFunction,
+    layout: &FrameLayout,
+    func_name: &dyn Fn(u32) -> String,
+    global_name: &dyn Fn(u32) -> String,
+    mut lines: Option<&mut Vec<(u64, u32)>>,
+) -> Emitted {
     let mut e = Emitter::new();
     let labels: Vec<_> = (0..mf.num_blocks()).map(|_| e.create_label()).collect();
     let ctx = EncodeCtx { labels: &labels, layout, func_name, global_name };
@@ -670,6 +696,12 @@ pub fn encode_function(
     for bid in order {
         e.bind_label(labels[bid.index()]);
         for inst in &mf.block(bid).insts {
+            if let Some(rows) = lines.as_deref_mut()
+                && inst.line != 0
+                && rows.last().map(|&(_, l)| l) != Some(inst.line)
+            {
+                rows.push((e.offset(), inst.line));
+            }
             encode_inst(&mut e, inst, &ctx);
         }
     }
@@ -739,6 +771,129 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
         }
     }
     obj
+}
+
+/// Like [`compile_function`], but also returns the `(offset, line)` statement
+/// rows for the function's `.debug_line` program.
+pub fn compile_function_lines(
+    module: &Module,
+    func: crate::ir::FuncId,
+    syms: &StrInterner,
+) -> (Emitted, Vec<(u64, u32)>) {
+    let target = X86_64Target::new();
+    let mut mf = target.select(module, func);
+    regalloc::allocate(&mut mf, &target);
+    let layout = layout_frame(&mf, &target);
+    insert_prologue_epilogue(&mut mf, &layout);
+    let func_name = |idx: u32| -> String {
+        syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
+    };
+    let global_name = |idx: u32| -> String {
+        syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
+    };
+    encode_function_lines(&mf, &layout, &func_name, &global_name)
+}
+
+/// Metadata identifying the `.lf` source a debug build was compiled from.
+#[derive(Clone, Debug)]
+pub struct DebugSource {
+    /// The source file name (`DW_AT_name`), relative to `comp_dir`.
+    pub file_name: String,
+    /// The compilation directory (`DW_AT_comp_dir`).
+    pub comp_dir: String,
+}
+
+/// Compile `module` to a relocatable [`ObjectModule`] like [`compile_module`],
+/// and additionally emit the DWARF `.debug_abbrev`/`.debug_info`/`.debug_str`/
+/// `.debug_line` sections describing every defined function (name, address
+/// range, and source-line table). Address fields in the debug data become
+/// [`Abs64`](crate::mc::object::RelocKind::Abs64) relocations against the
+/// function symbols, so the linker fills real addresses.
+pub fn compile_module_debug(
+    module: &Module,
+    syms: &StrInterner,
+    source: &DebugSource,
+) -> ObjectModule {
+    use crate::mc::dwarf::{DebugUnit, FuncDebug};
+
+    let mut obj = ObjectModule::new(module.name.clone());
+    let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));
+    let mut funcs: Vec<FuncDebug> = Vec::new();
+
+    for (i, f) in module.functions().enumerate() {
+        if f.is_declaration() {
+            continue;
+        }
+        let fid = crate::ir::FuncId::from_index(i);
+        let (emitted, stmt_rows) = compile_function_lines(module, fid, syms);
+        // 16-align this function's start within .text.
+        {
+            let sec = obj.section_mut(text);
+            while !sec.bytes.len().is_multiple_of(16) {
+                sec.bytes.push(0x90); // nop padding
+            }
+        }
+        let off = obj.section(text).bytes.len() as u64;
+        let len = emitted.bytes.len() as u64;
+        obj.section_mut(text).bytes.extend_from_slice(&emitted.bytes);
+
+        let name = syms.resolve(f.name).to_owned();
+        obj.add_symbol(Symbol::defined(
+            name.clone(),
+            SymbolBinding::Global,
+            SymbolType::Func,
+            text,
+            off,
+            len,
+        ));
+        for r in &emitted.relocations {
+            let sym = obj.reference_symbol(&r.symbol);
+            obj.add_relocation(crate::mc::object::Relocation {
+                section: text,
+                offset: off + r.offset,
+                symbol: sym,
+                kind: r.kind,
+                addend: r.addend,
+            });
+        }
+
+        // Build the function's line rows: a function-entry row at the decl line,
+        // then the statement rows (dropping runs of the same line).
+        let decl_line = f.decl_line.unwrap_or(1);
+        let mut rows = vec![(0u64, decl_line)];
+        for (roff, line) in stmt_rows {
+            if rows.last().map(|&(_, l)| l) != Some(line) {
+                rows.push((roff, line));
+            }
+        }
+        funcs.push(FuncDebug { name, decl_line, size: len, rows });
+    }
+
+    let text_size = obj.section(text).bytes.len() as u64;
+    let unit = DebugUnit {
+        file_name: source.file_name.clone(),
+        comp_dir: source.comp_dir.clone(),
+        producer: "LatticeFoundry".to_owned(),
+        text_size,
+        funcs,
+    };
+    let dw = crate::mc::dwarf::build(&unit);
+
+    // Plain (relocation-free) sections.
+    obj.add_section(debug_section(".debug_abbrev", dw.abbrev));
+    obj.add_section(debug_section(".debug_str", dw.str));
+    // Sections carrying address relocations against the function symbols.
+    obj.add_emitted_section(".debug_info", SectionKind::Debug, 1, dw.info);
+    obj.add_emitted_section(".debug_line", SectionKind::Debug, 1, dw.line);
+
+    obj
+}
+
+/// A non-allocated debug [`Section`] holding `bytes`.
+fn debug_section(name: &str, bytes: Vec<u8>) -> Section {
+    let mut s = Section::new(name, SectionKind::Debug, 1);
+    s.bytes = bytes;
+    s
 }
 
 /// Compile `module` to a complete ELF64 relocatable object image.

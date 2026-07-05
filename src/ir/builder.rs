@@ -30,6 +30,9 @@ pub struct FunctionBuilder<'a> {
     types: &'a mut TypeContext,
     consts: &'a mut ConstPool,
     cur: Option<BlockId>,
+    /// The source line attributed to instructions emitted next (0 = none). Set
+    /// via [`FunctionBuilder::set_line`] when building with debug provenance.
+    cur_line: u32,
 }
 
 impl<'a> FunctionBuilder<'a> {
@@ -39,7 +42,21 @@ impl<'a> FunctionBuilder<'a> {
         types: &'a mut TypeContext,
         consts: &'a mut ConstPool,
     ) -> Self {
-        Self { func, types, consts, cur: None }
+        Self { func, types, consts, cur: None, cur_line: 0 }
+    }
+
+    // --- debug source-line provenance --------------------------------------
+
+    /// Attribute a 1-based source `line` to every instruction emitted after this
+    /// call (until changed). Building the per-instruction line side table is
+    /// opt-in: callers that never call this leave the table empty.
+    pub fn set_line(&mut self, line: u32) {
+        self.cur_line = line;
+    }
+
+    /// Record the function's declaration source line (for debug info).
+    pub fn set_decl_line(&mut self, line: u32) {
+        self.func.decl_line = Some(line);
     }
 
     // --- blocks & insertion point ------------------------------------------
@@ -179,6 +196,15 @@ impl<'a> FunctionBuilder<'a> {
             self.func.uses[op.index()].push(Use { inst, operand: i as u32 });
         }
         self.func.insts.push(InstData { kind, flags, ty, operands, result });
+        // Keep the per-instruction line side table parallel to `insts`, but only
+        // once debug provenance is in play (a nonzero line has been set, or the
+        // table is already populated). Ordinary builds leave it empty.
+        if self.cur_line != 0 || !self.func.inst_lines.is_empty() {
+            while self.func.inst_lines.len() + 1 < self.func.insts.len() {
+                self.func.inst_lines.push(0);
+            }
+            self.func.inst_lines.push(self.cur_line);
+        }
 
         let b = &mut self.func.blocks[block.index()];
         if is_term {

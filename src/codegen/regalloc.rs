@@ -390,7 +390,8 @@ fn rewrite(
             }
 
             new_insts.append(&mut pre);
-            new_insts.push(MachineInst::new(inst.opcode, new_ops));
+            // Preserve the source line so debug-line info survives allocation.
+            new_insts.push(MachineInst::new(inst.opcode, new_ops).with_line(inst.line));
             new_insts.append(&mut post);
         }
         mf.block_mut(bid).insts = new_insts;

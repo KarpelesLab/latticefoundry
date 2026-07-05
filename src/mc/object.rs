@@ -75,6 +75,10 @@ pub enum SectionKind {
     Rodata,
     /// Zero-initialized data that occupies no file space (`.bss`).
     Bss,
+    /// Non-allocated metadata that is present in the file but not loaded into
+    /// memory at run time (e.g. the `.debug_*` DWARF sections). Occupies file
+    /// space like a content section, but is never part of a `PT_LOAD` segment.
+    Debug,
 }
 
 /// A named region of an object: code or data bytes (or, for [`SectionKind::Bss`],
