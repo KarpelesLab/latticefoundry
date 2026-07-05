@@ -1,0 +1,35 @@
+# lf-cc — a C frontend for LatticeFoundry.
+#
+# This is a SEPARATE crate that will eventually become its own project. It lives
+# in-tree for now for convenience, but is deliberately NOT a member of the root
+# `latticefoundry` package's build: the root Cargo.toml has no [workspace] table,
+# so `cargo build` at the repo root ignores this directory entirely. Build/test
+# lf-cc by running cargo from inside `lf-cc/`. It depends on the framework via a
+# path dependency.
+[package]
+name = "lf-cc"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Mark Karpeles <admin@echelle.co.jp>"]
+description = "A C frontend that compiles to LatticeFoundry IR"
+
+[lib]
+name = "lf_cc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lf-cc"
+path = "src/main.rs"
+
+[dependencies]
+latticefoundry = { path = ".." }
+
+[lints.rust]
+unsafe_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

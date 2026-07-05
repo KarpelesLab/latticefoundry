@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# lf-cc is a separate nested crate with its own target/
+/lf-cc/target
+/lf-cc/Cargo.lock
