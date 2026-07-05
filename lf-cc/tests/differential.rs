@@ -83,6 +83,26 @@ fn programs() -> Vec<(&'static str, &'static str)> {
             "int gcd(int a,int b){ while(b){ int t=b; b=a%b; a=t; } return a; } \
              int main(){ int acc=0; for(int i=1;i<=12;i++) acc += gcd(i,12); return acc; }",
         ),
+        // Preprocessor: object- and function-like macros, `##`, conditionals, and
+        // a predefined macro. These use the default dialect (gnu17), which also
+        // matches gcc's default, so the same corpus compares cleanly.
+        ("pp_object_macro", "#define N 21\nint main(){ return N + N; }"),
+        ("pp_func_macro", "#define MAX(a,b) ((a)>(b)?(a):(b))\nint main(){ return MAX(40,42); }"),
+        ("pp_paste", "#define CAT(a,b) a##b\nint CAT(v,al)=34;\nint main(){ return val + 8; }"),
+        (
+            "pp_conditional",
+            "#define MODE 2\n#if MODE==1\nint main(){return 1;}\n\
+             #elif MODE==2\nint main(){return 42;}\n#else\nint main(){return 0;}\n#endif",
+        ),
+        (
+            "pp_ifdef",
+            "#define ON\n#ifdef ON\nint main(){return 42;}\n#else\nint main(){return 0;}\n#endif",
+        ),
+        (
+            "pp_nested_macro",
+            "#define SQ(x) ((x)*(x))\n#define SUMSQ(a,b) (SQ(a)+SQ(b))\n\
+             int main(){ return SUMSQ(3,4) - 3; }",
+        ),
     ]
 }
 

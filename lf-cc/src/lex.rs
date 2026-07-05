@@ -26,6 +26,10 @@ pub enum TokenKind {
     Ident(String),
     /// An integer or character constant, with the C type its literal implies.
     IntLit(i128, CType),
+    /// A string literal, carrying its already-decoded contents (produced by the
+    /// preprocessor; the expression grammar of this subset rejects it, but
+    /// directives such as `_Static_assert` accept one).
+    Str(String),
     /// A language keyword.
     Keyword(Keyword),
     /// A punctuator or operator.
@@ -79,6 +83,18 @@ pub enum Keyword {
     Continue,
     /// `sizeof`
     Sizeof,
+    /// `restrict` (C99; accepted as a type qualifier and ignored)
+    Restrict,
+    /// `inline` (C99; accepted as a function specifier and ignored)
+    Inline,
+    /// `_Noreturn` (C11; accepted as a function specifier and ignored)
+    Noreturn,
+    /// `_Alignof` (C11)
+    Alignof,
+    /// `_Static_assert` (C11)
+    StaticAssert,
+    /// `_Generic` (C11)
+    Generic,
 }
 
 /// The punctuators and operators recognized by the subset.
@@ -499,7 +515,12 @@ impl Lexer<'_> {
 /// suffix, per the C rules restricted to this subset (32-bit `int`, 64-bit
 /// `long`). Decimal literals never pick an unsigned type unless suffixed `u`;
 /// hex/octal literals may.
-fn integer_literal_type(value: i128, hex_or_octal: bool, unsigned: bool, long: bool) -> CType {
+pub(crate) fn integer_literal_type(
+    value: i128,
+    hex_or_octal: bool,
+    unsigned: bool,
+    long: bool,
+) -> CType {
     let fits_i32 = value <= i128::from(i32::MAX);
     let fits_u32 = value <= i128::from(u32::MAX);
     let fits_i64 = value <= i128::from(i64::MAX);

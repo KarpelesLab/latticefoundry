@@ -11,10 +11,15 @@
 //! tree, and a [`lower`]ing pass to the IR builder. No `unsafe` is used.
 
 pub mod ast;
+pub mod cstd;
 pub mod lex;
 pub mod lower;
 pub mod parse;
+pub mod preprocess;
 pub mod sema;
+
+pub use cstd::CStd;
+pub use preprocess::{MacroOp, PpOptions};
 
 use latticefoundry::ir::Module;
 use latticefoundry::link::{self, ImageOptions};
@@ -22,7 +27,7 @@ use latticefoundry::mc::object::{
     ObjectModule, Section, SectionKind, Symbol, SymbolBinding, SymbolType,
 };
 use latticefoundry::support::StrInterner;
-use latticefoundry::support::diagnostics::{Diagnostic, FileId};
+use latticefoundry::support::diagnostics::Diagnostic;
 use latticefoundry::target::x86_64;
 use latticefoundry::transform::pipeline::{self, OptLevel};
 use latticefoundry::verify;
@@ -40,15 +45,34 @@ pub fn compile_to_ir(
     module_name: &str,
     debug: bool,
 ) -> Result<(Module, StrInterner), Vec<Diagnostic>> {
-    let program = check_source(source)?;
+    let opts = PpOptions { main_file_name: module_name.to_owned(), ..PpOptions::default() };
+    compile_to_ir_with(source, module_name, &opts, debug)
+}
+
+/// Like [`compile_to_ir`], but with explicit preprocessor/standard [`PpOptions`].
+pub fn compile_to_ir_with(
+    source: &str,
+    module_name: &str,
+    opts: &PpOptions,
+    debug: bool,
+) -> Result<(Module, StrInterner), Vec<Diagnostic>> {
+    let program = check_source_with(source, opts)?;
     Ok(lower::lower(&program, source, module_name, debug))
 }
 
-/// Lex, parse, and type-check `source`, returning the typed [`sema::Program`] or
-/// the diagnostics. Exposed so tests can inspect the checked program directly.
+/// Preprocess, parse, and type-check `source` under the default standard
+/// (`gnu17`, no includes/defines). Exposed so tests can inspect the program.
 pub fn check_source(source: &str) -> Result<sema::Program, Vec<Diagnostic>> {
-    let tokens = lex::lex(source, FileId::new(0))?;
-    let unit = parse::parse(tokens)?;
+    check_source_with(source, &PpOptions::default())
+}
+
+/// Preprocess `source` with `opts`, then parse and type-check it.
+pub fn check_source_with(
+    source: &str,
+    opts: &PpOptions,
+) -> Result<sema::Program, Vec<Diagnostic>> {
+    let tokens = preprocess::preprocess(source, opts)?;
+    let unit = parse::parse(tokens, opts.std)?;
     sema::check(&unit)
 }
 
@@ -72,7 +96,20 @@ pub fn build_image(
     opt: OptLevel,
     debug: bool,
 ) -> Result<Vec<u8>, BuildError> {
-    let program = check_source(source).map_err(BuildError::Frontend)?;
+    let opts = PpOptions { main_file_name: input_name.to_owned(), ..PpOptions::default() };
+    build_image_with(source, input_name, &opts, opt, debug)
+}
+
+/// Like [`build_image`], but with explicit preprocessor/standard [`PpOptions`]
+/// (the driver's `--std`, `-I`, and `-D`/`-U` flags feed into these).
+pub fn build_image_with(
+    source: &str,
+    input_name: &str,
+    opts: &PpOptions,
+    opt: OptLevel,
+    debug: bool,
+) -> Result<Vec<u8>, BuildError> {
+    let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
     let (mut module, syms) = lower::lower(&program, source, input_name, debug);
 
     verify_or(&module, "lowered")?;

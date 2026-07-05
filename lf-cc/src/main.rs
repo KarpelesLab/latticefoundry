@@ -6,7 +6,7 @@
 //! x86-64 compile → link → write an executable and `chmod +x` it. `-S` /
 //! `--emit-lf` dumps the lowered `.lf` IR instead of compiling.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use latticefoundry::ir::text;
@@ -14,7 +14,7 @@ use latticefoundry::link;
 use latticefoundry::support::diagnostics::{Diagnostic, Severity};
 use latticefoundry::transform::pipeline::OptLevel;
 
-use lf_cc::BuildError;
+use lf_cc::{BuildError, CStd, MacroOp, PpOptions};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,6 +33,20 @@ struct Options {
     opt: OptLevel,
     debug: bool,
     emit_lf: bool,
+    std: CStd,
+    include_dirs: Vec<PathBuf>,
+    cmdline: Vec<MacroOp>,
+}
+
+impl Options {
+    fn pp_options(&self) -> PpOptions {
+        PpOptions {
+            std: self.std,
+            include_dirs: self.include_dirs.clone(),
+            cmdline: self.cmdline.clone(),
+            main_file_name: self.input.clone(),
+        }
+    }
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -50,9 +64,11 @@ fn run(args: &[String]) -> Result<(), String> {
         .unwrap_or("module")
         .to_owned();
 
+    let pp = opts.pp_options();
+
     // `-S` / `--emit-lf`: lower and dump the IR, then stop.
     if opts.emit_lf {
-        let (module, syms) = lf_cc::compile_to_ir(&source, &module_name, opts.debug)
+        let (module, syms) = lf_cc::compile_to_ir_with(&source, &module_name, &pp, opts.debug)
             .map_err(|diags| render_diags(&opts.input, &source, &diags))?;
         let out = text::print_module(&module, &syms);
         match &opts.output {
@@ -65,10 +81,11 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 
     // Full build: front end → IR → verify → optimize → codegen → link.
-    let image = lf_cc::build_image(&source, &opts.input, opts.opt, opts.debug).map_err(|e| match e {
-        BuildError::Frontend(diags) => render_diags(&opts.input, &source, &diags),
-        BuildError::Backend(msg) => msg,
-    })?;
+    let image = lf_cc::build_image_with(&source, &opts.input, &pp, opts.opt, opts.debug)
+        .map_err(|e| match e {
+            BuildError::Frontend(diags) => render_diags(&opts.input, &source, &diags),
+            BuildError::Backend(msg) => msg,
+        })?;
 
     let output = opts.output.clone().unwrap_or_else(|| default_output(&opts.input));
     link::write_executable(&output, &image)?;
@@ -81,13 +98,28 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut opt = OptLevel::O0;
     let mut debug = false;
     let mut emit_lf = false;
+    let mut std = CStd::default();
+    let mut include_dirs: Vec<PathBuf> = Vec::new();
+    let mut cmdline: Vec<MacroOp> = Vec::new();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        match arg.as_str() {
+        let arg = arg.as_str();
+        match arg {
             "-o" => output = Some(it.next().ok_or("-o requires a path")?.clone()),
             "-g" | "--debug" => debug = true,
             "-S" | "--emit-lf" => emit_lf = true,
+            "-I" => include_dirs.push(PathBuf::from(it.next().ok_or("-I requires a directory")?)),
+            "-D" => cmdline.push(MacroOp::Define(it.next().ok_or("-D requires a name")?.clone())),
+            "-U" => cmdline.push(MacroOp::Undef(it.next().ok_or("-U requires a name")?.clone())),
+            _ if arg.starts_with("-I") => include_dirs.push(PathBuf::from(&arg[2..])),
+            _ if arg.starts_with("-D") => cmdline.push(MacroOp::Define(arg[2..].to_owned())),
+            _ if arg.starts_with("-U") => cmdline.push(MacroOp::Undef(arg[2..].to_owned())),
+            _ if arg.starts_with("--std=") || arg.starts_with("-std=") => {
+                let name = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                std = CStd::parse(name)
+                    .ok_or_else(|| format!("unknown -std value '{name}'"))?;
+            }
             tok if OptLevel::parse_flag(tok).is_some() => {
                 opt = OptLevel::parse_flag(tok).expect("checked");
             }
@@ -104,15 +136,22 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     }
 
     let input = input.ok_or("no input file (see `lf-cc --help`)")?;
-    Ok(Options { input, output, opt, debug, emit_lf })
+    Ok(Options { input, output, opt, debug, emit_lf, std, include_dirs, cmdline })
 }
 
 fn print_usage() {
     println!("lf-cc — a C frontend for LatticeFoundry\n");
     println!("usage:");
-    println!("  lf-cc [-O0|-O1|-O2|-O3] [-g] [-o <out>] [-S|--emit-lf] <file.c>\n");
+    println!(
+        "  lf-cc [-O0|-O1|-O2|-O3] [-g] [--std=<std>] [-I<dir>] [-D<m>] [-U<m>] \
+         [-o <out>] [-S|--emit-lf] <file.c>\n"
+    );
     println!("  -O0..-O3       optimization level (default: -O0)");
     println!("  -g / --debug   emit DWARF debug info (source lines)");
+    println!("  --std=<std>    C standard: c89/c99/c11/c17/c23 or gnuNN (default: gnu17)");
+    println!("  -I <dir>       add a directory to the #include search path (repeatable)");
+    println!("  -D name[=val]  predefine a macro (repeatable)");
+    println!("  -U name        undefine a macro (repeatable)");
     println!("  -S / --emit-lf dump the lowered .lf IR instead of an executable");
     println!("  -o <out>       output path (default: the input stem)");
 }

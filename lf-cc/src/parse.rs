@@ -13,13 +13,15 @@ use crate::ast::{
     BinaryOp, CType, Expr, ExprKind, FuncDef, FuncProto, IntTy, Param, Stmt, StmtKind, TopLevel,
     TranslationUnit, UnaryOp, VarDecl,
 };
+use crate::cstd::CStd;
 use crate::lex::{Keyword, Punct, Token, TokenKind};
 
 type PResult<T> = Result<T, Diagnostic>;
 
-/// Parse a token stream into a [`TranslationUnit`].
-pub fn parse(tokens: Vec<Token>) -> Result<TranslationUnit, Vec<Diagnostic>> {
-    let mut parser = Parser { tokens, pos: 0 };
+/// Parse a token stream into a [`TranslationUnit`], gating language features by
+/// the selected `std`.
+pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagnostic>> {
+    let mut parser = Parser { tokens, pos: 0, std };
     match parser.parse_unit() {
         Ok(unit) => Ok(unit),
         Err(d) => Err(vec![d]),
@@ -29,6 +31,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<TranslationUnit, Vec<Diagnostic>> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    std: CStd,
 }
 
 impl Parser {
@@ -110,9 +113,33 @@ impl Parser {
     fn parse_unit(&mut self) -> PResult<TranslationUnit> {
         let mut items = Vec::new();
         while !self.at_eof() {
+            // A file-scope `_Static_assert` is a declaration with no external
+            // effect in this subset; consume and drop it.
+            if self.is_kw(Keyword::StaticAssert) {
+                self.parse_static_assert()?;
+                continue;
+            }
             items.push(self.parse_top_level()?);
         }
         Ok(TranslationUnit { items })
+    }
+
+    /// Parse and discard a `_Static_assert ( expr [, "msg"] ) ;` declaration.
+    fn parse_static_assert(&mut self) -> PResult<()> {
+        self.bump(); // _Static_assert
+        self.expect_punct(Punct::LParen, "'(' after _Static_assert")?;
+        let _ = self.parse_assign()?;
+        if self.eat_punct(Punct::Comma) {
+            match self.peek().clone() {
+                TokenKind::Str(_) => {
+                    self.bump();
+                }
+                _ => return self.err("expected a string message in _Static_assert"),
+            }
+        }
+        self.expect_punct(Punct::RParen, "')' to close _Static_assert")?;
+        self.expect_punct(Punct::Semi, "';' after _Static_assert")?;
+        Ok(())
     }
 
     fn parse_top_level(&mut self) -> PResult<TopLevel> {
@@ -160,7 +187,11 @@ impl Parser {
     }
 
     fn consume_storage(&mut self) {
-        while self.is_kw(Keyword::Extern) || self.is_kw(Keyword::Static) {
+        while self.is_kw(Keyword::Extern)
+            || self.is_kw(Keyword::Static)
+            || self.is_kw(Keyword::Inline)
+            || self.is_kw(Keyword::Noreturn)
+        {
             self.bump();
         }
     }
@@ -219,6 +250,9 @@ impl Parser {
                     | Keyword::Unsigned
                     | Keyword::Const
                     | Keyword::Volatile
+                    | Keyword::Restrict
+                    | Keyword::Inline
+                    | Keyword::Noreturn
                     | Keyword::Extern
                     | Keyword::Static
             )
@@ -238,7 +272,13 @@ impl Parser {
 
         loop {
             match self.peek() {
-                TokenKind::Keyword(Keyword::Const | Keyword::Volatile) => {
+                TokenKind::Keyword(
+                    Keyword::Const
+                    | Keyword::Volatile
+                    | Keyword::Restrict
+                    | Keyword::Inline
+                    | Keyword::Noreturn,
+                ) => {
                     self.bump();
                 }
                 TokenKind::Keyword(Keyword::Void) => {
@@ -288,6 +328,12 @@ impl Parser {
         if !saw_any {
             return Err(Diagnostic::error("expected a type").with_span(start));
         }
+        if longs >= 2 && !self.std.has_long_long() {
+            return Err(Diagnostic::error(
+                "`long long` is a C99 feature (use -std=c99 or later)",
+            )
+            .with_span(start));
+        }
         if has_void {
             return Ok(CType::Void);
         }
@@ -316,7 +362,10 @@ impl Parser {
     fn parse_pointers(&mut self, mut base: CType) -> CType {
         while self.eat_punct(Punct::Star) {
             // Skip pointer qualifiers.
-            while self.is_kw(Keyword::Const) || self.is_kw(Keyword::Volatile) {
+            while self.is_kw(Keyword::Const)
+                || self.is_kw(Keyword::Volatile)
+                || self.is_kw(Keyword::Restrict)
+            {
                 self.bump();
             }
             base = CType::ptr_to(base);
@@ -336,7 +385,22 @@ impl Parser {
     fn parse_block_stmts(&mut self) -> PResult<Vec<Stmt>> {
         self.expect_punct(Punct::LBrace, "'{'")?;
         let mut stmts = Vec::new();
+        let mut seen_stmt = false;
         while !self.is_punct(Punct::RBrace) && !self.at_eof() {
+            // A file-scope-style `_Static_assert` may also appear in a block.
+            if self.is_kw(Keyword::StaticAssert) {
+                self.parse_static_assert()?;
+                continue;
+            }
+            let is_decl = self.at_type_specifier();
+            if is_decl && seen_stmt && !self.std.mixed_declarations() {
+                return self.err(
+                    "declarations after statements are a C99 feature (use -std=c99 or later)",
+                );
+            }
+            if !is_decl {
+                seen_stmt = true;
+            }
             stmts.push(self.parse_stmt()?);
         }
         self.expect_punct(Punct::RBrace, "'}' to close block")?;
@@ -450,6 +514,10 @@ impl Parser {
             self.bump();
             None
         } else if self.at_type_specifier() {
+            if !self.std.for_loop_decls() {
+                return self
+                    .err("a declaration in `for` is a C99 feature (use -std=c99 or later)");
+            }
             Some(Box::new(self.parse_local_decl()?))
         } else {
             let sp = self.peek_span();
@@ -600,6 +668,7 @@ impl Parser {
                     | Keyword::Unsigned
                     | Keyword::Const
                     | Keyword::Volatile
+                    | Keyword::Restrict
             )
         )
     }
@@ -635,6 +704,9 @@ impl Parser {
         if self.is_kw(Keyword::Sizeof) {
             return self.parse_sizeof();
         }
+        if self.is_kw(Keyword::Alignof) {
+            return self.parse_alignof();
+        }
         self.parse_postfix()
     }
 
@@ -650,6 +722,17 @@ impl Parser {
         let inner = self.parse_unary()?;
         let span = start.merge(inner.span);
         Ok(Expr { kind: ExprKind::SizeofExpr(Box::new(inner)), span })
+    }
+
+    /// `_Alignof ( type-name )`. For this scalar/pointer subset the alignment of a
+    /// type equals its size, so it reuses [`ExprKind::SizeofType`].
+    fn parse_alignof(&mut self) -> PResult<Expr> {
+        let start = self.peek_span();
+        self.bump(); // _Alignof
+        self.expect_punct(Punct::LParen, "'(' after _Alignof")?;
+        let ty = self.parse_type_name()?;
+        let end = self.expect_punct(Punct::RParen, "')' after _Alignof type")?;
+        Ok(Expr { kind: ExprKind::SizeofType(ty), span: start.merge(end) })
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
@@ -701,6 +784,10 @@ impl Parser {
                 let inner = self.parse_expr()?;
                 self.expect_punct(Punct::RParen, "')' to close parenthesized expression")?;
                 Ok(inner)
+            }
+            TokenKind::Str(_) => self.err("string literals are out of scope in this C subset"),
+            TokenKind::Keyword(Keyword::Generic) => {
+                self.err("`_Generic` is not supported in this C subset")
             }
             _ => self.err("expected an expression"),
         }
