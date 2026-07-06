@@ -10,7 +10,7 @@ use crate::ir::builder::FunctionBuilder;
 use crate::ir::inst::{BinOp, Flags};
 use crate::ir::value::ValueId;
 use crate::ir::{
-    CastOp, EvalOutcome, FloatKind, FloatBits, Module, SemValue, TypeId, eval,
+    BlockId, CastOp, EvalOutcome, FloatKind, FloatBits, Module, SemValue, TypeId, eval,
 };
 use crate::support::StrInterner;
 
@@ -69,6 +69,34 @@ impl Harness {
 
     fn set_tgt(&mut self, f: impl FnOnce(&mut FunctionBuilder, &[ValueId]) -> ValueId) {
         self.tgt = Some(self.build("tgt", f));
+    }
+
+    /// Build a **multi-block** body: `f` receives the builder, the entry block id,
+    /// and the entry (function) parameters, and is responsible for creating any
+    /// further blocks and terminating every one of them (including its `ret`s).
+    fn build_raw(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut FunctionBuilder, BlockId, &[ValueId]),
+    ) -> crate::ir::FuncId {
+        let sig = self.module.types_mut().func(self.params.clone(), self.ret, false);
+        let sym = self.syms.intern(name);
+        let id = self.module.declare_function(sym, sig);
+        {
+            let mut b = self.module.build(id);
+            let entry = b.create_entry_block();
+            let params: Vec<ValueId> = b.block_params(entry).to_vec();
+            f(&mut b, entry, &params);
+        }
+        id
+    }
+
+    fn set_src_raw(&mut self, f: impl FnOnce(&mut FunctionBuilder, BlockId, &[ValueId])) {
+        self.src = Some(self.build_raw("src", f));
+    }
+
+    fn set_tgt_raw(&mut self, f: impl FnOnce(&mut FunctionBuilder, BlockId, &[ValueId])) {
+        self.tgt = Some(self.build_raw("tgt", f));
     }
 
     fn check(&self) -> RefinementResult {
@@ -452,4 +480,329 @@ fn target_introducing_ub_is_unsound() {
         b.bin(BinOp::SDiv, c, p[0], Flags::NONE)
     });
     assert_counterexample(h.check());
+}
+
+// ---------------------------------------------------------------------------
+// Multi-block (acyclic) control flow.
+// ---------------------------------------------------------------------------
+
+/// An `(i8, i8, i1) -> i8` harness: two integer values and a branch condition.
+fn diamond_harness() -> Harness {
+    Harness::signature(|m| {
+        let i8 = m.types_mut().int(8);
+        let i1 = m.types_mut().bool();
+        (vec![i8, i8, i1], i8)
+    })
+}
+
+/// THE simplify_cfg-class miscompile, caught automatically. `src` is a diamond
+/// that merges `a`/`b` through a block parameter and returns it; `tgt`
+/// (incorrectly) drops the merge to `poison`. A defined source pins the target,
+/// so the checker must produce a counterexample.
+#[test]
+fn merge_dropped_to_poison_is_caught() {
+    let mut h = diamond_harness();
+    // src: cond_br(c) -> L(a) / R(b); M(x) = phi; ret x.
+    h.set_src_raw(|b, entry, p| {
+        let (a, bb, c) = (p[0], p[1], p[2]);
+        let i8 = b.value_type(a);
+        let l = b.create_block(&[]);
+        let r = b.create_block(&[]);
+        let m = b.create_block(&[i8]);
+        b.switch_to(entry);
+        b.cond_br(c, l, &[], r, &[]);
+        b.switch_to(l);
+        b.br(m, &[a]);
+        b.switch_to(r);
+        b.br(m, &[bb]);
+        b.switch_to(m);
+        let x = b.param(m, 0);
+        b.ret(Some(x));
+    });
+    // tgt: same CFG, but both edges feed poison into M (the merge is dropped).
+    h.set_tgt_raw(|b, entry, p| {
+        let c = p[2];
+        let i8 = b.value_type(p[0]);
+        let poison = b.poison(i8);
+        let l = b.create_block(&[]);
+        let r = b.create_block(&[]);
+        let m = b.create_block(&[i8]);
+        b.switch_to(entry);
+        b.cond_br(c, l, &[], r, &[]);
+        b.switch_to(l);
+        b.br(m, &[poison]);
+        b.switch_to(r);
+        b.br(m, &[poison]);
+        b.switch_to(m);
+        let x = b.param(m, 0);
+        b.ret(Some(x));
+    });
+    assert_counterexample(h.check());
+}
+
+/// Sound: constant-condition branch folding. `src` branches on a constant `true`
+/// into one of two `ret` blocks; `tgt` returns the taken edge's value directly.
+#[test]
+fn const_condition_branch_folded_refines() {
+    let mut h = Harness::signature(|m| {
+        let i8 = m.types_mut().int(8);
+        (vec![i8, i8], i8)
+    });
+    h.set_src_raw(|b, entry, p| {
+        let (a, bb) = (p[0], p[1]);
+        let t = b.create_block(&[]);
+        let f = b.create_block(&[]);
+        b.switch_to(entry);
+        let tru = b.const_bool(true);
+        b.cond_br(tru, t, &[], f, &[]);
+        b.switch_to(t);
+        b.ret(Some(a));
+        b.switch_to(f);
+        b.ret(Some(bb));
+    });
+    h.set_tgt_raw(|b, entry, p| {
+        b.switch_to(entry);
+        b.ret(Some(p[0]));
+    });
+    assert_refines(h.check());
+}
+
+/// Sound: removing an unreachable block. `src` carries a dangling block with no
+/// predecessor (a different `ret`); `tgt` drops it. Both return the same value.
+#[test]
+fn removing_unreachable_block_refines() {
+    let mut h = Harness::signature(|m| {
+        let i8 = m.types_mut().int(8);
+        (vec![i8, i8], i8)
+    });
+    h.set_src_raw(|b, entry, p| {
+        let (a, bb) = (p[0], p[1]);
+        let i8 = b.value_type(a);
+        let m = b.create_block(&[i8]);
+        let dead = b.create_block(&[]); // no predecessor: unreachable
+        b.switch_to(entry);
+        b.br(m, &[a]);
+        b.switch_to(m);
+        let x = b.param(m, 0);
+        b.ret(Some(x));
+        b.switch_to(dead);
+        b.ret(Some(bb));
+    });
+    h.set_tgt_raw(|b, entry, p| {
+        let a = p[0];
+        let i8 = b.value_type(a);
+        let m = b.create_block(&[i8]);
+        b.switch_to(entry);
+        b.br(m, &[a]);
+        b.switch_to(m);
+        let x = b.param(m, 0);
+        b.ret(Some(x));
+    });
+    assert_refines(h.check());
+}
+
+/// Sound: a diamond that merges `a`/`b` on `c` equals `select(c, a, b)`.
+#[test]
+fn diamond_equals_select_refines() {
+    let mut h = diamond_harness();
+    h.set_src_raw(|b, entry, p| {
+        let (a, bb, c) = (p[0], p[1], p[2]);
+        let i8 = b.value_type(a);
+        let l = b.create_block(&[]);
+        let r = b.create_block(&[]);
+        let m = b.create_block(&[i8]);
+        b.switch_to(entry);
+        b.cond_br(c, l, &[], r, &[]);
+        b.switch_to(l);
+        b.br(m, &[a]);
+        b.switch_to(r);
+        b.br(m, &[bb]);
+        b.switch_to(m);
+        let x = b.param(m, 0);
+        b.ret(Some(x));
+    });
+    h.set_tgt_raw(|b, entry, p| {
+        let (a, bb, c) = (p[0], p[1], p[2]);
+        b.switch_to(entry);
+        let s = b.select(c, a, bb);
+        b.ret(Some(s));
+    });
+    assert_refines(h.check());
+}
+
+/// Sound: straightening a single-predecessor block. `src` jumps to `M(a)` and
+/// computes `x + 1` there; `tgt` computes it inline. Equivalent.
+#[test]
+fn straighten_single_predecessor_refines() {
+    let mut h = unary_int(8);
+    let i8 = h.params[0];
+    h.set_src_raw(move |b, entry, p| {
+        let a = p[0];
+        let m = b.create_block(&[i8]);
+        b.switch_to(entry);
+        b.br(m, &[a]);
+        b.switch_to(m);
+        let x = b.param(m, 0);
+        let one = b.const_i64(i8, 1);
+        let y = b.add(x, one, Flags::NONE);
+        b.ret(Some(y));
+    });
+    h.set_tgt_raw(move |b, entry, p| {
+        let a = p[0];
+        b.switch_to(entry);
+        let one = b.const_i64(i8, 1);
+        let y = b.add(a, one, Flags::NONE);
+        b.ret(Some(y));
+    });
+    assert_refines(h.check());
+}
+
+/// Sound: two `ret` blocks. `src` returns `a` on the true edge and `b` on the
+/// false edge (a multi-`ret` function); `tgt` folds them to `select(c, a, b)`.
+#[test]
+fn two_ret_blocks_refine_select() {
+    let mut h = diamond_harness();
+    h.set_src_raw(|b, entry, p| {
+        let (a, bb, c) = (p[0], p[1], p[2]);
+        let t = b.create_block(&[]);
+        let f = b.create_block(&[]);
+        b.switch_to(entry);
+        b.cond_br(c, t, &[], f, &[]);
+        b.switch_to(t);
+        b.ret(Some(a));
+        b.switch_to(f);
+        b.ret(Some(bb));
+    });
+    h.set_tgt_raw(|b, entry, p| {
+        let (a, bb, c) = (p[0], p[1], p[2]);
+        b.switch_to(entry);
+        let s = b.select(c, a, bb);
+        b.ret(Some(s));
+    });
+    assert_refines(h.check());
+}
+
+/// Unsound: swapping the arms of a `cond_br`. `tgt` feeds `b` on the true edge
+/// and `a` on the false edge — the opposite of `src`.
+#[test]
+fn swapped_cond_br_arms_is_caught() {
+    let mut h = diamond_harness();
+    let build = |swap: bool| {
+        move |b: &mut FunctionBuilder, entry: BlockId, p: &[ValueId]| {
+            let (a, bb, c) = (p[0], p[1], p[2]);
+            let i8 = b.value_type(a);
+            let l = b.create_block(&[]);
+            let r = b.create_block(&[]);
+            let m = b.create_block(&[i8]);
+            let (larg, rarg) = if swap { (bb, a) } else { (a, bb) };
+            b.switch_to(entry);
+            b.cond_br(c, l, &[], r, &[]);
+            b.switch_to(l);
+            b.br(m, &[larg]);
+            b.switch_to(r);
+            b.br(m, &[rarg]);
+            b.switch_to(m);
+            let x = b.param(m, 0);
+            b.ret(Some(x));
+        }
+    };
+    h.set_src_raw(build(false));
+    h.set_tgt_raw(build(true));
+    assert_counterexample(h.check());
+}
+
+/// Unsound: a merge that picks the wrong incoming value. `src` returns `a`/`b`
+/// on `c`; `tgt` folds to `select(c, b, a)` (arms reversed).
+#[test]
+fn wrong_merge_value_is_caught() {
+    let mut h = diamond_harness();
+    h.set_src_raw(|b, entry, p| {
+        let (a, bb, c) = (p[0], p[1], p[2]);
+        let i8 = b.value_type(a);
+        let l = b.create_block(&[]);
+        let r = b.create_block(&[]);
+        let m = b.create_block(&[i8]);
+        b.switch_to(entry);
+        b.cond_br(c, l, &[], r, &[]);
+        b.switch_to(l);
+        b.br(m, &[a]);
+        b.switch_to(r);
+        b.br(m, &[bb]);
+        b.switch_to(m);
+        let x = b.param(m, 0);
+        b.ret(Some(x));
+    });
+    h.set_tgt_raw(|b, entry, p| {
+        let (a, bb, c) = (p[0], p[1], p[2]);
+        b.switch_to(entry);
+        let s = b.select(c, bb, a); // reversed arms
+        b.ret(Some(s));
+    });
+    assert_counterexample(h.check());
+}
+
+/// Sound: a `switch` folded to its matching case. `src` switches on `a`; `tgt`
+/// straight-lines the block a concrete constant selects.
+#[test]
+fn switch_constant_folds_refines() {
+    let mut h = Harness::signature(|m| {
+        let i8 = m.types_mut().int(8);
+        (vec![i8], i8)
+    });
+    let i8 = h.params[0];
+    // src: switch a { 7 => C7 (ret 70), default => D (ret 99) }, but a is the
+    // constant 7, so it always lands in C7.
+    h.set_src_raw(move |b, entry, _p| {
+        let c7 = b.create_block(&[]);
+        let d = b.create_block(&[]);
+        b.switch_to(entry);
+        let seven = b.const_i64(i8, 7);
+        b.switch(seven, d, &[], vec![(puremp::Int::from_i64(7), c7, vec![])]);
+        b.switch_to(c7);
+        let r70 = b.const_i64(i8, 70);
+        b.ret(Some(r70));
+        b.switch_to(d);
+        let r99 = b.const_i64(i8, 99);
+        b.ret(Some(r99));
+    });
+    h.set_tgt_raw(move |b, entry, _p| {
+        b.switch_to(entry);
+        let r70 = b.const_i64(i8, 70);
+        b.ret(Some(r70));
+    });
+    assert_refines(h.check());
+}
+
+/// A function with a loop (a back-edge) is reported cleanly as `Unknown`,
+/// never encoded. `src` loops on `L`; the checker must bail before the target.
+#[test]
+fn loop_is_unknown() {
+    let mut h = Harness::signature(|m| {
+        let i8 = m.types_mut().int(8);
+        let i1 = m.types_mut().bool();
+        (vec![i8, i1], i8)
+    });
+    h.set_src_raw(|b, entry, p| {
+        let (a, c) = (p[0], p[1]);
+        let i8 = b.value_type(a);
+        let l = b.create_block(&[i8]);
+        let m = b.create_block(&[i8]);
+        b.switch_to(entry);
+        b.br(l, &[a]);
+        b.switch_to(l);
+        let x = b.param(l, 0);
+        // true edge is a back-edge to L; false edge exits to M.
+        b.cond_br(c, l, &[x], m, &[x]);
+        b.switch_to(m);
+        let y = b.param(m, 0);
+        b.ret(Some(y));
+    });
+    h.set_tgt_raw(|b, entry, p| {
+        b.switch_to(entry);
+        b.ret(Some(p[0]));
+    });
+    match h.check() {
+        RefinementResult::Unknown(s) => assert_eq!(s, "loops unsupported"),
+        other => panic!("expected Unknown(\"loops unsupported\"), got {other:?}"),
+    }
 }
