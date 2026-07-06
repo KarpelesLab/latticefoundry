@@ -331,24 +331,29 @@ const FLOAT_H: &str = r##"#ifndef _LF_FLOAT_H
 #endif /* _LF_FLOAT_H */
 "##;
 
-/// `<stdarg.h>`: placeholder interface.
+/// `<stdarg.h>`: the System V AMD64 `va_list` and the `va_*` macros.
 ///
-/// NOTE: working variadic functions require backend support (a register-save
-/// area / `va_list` ABI) that lf-cc does not implement yet. The definitions
-/// below exist only so that translation units which `#include <stdarg.h>` and
-/// mention `va_list`/`va_start`/`va_arg`/`va_end` *parse*; they do not perform
-/// real argument extraction. Variadic support is a separate future task.
+/// `va_list` is the psABI `__va_list_tag[1]` (a one-element array, so it decays
+/// to a `__va_list_tag*` when passed to the builtins). The macros expand to the
+/// compiler builtins the frontend recognizes and lowers against the register
+/// save area / overflow area set up by a variadic function's prologue. Defined
+/// under every `--std` (variadic functions predate C89).
 const STDARG_H: &str = r##"#ifndef _LF_STDARG_H
 #define _LF_STDARG_H
 
-/* Placeholder only — see the note in lf-cc/src/headers.rs; variadic calls are
-   not yet supported by the backend. */
-typedef char *va_list;
+typedef struct __va_list_tag {
+    unsigned gp_offset;
+    unsigned fp_offset;
+    void *overflow_arg_area;
+    void *reg_save_area;
+} __va_list_tag;
 
-#define va_start(ap, last) ((void)((ap) = (va_list)0))
-#define va_arg(ap, type)   (*(type *)0)
-#define va_end(ap)         ((void)((ap) = (va_list)0))
-#define va_copy(dst, src)  ((void)((dst) = (src)))
+typedef __va_list_tag va_list[1];
+
+#define va_start(ap, last) __builtin_va_start(ap, last)
+#define va_arg(ap, type)   __builtin_va_arg(ap, type)
+#define va_end(ap)         __builtin_va_end(ap)
+#define va_copy(dst, src)  __builtin_va_copy(dst, src)
 
 #endif /* _LF_STDARG_H */
 "##;

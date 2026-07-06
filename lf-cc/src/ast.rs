@@ -451,6 +451,16 @@ pub enum ExprKind {
     /// A compound literal `(type-name){ initializer-list }` (C99): an unnamed
     /// object of the given type with the given initializer, usable as an lvalue.
     CompoundLiteral(CType, Box<Init>),
+    /// `__builtin_va_start(ap, last)` — initialize the `va_list` `ap` (the second
+    /// operand, the last named parameter, is only used to validate the call and is
+    /// otherwise unused: the argument counts come from the enclosing function).
+    VaStart(Box<Expr>, Box<Expr>),
+    /// `__builtin_va_arg(ap, type)` — fetch the next variadic argument of `type`.
+    VaArg(Box<Expr>, CType),
+    /// `__builtin_va_end(ap)` — finish traversing `ap` (a no-op on this target).
+    VaEnd(Box<Expr>),
+    /// `__builtin_va_copy(dst, src)` — copy the traversal state of `src` to `dst`.
+    VaCopy(Box<Expr>, Box<Expr>),
 }
 
 /// One association of a `_Generic` selection: a type (`None` for `default`) and
@@ -571,6 +581,8 @@ pub struct FuncDef {
     pub ret: CType,
     /// The parameter list.
     pub params: Vec<Param>,
+    /// Whether the function is variadic (`...` after its named parameters).
+    pub variadic: bool,
     /// The function body (a list of statements).
     pub body: Vec<Stmt>,
     /// The source span of the function's declarator (its name).

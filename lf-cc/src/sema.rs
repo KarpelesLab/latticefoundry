@@ -46,6 +46,9 @@ enum InitBuilt {
     Scalar(TExpr),
     /// Aggregate stores (offsets relative to the object's base).
     Aggregate(Vec<AggStore>),
+    /// A whole-`struct`/`union` copy from another value of the same record type
+    /// (e.g. `struct P r = make_p();`): the source is copied byte-for-byte.
+    StructCopy(TExpr),
 }
 
 /// One scalar store emitted for an aggregate initializer: a value to write at a
@@ -171,6 +174,16 @@ pub enum TStmt {
     Goto(u32),
     /// Initialize a scalar local object with a value already converted to its type.
     InitLocal(ObjId, TExpr),
+    /// Initialize a `struct`/`union` local object by copying `size` bytes from a
+    /// value of the same record type (`struct P r = expr;`).
+    CopyInit {
+        /// The object being initialized.
+        obj: ObjId,
+        /// The source struct value (an lvalue or a struct-returning call result).
+        src: TExpr,
+        /// The number of bytes to copy.
+        size: u64,
+    },
     /// Initialize an aggregate local object: zero its `size` bytes, then perform
     /// each scalar `(byte offset, value)` store.
     InitAggregate {
@@ -268,6 +281,17 @@ pub enum TExprKind {
     /// performing the scalar `stores`). The expression designates that object (an
     /// lvalue), so it lowers like [`TExprKind::Obj`] once initialized.
     CompoundLiteral { obj: ObjId, zero_size: u64, stores: Vec<AggStore> },
+    /// `__builtin_va_start(ap, ...)`: initialize the `va_list` at `ap` (a pointer
+    /// to its `__va_list_tag`) from the enclosing function's argument frame.
+    VaStart(Box<TExpr>),
+    /// `__builtin_va_arg(ap, T)`: fetch the next variadic argument as type `T`
+    /// (this node's `ty`); `ap` is a pointer to the `__va_list_tag`.
+    VaArg(Box<TExpr>),
+    /// `__builtin_va_end(ap)`: a no-op on this target (`ty` is `void`).
+    VaEnd,
+    /// `__builtin_va_copy(dst, src)`: copy the 24-byte `__va_list_tag` state from
+    /// `src` to `dst` (both pointers to their tags).
+    VaCopy(Box<TExpr>, Box<TExpr>),
 }
 
 impl TExpr {
@@ -409,7 +433,7 @@ impl Checker {
                 }
                 TopLevel::Func(f) => {
                     let params = f.params.iter().map(|pp| pp.ty.clone()).collect();
-                    self.register_sig(&f.name, f.ret.clone(), params, false, true, f.span);
+                    self.register_sig(&f.name, f.ret.clone(), params, f.variadic, true, f.span);
                 }
                 TopLevel::Global(g) => self.register_global(g),
             }
@@ -444,18 +468,6 @@ impl Checker {
                 existing.variadic = variadic;
             }
             return;
-        }
-        if ret.is_record() {
-            self.error(
-                span,
-                "returning a struct/union by value is not supported in this subset; return a pointer",
-            );
-        }
-        if params.iter().any(CType::is_record) {
-            self.error(
-                span,
-                "passing a struct/union by value is not supported in this subset; pass a pointer",
-            );
         }
         let idx = self.sigs.len();
         self.sigs.push(FuncSig { name: name.to_owned(), ret, params, variadic, defined });
@@ -783,7 +795,7 @@ impl Checker {
                 Some(TStmt::For(init_s, cond_e, step_e, Box::new(b?)))
             }
             StmtKind::Return(None) => {
-                if !matches!(ctx.ret_ty, CType::Void) {
+                if !matches!(ctx.ret_ty, CType::Void) && !ctx.ret_ty.is_record() {
                     // A missing value in a value-returning function: default to 0.
                     let zero = TExpr::new(TExprKind::Const(0), ctx.ret_ty.clone(), stmt.span);
                     return Some(TStmt::Return(Some(zero)));
@@ -938,6 +950,10 @@ impl Checker {
                     let size = self.size_of(&ty);
                     out.push(TStmt::InitAggregate { obj: id, size, stores });
                 }
+                Some(InitBuilt::StructCopy(src)) => {
+                    let size = self.size_of(&ty);
+                    out.push(TStmt::CopyInit { obj: id, src, size });
+                }
                 None => {}
             }
         }
@@ -958,6 +974,18 @@ impl Checker {
         init: &Init,
         span: Span,
     ) -> Option<InitBuilt> {
+        // A `struct`/`union` object may be initialized from a single expression of
+        // the same record type (`struct P r = expr;`) — a whole-object copy.
+        if ty.is_record()
+            && let Init::Expr(e) = init
+        {
+            let te = self.check_rvalue(ctx, e)?;
+            if &te.ty == ty {
+                return Some(InitBuilt::StructCopy(te));
+            }
+            self.error(span, "invalid initializer for a struct/union object");
+            return None;
+        }
         if ty.is_aggregate() {
             let mut stores = Vec::new();
             self.build_agg_stores(ctx, ty, init, 0, &mut stores, span)?;
@@ -1180,7 +1208,68 @@ impl Checker {
             ExprKind::CompoundLiteral(ty, init) => {
                 self.check_compound_literal(ctx, ty, init, span)
             }
+            ExprKind::VaStart(ap, last) => self.check_va_start(ctx, ap, last, span),
+            ExprKind::VaArg(ap, ty) => self.check_va_arg(ctx, ap, ty, span),
+            ExprKind::VaEnd(ap) => self.check_va_end(ctx, ap, span),
+            ExprKind::VaCopy(dst, src) => self.check_va_copy(ctx, dst, src, span),
         }
+    }
+
+    /// Type-check `__builtin_va_start(ap, last)`: `ap` decays to a pointer to its
+    /// `__va_list_tag`; `last` (the last named parameter) is evaluated only to
+    /// validate the call and is otherwise unused. Result type `void`.
+    fn check_va_start(
+        &mut self,
+        ctx: &mut FnCtx,
+        ap: &Expr,
+        last: &Expr,
+        span: Span,
+    ) -> Option<TExpr> {
+        let ap_ptr = self.check_va_list_ptr(ctx, ap, span)?;
+        // `last` is required by the interface but carries no lowering information.
+        let _ = self.check_expr(ctx, last)?;
+        Some(TExpr::new(TExprKind::VaStart(Box::new(ap_ptr)), CType::Void, span))
+    }
+
+    /// Type-check `__builtin_va_arg(ap, T)`: the result is a value of type `T`.
+    fn check_va_arg(&mut self, ctx: &mut FnCtx, ap: &Expr, ty: &CType, span: Span) -> Option<TExpr> {
+        let ap_ptr = self.check_va_list_ptr(ctx, ap, span)?;
+        if !(ty.is_integer() || ty.is_pointer() || ty.is_float()) {
+            self.error(span, "va_arg supports only integer, pointer, and floating types");
+            return None;
+        }
+        Some(TExpr::new(TExprKind::VaArg(Box::new(ap_ptr)), ty.clone(), span))
+    }
+
+    /// Type-check `__builtin_va_end(ap)`: a no-op returning `void`.
+    fn check_va_end(&mut self, ctx: &mut FnCtx, ap: &Expr, span: Span) -> Option<TExpr> {
+        let _ = self.check_va_list_ptr(ctx, ap, span)?;
+        Some(TExpr::new(TExprKind::VaEnd, CType::Void, span))
+    }
+
+    /// Type-check `__builtin_va_copy(dst, src)`: copy the traversal state.
+    fn check_va_copy(
+        &mut self,
+        ctx: &mut FnCtx,
+        dst: &Expr,
+        src: &Expr,
+        span: Span,
+    ) -> Option<TExpr> {
+        let d = self.check_va_list_ptr(ctx, dst, span)?;
+        let s = self.check_va_list_ptr(ctx, src, span)?;
+        Some(TExpr::new(TExprKind::VaCopy(Box::new(d), Box::new(s)), CType::Void, span))
+    }
+
+    /// Evaluate a `va_list` argument to a pointer to its `__va_list_tag`. A
+    /// `va_list` is `__va_list_tag[1]`, so as a value it decays to a pointer to
+    /// its element; a pointer operand is accepted as-is.
+    fn check_va_list_ptr(&mut self, ctx: &mut FnCtx, e: &Expr, span: Span) -> Option<TExpr> {
+        let te = self.check_rvalue(ctx, e)?;
+        if !te.ty.is_pointer() {
+            self.error(span, "expected a 'va_list' argument");
+            return None;
+        }
+        Some(te)
     }
 
     /// Check a `_Generic` selection: type (but do not evaluate) the controlling
@@ -1682,10 +1771,12 @@ impl Checker {
             return None;
         }
         let target_ty = lt.ty.clone();
-        // Whole struct/union assignment copies the object's bytes.
+        // Whole struct/union assignment copies the object's bytes. The source may
+        // be any expression of the same record type (a struct lvalue, or a
+        // struct-returning call — both designate readable storage at lowering).
         if compound.is_none() && target_ty.is_record() {
             let rt = self.check_expr(ctx, r)?;
-            if rt.ty != target_ty || !rt.is_lvalue() {
+            if rt.ty != target_ty {
                 self.error(span, "incompatible struct/union assignment");
                 return None;
             }

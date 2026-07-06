@@ -23,6 +23,9 @@ use crate::layout;
 use crate::layout::BitPlacement;
 use crate::sema::{AggStore, LocalInfo, Program, TExpr, TExprKind, TFunc, TStmt};
 
+/// The size in bytes of a System V `__va_list_tag` (`va_copy` copies this many).
+const VA_LIST_SIZE: u64 = 24;
+
 /// A precomputed set of the small, fixed set of IR types the frontend needs.
 #[derive(Clone, Copy, Debug)]
 struct Tys {
@@ -111,14 +114,35 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
     };
 
     // Declare every function signature in order so a sig index equals its FuncId.
+    // A struct/union return is lowered by hidden-pointer (`sret`) convention: the
+    // caller allocates the result and passes its address as a hidden leading
+    // pointer parameter, and the function returns `void`. A struct/union *value*
+    // parameter or argument is likewise passed by pointer to a caller-made copy
+    // (`tys.of` already maps a record to a pointer). This keeps every crossing of
+    // the ABI a scalar/pointer operation, which the IR verifier accepts.
     let mut func_ids: Vec<FuncId> = Vec::with_capacity(program.sigs.len());
     for sig in &program.sigs {
-        let params: Vec<TypeId> = sig.params.iter().map(|p| tys.of(p)).collect();
-        let ret = tys.of(&sig.ret);
+        let mut params: Vec<TypeId> = Vec::with_capacity(sig.params.len() + 1);
+        if sig.ret.is_record() {
+            params.push(tys.ptr); // hidden sret pointer
+        }
+        params.extend(sig.params.iter().map(|p| tys.of(p)));
+        let ret = if sig.ret.is_record() { tys.void } else { tys.of(&sig.ret) };
         let ft = module.types_mut().func(params, ret, sig.variadic);
         let name = syms.intern(&sig.name);
         func_ids.push(module.declare_function(name, ft));
     }
+
+    // The System V variadic frame-address intrinsics, declared once as external
+    // `ptr @name()`. `va_start` calls these inside a variadic function; the
+    // backend recognizes them by name and replaces each call with the frame
+    // address of the register save area / overflow argument area.
+    let (va_reg_save, va_overflow) = {
+        let hook_sig = module.types_mut().func(Vec::new(), tys.ptr, false);
+        let rs = module.declare_function(syms.intern("__lf_va_reg_save_area"), hook_sig);
+        let ov = module.declare_function(syms.intern("__lf_va_overflow_area"), hook_sig);
+        (rs, ov)
+    };
 
     // Add globals. Their storage bytes are emitted by the driver's
     // `emit_globals`; the IR init here exists only so each global is well-typed.
@@ -201,6 +225,11 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             agg_types: &agg_types,
             blob_types: &blob_types,
             records: &program.records,
+            sret: None,
+            va_gp: 0,
+            va_fp: 0,
+            va_reg_save,
+            va_overflow,
             debug,
             linemap: &linemap,
         };
@@ -299,6 +328,16 @@ struct FnLower<'a> {
     blob_types: &'a HashMap<u64, TypeId>,
     /// The struct/union registry, for layout queries during lowering.
     records: &'a Records,
+    /// The hidden `sret` pointer of the function being lowered, if it returns a
+    /// struct/union by value (the caller-allocated result storage).
+    sret: Option<ValueId>,
+    /// `va_start` seeds: `gp_offset = 8 * va_gp`, `fp_offset = 48 + 16 * va_fp`,
+    /// where the counts are the enclosing function's named GPR/SSE arguments.
+    va_gp: u32,
+    va_fp: u32,
+    /// The variadic frame-address intrinsics (`ptr @__lf_va_*()`).
+    va_reg_save: FuncId,
+    va_overflow: FuncId,
     debug: bool,
     linemap: &'a LineMap,
 }
@@ -330,20 +369,58 @@ impl FnLower<'_> {
             };
             self.slots.push(slot);
         }
-        // Store the incoming parameter values into their slots.
+        // A struct/union return uses the hidden `sret` pointer (the first IR
+        // parameter); the real parameters follow it.
         let params: Vec<ValueId> = self.b.block_params(entry).to_vec();
+        let base = if f.ret.is_record() {
+            self.sret = Some(params[0]);
+            1
+        } else {
+            0
+        };
+        // The `va_start` seed counts: how many named GPR/SSE argument registers
+        // the enclosing function consumes (an sret pointer takes one GPR).
+        let mut gp = base as u32;
+        let mut fp = 0u32;
+        // Store the incoming parameter values into their slots. A struct/union
+        // value parameter arrives as a pointer to the caller's copy; copy it into
+        // the parameter object's own storage so the body owns a private copy.
         for (i, &obj) in f.params.iter().enumerate() {
-            let ty = self.tys.of(&self.locals[obj].ty);
-            let align = align_of(&self.locals[obj].ty);
-            self.b.store(ty, self.slots[obj], params[i], align);
+            let pty = self.locals[obj].ty.clone();
+            let incoming = params[base + i];
+            if pty.is_record() {
+                let size = layout::size_of(self.records, &pty);
+                let dst = self.slots[obj];
+                self.copy_bytes(dst, incoming, size);
+                if gp < 6 {
+                    gp += 1;
+                }
+            } else if pty.is_float() {
+                let ty = self.tys.of(&pty);
+                let align = align_of(&pty);
+                self.b.store(ty, self.slots[obj], incoming, align);
+                if fp < 8 {
+                    fp += 1;
+                }
+            } else {
+                let ty = self.tys.of(&pty);
+                let align = align_of(&pty);
+                self.b.store(ty, self.slots[obj], incoming, align);
+                if gp < 6 {
+                    gp += 1;
+                }
+            }
         }
+        self.va_gp = gp;
+        self.va_fp = fp;
 
         self.lower_block(&f.body);
 
         if !self.terminated {
-            // Fall off the end: return 0 (or nothing for void).
+            // Fall off the end: return 0 (or nothing for void / a struct return).
             match &f.ret {
                 CType::Void => self.b.ret(None),
+                r if r.is_record() => self.b.ret(None),
                 other => {
                     let ty = self.tys.of(other);
                     let zero = if other.is_pointer() {
@@ -428,6 +505,12 @@ impl FnLower<'_> {
                 let slot = self.slots[*id];
                 self.b.store(ty, slot, val, align);
             }
+            TStmt::CopyInit { obj, src, size } => {
+                self.set_line(src.span);
+                let dst = self.slots[*obj];
+                let s = self.lower_struct_addr(src);
+                self.copy_bytes(dst, s, *size);
+            }
             TStmt::InitAggregate { obj, size, stores } => {
                 let base = self.slots[*obj];
                 self.zero_fill(base, *size);
@@ -455,6 +538,16 @@ impl FnLower<'_> {
             }
             TStmt::Return(v) => {
                 match v {
+                    // A struct/union return copies the value into the caller's
+                    // `sret` storage and returns no register value.
+                    Some(e) if e.ty.is_record() => {
+                        self.set_line(e.span);
+                        let sret = self.sret.expect("struct return has an sret pointer");
+                        let src = self.lower_struct_addr(e);
+                        let size = layout::size_of(self.records, &e.ty);
+                        self.copy_bytes(sret, src, size);
+                        self.b.ret(None);
+                    }
                     Some(e) => {
                         self.set_line(e.span);
                         let val = self.lower_rvalue(e);
@@ -821,8 +914,10 @@ impl FnLower<'_> {
             }
             TExprKind::Decay(inner) => self.lower_lvalue(inner),
             TExprKind::CopyAssign { dst, src, size } => {
+                // Evaluate the source address first (it may be a struct-returning
+                // call that must run before the destination is written).
+                let s = self.lower_struct_addr(src);
                 let d = self.lower_lvalue(dst);
-                let s = self.lower_lvalue(src);
                 self.copy_bytes(d, s, *size);
                 d
             }
@@ -946,7 +1041,97 @@ impl FnLower<'_> {
             TExprKind::FuncRef(_) => {
                 unreachable!("function designator not decayed to a function pointer")
             }
+            TExprKind::VaStart(ap) => self.lower_va_start(ap),
+            TExprKind::VaArg(ap) => self.lower_va_arg(ap, &e.ty),
+            TExprKind::VaEnd => self.void_value(),
+            TExprKind::VaCopy(dst, src) => {
+                let d = self.lower_rvalue(dst);
+                let s = self.lower_rvalue(src);
+                self.copy_bytes(d, s, VA_LIST_SIZE);
+                self.void_value()
+            }
         }
+    }
+
+    /// A throwaway value for a `void`-typed builtin used in an rvalue position
+    /// (its result is discarded).
+    fn void_value(&mut self) -> ValueId {
+        self.b.const_i64(self.tys.i32, 0)
+    }
+
+    /// Call one of the variadic frame-address intrinsics, returning its `ptr`.
+    fn call_va_hook(&mut self, hook: FuncId) -> ValueId {
+        let f = self.b.func_ref(hook);
+        self.b.call(f, &[], self.tys.ptr).expect("va hook returns a pointer")
+    }
+
+    /// Lower `__builtin_va_start(ap, ...)`: seed the `__va_list_tag` at `ap` per
+    /// the System V layout — `gp_offset`/`fp_offset` from the enclosing function's
+    /// named argument counts, and the register-save / overflow area addresses from
+    /// the backend intrinsics.
+    fn lower_va_start(&mut self, ap: &TExpr) -> ValueId {
+        let p = self.lower_rvalue(ap);
+        let gp_off = 8 * self.va_gp;
+        let fp_off = 48 + 16 * self.va_fp;
+        let gp = self.b.const_i64(self.tys.i32, i64::from(gp_off));
+        self.b.store(self.tys.i32, p, gp, 4);
+        let fp_ptr = self.offset_ptr(p, 4);
+        let fp = self.b.const_i64(self.tys.i32, i64::from(fp_off));
+        self.b.store(self.tys.i32, fp_ptr, fp, 4);
+        let ov = self.call_va_hook(self.va_overflow);
+        let ov_ptr = self.offset_ptr(p, 8);
+        self.b.store(self.tys.ptr, ov_ptr, ov, 8);
+        let rsa = self.call_va_hook(self.va_reg_save);
+        let rsa_ptr = self.offset_ptr(p, 16);
+        self.b.store(self.tys.ptr, rsa_ptr, rsa, 8);
+        self.void_value()
+    }
+
+    /// Lower `__builtin_va_arg(ap, T)` using the System V walk: an INTEGER-class
+    /// `T` (int/pointer) reads from `reg_save_area + gp_offset` while
+    /// `gp_offset < 48` (stride 8), else from `overflow_arg_area` (stride 8); an
+    /// SSE-class `T` (float/double) reads from `reg_save_area + fp_offset` while
+    /// `fp_offset < 176` (stride 16), else the overflow area. The scalar value is
+    /// then loaded from the chosen address.
+    fn lower_va_arg(&mut self, ap: &TExpr, ty: &CType) -> ValueId {
+        let p = self.lower_rvalue(ap);
+        let is_sse = ty.is_float();
+        let (off_field, max, stride) =
+            if is_sse { (4u64, 176i64, 16i64) } else { (0u64, 48i64, 8i64) };
+        let off_ptr = self.offset_ptr(p, off_field);
+        let cur = self.b.load(self.tys.i32, off_ptr, 4);
+        let maxc = self.b.const_i64(self.tys.i32, max);
+        let is_reg = self.b.icmp(IntPred::Ult, cur, maxc);
+        let reg_bb = self.b.create_block(&[]);
+        let ov_bb = self.b.create_block(&[]);
+        let join = self.b.create_block(&[self.tys.ptr]);
+        self.b.cond_br(is_reg, reg_bb, &[], ov_bb, &[]);
+
+        // Register save area: addr = reg_save_area + cur; cur += stride.
+        self.switch(reg_bb);
+        let rsa_ptr = self.offset_ptr(p, 16);
+        let rsa = self.b.load(self.tys.ptr, rsa_ptr, 8);
+        let cur64 = self.b.cast(CastOp::ZExt, cur, self.tys.i64);
+        let addr_r = self.b.ptr_add(rsa, cur64, true);
+        let stridec = self.b.const_i64(self.tys.i32, stride);
+        let new_off = self.b.add(cur, stridec, Flags::NONE);
+        self.b.store(self.tys.i32, off_ptr, new_off, 4);
+        self.b.br(join, &[addr_r]);
+
+        // Overflow area: addr = overflow_arg_area; overflow_arg_area += 8.
+        self.switch(ov_bb);
+        let ov_slot = self.offset_ptr(p, 8);
+        let ov = self.b.load(self.tys.ptr, ov_slot, 8);
+        let eight = self.b.const_i64(self.tys.i64, 8);
+        let new_ov = self.b.ptr_add(ov, eight, true);
+        self.b.store(self.tys.ptr, ov_slot, new_ov, 8);
+        self.b.br(join, &[ov]);
+
+        self.switch(join);
+        let addr = self.b.param(join, 0);
+        let ity = self.tys.of(ty);
+        let align = align_of(ty);
+        self.b.load(ity, addr, align)
     }
 
     fn lower_logical(&mut self, l: &TExpr, r: &TExpr, is_and: bool) -> ValueId {
@@ -1206,9 +1391,59 @@ impl FnLower<'_> {
             TExprKind::FuncPtr(idx) => self.b.func_ref(self.func_ids[*idx]),
             _ => self.lower_rvalue(callee),
         };
-        let arg_vals: Vec<ValueId> = args.iter().map(|a| self.lower_rvalue(a)).collect();
-        let ret_ty = self.tys.of(&call.ty);
-        self.b.call(callee_val, &arg_vals, ret_ty)
+        let ret_is_record = call.ty.is_record();
+        let mut arg_vals: Vec<ValueId> = Vec::with_capacity(args.len() + 1);
+        // A struct/union return: allocate the caller's result storage and pass its
+        // address as the hidden leading argument; the call's value is that address.
+        let ret_slot = if ret_is_record {
+            let ty = self.ir_of(&call.ty);
+            let slot = self.b.alloca(ty);
+            arg_vals.push(slot);
+            Some(slot)
+        } else {
+            None
+        };
+        for a in args {
+            if a.ty.is_record() {
+                // Pass a struct/union argument by pointer to a fresh copy, so the
+                // callee cannot mutate the caller's object (value semantics).
+                let ty = self.ir_of(&a.ty);
+                let tmp = self.b.alloca(ty);
+                let src = self.lower_struct_addr(a);
+                let size = layout::size_of(self.records, &a.ty);
+                self.copy_bytes(tmp, src, size);
+                arg_vals.push(tmp);
+            } else {
+                arg_vals.push(self.lower_rvalue(a));
+            }
+        }
+        let ret_ty = if ret_is_record { self.tys.void } else { self.tys.of(&call.ty) };
+        let res = self.b.call(callee_val, &arg_vals, ret_ty);
+        if ret_is_record { ret_slot } else { res }
+    }
+
+    /// Lower a `struct`/`union`-typed expression to a pointer to its storage. Used
+    /// wherever a whole record value is consumed by a copy (assignment, return,
+    /// argument passing): an lvalue yields its address, a struct-returning call
+    /// yields its result slot.
+    fn lower_struct_addr(&mut self, e: &TExpr) -> ValueId {
+        match &e.kind {
+            TExprKind::Obj(_)
+            | TExprKind::Global(_)
+            | TExprKind::Deref(_)
+            | TExprKind::Field { .. }
+            | TExprKind::CompoundLiteral { .. } => self.lower_lvalue(e),
+            TExprKind::Call(callee, args) => {
+                self.lower_call(callee, args, e).expect("struct call yields a result pointer")
+            }
+            // A whole-struct assignment yields the destination address as its value.
+            TExprKind::CopyAssign { .. } => self.lower_rvalue(e),
+            TExprKind::Comma(a, b) => {
+                self.lower_effect(a);
+                self.lower_struct_addr(b)
+            }
+            _ => unreachable!("not a struct-addressable expression: {:?}", e.kind),
+        }
     }
 
     /// Evaluate a scalar expression and reduce it to an `i1` truth value. In a

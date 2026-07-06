@@ -340,6 +340,7 @@ impl Parser {
                     name,
                     ret: ty0,
                     params,
+                    variadic,
                     body,
                     span: name_span,
                 })]);
@@ -873,6 +874,9 @@ impl Parser {
                 }
             }
             ExprKind::Generic(..) => None,
+            // `va_arg` yields its type operand; the others are `void`.
+            ExprKind::VaArg(_, ty) => Some(ty.clone()),
+            ExprKind::VaStart(..) | ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => Some(CType::Void),
         }
     }
 
@@ -1661,6 +1665,41 @@ impl Parser {
         Ok(Expr { kind: ExprKind::Generic(controlling, assocs), span: start.merge(end) })
     }
 
+    /// Parse a `__builtin_va_*` primary. The current token is the builtin's
+    /// identifier (already known to be followed by `(`). `va_arg`'s second
+    /// operand is a type-name; every other builtin takes ordinary expressions.
+    fn parse_va_builtin(&mut self, name: &str) -> PResult<Expr> {
+        let start = self.bump().span; // the builtin identifier
+        self.expect_punct(Punct::LParen, "'(' after a va_* builtin")?;
+        let kind = match name {
+            "__builtin_va_start" => {
+                let ap = self.parse_assign()?;
+                self.expect_punct(Punct::Comma, "',' in __builtin_va_start")?;
+                let last = self.parse_assign()?;
+                ExprKind::VaStart(Box::new(ap), Box::new(last))
+            }
+            "__builtin_va_arg" => {
+                let ap = self.parse_assign()?;
+                self.expect_punct(Punct::Comma, "',' in __builtin_va_arg")?;
+                let ty = self.parse_type_name()?;
+                ExprKind::VaArg(Box::new(ap), ty)
+            }
+            "__builtin_va_end" => {
+                let ap = self.parse_assign()?;
+                ExprKind::VaEnd(Box::new(ap))
+            }
+            // "__builtin_va_copy"
+            _ => {
+                let dst = self.parse_assign()?;
+                self.expect_punct(Punct::Comma, "',' in __builtin_va_copy")?;
+                let src = self.parse_assign()?;
+                ExprKind::VaCopy(Box::new(dst), Box::new(src))
+            }
+        };
+        let end = self.expect_punct(Punct::RParen, "')' to close a va_* builtin")?;
+        Ok(Expr { kind, span: start.merge(end) })
+    }
+
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let expr = self.parse_primary()?;
         self.parse_postfix_tail(expr)
@@ -1725,6 +1764,13 @@ impl Parser {
                 Ok(Expr { kind: ExprKind::FloatLit(value, ty), span })
             }
             TokenKind::Ident(name) => {
+                // The variadic compiler builtins look like calls but `va_arg` takes
+                // a type-name argument, so they are parsed as dedicated primaries.
+                if is_va_builtin(&name)
+                    && matches!(self.peek_at(1), TokenKind::Punct(Punct::LParen))
+                {
+                    return self.parse_va_builtin(&name);
+                }
                 let span = self.bump().span;
                 Ok(Expr { kind: ExprKind::Ident(name), span })
             }
@@ -1867,6 +1913,15 @@ fn deref_target(ty: &CType) -> Option<CType> {
         CType::Array(e, _) => Some((**e).clone()),
         _ => None,
     }
+}
+
+/// Whether `name` is one of the variadic compiler builtins the frontend expands
+/// (the `<stdarg.h>` `va_*` macros map onto these).
+fn is_va_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "__builtin_va_start" | "__builtin_va_arg" | "__builtin_va_end" | "__builtin_va_copy"
+    )
 }
 
 /// Fold a binary operator over two constant integers (constant-expression

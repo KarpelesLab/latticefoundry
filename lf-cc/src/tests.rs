@@ -377,10 +377,15 @@ fn designated_initializer_accepted_in_c99() {
 }
 
 #[test]
-fn struct_by_value_return_is_rejected() {
-    let err = check_source("struct S { int a; }; struct S f(){ struct S s; s.a=1; return s; }")
-        .unwrap_err();
-    assert!(err.iter().any(|d| d.message.contains("returning a struct/union by value")));
+fn struct_by_value_return_and_pass_lowers() {
+    // Returning and passing a struct by value is supported (a by-reference +
+    // `sret` ABI at lowering); both directions type-check and lower.
+    lower_ok(
+        "struct P { int x, y; }; \
+         struct P mk(int a, int b){ struct P p; p.x=a; p.y=b; return p; } \
+         int sum(struct P p){ return p.x + p.y; } \
+         int main(){ struct P q = mk(3, 4); return sum(q); }",
+    );
 }
 
 #[test]
