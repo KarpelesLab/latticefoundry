@@ -25,7 +25,7 @@
 //! The encoding tables are implemented from the published ARM A64 instruction
 //! encodings (tenet T1), not copied from any assembler.
 
-use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, StackSlot};
+use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, PReg, Reg, RegClass, StackSlot};
 use crate::codegen::regalloc;
 use crate::ir::Module;
 use crate::mc::emit::{Emitted, EmittedReloc};
@@ -231,6 +231,104 @@ pub(crate) fn ldp_post(rt: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
     ldstp(0xA8C0_0000, rt, rt2, rn, imm7)
 }
 
+// ---------------------------------------------------------------------------
+// Scalar floating-point (FP/SIMD) instruction words (from the ARM A64 encodings)
+// ---------------------------------------------------------------------------
+
+/// The FP "ptype" field: `0` = single (`s`/f32), `1` = double (`d`/f64). It sits
+/// in bits `[23:22]` of most FP instructions.
+#[inline]
+fn ptype_bits(ptype: u32) -> u32 {
+    ptype << 22
+}
+
+/// Floating-point data-processing (2 source) `op Vd, Vn, Vm`. `opcode` (bits
+/// `[15:12]`): 0=`fmul`, 1=`fdiv`, 2=`fadd`, 3=`fsub`.
+#[inline]
+pub(crate) fn fp_dp2(ptype: u32, opcode: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    0x1E20_0800 | ptype_bits(ptype) | (rm << 16) | (opcode << 12) | (rn << 5) | rd
+}
+pub(crate) fn fadd(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    fp_dp2(ptype, 0b0010, rd, rn, rm)
+}
+pub(crate) fn fsub(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    fp_dp2(ptype, 0b0011, rd, rn, rm)
+}
+pub(crate) fn fmul(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    fp_dp2(ptype, 0b0000, rd, rn, rm)
+}
+pub(crate) fn fdiv(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    fp_dp2(ptype, 0b0001, rd, rn, rm)
+}
+
+/// Floating-point data-processing (1 source) `op Vd, Vn`. `opcode` (bits
+/// `[20:15]`): 0=`fmov`, 2=`fneg`, `fcvt`→single=4/double=5/half=7.
+#[inline]
+pub(crate) fn fp_dp1(ptype: u32, opcode: u32, rd: u32, rn: u32) -> u32 {
+    0x1E20_4000 | ptype_bits(ptype) | (opcode << 15) | (rn << 5) | rd
+}
+/// `fmov Vd, Vn` (register move within the FP file).
+pub(crate) fn fmov_reg(ptype: u32, rd: u32, rn: u32) -> u32 {
+    fp_dp1(ptype, 0b000000, rd, rn)
+}
+/// `fneg Vd, Vn`.
+pub(crate) fn fneg(ptype: u32, rd: u32, rn: u32) -> u32 {
+    fp_dp1(ptype, 0b000010, rd, rn)
+}
+/// `fcvt Vd, Vn` between precisions; `src`/`dst` are ptypes (0=s,1=d).
+pub(crate) fn fcvt(src: u32, dst: u32, rd: u32, rn: u32) -> u32 {
+    // The FCVT opcode is `0001` concatenated with the destination type opc
+    // (single=00, double=01, half=11).
+    let opc = match dst {
+        1 => 0b01, // to double
+        3 => 0b11, // to half (unused here)
+        _ => 0b00, // to single
+    };
+    fp_dp1(src, 0b000100 | opc, rd, rn)
+}
+
+/// Floating-point compare `fcmp Vn, Vm` (sets NZCV; opcode2 = 00000).
+pub(crate) fn fcmp(ptype: u32, rn: u32, rm: u32) -> u32 {
+    0x1E20_2000 | ptype_bits(ptype) | (rm << 16) | (rn << 5)
+}
+
+/// Conversion between floating-point and integer `op Rd, Rn`. `sf` selects the
+/// 64-bit gpr; `rmode`/`opcode` select the operation (see the ARM ARM):
+/// `fcvtzs`=(11,000), `fcvtzu`=(11,001), `scvtf`=(00,010), `ucvtf`=(00,011),
+/// `fmov` gpr↔fp = (00,110)/(00,111).
+#[inline]
+pub(crate) fn fp_int_cvt(sf: u32, ptype: u32, rmode: u32, opcode: u32, rd: u32, rn: u32) -> u32 {
+    0x1E20_0000 | (sf << 31) | ptype_bits(ptype) | (rmode << 19) | (opcode << 16) | (rn << 5) | rd
+}
+/// `fcvtzs Rd(gpr), Vn` — float→signed int, round toward zero.
+pub(crate) fn fcvtzs(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    fp_int_cvt(sf, ptype, 0b11, 0b000, rd, rn)
+}
+/// `fcvtzu Rd(gpr), Vn` — float→unsigned int, round toward zero.
+pub(crate) fn fcvtzu(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    fp_int_cvt(sf, ptype, 0b11, 0b001, rd, rn)
+}
+/// `scvtf Vd, Rn(gpr)` — signed int→float.
+pub(crate) fn scvtf(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    fp_int_cvt(sf, ptype, 0b00, 0b010, rd, rn)
+}
+/// `ucvtf Vd, Rn(gpr)` — unsigned int→float.
+pub(crate) fn ucvtf(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    fp_int_cvt(sf, ptype, 0b00, 0b011, rd, rn)
+}
+/// `fmov Vd, Rn(gpr)` — move gpr bit pattern into the low FP lane.
+pub(crate) fn fmov_from_gpr(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    fp_int_cvt(sf, ptype, 0b00, 0b111, rd, rn)
+}
+
+/// An FP unsigned-offset load/store `ldr`/`str Vt, [Rn, #(imm12*scale)]`. `size`
+/// is the log2 access width (2=`s`/word, 3=`d`/dword).
+#[inline]
+pub(crate) fn fp_ldst_uimm(load: bool, size: u32, rt: u32, rn: u32, imm12: u32) -> u32 {
+    let base = if load { 0x3D40_0000 } else { 0x3D00_0000 };
+    base | (size << 30) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rt
+}
+
 // ===========================================================================
 // Frame layout + prologue/epilogue
 // ===========================================================================
@@ -242,8 +340,9 @@ pub(crate) fn ldp_post(rt: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
 pub struct FrameLayout {
     /// `sp`-relative byte offset of each stack slot (by slot index).
     slot_off: Vec<u32>,
-    /// The callee-saved registers the allocation used (hardware numbers).
-    cs_regs: Vec<u16>,
+    /// The callee-saved registers the allocation used (class-tagged, so the
+    /// prologue saves GPRs and FP registers with the right `str`/`ldr` form).
+    cs_regs: Vec<PReg>,
     /// `sp`-relative byte offset each callee-saved register is stored at.
     cs_off: Vec<u32>,
     /// The `sub sp` amount below the fp/lr save (16-byte aligned).
@@ -258,20 +357,31 @@ fn align_up(value: u64, align: u64) -> u64 {
 /// Compute the frame layout of an allocated machine function.
 pub fn layout_frame(mf: &MachineFunction, target: &AArch64Target) -> FrameLayout {
     use crate::codegen::target::MachineTarget;
-    let callee: Vec<u16> = target.callee_saved().iter().map(|p| p.num).collect();
+    let callee: Vec<PReg> = target.callee_saved().to_vec();
 
-    // Which callee-saved registers does the allocation actually define?
-    let mut used = [false; 32];
+    // Which callee-saved registers does the allocation actually define? Track by
+    // (class, number): the GPR `x8` and the FP `v8` share the number 8, so a
+    // per-number-only set would confuse the two files.
+    let mut used_gpr = [false; 32];
+    let mut used_fp = [false; 32];
     for bid in mf.block_ids() {
         for inst in &mf.block(bid).insts {
             for d in inst.defs() {
                 if let Reg::Physical(p) = d {
-                    used[p.num as usize] = true;
+                    let set = match p.class {
+                        RegClass::Gpr => &mut used_gpr,
+                        RegClass::Fp => &mut used_fp,
+                    };
+                    set[p.num as usize] = true;
                 }
             }
         }
     }
-    let cs_regs: Vec<u16> = callee.into_iter().filter(|&r| used[r as usize]).collect();
+    let is_used = |p: &PReg| match p.class {
+        RegClass::Gpr => used_gpr[p.num as usize],
+        RegClass::Fp => used_fp[p.num as usize],
+    };
+    let cs_regs: Vec<PReg> = callee.into_iter().filter(is_used).collect();
     // Callee-saved live at the bottom of the `extra` region, 8 bytes each.
     let cs_off: Vec<u32> = (0..cs_regs.len()).map(|i| (i * 8) as u32).collect();
     let cs_bytes = (cs_regs.len() * 8) as u64;
@@ -292,17 +402,11 @@ pub fn layout_frame(mf: &MachineFunction, target: &AArch64Target) -> FrameLayout
     FrameLayout { slot_off, cs_regs, cs_off, extra }
 }
 
-fn def_p(r: u16) -> MachineOperand {
-    MachineOperand::Def(Reg::Physical(crate::codegen::mir::PReg::new(
-        crate::codegen::mir::RegClass::Gpr,
-        r,
-    )))
+fn def_preg(r: PReg) -> MachineOperand {
+    MachineOperand::Def(Reg::Physical(r))
 }
-fn use_p(r: u16) -> MachineOperand {
-    MachineOperand::Use(Reg::Physical(crate::codegen::mir::PReg::new(
-        crate::codegen::mir::RegClass::Gpr,
-        r,
-    )))
+fn use_preg(r: PReg) -> MachineOperand {
+    MachineOperand::Use(Reg::Physical(r))
 }
 fn imm_op(v: u64) -> MachineOperand {
     MachineOperand::Imm(puremp::Int::from_u64(v))
@@ -323,7 +427,7 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
     for (&cs, &off) in layout.cs_regs.iter().zip(&layout.cs_off) {
         prologue.push(MachineInst::new(
             A64Op::SaveReg.opcode(),
-            vec![use_p(cs), imm_op(u64::from(off))],
+            vec![use_preg(cs), imm_op(u64::from(off))],
         ));
     }
     let old = std::mem::take(&mut mf.block_mut(entry).insts);
@@ -340,7 +444,7 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
                 for (&cs, &off) in layout.cs_regs.iter().zip(&layout.cs_off) {
                     new_insts.push(MachineInst::new(
                         A64Op::RestoreReg.opcode(),
-                        vec![def_p(cs), imm_op(u64::from(off))],
+                        vec![def_preg(cs), imm_op(u64::from(off))],
                     ));
                 }
                 if layout.extra > 0 {
@@ -366,6 +470,14 @@ fn rnum(op: &MachineOperand) -> u32 {
         MachineOperand::Def(Reg::Physical(p)) | MachineOperand::Use(Reg::Physical(p)) => {
             u32::from(p.num)
         }
+        other => panic!("expected a physical register operand, found {other:?}"),
+    }
+}
+
+/// The register class of a physical register operand.
+fn rclass(op: &MachineOperand) -> RegClass {
+    match op {
+        MachineOperand::Def(Reg::Physical(p)) | MachineOperand::Use(Reg::Physical(p)) => p.class,
         other => panic!("expected a physical register operand, found {other:?}"),
     }
 }
@@ -495,7 +607,13 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let d = rnum(&ops[0]);
             let s = rnum(&ops[1]);
             if d != s {
-                b.word(mov_reg(1, d, s));
+                match rclass(&ops[0]) {
+                    // A GPR copy is `orr d, xzr, s`; an FP copy is `fmov d, s`
+                    // (the double form copies the whole 64-bit lane, which holds an
+                    // f32 too).
+                    RegClass::Gpr => b.word(mov_reg(1, d, s)),
+                    RegClass::Fp => b.word(fmov_reg(1, d, s)),
+                }
             }
         }
         A64Op::MovRI => encode_movri(b, rnum(&ops[0]), uimm(&ops[1])),
@@ -589,13 +707,21 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let d = rnum(&ops[0]);
             let ptr = rnum(&ops[1]);
             let size = uimm(&ops[2]);
-            b.word(ldst_uimm(true, ldst_size(size), d, ptr, 0));
+            let word = match rclass(&ops[0]) {
+                RegClass::Gpr => ldst_uimm(true, ldst_size(size), d, ptr, 0),
+                RegClass::Fp => fp_ldst_uimm(true, ldst_size(size), d, ptr, 0),
+            };
+            b.word(word);
         }
         A64Op::Store => {
             let ptr = rnum(&ops[0]);
             let val = rnum(&ops[1]);
             let size = uimm(&ops[2]);
-            b.word(ldst_uimm(false, ldst_size(size), val, ptr, 0));
+            let word = match rclass(&ops[1]) {
+                RegClass::Gpr => ldst_uimm(false, ldst_size(size), val, ptr, 0),
+                RegClass::Fp => fp_ldst_uimm(false, ldst_size(size), val, ptr, 0),
+            };
+            b.word(word);
         }
         A64Op::FrameAddr => {
             let d = rnum(&ops[0]);
@@ -605,12 +731,12 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         A64Op::StoreFrame => {
             let src = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            b.word(ldst_uimm(false, SIZE_DWORD, src, SP.into(), off / 8));
+            b.word(frame_ldst(rclass(&ops[0]), false, src, off));
         }
         A64Op::LoadFrame => {
             let dst = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            b.word(ldst_uimm(true, SIZE_DWORD, dst, SP.into(), off / 8));
+            b.word(frame_ldst(rclass(&ops[0]), true, dst, off));
         }
         A64Op::GlobalAddr => {
             let d = rnum(&ops[0]);
@@ -666,14 +792,118 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         A64Op::AddSp => b.word(add_imm(1, SP.into(), SP.into(), uimm(&ops[0]) as u32)),
         A64Op::SaveReg => {
             let r = rnum(&ops[0]);
-            let off = uimm(&ops[1]);
-            b.word(ldst_uimm(false, SIZE_DWORD, r, SP.into(), (off / 8) as u32));
+            let off = uimm(&ops[1]) as u32;
+            b.word(frame_ldst(rclass(&ops[0]), false, r, off));
         }
         A64Op::RestoreReg => {
             let r = rnum(&ops[0]);
-            let off = uimm(&ops[1]);
-            b.word(ldst_uimm(true, SIZE_DWORD, r, SP.into(), (off / 8) as u32));
+            let off = uimm(&ops[1]) as u32;
+            b.word(frame_ldst(rclass(&ops[0]), true, r, off));
         }
+
+        // --- scalar floating-point ----------------------------------------
+        A64Op::FAdd | A64Op::FSub | A64Op::FMul | A64Op::FDiv => {
+            let ptype = super::isel::ptype_of(uimm(&ops[3]) as u32);
+            let (d, a, m) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+            let word = match A64Op::decode(inst.opcode) {
+                A64Op::FAdd => fadd(ptype, d, a, m),
+                A64Op::FSub => fsub(ptype, d, a, m),
+                A64Op::FMul => fmul(ptype, d, a, m),
+                _ => fdiv(ptype, d, a, m),
+            };
+            b.word(word);
+        }
+        A64Op::FNeg => {
+            let ptype = super::isel::ptype_of(uimm(&ops[2]) as u32);
+            b.word(fneg(ptype, rnum(&ops[0]), rnum(&ops[1])));
+        }
+        A64Op::Fcmp => {
+            let d = rnum(&ops[0]);
+            let a = rnum(&ops[1]);
+            let m = rnum(&ops[2]);
+            let packed = uimm(&ops[3]);
+            let ptype = super::isel::ptype_of(uimm(&ops[4]) as u32);
+            let cond = (packed & 0xF) as u32;
+            let combine = super::isel::Combine::decode((packed >> 4) & 0xF);
+            let cond2 = ((packed >> 8) & 0xF) as u32;
+            b.word(fcmp(ptype, a, m)); // fcmp Da, Db (sets NZCV)
+            // The i1 result is a 32-bit gpr value; `cset w` zeroes the top 32 bits.
+            b.word(cset(0, d, cond));
+            match combine {
+                super::isel::Combine::None => {}
+                super::isel::Combine::And | super::isel::Combine::Or => {
+                    let tmp = u32::from(super::regs::X9);
+                    b.word(cset(0, tmp, cond2));
+                    if combine == super::isel::Combine::And {
+                        b.word(and_reg(0, d, d, tmp));
+                    } else {
+                        b.word(orr_reg(0, d, d, tmp));
+                    }
+                }
+            }
+        }
+        A64Op::LoadFConst => {
+            let d = rnum(&ops[0]);
+            let bits = uimm(&ops[1]);
+            let width = uimm(&ops[2]) as u32;
+            let tmp = u32::from(super::regs::X9);
+            let ptype = super::isel::ptype_of(width);
+            if width >= 64 {
+                encode_movri(b, tmp, bits);
+                b.word(fmov_from_gpr(1, ptype, d, tmp)); // fmov Dd, x9
+            } else {
+                // Materialize the 32-bit pattern (a `movz`/`movk` chain), then move
+                // the low word into the single-precision lane (`fmov Sd, w9`).
+                encode_movri(b, tmp, bits & 0xFFFF_FFFF);
+                b.word(fmov_from_gpr(0, ptype, d, tmp)); // fmov Sd, w9
+            }
+        }
+        A64Op::Fcvt => {
+            let dst_w = uimm(&ops[2]) as u32;
+            let src_w = uimm(&ops[3]) as u32;
+            b.word(fcvt(super::isel::ptype_of(src_w), fcvt_dst_ptype(dst_w), rnum(&ops[0]), rnum(&ops[1])));
+        }
+        A64Op::Fcvtzs | A64Op::Fcvtzu => {
+            let dst_int_w = uimm(&ops[2]) as u32;
+            let src_flt_w = uimm(&ops[3]) as u32;
+            let sf = u32::from(dst_int_w > 32);
+            let ptype = super::isel::ptype_of(src_flt_w);
+            let word = if A64Op::decode(inst.opcode) == A64Op::Fcvtzs {
+                fcvtzs(sf, ptype, rnum(&ops[0]), rnum(&ops[1]))
+            } else {
+                fcvtzu(sf, ptype, rnum(&ops[0]), rnum(&ops[1]))
+            };
+            b.word(word);
+        }
+        A64Op::Scvtf | A64Op::Ucvtf => {
+            let dst_flt_w = uimm(&ops[2]) as u32;
+            let src_int_w = uimm(&ops[3]) as u32;
+            let sf = u32::from(src_int_w > 32);
+            let ptype = super::isel::ptype_of(dst_flt_w);
+            let word = if A64Op::decode(inst.opcode) == A64Op::Scvtf {
+                scvtf(sf, ptype, rnum(&ops[0]), rnum(&ops[1]))
+            } else {
+                ucvtf(sf, ptype, rnum(&ops[0]), rnum(&ops[1]))
+            };
+            b.word(word);
+        }
+    }
+}
+
+/// The `fcvt` destination ptype for an integer bit width: `1` for f64, `0` for
+/// f32 (the FP data-processing "ptype" convention).
+#[inline]
+fn fcvt_dst_ptype(dst_w: u32) -> u32 {
+    u32::from(dst_w >= 64)
+}
+
+/// A frame (spill/reload/callee-save) `ldr`/`str` of a whole 64-bit lane, using
+/// the GPR (`x`) or FP (`d`) form per the register class. `off` is a byte offset;
+/// the encoded unsigned immediate is `off / 8`.
+fn frame_ldst(class: RegClass, load: bool, rt: u32, off: u32) -> u32 {
+    match class {
+        RegClass::Gpr => ldst_uimm(load, SIZE_DWORD, rt, SP.into(), off / 8),
+        RegClass::Fp => fp_ldst_uimm(load, SIZE_DWORD, rt, SP.into(), off / 8),
     }
 }
 

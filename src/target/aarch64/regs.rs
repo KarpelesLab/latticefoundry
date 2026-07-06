@@ -52,15 +52,33 @@ pub(crate) fn gpr(n: u16) -> PReg {
     PReg::new(RegClass::Gpr, n)
 }
 
+/// Construct an FP/SIMD [`PReg`] from its hardware number. `n` is the hardware
+/// `v`-register number 0..=31 (the value the encoder puts into the `Rd`/`Rn`/`Rm`
+/// fields of an FP instruction). Scalar `d`/`s` views share the same number.
+#[inline]
+pub(crate) fn fp(n: u16) -> PReg {
+    PReg::new(RegClass::Fp, n)
+}
+
 /// The register-file and ABI sets, computed once and borrowed by the target.
+///
+/// The FP/SIMD file is `v0..v31` (scalar `d0..d31` / `s0..s31`). Under AAPCS64
+/// float/double arguments go in `v0..v7` (a counter separate from the integer
+/// `x0..x7`), a float/double return is in `v0`, `v8..v15` are callee-saved (only
+/// their low 64 bits, but treated as fully callee-saved here for simplicity), and
+/// `v16..v31` are caller-saved. `v29..v31` are reserved as spill/reload scratch —
+/// three of them, so an FP three-operand instruction whose destination and both
+/// sources all spill still has a distinct scratch per operand, mirroring the GPR
+/// `x9/x10/x11` reservation.
 #[derive(Debug)]
 pub(crate) struct RegFile {
     pub(crate) classes: Vec<RegClass>,
     pub(crate) allocatable: Vec<PReg>,
+    pub(crate) allocatable_fp: Vec<PReg>,
     pub(crate) scratch: Vec<PReg>,
+    pub(crate) scratch_fp: Vec<PReg>,
     pub(crate) caller_saved: Vec<PReg>,
     pub(crate) callee_saved: Vec<PReg>,
-    pub(crate) empty: Vec<PReg>,
     pub(crate) cc: CallConv,
 }
 
@@ -76,27 +94,37 @@ impl RegFile {
         // Three scratch registers: enough for one instruction whose dest and both
         // source operands are all spilled. None is an ABI-fixed operand.
         let scratch = [X9, X10, X11].into_iter().map(gpr).collect();
-        // The AAPCS64 caller-saved (volatile) set: x0..x18. Listing the reserved
-        // non-allocatable ones is harmless — it only tells the allocator a call
-        // may clobber them, which is true.
-        let caller_saved = (0u16..=18).map(gpr).collect();
-        let callee_saved = (19u16..=28).map(gpr).collect();
+
+        // FP/SIMD file: v0..v7 (arg/caller-saved) and v16..v28 (caller-saved)
+        // preferred first, then the callee-saved v8..v15; v29..v31 are scratch.
+        let allocatable_fp =
+            (0u16..=7).chain(16u16..=28).chain(8u16..=15).map(fp).collect();
+        let scratch_fp = [29u16, 30, 31].into_iter().map(fp).collect();
+
+        // The AAPCS64 caller-saved (volatile) set: x0..x18 plus the volatile FP
+        // registers v0..v7 and v16..v31. Listing the reserved non-allocatable
+        // ones is harmless — it only tells the allocator a call may clobber them,
+        // which is true.
+        let mut caller_saved: Vec<PReg> = (0u16..=18).map(gpr).collect();
+        caller_saved.extend((0u16..=7).chain(16u16..=31).map(fp));
+        let mut callee_saved: Vec<PReg> = (19u16..=28).map(gpr).collect();
+        callee_saved.extend((8u16..=15).map(fp));
+
         let cc = CallConv {
             arg_regs: (0u16..=7).map(gpr).collect(),
-            // AArch64 floating-point (v0..v7 args, v0 return) is a follow-up; the
-            // scalar SSE work here is x86-only. No Fp registers are exposed yet.
-            fp_arg_regs: Vec::new(),
+            fp_arg_regs: (0u16..=7).map(fp).collect(),
             ret_reg: gpr(X0),
-            fp_ret_reg: PReg::new(RegClass::Fp, 0),
+            fp_ret_reg: fp(0),
             stack_grows_down: true,
         };
         RegFile {
-            classes: vec![RegClass::Gpr],
+            classes: vec![RegClass::Gpr, RegClass::Fp],
             allocatable,
+            allocatable_fp,
             scratch,
+            scratch_fp,
             caller_saved,
             callee_saved,
-            empty: Vec::new(),
             cc,
         }
     }

@@ -11,7 +11,7 @@
 //! evaluated as compare-then-set, `MovRI` as a load-immediate) rather than the
 //! encoder's multi-word expansion.
 
-use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, StackSlot};
+use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, RegClass, StackSlot};
 use crate::codegen::target::MachineTarget;
 use crate::support::DetHashMap;
 
@@ -48,6 +48,10 @@ struct Frame {
     mem: Vec<u8>,
     slot_base: Vec<u64>,
     slot_val: DetHashMap<StackSlot, Int>,
+    /// The most recent value moved into a physical return register (`x0` or `v0`).
+    /// The lowering writes the return value there immediately before `ret`, so
+    /// this captures a float return (in `v0`) as well as an integer one (`x0`).
+    ret_val: Option<Int>,
 }
 
 fn mask(v: &Int, width: u32) -> Int {
@@ -88,11 +92,30 @@ impl Interp<'_> {
             mem: vec![0u8; (off + 32) as usize],
             slot_base,
             slot_val: DetHashMap::default(),
+            ret_val: None,
         };
 
+        // Route each positional argument into its physical argument register by
+        // the parameter's register class: integers into x0.. and floats into
+        // v0.. (separate counters), matching the framework prologue.
         let cc = self.target.call_conv();
-        for (areg, val) in cc.arg_regs.iter().zip(args) {
-            fr.regs.insert(Reg::Physical(*areg), val.clone());
+        let params: Vec<_> = mf.block(entry).params.clone();
+        let mut int_i = 0usize;
+        let mut fp_i = 0usize;
+        for (&p, val) in params.iter().zip(args) {
+            let areg = match mf.vreg_class(p) {
+                RegClass::Gpr => {
+                    let r = cc.arg_regs[int_i];
+                    int_i += 1;
+                    r
+                }
+                RegClass::Fp => {
+                    let r = cc.fp_arg_regs[fp_i];
+                    fp_i += 1;
+                    r
+                }
+            };
+            fr.regs.insert(Reg::Physical(areg), val.clone());
         }
 
         let mut block = entry;
@@ -123,6 +146,10 @@ impl Interp<'_> {
             A64Op::MovRR => {
                 let d = def(ops, 0)?;
                 let s = self.rd(fr, use_reg(ops, 1)?);
+                let cc = self.target.call_conv();
+                if d == Reg::Physical(cc.ret_reg) || d == Reg::Physical(cc.fp_ret_reg) {
+                    fr.ret_val = Some(s.clone());
+                }
                 fr.regs.insert(d, s);
             }
             A64Op::Add | A64Op::Sub | A64Op::And | A64Op::Or | A64Op::Eor | A64Op::Mul => {
@@ -226,9 +253,9 @@ impl Interp<'_> {
             }
             A64Op::Call => return self.exec_call(fr, inst),
             A64Op::Ret => {
-                // The lowering has already moved the value into x0.
-                let x0 = Reg::Physical(self.target.call_conv().ret_reg);
-                return Ok(Flow::Return(Some(self.rd(fr, x0))));
+                // The lowering moved the value into the class-appropriate return
+                // register (`x0` or `v0`) immediately before this `ret`.
+                return Ok(Flow::Return(fr.ret_val.clone()));
             }
             A64Op::B => return Ok(Flow::Goto(label(ops, 0)?)),
             A64Op::BrCond => {
@@ -253,6 +280,73 @@ impl Interp<'_> {
             }
             A64Op::GlobalAddr => return Err("global addressing is not modeled".into()),
             A64Op::Unreachable => return Err("reached an unreachable point (UB)".into()),
+
+            // --- scalar floating-point ------------------------------------
+            A64Op::FAdd | A64Op::FSub | A64Op::FMul | A64Op::FDiv => {
+                let d = def(ops, 0)?;
+                let a = self.rd(fr, use_reg(ops, 1)?);
+                let bb = self.rd(fr, use_reg(ops, 2)?);
+                let w = imm_u32(ops, 3)?;
+                fr.regs.insert(d, fbin(op, &a, &bb, w));
+            }
+            A64Op::FNeg => {
+                let d = def(ops, 0)?;
+                let s = self.rd(fr, use_reg(ops, 1)?);
+                let w = imm_u32(ops, 2)?;
+                let raw = fbits(&s, w);
+                let sign = if w >= 64 { 0x8000_0000_0000_0000 } else { 0x8000_0000 };
+                fr.regs.insert(d, Int::from_u64(raw ^ sign));
+            }
+            A64Op::Fcmp => {
+                let d = def(ops, 0)?;
+                let a = self.rd(fr, use_reg(ops, 1)?);
+                let bb = self.rd(fr, use_reg(ops, 2)?);
+                let packed = imm(ops, 3)?.to_u64().unwrap_or(0);
+                let w = imm_u32(ops, 4)?;
+                let r = eval_fcmp(packed, &a, &bb, w);
+                fr.regs.insert(d, if r { Int::ONE } else { Int::ZERO });
+            }
+            A64Op::LoadFConst => {
+                let d = def(ops, 0)?;
+                let bits = imm(ops, 1)?.to_u64().unwrap_or(0);
+                let w = imm_u32(ops, 2)?;
+                let raw = if w >= 64 { bits } else { bits & 0xFFFF_FFFF };
+                fr.regs.insert(d, Int::from_u64(raw));
+            }
+            A64Op::Fcvt => {
+                let d = def(ops, 0)?;
+                let s = self.rd(fr, use_reg(ops, 1)?);
+                let dst_w = imm_u32(ops, 2)?;
+                let src_w = imm_u32(ops, 3)?;
+                let x = fval(&s, src_w);
+                fr.regs.insert(d, fenc(x, dst_w));
+            }
+            A64Op::Fcvtzs | A64Op::Fcvtzu => {
+                let d = def(ops, 0)?;
+                let s = self.rd(fr, use_reg(ops, 1)?);
+                let dst_int_w = imm_u32(ops, 2)?;
+                let src_flt_w = imm_u32(ops, 3)?;
+                let x = fval(&s, src_flt_w).trunc();
+                let v = if op == A64Op::Fcvtzs {
+                    mask(&Int::from_i64(x as i64), dst_int_w)
+                } else {
+                    mask(&Int::from_u64(x as u64), dst_int_w)
+                };
+                fr.regs.insert(d, v);
+            }
+            A64Op::Scvtf | A64Op::Ucvtf => {
+                let d = def(ops, 0)?;
+                let s = self.rd(fr, use_reg(ops, 1)?);
+                let dst_flt_w = imm_u32(ops, 2)?;
+                let src_int_w = imm_u32(ops, 3)?;
+                let bits = mask(&s, src_int_w);
+                let x = if op == A64Op::Scvtf {
+                    signed(&bits, src_int_w).to_i64().unwrap_or(0) as f64
+                } else {
+                    bits.to_u64().unwrap_or(0) as f64
+                };
+                fr.regs.insert(d, fenc(x, dst_flt_w));
+            }
             // Prologue/epilogue pseudo-ops never appear in pre-regalloc MIR.
             A64Op::StpFpLr
             | A64Op::LdpFpLr
@@ -275,18 +369,35 @@ impl Interp<'_> {
                 _ => None,
             })
             .ok_or("indirect calls are not modeled")?;
-        let mut args = Vec::new();
-        for &areg in &cc.arg_regs {
-            let used = inst
-                .operands
-                .iter()
-                .any(|o| matches!(o, MachineOperand::Use(Reg::Physical(p)) if *p == areg));
-            if used {
-                args.push(self.rd(fr, Reg::Physical(areg)));
-            }
+        // Reconstruct the positional argument list in *parameter order* by reading
+        // each callee parameter's physical argument register (x-regs and v-regs
+        // are counted separately, exactly as the argument-passing lowering did).
+        let callee_mf = self.funcs.get(fidx).ok_or_else(|| format!("no function #{fidx}"))?;
+        let params: Vec<_> =
+            callee_mf.entry().map(|e| callee_mf.block(e).params.clone()).unwrap_or_default();
+        let mut args = Vec::with_capacity(params.len());
+        let mut int_i = 0usize;
+        let mut fp_i = 0usize;
+        for &p in &params {
+            let areg = match callee_mf.vreg_class(p) {
+                RegClass::Gpr => {
+                    let r = cc.arg_regs[int_i];
+                    int_i += 1;
+                    r
+                }
+                RegClass::Fp => {
+                    let r = cc.fp_arg_regs[fp_i];
+                    fp_i += 1;
+                    r
+                }
+            };
+            args.push(self.rd(fr, Reg::Physical(areg)));
         }
-        let ret = self.call(fidx, &args)?;
-        fr.regs.insert(Reg::Physical(cc.ret_reg), ret.unwrap_or(Int::ZERO));
+        let ret = self.call(fidx, &args)?.unwrap_or(Int::ZERO);
+        // Deposit the result in both return registers; the caller's lowering reads
+        // exactly the class-appropriate one, and the value is identical.
+        fr.regs.insert(Reg::Physical(cc.ret_reg), ret.clone());
+        fr.regs.insert(Reg::Physical(cc.fp_ret_reg), ret);
         Ok(Flow::Next)
     }
 
@@ -326,6 +437,103 @@ fn shift(op: A64Op, a: &Int, k: u32, w: u32) -> Int {
         A64Op::LsrI | A64Op::LsrV => mask(&a.div_2k_trunc(k), w),
         A64Op::AsrI | A64Op::AsrV => mask(&signed(&a, w).div_floor(&Int::ONE.mul_2k(k)), w),
         _ => unreachable!(),
+    }
+}
+
+// --- floating-point helpers -----------------------------------------------
+
+/// The raw IEEE bit pattern a register holds (masked to the float width).
+fn fbits(v: &Int, width: u32) -> u64 {
+    let raw = v.to_u64().unwrap_or(0);
+    if width >= 64 { raw } else { raw & 0xFFFF_FFFF }
+}
+
+/// Decode a register's stored bit pattern to the `f64` it denotes at `width`.
+fn fval(v: &Int, width: u32) -> f64 {
+    if width >= 64 {
+        f64::from_bits(fbits(v, 64))
+    } else {
+        f64::from(f32::from_bits(fbits(v, 32) as u32))
+    }
+}
+
+/// Encode an `f64` value into the register bit pattern of a `width`-bit float.
+fn fenc(x: f64, width: u32) -> Int {
+    if width >= 64 {
+        Int::from_u64(x.to_bits())
+    } else {
+        Int::from_u64(u64::from((x as f32).to_bits()))
+    }
+}
+
+/// Execute a scalar FP binary op at the given width, in that width's precision.
+fn fbin(op: A64Op, a: &Int, b: &Int, width: u32) -> Int {
+    if width >= 64 {
+        let (x, y) = (f64::from_bits(fbits(a, 64)), f64::from_bits(fbits(b, 64)));
+        let r = match op {
+            A64Op::FAdd => x + y,
+            A64Op::FSub => x - y,
+            A64Op::FMul => x * y,
+            _ => x / y,
+        };
+        Int::from_u64(r.to_bits())
+    } else {
+        let (x, y) = (f32::from_bits(fbits(a, 32) as u32), f32::from_bits(fbits(b, 32) as u32));
+        let r = match op {
+            A64Op::FAdd => x + y,
+            A64Op::FSub => x - y,
+            A64Op::FMul => x * y,
+            _ => x / y,
+        };
+        Int::from_u64(u64::from(r.to_bits()))
+    }
+}
+
+/// Model the NZCV flags an A64 `fcmp` sets, then evaluate the packed condition
+/// plan (`cond | combine<<4 | cond2<<8`) — validating the isel's condition
+/// mapping the same way hardware would.
+fn eval_fcmp(packed: u64, a: &Int, b: &Int, width: u32) -> bool {
+    let (x, y) = (fval(a, width), fval(b, width));
+    // fcmp NZCV: unordered ⇒ (0,0,1,1); a<b ⇒ (1,0,0,0); a==b ⇒ (0,1,1,0);
+    // a>b ⇒ (0,0,1,0).
+    let (n, z, c, v) = if x.is_nan() || y.is_nan() {
+        (false, false, true, true)
+    } else if x < y {
+        (true, false, false, false)
+    } else if x == y {
+        (false, true, true, false)
+    } else {
+        (false, false, true, false)
+    };
+    let cond = (packed & 0xF) as u8;
+    let combine = (packed >> 4) & 0xF;
+    let cond2 = ((packed >> 8) & 0xF) as u8;
+    let r1 = cond_holds(cond, n, z, c, v);
+    match combine {
+        1 => r1 && cond_holds(cond2, n, z, c, v), // And
+        2 => r1 || cond_holds(cond2, n, z, c, v), // Or
+        _ => r1,
+    }
+}
+
+/// Whether an A64 condition code holds for the given NZCV flags.
+fn cond_holds(cc: u8, n: bool, z: bool, c: bool, v: bool) -> bool {
+    match cc {
+        0x0 => z,                 // EQ
+        0x1 => !z,                // NE
+        0x2 => c,                 // CS/HS
+        0x3 => !c,                // CC/LO
+        0x4 => n,                 // MI
+        0x5 => !n,                // PL
+        0x6 => v,                 // VS
+        0x7 => !v,                // VC
+        0x8 => c && !z,           // HI
+        0x9 => !c || z,           // LS
+        0xA => n == v,            // GE
+        0xB => n != v,            // LT
+        0xC => !z && (n == v),    // GT
+        0xD => z || (n != v),     // LE
+        _ => true,                // AL
     }
 }
 

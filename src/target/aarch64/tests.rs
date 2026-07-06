@@ -17,7 +17,9 @@
 use super::encode::*;
 use super::interp;
 use super::isel::AArch64Target;
-use crate::ir::inst::{BinOp, Flags, IntPred};
+use crate::ir::inst::{BinOp, CastOp, Flags, FloatPred, IntPred};
+use crate::ir::types::FloatKind;
+use crate::ir::value::FloatBits;
 use crate::ir::{FuncId, Module};
 use crate::support::StrInterner;
 
@@ -579,4 +581,391 @@ fn encoding_is_deterministic() {
     let a = compile_function(&m, f, &syms);
     let b = compile_function(&m, f, &syms);
     assert_eq!(a, b, "identical input must yield identical bytes");
+}
+
+// ===========================================================================
+// Scalar floating-point: golden bytes, differential encoding, interpretation
+// ===========================================================================
+
+#[test]
+fn golden_fp_encodings() {
+    // Verified against the ARM A64 encodings (and cross-checked with llvm-mc).
+    // fadd d0, d1, d2 = 20 28 62 1e ; fmul s0, s1, s2 = 20 08 22 1e
+    assert_eq!(fadd(1, 0, 1, 2).to_le_bytes(), [0x20, 0x28, 0x62, 0x1e]);
+    assert_eq!(fmul(0, 0, 1, 2).to_le_bytes(), [0x20, 0x08, 0x22, 0x1e]);
+    // fneg d0, d1 = 20 40 61 1e ; fcmp d0, d1 = 00 20 61 1e
+    assert_eq!(fneg(1, 0, 1).to_le_bytes(), [0x20, 0x40, 0x61, 0x1e]);
+    assert_eq!(fcmp(1, 0, 1).to_le_bytes(), [0x00, 0x20, 0x61, 0x1e]);
+    // fcvt d0, s0 = 00 c0 22 1e ; fcvtzs w0, d0 = 00 00 78 1e
+    assert_eq!(fcvt(0, 1, 0, 0).to_le_bytes(), [0x00, 0xc0, 0x22, 0x1e]);
+    assert_eq!(fcvtzs(0, 1, 0, 0).to_le_bytes(), [0x00, 0x00, 0x78, 0x1e]);
+    // scvtf d0, x0 = 00 00 62 9e ; fmov d0, x1 = 20 00 67 9e
+    assert_eq!(scvtf(1, 1, 0, 0).to_le_bytes(), [0x00, 0x00, 0x62, 0x9e]);
+    assert_eq!(fmov_from_gpr(1, 1, 0, 1).to_le_bytes(), [0x20, 0x00, 0x67, 0x9e]);
+    // ldr d0, [x1] = 20 00 40 fd ; fmov d0, d1 = 20 40 60 1e
+    assert_eq!(fp_ldst_uimm(true, 3, 0, 1, 0).to_le_bytes(), [0x20, 0x00, 0x40, 0xfd]);
+    assert_eq!(fmov_reg(1, 0, 1).to_le_bytes(), [0x20, 0x40, 0x60, 0x1e]);
+    // A v16+ form: fadd d16, d17, d18 = 30 2a 72 1e (exercises the high registers).
+    assert_eq!(fadd(1, 16, 17, 18).to_le_bytes(), [0x30, 0x2a, 0x72, 0x1e]);
+}
+
+#[test]
+fn differential_fp_encoding_matches_llvm_mc() {
+    // Every FP instruction form the isel emits, checked against llvm-mc.
+    let corpus: Vec<(u32, &str)> = vec![
+        // data-processing (2 source), double and single
+        (fadd(1, 0, 1, 2), "fadd d0, d1, d2"),
+        (fadd(0, 0, 1, 2), "fadd s0, s1, s2"),
+        (fsub(1, 3, 4, 5), "fsub d3, d4, d5"),
+        (fsub(0, 3, 4, 5), "fsub s3, s4, s5"),
+        (fmul(1, 0, 1, 2), "fmul d0, d1, d2"),
+        (fmul(0, 0, 1, 2), "fmul s0, s1, s2"),
+        (fdiv(1, 0, 1, 2), "fdiv d0, d1, d2"),
+        (fdiv(0, 0, 1, 2), "fdiv s0, s1, s2"),
+        (fadd(1, 16, 17, 18), "fadd d16, d17, d18"),
+        (fmul(0, 20, 21, 22), "fmul s20, s21, s22"),
+        // data-processing (1 source)
+        (fneg(1, 0, 1), "fneg d0, d1"),
+        (fneg(0, 0, 1), "fneg s0, s1"),
+        (fmov_reg(1, 0, 1), "fmov d0, d1"),
+        (fmov_reg(0, 5, 6), "fmov s5, s6"),
+        (fcvt(0, 1, 0, 0), "fcvt d0, s0"),
+        (fcvt(1, 0, 0, 0), "fcvt s0, d0"),
+        // compare
+        (fcmp(1, 0, 1), "fcmp d0, d1"),
+        (fcmp(0, 3, 4), "fcmp s3, s4"),
+        // float↔int conversions
+        (fcvtzs(0, 1, 0, 0), "fcvtzs w0, d0"),
+        (fcvtzs(1, 1, 0, 0), "fcvtzs x0, d0"),
+        (fcvtzs(0, 0, 0, 0), "fcvtzs w0, s0"),
+        (fcvtzu(0, 1, 0, 0), "fcvtzu w0, d0"),
+        (fcvtzu(1, 1, 0, 0), "fcvtzu x0, d0"),
+        (scvtf(1, 1, 0, 0), "scvtf d0, x0"),
+        (scvtf(0, 1, 0, 0), "scvtf d0, w0"),
+        (scvtf(0, 0, 0, 0), "scvtf s0, w0"),
+        (ucvtf(1, 1, 0, 0), "ucvtf d0, x0"),
+        (ucvtf(0, 1, 0, 0), "ucvtf d0, w0"),
+        (fmov_from_gpr(1, 1, 0, 1), "fmov d0, x1"),
+        (fmov_from_gpr(0, 0, 0, 1), "fmov s0, w1"),
+        // FP loads / stores (unsigned offset)
+        (fp_ldst_uimm(true, 3, 0, 1, 0), "ldr d0, [x1]"),
+        (fp_ldst_uimm(false, 3, 0, 1, 0), "str d0, [x1]"),
+        (fp_ldst_uimm(true, 2, 0, 1, 0), "ldr s0, [x1]"),
+        (fp_ldst_uimm(false, 2, 0, 1, 0), "str s0, [x1]"),
+        (fp_ldst_uimm(true, 3, 0, 1, 2), "ldr d0, [x1, #16]"),
+    ];
+
+    if llvm_mc("ret").is_none() {
+        eprintln!("skipping differential_fp_encoding_matches_llvm_mc: no llvm-mc");
+        return;
+    }
+    let mut checked = 0usize;
+    for (word, asm) in &corpus {
+        let expected = llvm_mc(asm).unwrap_or_else(|| panic!("llvm-mc failed on `{asm}`"));
+        assert_eq!(
+            word.to_le_bytes().to_vec(),
+            expected,
+            "FP encoding mismatch for `{asm}`: ours={:02x?} llvm={:02x?}",
+            word.to_le_bytes(),
+            expected
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, corpus.len());
+    assert!(checked >= 30, "the FP corpus stays broad ({checked} instructions)");
+    eprintln!("differential FP encoder gate: {checked} instructions matched llvm-mc");
+}
+
+// --- FP IR fixtures --------------------------------------------------------
+
+/// `double lffd(double a, double b) = a*b + a/b` — F64 arithmetic.
+fn build_fdouble() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig = m.types_mut().func(vec![f64t, f64t], f64t, false);
+    let f = m.declare_function(syms.intern("lffd"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let mul = b.bin(BinOp::FMul, a, bb, Flags::NONE);
+        let div = b.bin(BinOp::FDiv, a, bb, Flags::NONE);
+        let r = b.bin(BinOp::FAdd, mul, div, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, f)
+}
+
+/// `float lffs(float a, float b) = a*b + a/b` — F32 arithmetic.
+fn build_ffloat() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f32t = m.types_mut().float(FloatKind::F32);
+    let sig = m.types_mut().func(vec![f32t, f32t], f32t, false);
+    let f = m.declare_function(syms.intern("lffs"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let mul = b.bin(BinOp::FMul, a, bb, Flags::NONE);
+        let div = b.bin(BinOp::FDiv, a, bb, Flags::NONE);
+        let r = b.bin(BinOp::FAdd, mul, div, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, f)
+}
+
+/// `int lff2i(double x) = (int)(x*x)` — `fptosi` after an `fmul` (`fcvtzs`).
+fn build_fptosi() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let i32t = m.types_mut().int(32);
+    let sig = m.types_mut().func(vec![f64t], i32t, false);
+    let f = m.declare_function(syms.intern("lff2i"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let sq = b.bin(BinOp::FMul, x, x, Flags::NONE);
+        let r = b.cast(CastOp::FpToSi, sq, i32t);
+        b.ret(Some(r));
+    }
+    (m, f)
+}
+
+/// `double lfi2f(int n) = (double)n / 2.0` — `sitofp` (`scvtf`) then `fdiv` by a
+/// materialized float constant.
+fn build_sitofp() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let i32t = m.types_mut().int(32);
+    let sig = m.types_mut().func(vec![i32t], f64t, false);
+    let f = m.declare_function(syms.intern("lfi2f"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let nf = b.cast(CastOp::SiToFp, n, f64t);
+        let two = b.const_float(f64t, FloatBits::F64(2.0f64.to_bits()));
+        let r = b.bin(BinOp::FDiv, nf, two, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, f)
+}
+
+/// `double lffmax(double a, double b) = a > b ? a : b` — an `fcmp ogt` driving a
+/// branch, the winner passed as an F64 block argument.
+fn build_fmax() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig = m.types_mut().func(vec![f64t, f64t], f64t, false);
+    let f = m.declare_function(syms.intern("lffmax"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let then_b = b.create_block(&[]);
+        let else_b = b.create_block(&[]);
+        let join = b.create_block(&[f64t]);
+        let cond = b.fcmp(FloatPred::Ogt, a, bb, Flags::NONE);
+        b.cond_br(cond, then_b, &[], else_b, &[]);
+        b.switch_to(then_b);
+        b.br(join, &[a]);
+        b.switch_to(else_b);
+        b.br(join, &[bb]);
+        b.switch_to(join);
+        let r = b.param(join, 0);
+        b.ret(Some(r));
+    }
+    (m, f)
+}
+
+/// `double lfmix(int a, double b, int c, double d) = (double)(a + c) + (b - d)` —
+/// a mixed integer/float parameter list exercising the split ABI (`a`→x0, `b`→v0,
+/// `c`→x1, `d`→v1).
+fn build_fmixed() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let i32t = m.types_mut().int(32);
+    let sig = m.types_mut().func(vec![i32t, f64t, i32t, f64t], f64t, false);
+    let f = m.declare_function(syms.intern("lfmix"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let c = b.param(entry, 2);
+        let d = b.param(entry, 3);
+        let sum = b.add(a, c, Flags::NONE);
+        let sumf = b.cast(CastOp::SiToFp, sum, f64t);
+        let diff = b.bin(BinOp::FSub, bb, d, Flags::NONE);
+        let r = b.bin(BinOp::FAdd, sumf, diff, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, f)
+}
+
+// --- FP interpretation helpers + tests -------------------------------------
+
+fn fd(x: f64) -> Int {
+    Int::from_u64(x.to_bits())
+}
+fn ff(x: f32) -> Int {
+    Int::from_u64(u64::from(x.to_bits()))
+}
+fn as_f64(v: &Int) -> f64 {
+    f64::from_bits(v.to_u64().expect("f64 result fits u64"))
+}
+fn as_f32(v: &Int) -> f32 {
+    f32::from_bits(v.to_u64().expect("f32 result fits u64") as u32)
+}
+
+fn run_fp(m: &Module, f: FuncId, args: &[Int]) -> Int {
+    let (target, funcs) = lower_all(m);
+    interp::run(&target, &funcs, f.index(), args)
+        .expect("interpretation succeeds")
+        .expect("function returns a value")
+}
+
+#[test]
+fn interp_fdouble() {
+    let (m, f) = build_fdouble();
+    for (a, b) in [(3.0, 4.0), (1.5, -2.25), (100.0, 7.0), (-8.0, 0.5)] {
+        let want = a * b + a / b;
+        assert_eq!(as_f64(&run_fp(&m, f, &[fd(a), fd(b)])), want, "lffd({a},{b})");
+    }
+}
+
+#[test]
+fn interp_ffloat() {
+    let (m, f) = build_ffloat();
+    for (a, b) in [(3.0f32, 4.0f32), (1.5, -2.25), (100.0, 7.0), (-8.0, 0.5)] {
+        let want = a * b + a / b;
+        assert_eq!(as_f32(&run_fp(&m, f, &[ff(a), ff(b)])), want, "lffs({a},{b})");
+    }
+}
+
+#[test]
+fn interp_fptosi() {
+    let (m, f) = build_fptosi();
+    for x in [0.0f64, 2.0, 3.5, 7.9, -4.2] {
+        let want = Int::from_i64((x * x) as i64).mod_2k(32);
+        assert_eq!(run_fp(&m, f, &[fd(x)]), want, "lff2i({x})");
+    }
+}
+
+#[test]
+fn interp_sitofp() {
+    let (m, f) = build_sitofp();
+    for n in [0i64, 1, 5, 42, -7, 100] {
+        let want = n as f64 / 2.0;
+        assert_eq!(as_f64(&run_fp(&m, f, &[i(n)])), want, "lfi2f({n})");
+    }
+}
+
+#[test]
+fn interp_fmax() {
+    let (m, f) = build_fmax();
+    for (a, b) in [(3.0, 4.0), (9.0, 2.0), (-1.0, -5.0), (7.0, 7.0)] {
+        let want = if a > b { a } else { b };
+        assert_eq!(as_f64(&run_fp(&m, f, &[fd(a), fd(b)])), want, "lffmax({a},{b})");
+    }
+}
+
+#[test]
+fn interp_fmixed() {
+    let (m, f) = build_fmixed();
+    let cases = [(3i64, 1.5f64, 4i64, 0.25f64), (-2, 10.0, 5, -3.5), (0, 0.0, 0, 0.0)];
+    for (a, b, c, d) in cases {
+        let want = (a + c) as f64 + (b - d);
+        let got = run_fp(&m, f, &[i(a), fd(b), i(c), fd(d)]);
+        assert_eq!(as_f64(&got), want, "lfmix({a},{b},{c},{d})");
+    }
+}
+
+/// Every `fcmp` predicate lowers to a condition plan that matches `ir::semantics`
+/// across ordered, unordered (NaN), and equal operands.
+#[test]
+fn interp_fcmp_all_predicates() {
+    use crate::ir::semantics::{self, SemValue};
+    let preds = [
+        FloatPred::Oeq, FloatPred::Ogt, FloatPred::Oge, FloatPred::Olt, FloatPred::Ole,
+        FloatPred::One, FloatPred::Ord, FloatPred::Ueq, FloatPred::Ugt, FloatPred::Uge,
+        FloatPred::Ult, FloatPred::Ule, FloatPred::Une, FloatPred::Uno,
+    ];
+    let nan = f64::NAN;
+    let operands = [(1.0, 2.0), (2.0, 1.0), (3.0, 3.0), (nan, 1.0), (1.0, nan), (nan, nan)];
+    for pred in preds {
+        // Build `int cmp(double a, double b) = (a <pred> b) ? 1 : 0`.
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let f64t = m.types_mut().float(FloatKind::F64);
+        let i1t = m.types_mut().int(1);
+        let sig = m.types_mut().func(vec![f64t, f64t], i1t, false);
+        let f = m.declare_function(syms.intern("cmp"), sig);
+        {
+            let mut b = m.build(f);
+            let entry = b.create_entry_block();
+            let a = b.param(entry, 0);
+            let bb = b.param(entry, 1);
+            let r = b.fcmp(pred, a, bb, Flags::NONE);
+            b.ret(Some(r));
+        }
+        for (x, y) in operands {
+            let got = run_fp(&m, f, &[fd(x), fd(y)]);
+            let want = match semantics::eval(
+                m.types(),
+                i1t,
+                &crate::ir::inst::InstKind::FCmp(pred),
+                &Flags::NONE,
+                &[SemValue::Float(FloatBits::F64(x.to_bits())), SemValue::Float(FloatBits::F64(y.to_bits()))],
+            ) {
+                semantics::EvalOutcome::Value(SemValue::Int { bits, .. }) => bits.to_u64().unwrap(),
+                other => panic!("unexpected fcmp semantics outcome: {other:?}"),
+            };
+            assert_eq!(
+                got.to_u64().unwrap(),
+                want,
+                "fcmp {pred:?} ({x}, {y}): interp={got:?} semantics={want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fp_encoding_is_deterministic() {
+    let (m, f) = build_fdouble();
+    let syms = {
+        let mut s = StrInterner::new();
+        s.intern("lffd");
+        s
+    };
+    let a = compile_function(&m, f, &syms);
+    let b = compile_function(&m, f, &syms);
+    assert_eq!(a, b, "identical FP input must yield identical bytes");
+}
+
+/// Full FP pipeline (isel → regalloc → frame → encode) round-trips through
+/// `llvm-mc` disassembly to the expected A64 FP idioms.
+#[test]
+fn fp_pipeline_disassembles() {
+    let (m, f) = build_fdouble();
+    let mut syms = StrInterner::new();
+    syms.intern("lffd");
+    let emitted = compile_function(&m, f, &syms);
+    let Some(text) = llvm_disasm(&emitted.bytes) else {
+        eprintln!("skipping fp_pipeline_disassembles: no llvm-mc");
+        return;
+    };
+    for needle in ["fmul", "fdiv", "fadd", "ret"] {
+        assert!(text.contains(needle), "expected `{needle}` in disassembly:\n{text}");
+    }
 }

@@ -11,9 +11,12 @@
 //! (register file, ABI, move/spill builders) and
 //! [`crate::codegen::isel::TargetIsel`] (per-opcode lowering).
 //!
-//! Scope is the integer subset: arithmetic/bitwise/shift/divide, comparisons and
-//! branches, loads/stores and `alloca`, and calls under AAPCS64. Floating-point
-//! and SIMD are deferred.
+//! Scope covers the integer subset — arithmetic/bitwise/shift/divide, comparisons
+//! and branches, loads/stores and `alloca`, and calls under AAPCS64 — plus scalar
+//! floating-point (FP/SIMD): `fadd`/`fsub`/`fmul`/`fdiv`/`fneg`, `fcmp` with the
+//! ordered/unordered condition mapping, the `fcvt`/`fcvtz*`/`scvtf`/`ucvtf`
+//! conversions, gpr-materialized float constants, and the AAPCS64 float ABI
+//! (`v0`–`v7` args, `v0` return). Packed SIMD/vector ops are deferred.
 //!
 //! Submodules:
 //!

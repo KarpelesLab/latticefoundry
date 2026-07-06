@@ -27,7 +27,7 @@ use crate::codegen::mir::{
     MBlockId, MachineInst, MachineOperand, Opcode, PReg, Reg, RegClass, StackSlot, VReg,
 };
 use crate::codegen::target::{CallConv, MachineTarget};
-use crate::ir::inst::{BinOp, InstKind, IntPred};
+use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{InstData, Module, ValueId};
 
@@ -122,6 +122,39 @@ pub enum A64Op {
     SaveReg = 38,
     /// `[Def r, Imm off]` — `ldr r, [sp, #off]` (callee-saved restore).
     RestoreReg = 39,
+
+    // --- scalar floating-point (FP/SIMD) ----------------------------------
+    /// `[Def d, Use a, Use b, Imm width]` — `fadd d, a, b` (`d`/`s` by width).
+    FAdd = 40,
+    /// `[Def d, Use a, Use b, Imm width]` — `fsub d, a, b`.
+    FSub = 41,
+    /// `[Def d, Use a, Use b, Imm width]` — `fmul d, a, b`.
+    FMul = 42,
+    /// `[Def d, Use a, Use b, Imm width]` — `fdiv d, a, b`.
+    FDiv = 43,
+    /// `[Def d, Use s, Imm width]` — `fneg d, s`.
+    FNeg = 44,
+    /// `[Def d, Use a, Use b, Imm packed, Imm width]` — `fcmp a,b` then
+    /// `cset d,cond` (with an optional second `cset`+`and`/`orr` combine). `packed`
+    /// carries `cond | combine<<4 | cond2<<8` (see [`fcmp_plan`]).
+    Fcmp = 45,
+    /// `[Def d, Imm bits, Imm width]` — materialize a float constant: the exact
+    /// IEEE bit pattern via a scratch gpr (`movz/movk x9; fmov d, x9`).
+    LoadFConst = 46,
+    /// `[Def d, Use s, Imm dst_w, Imm src_w]` — `fcvt d, s` (f32↔f64).
+    Fcvt = 47,
+    /// `[Def d, Use s, Imm dst_int_w, Imm src_flt_w]` — `fcvtzs d, s` (float→signed
+    /// int, truncating toward zero).
+    Fcvtzs = 48,
+    /// `[Def d, Use s, Imm dst_int_w, Imm src_flt_w]` — `fcvtzu d, s` (float→unsigned
+    /// int, truncating toward zero).
+    Fcvtzu = 49,
+    /// `[Def d, Use s, Imm dst_flt_w, Imm src_int_w]` — `scvtf d, s` (signed
+    /// int→float).
+    Scvtf = 50,
+    /// `[Def d, Use s, Imm dst_flt_w, Imm src_int_w]` — `ucvtf d, s` (unsigned
+    /// int→float).
+    Ucvtf = 51,
 }
 
 impl A64Op {
@@ -134,11 +167,12 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 40] = [
+        const TABLE: [A64Op; 52] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
-            AddSp, SaveReg, RestoreReg,
+            AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
+            Fcvtzs, Fcvtzu, Scvtf, Ucvtf,
         ];
         TABLE[op.0 as usize]
     }
@@ -159,6 +193,90 @@ pub(crate) fn cond_code(p: IntPred) -> u8 {
         IntPred::Sgt => 0xC, // GT
         IntPred::Sle => 0xD, // LE
     }
+}
+
+/// A64 condition-code nibbles used by `cset`/`csel`.
+mod cc {
+    pub(super) const EQ: u8 = 0x0;
+    pub(super) const NE: u8 = 0x1;
+    pub(super) const HS: u8 = 0x2; // C set (unsigned ≥ / "carry set")
+    pub(super) const MI: u8 = 0x4; // N set (negative)
+    pub(super) const VS: u8 = 0x6; // V set (overflow ⇒ FP unordered)
+    pub(super) const VC: u8 = 0x7; // V clear (⇒ FP ordered)
+    pub(super) const HI: u8 = 0x8;
+    pub(super) const LS: u8 = 0x9;
+    pub(super) const GE: u8 = 0xA;
+    pub(super) const LT: u8 = 0xB;
+    pub(super) const GT: u8 = 0xC;
+    pub(super) const LE: u8 = 0xD;
+}
+
+/// The `fcmp`+`cset` plan for a floating-point predicate: the primary condition
+/// code and, when a single code cannot express the ordered/unordered reading, a
+/// second condition combined with `and`/`orr`. Returns `None` for the constant
+/// predicates `False`/`True`, which the caller materializes directly.
+///
+/// After `fcmp`, NZCV encodes: unordered (a NaN operand) ⇒ `N=0,Z=0,C=1,V=1`;
+/// `a<b` ⇒ `N=1,Z=0,C=0,V=0`; `a==b` ⇒ `N=0,Z=1,C=1,V=0`; `a>b` ⇒
+/// `N=0,Z=0,C=1,V=0`. The condition codes below are chosen so each `FloatPred`
+/// matches `ir::semantics`. `one` (ordered ≠) and `ueq` (unordered ∨ =) need two
+/// codes: `one = NE ∧ VC`, `ueq = EQ ∨ VS`.
+pub(crate) fn fcmp_plan(pred: FloatPred) -> Option<(u8, Combine, u8)> {
+    use Combine::{And, None, Or};
+    Option::Some(match pred {
+        FloatPred::False | FloatPred::True => return Option::None,
+        FloatPred::Oeq => (cc::EQ, None, 0),
+        FloatPred::Ogt => (cc::GT, None, 0),
+        FloatPred::Oge => (cc::GE, None, 0),
+        FloatPred::Olt => (cc::MI, None, 0),
+        FloatPred::Ole => (cc::LS, None, 0),
+        FloatPred::One => (cc::NE, And, cc::VC),
+        FloatPred::Ord => (cc::VC, None, 0),
+        FloatPred::Ueq => (cc::EQ, Or, cc::VS),
+        FloatPred::Ugt => (cc::HI, None, 0),
+        FloatPred::Uge => (cc::HS, None, 0),
+        FloatPred::Ult => (cc::LT, None, 0),
+        FloatPred::Ule => (cc::LE, None, 0),
+        FloatPred::Une => (cc::NE, None, 0),
+        FloatPred::Uno => (cc::VS, None, 0),
+    })
+}
+
+/// How the second `cset` of an `fcmp` plan is folded into the result.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Combine {
+    /// A single `cset` — no second condition.
+    None,
+    /// `and d, d, d2` with the second `cset`.
+    And,
+    /// `orr d, d, d2` with the second `cset`.
+    Or,
+}
+
+impl Combine {
+    /// The 4-bit code packed into the [`A64Op::Fcmp`] immediate.
+    fn code(self) -> u64 {
+        match self {
+            Combine::None => 0,
+            Combine::And => 1,
+            Combine::Or => 2,
+        }
+    }
+
+    /// Decode a packed 4-bit code back to a [`Combine`].
+    pub(crate) fn decode(code: u64) -> Combine {
+        match code {
+            1 => Combine::And,
+            2 => Combine::Or,
+            _ => Combine::None,
+        }
+    }
+}
+
+/// The floating-point "ptype" field (0 = single/`s`, 1 = double/`d`) for a width.
+#[inline]
+pub(crate) fn ptype_of(width: u32) -> u32 {
+    u32::from(width >= 64)
 }
 
 fn def(r: PReg) -> MachineOperand {
@@ -227,6 +345,24 @@ impl AArch64Target {
             BinOp::Mul => Some(A64Op::Mul),
             _ => None,
         };
+        // Scalar FP arithmetic (F32/F64). The operand width comes from the float
+        // type (32 or 64); the encoder picks the `s`/`d` form.
+        let fop = match op {
+            BinOp::FAdd => Some(A64Op::FAdd),
+            BinOp::FSub => Some(A64Op::FSub),
+            BinOp::FMul => Some(A64Op::FMul),
+            BinOp::FDiv => Some(A64Op::FDiv),
+            _ => None,
+        };
+        if let Some(x) = fop {
+            let a = lo.reg(inst.operands()[0]);
+            let b = lo.reg(inst.operands()[1]);
+            lo.emit(MachineInst::new(
+                x.opcode(),
+                vec![def_v(d), use_v(a), use_v(b), imm(u64::from(width))],
+            ));
+            return;
+        }
         if let Some(x) = simple {
             // add/sub take a 12-bit unsigned immediate directly; use it when the
             // RHS is a constant that fits, avoiding a `movz` to materialize it.
@@ -259,9 +395,74 @@ impl AArch64Target {
             BinOp::URem => self.lower_div(lo, A64Op::Udiv, true, d, inst, width),
             BinOp::SDiv => self.lower_div(lo, A64Op::Sdiv, false, d, inst, width),
             BinOp::SRem => self.lower_div(lo, A64Op::Sdiv, true, d, inst, width),
-            // Floating-point binops are outside the integer subset; keep the MIR
-            // well-formed with a zero placeholder (never executed in tests).
-            _ => lo.emit(MachineInst::new(A64Op::MovRI.opcode(), vec![def_v(d), imm(0)])),
+            // `frem` has no direct A64 form (it is an `fmod` libcall); a documented
+            // follow-up. `d` is an fp register, so keep the MIR well-formed with a
+            // zero float constant (never executed in tests).
+            _ => lo.emit(MachineInst::new(
+                A64Op::LoadFConst.opcode(),
+                vec![def_v(d), imm(0), imm(u64::from(width))],
+            )),
+        }
+    }
+
+    /// `fneg`: flip the IEEE sign bit (a sign flip, matching `ir::semantics`), via
+    /// the A64 `fneg` instruction.
+    fn lower_fneg(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        let d = lo.result_reg(inst);
+        let s = lo.reg(inst.operands()[0]);
+        let width = lo.int_width(inst.operands()[0]);
+        lo.emit(MachineInst::new(
+            A64Op::FNeg.opcode(),
+            vec![def_v(d), use_v(s), imm(u64::from(width))],
+        ));
+    }
+
+    /// `fcmp`: `fcmp a,b` then `cset` (with the ordered/unordered condition from
+    /// [`fcmp_plan`]). The result is an `i1` in a gpr.
+    fn lower_fcmp(&self, lo: &mut Lower<'_, Self>, pred: FloatPred, inst: &InstData) {
+        let d = lo.result_reg(inst);
+        match fcmp_plan(pred) {
+            None => {
+                // `False`/`True` are constants.
+                let v = u64::from(pred == FloatPred::True);
+                lo.emit(MachineInst::new(A64Op::MovRI.opcode(), vec![def_v(d), imm(v)]));
+            }
+            Some((cond, combine, cond2)) => {
+                let a = lo.reg(inst.operands()[0]);
+                let b = lo.reg(inst.operands()[1]);
+                let width = lo.int_width(inst.operands()[0]);
+                let packed =
+                    u64::from(cond) | (combine.code() << 4) | (u64::from(cond2) << 8);
+                lo.emit(MachineInst::new(
+                    A64Op::Fcmp.opcode(),
+                    vec![def_v(d), use_v(a), use_v(b), imm(packed), imm(u64::from(width))],
+                ));
+            }
+        }
+    }
+
+    /// Conversions. Float↔float and int↔float go through the A64 `fcvt`/`fcvtz*`/
+    /// `scvtf`/`ucvtf` forms; every other cast (integer width change, ptr↔int,
+    /// bitcast within a class) is a low-bits-preserving copy, as before.
+    fn lower_cast(&self, lo: &mut Lower<'_, Self>, op: CastOp, inst: &InstData) {
+        let d = lo.result_reg(inst);
+        let s = lo.reg(inst.operands()[0]);
+        let src_w = lo.int_width(inst.operands()[0]);
+        let dst_w = lo.types().bit_width(inst.ty).unwrap_or(64);
+        let emit3 = |lo: &mut Lower<'_, Self>, o: A64Op, a: u32, b: u32| {
+            lo.emit(MachineInst::new(
+                o.opcode(),
+                vec![def_v(d), use_v(s), imm(u64::from(a)), imm(u64::from(b))],
+            ));
+        };
+        match op {
+            CastOp::FpTrunc | CastOp::FpExt => emit3(lo, A64Op::Fcvt, dst_w, src_w),
+            CastOp::FpToSi => emit3(lo, A64Op::Fcvtzs, dst_w, src_w),
+            CastOp::FpToUi => emit3(lo, A64Op::Fcvtzu, dst_w, src_w),
+            CastOp::SiToFp => emit3(lo, A64Op::Scvtf, dst_w, src_w),
+            CastOp::UiToFp => emit3(lo, A64Op::Ucvtf, dst_w, src_w),
+            // Integer↔integer / ptr↔int / same-class bitcast: preserve low bits.
+            _ => lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)])),
         }
     }
 
@@ -326,13 +527,44 @@ impl AArch64Target {
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
-        let n_arg = args.len().min(cc.arg_regs.len());
-        debug_assert!(args.len() <= cc.arg_regs.len(), "stack-passed args are out of scope");
 
-        for (areg, &arg) in cc.arg_regs.iter().zip(args) {
+        // Route each argument by class: integer/pointer into x0.. (a separate
+        // counter from) float/double into v0.. — the AAPCS64 rule for mixed calls.
+        // Materialize *every* argument value into a vreg first, then move them all
+        // into the physical argument registers immediately before the call, so no
+        // later materialization is colored into an argument register already
+        // holding an earlier argument (the allocator's fixed-register model is
+        // point-based; see the x86-64 backend's note).
+        let mut int_i = 0usize;
+        let mut fp_i = 0usize;
+        let mut moves: Vec<(PReg, VReg)> = Vec::with_capacity(args.len());
+        for &arg in args {
             let r = lo.reg(arg);
-            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(*areg), use_v(r)]));
+            let areg = match lo.mf().vreg_class(r) {
+                RegClass::Gpr => {
+                    let a = cc.arg_regs[int_i];
+                    int_i += 1;
+                    a
+                }
+                RegClass::Fp => {
+                    let a = cc.fp_arg_regs[fp_i];
+                    fp_i += 1;
+                    a
+                }
+            };
+            moves.push((areg, r));
         }
+        let used_arg_regs: Vec<PReg> = moves.iter().map(|&(areg, _)| areg).collect();
+        for (areg, r) in moves {
+            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(areg), use_v(r)]));
+        }
+
+        // The return register follows the result type's class (v0 for a float
+        // return, x0 otherwise).
+        let ret_is_fp = inst
+            .result()
+            .is_some_and(|r| lo.types().get(lo.func().value_type(r)).is_float());
+        let ret_reg = if ret_is_fp { cc.fp_ret_reg } else { cc.ret_reg };
 
         let mut operands = Vec::new();
         match lo.callee_func(callee) {
@@ -342,20 +574,20 @@ impl AArch64Target {
                 operands.push(use_v(cr));
             }
         }
-        operands.push(def(cc.ret_reg));
+        operands.push(def(ret_reg));
         for &cs in &self.rf.caller_saved {
-            if cs != cc.ret_reg {
+            if cs != ret_reg {
                 operands.push(def(cs));
             }
         }
-        for &areg in &cc.arg_regs[..n_arg] {
+        for &areg in &used_arg_regs {
             operands.push(use_p(areg));
         }
         lo.emit(MachineInst::new(A64Op::Call.opcode(), operands));
 
         if inst.result().is_some() {
             let d = lo.result_reg(inst);
-            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_p(cc.ret_reg)]));
+            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_p(ret_reg)]));
         }
     }
 }
@@ -372,14 +604,14 @@ impl MachineTarget for AArch64Target {
     fn allocatable(&self, class: RegClass) -> &[PReg] {
         match class {
             RegClass::Gpr => &self.rf.allocatable,
-            RegClass::Fp => &self.rf.empty,
+            RegClass::Fp => &self.rf.allocatable_fp,
         }
     }
 
     fn scratch(&self, class: RegClass) -> &[PReg] {
         match class {
             RegClass::Gpr => &self.rf.scratch,
-            RegClass::Fp => &self.rf.empty,
+            RegClass::Fp => &self.rf.scratch_fp,
         }
     }
 
@@ -436,6 +668,13 @@ impl TargetIsel for AArch64Target {
         MachineInst::new(A64Op::GlobalAddr.opcode(), vec![def_v(dst), MachineOperand::Global(g)])
     }
 
+    fn float_const(&self, dst: VReg, bits: u64, width: u32) -> MachineInst {
+        MachineInst::new(
+            A64Op::LoadFConst.opcode(),
+            vec![def_v(dst), imm(bits), imm(u64::from(width))],
+        )
+    }
+
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
@@ -455,14 +694,7 @@ impl TargetIsel for AArch64Target {
                     ],
                 ));
             }
-            InstKind::Cast(_) => {
-                // Integer casts in the tested subset are width changes computed in
-                // registers; a plain copy preserves the low bits (zero/sign
-                // extension of narrow types is out of the executed subset).
-                let d = lo.result_reg(inst);
-                let s = lo.reg(inst.operands()[0]);
-                lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
-            }
+            InstKind::Cast(op) => self.lower_cast(lo, *op, inst),
             InstKind::Alloca { elem_ty } => {
                 let d = lo.result_reg(inst);
                 let size = lo.byte_size(*elem_ty);
@@ -513,10 +745,8 @@ impl TargetIsel for AArch64Target {
                 lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
             }
             InstKind::Call => self.lower_call(lo, inst),
-            InstKind::Unary(_) | InstKind::FCmp(_) => {
-                let d = lo.result_reg(inst);
-                lo.emit(MachineInst::new(A64Op::MovRI.opcode(), vec![def_v(d), imm(0)]));
-            }
+            InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),
+            InstKind::FCmp(pred) => self.lower_fcmp(lo, *pred, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),
         }
     }
@@ -526,8 +756,12 @@ impl TargetIsel for AArch64Target {
             InstKind::Ret => {
                 if let Some(&v) = inst.operands().first() {
                     let r = lo.reg(v);
-                    let x0 = self.rf.cc.ret_reg;
-                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(x0), use_v(r)]));
+                    // A float return goes in v0, an integer/pointer return in x0.
+                    let ret = match lo.mf().vreg_class(r) {
+                        RegClass::Fp => self.rf.cc.fp_ret_reg,
+                        RegClass::Gpr => self.rf.cc.ret_reg,
+                    };
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(ret), use_v(r)]));
                 }
                 lo.emit(MachineInst::new(A64Op::Ret.opcode(), Vec::new()));
             }
