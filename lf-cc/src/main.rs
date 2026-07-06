@@ -36,6 +36,7 @@ struct Options {
     std: CStd,
     include_dirs: Vec<PathBuf>,
     cmdline: Vec<MacroOp>,
+    nostdinc: bool,
 }
 
 impl Options {
@@ -45,6 +46,7 @@ impl Options {
             include_dirs: self.include_dirs.clone(),
             cmdline: self.cmdline.clone(),
             main_file_name: self.input.clone(),
+            builtin_headers: !self.nostdinc,
         }
     }
 }
@@ -101,6 +103,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut std = CStd::default();
     let mut include_dirs: Vec<PathBuf> = Vec::new();
     let mut cmdline: Vec<MacroOp> = Vec::new();
+    let mut nostdinc = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -109,6 +112,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-o" => output = Some(it.next().ok_or("-o requires a path")?.clone()),
             "-g" | "--debug" => debug = true,
             "-S" | "--emit-lf" => emit_lf = true,
+            "-nostdinc" => nostdinc = true,
             "-I" => include_dirs.push(PathBuf::from(it.next().ok_or("-I requires a directory")?)),
             "-D" => cmdline.push(MacroOp::Define(it.next().ok_or("-D requires a name")?.clone())),
             "-U" => cmdline.push(MacroOp::Undef(it.next().ok_or("-U requires a name")?.clone())),
@@ -136,7 +140,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     }
 
     let input = input.ok_or("no input file (see `lf-cc --help`)")?;
-    Ok(Options { input, output, opt, debug, emit_lf, std, include_dirs, cmdline })
+    Ok(Options { input, output, opt, debug, emit_lf, std, include_dirs, cmdline, nostdinc })
 }
 
 fn print_usage() {
@@ -150,6 +154,7 @@ fn print_usage() {
     println!("  -g / --debug   emit DWARF debug info (source lines)");
     println!("  --std=<std>    C standard: c89/c99/c11/c17/c23 or gnuNN (default: gnu17)");
     println!("  -I <dir>       add a directory to the #include search path (repeatable)");
+    println!("  -nostdinc      do not consult the builtin freestanding standard headers");
     println!("  -D name[=val]  predefine a macro (repeatable)");
     println!("  -U name        undefine a macro (repeatable)");
     println!("  -S / --emit-lf dump the lowered .lf IR instead of an executable");

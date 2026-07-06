@@ -484,6 +484,7 @@ fn preprocessor_differential_against_gcc() {
             include_dirs: vec![inc.clone()],
             cmdline: c.defines.iter().map(|(n, v)| MacroOp::Define(format!("{n}={v}"))).collect(),
             main_file_name: format!("{}.c", c.name),
+            ..PpOptions::default()
         };
 
         let o0 = build_run(&dir, c.name, c.src, &o, OptLevel::O0);

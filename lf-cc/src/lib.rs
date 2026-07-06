@@ -12,6 +12,7 @@
 
 pub mod ast;
 pub mod cstd;
+pub mod headers;
 pub mod layout;
 pub mod lex;
 pub mod lower;

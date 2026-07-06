@@ -21,6 +21,7 @@ use latticefoundry::support::diagnostics::{Diagnostic, FileId, Span};
 
 use crate::ast::CType;
 use crate::cstd::CStd;
+use crate::headers::builtin_header;
 use crate::lex::{self, Keyword, Punct, Token, TokenKind};
 
 /// A `-D` / `-U` command-line macro operation, applied in order before the main
@@ -45,6 +46,10 @@ pub struct PpOptions {
     /// The main source file's name (used for `__FILE__`, diagnostics, and to
     /// resolve `"…"` includes relative to its directory).
     pub main_file_name: String,
+    /// Consult the builtin freestanding standard headers (`<stddef.h>`,
+    /// `<stdint.h>`, …) for an `#include` not found on the `-I` path. Enabled by
+    /// default; the driver's `-nostdinc` clears it.
+    pub builtin_headers: bool,
 }
 
 impl Default for PpOptions {
@@ -54,13 +59,20 @@ impl Default for PpOptions {
             include_dirs: Vec::new(),
             cmdline: Vec::new(),
             main_file_name: "input.c".to_owned(),
+            builtin_headers: true,
         }
     }
 }
 
 /// Preprocess `main_source` into the final token stream for the parser.
 pub fn preprocess(main_source: &str, opts: &PpOptions) -> Result<Vec<Token>, Vec<Diagnostic>> {
-    let mut pp = Pp::new(opts.std, &opts.include_dirs, &opts.main_file_name, main_source.len());
+    let mut pp = Pp::new(
+        opts.std,
+        &opts.include_dirs,
+        &opts.main_file_name,
+        main_source.len(),
+        opts.builtin_headers,
+    );
     pp.define_predefined();
     pp.apply_cmdline(&opts.cmdline);
 
@@ -177,10 +189,18 @@ struct Pp {
     /// `#line` filename override for the current file.
     file_override: Option<String>,
     main_len: u32,
+    /// Whether the builtin freestanding headers are consulted as a fallback.
+    builtin_headers: bool,
 }
 
 impl Pp {
-    fn new(std: CStd, include_dirs: &[PathBuf], main_name: &str, main_len: usize) -> Pp {
+    fn new(
+        std: CStd,
+        include_dirs: &[PathBuf],
+        main_name: &str,
+        main_len: usize,
+        builtin_headers: bool,
+    ) -> Pp {
         Pp {
             std,
             include_dirs: include_dirs.to_vec(),
@@ -195,6 +215,7 @@ impl Pp {
             line_delta: 0,
             file_override: None,
             main_len: main_len as u32,
+            builtin_headers,
         }
     }
 
@@ -682,7 +703,14 @@ impl Pp {
             }
         };
         let Some(path) = self.resolve_include(&name, angled, dir) else {
-            self.error(format!("cannot find include file {name:?}"), dspan);
+            // Not on disk: fall back to a builtin freestanding header, if enabled.
+            if self.builtin_headers
+                && let Some(text) = builtin_header(&name)
+            {
+                self.include_builtin(file_idx, &name, text, dspan);
+            } else {
+                self.error(format!("cannot find include file {name:?}"), dspan);
+            }
             return;
         };
         let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -709,6 +737,34 @@ impl Pp {
         self.include_site.push(attribution);
 
         let toks = self.lex_file(&text, new_idx);
+        let saved_delta = self.line_delta;
+        let saved_override = self.file_override.take();
+        self.line_delta = 0;
+        self.depth += 1;
+        self.process_file(new_idx, toks);
+        self.depth -= 1;
+        self.line_delta = saved_delta;
+        self.file_override = saved_override;
+    }
+
+    /// Process a builtin freestanding header's embedded source `text` as a
+    /// virtual file named `<name>` (its own include guard makes re-inclusion
+    /// idempotent), attributing every token to the `#include` site so provenance,
+    /// `__FILE__`, and `#line` behave exactly as for an on-disk header.
+    fn include_builtin(&mut self, file_idx: u32, name: &str, text: &str, dspan: Span) {
+        if self.depth >= INCLUDE_DEPTH_LIMIT {
+            self.error("`#include` nested too deeply (cyclic include?)", dspan);
+            return;
+        }
+        let display = format!("<{name}>");
+        let attribution =
+            if file_idx == 0 { dspan.start } else { self.include_site[file_idx as usize] };
+        let new_idx = self.filenames.len() as u32;
+        self.filenames.push(display.clone());
+        self.file_paths.push(PathBuf::from(display));
+        self.include_site.push(attribution);
+
+        let toks = self.lex_file(text, new_idx);
         let saved_delta = self.line_delta;
         let saved_override = self.file_override.take();
         self.line_delta = 0;
