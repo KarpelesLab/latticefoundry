@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CType, Designator, Expr, ExprKind, Field, FuncDef, FuncProto, FuncType, Init,
-    InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt, StmtKind, TopLevel,
-    TranslationUnit, UnaryOp, VarDecl,
+    BinaryOp, CType, Designator, Expr, ExprKind, Field, FloatTy, FuncDef, FuncProto, FuncType,
+    GenericAssoc, Init, InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt,
+    StmtKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
 use crate::layout;
@@ -34,6 +34,7 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         enum_map: HashMap::new(),
         enum_consts: Vec::new(),
         scopes: vec![HashMap::new()],
+        last_alignas: None,
     };
     match parser.parse_unit() {
         Ok(items) => Ok(TranslationUnit {
@@ -51,8 +52,9 @@ enum NameKind {
     /// A `typedef` name resolving to a type.
     Typedef(CType),
     /// An ordinary identifier (variable/parameter/function), which shadows any
-    /// outer `typedef` of the same name.
-    Ordinary,
+    /// outer `typedef` of the same name. Carries the object's type when known,
+    /// so `typeof(name)` can resolve it.
+    Ordinary(Option<CType>),
 }
 
 struct Parser {
@@ -69,6 +71,9 @@ struct Parser {
     enum_consts: Vec<(String, i128)>,
     /// Scoped name bindings for typedef-name disambiguation.
     scopes: Vec<HashMap<String, NameKind>>,
+    /// The pending `_Alignas`/`alignas` alignment from the declaration specifiers
+    /// currently being parsed (consumed by the declarators they apply to).
+    last_alignas: Option<u64>,
 }
 
 impl Parser {
@@ -155,8 +160,8 @@ impl Parser {
         self.scopes.pop();
     }
 
-    fn declare_ordinary(&mut self, name: &str) {
-        self.scopes.last_mut().unwrap().insert(name.to_owned(), NameKind::Ordinary);
+    fn declare_ordinary(&mut self, name: &str, ty: Option<CType>) {
+        self.scopes.last_mut().unwrap().insert(name.to_owned(), NameKind::Ordinary(ty));
     }
 
     fn declare_typedef(&mut self, name: &str, ty: CType) {
@@ -168,7 +173,19 @@ impl Parser {
         for scope in self.scopes.iter().rev() {
             match scope.get(name) {
                 Some(NameKind::Typedef(ty)) => return Some(ty.clone()),
-                Some(NameKind::Ordinary) => return None,
+                Some(NameKind::Ordinary(_)) => return None,
+                None => {}
+            }
+        }
+        None
+    }
+
+    /// The declared type of an ordinary identifier, for `typeof`.
+    fn var_type(&self, name: &str) -> Option<CType> {
+        for scope in self.scopes.iter().rev() {
+            match scope.get(name) {
+                Some(NameKind::Ordinary(ty)) => return ty.clone(),
+                Some(NameKind::Typedef(_)) => return None,
                 None => {}
             }
         }
@@ -207,6 +224,11 @@ impl Parser {
     fn parse_unit(&mut self) -> PResult<Vec<TopLevel>> {
         let mut items = Vec::new();
         while !self.at_eof() {
+            // An attribute specifier sequence may precede a top-level declaration.
+            self.skip_attributes()?;
+            if self.at_eof() {
+                break;
+            }
             // A file-scope `_Static_assert` is a declaration with no external
             // effect in this subset; consume and drop it.
             if self.is_kw(Keyword::StaticAssert) {
@@ -218,21 +240,39 @@ impl Parser {
         Ok(items)
     }
 
-    /// Parse and discard a `_Static_assert ( expr [, "msg"] ) ;` declaration.
+    /// Parse a `_Static_assert ( const-expr [, "msg"] ) ;` (C11) or
+    /// `static_assert ( const-expr [, "msg"] ) ;` (C23, message optional)
+    /// declaration: evaluate the integer constant expression and, if it is zero,
+    /// report a diagnostic that includes the message. A true assertion produces
+    /// no code.
     fn parse_static_assert(&mut self) -> PResult<()> {
-        self.bump(); // _Static_assert
+        self.bump(); // _Static_assert / static_assert
         self.expect_punct(Punct::LParen, "'(' after _Static_assert")?;
-        let _ = self.parse_assign()?;
+        let cond_span = self.peek_span();
+        let cond = self.parse_conditional()?;
+        let value = self.eval_const_expr(&cond).ok_or_else(|| {
+            Diagnostic::error("static assertion expression is not an integer constant expression")
+                .with_span(cond_span)
+        })?;
+        let mut message: Option<String> = None;
         if self.eat_punct(Punct::Comma) {
             match self.peek().clone() {
-                TokenKind::Str(_) => {
+                TokenKind::Str(s) => {
                     self.bump();
+                    message = Some(s);
                 }
                 _ => return self.err("expected a string message in _Static_assert"),
             }
         }
         self.expect_punct(Punct::RParen, "')' to close _Static_assert")?;
         self.expect_punct(Punct::Semi, "';' after _Static_assert")?;
+        if value == 0 {
+            let msg = match message {
+                Some(m) => format!("static assertion failed: {m}"),
+                None => "static assertion failed".to_owned(),
+            };
+            return Err(Diagnostic::error(msg).with_span(cond_span));
+        }
         Ok(())
     }
 
@@ -247,6 +287,7 @@ impl Parser {
             return self.parse_typedef();
         }
         let base = self.parse_decl_specs()?;
+        let align = self.last_alignas.take();
         self.consume_storage();
 
         // A bare `struct S { ... };` / `enum E { ... };` declares only a type.
@@ -263,33 +304,33 @@ impl Parser {
         if self.is_punct(Punct::LParen) {
             let mut items = Vec::new();
             let (name, ty, span) = self.parse_named_declarator(ty0)?;
-            self.declare_ordinary(&name);
+            self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            items.push(TopLevel::Global(VarDecl { name, ty, init, span }));
+            items.push(TopLevel::Global(VarDecl { name, ty, init, align, span }));
             while self.eat_punct(Punct::Comma) {
                 let (name, ty, span) = self.parse_named_declarator(base.clone())?;
-                self.declare_ordinary(&name);
+                self.declare_ordinary(&name, Some(ty.clone()));
                 let init = if self.eat_punct(Punct::Assign) {
                     Some(self.parse_initializer()?)
                 } else {
                     None
                 };
-                items.push(TopLevel::Global(VarDecl { name, ty, init, span }));
+                items.push(TopLevel::Global(VarDecl { name, ty, init, align, span }));
             }
             self.expect_punct(Punct::Semi, "';' after global declaration")?;
             return Ok(items);
         }
 
         let (name, name_span) = self.expect_ident()?;
-        self.declare_ordinary(&name);
+        self.declare_ordinary(&name, None);
 
         if self.is_punct(Punct::LParen) {
             self.push_scope();
             let (params, variadic) = self.parse_param_list()?;
             for p in &params {
                 if let Some(n) = &p.name {
-                    self.declare_ordinary(n);
+                    self.declare_ordinary(n, Some(p.ty.clone()));
                 }
             }
             if self.is_punct(Punct::LBrace) {
@@ -317,14 +358,15 @@ impl Parser {
         // One or more global variables (each may have an initializer).
         let mut items = Vec::new();
         let ty = self.parse_array_suffix(ty0)?;
+        self.declare_ordinary(&name, Some(ty.clone()));
         let init = if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-        items.push(TopLevel::Global(VarDecl { name, ty, init, span: name_span }));
+        items.push(TopLevel::Global(VarDecl { name, ty, init, align, span: name_span }));
         while self.eat_punct(Punct::Comma) {
             let (name, ty, span) = self.parse_named_declarator(base.clone())?;
-            self.declare_ordinary(&name);
+            self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            items.push(TopLevel::Global(VarDecl { name, ty, init, span }));
+            items.push(TopLevel::Global(VarDecl { name, ty, init, align, span }));
         }
         self.expect_punct(Punct::Semi, "';' after global declaration")?;
         Ok(items)
@@ -368,6 +410,63 @@ impl Parser {
             ty = CType::Array(Box::new(ty), d);
         }
         Ok(ty)
+    }
+
+    /// Parse and ignore any attribute specifier sequences at the cursor: C23
+    /// `[[ ... ]]` sequences and (under the GNU dialects) `__attribute__((...))`.
+    /// Standard attributes are accepted and ignored per C23 (an implementation
+    /// may ignore any attribute it does not recognize).
+    fn skip_attributes(&mut self) -> PResult<()> {
+        loop {
+            // C23 `[[ attribute-list ]]`.
+            if self.is_punct(Punct::LBracket)
+                && matches!(self.peek_at(1), TokenKind::Punct(Punct::LBracket))
+            {
+                if !self.std.attributes() {
+                    return self.err(
+                        "attribute specifier sequences '[[...]]' are a C23 feature (use -std=c23)",
+                    );
+                }
+                self.bump();
+                self.bump(); // consume `[[`
+                let mut depth = 2u32;
+                loop {
+                    match self.peek() {
+                        TokenKind::Punct(Punct::LBracket) => depth += 1,
+                        TokenKind::Punct(Punct::RBracket) => depth -= 1,
+                        TokenKind::Eof => return self.err("unterminated attribute specifier"),
+                        _ => {}
+                    }
+                    self.bump();
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // GNU `__attribute__((...))`.
+            if self.std.is_gnu()
+                && matches!(self.peek(), TokenKind::Ident(n) if n == "__attribute__")
+                && matches!(self.peek_at(1), TokenKind::Punct(Punct::LParen))
+            {
+                self.bump(); // __attribute__
+                let mut depth = 0u32;
+                loop {
+                    match self.peek() {
+                        TokenKind::Punct(Punct::LParen) => depth += 1,
+                        TokenKind::Punct(Punct::RParen) => depth -= 1,
+                        TokenKind::Eof => return self.err("unterminated __attribute__"),
+                        _ => {}
+                    }
+                    self.bump();
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            return Ok(());
+        }
     }
 
     fn consume_storage(&mut self) {
@@ -433,6 +532,9 @@ impl Parser {
                 | Keyword::Restrict
                 | Keyword::Inline
                 | Keyword::Noreturn
+                | Keyword::Alignas
+                | Keyword::Typeof
+                | Keyword::TypeofUnqual
                 | Keyword::Extern
                 | Keyword::Static
                 | Keyword::Struct
@@ -447,6 +549,7 @@ impl Parser {
 
     fn parse_decl_specs(&mut self) -> PResult<CType> {
         let start = self.peek_span();
+        self.last_alignas = None;
         let mut longs = 0u8;
         let mut has_short = false;
         let mut has_char = false;
@@ -487,6 +590,13 @@ impl Parser {
                     saw_any = true;
                     continue;
                 }
+                TokenKind::Keyword(Keyword::Typeof | Keyword::TypeofUnqual)
+                    if explicit.is_none() && !numeric_seen =>
+                {
+                    explicit = Some(self.parse_typeof()?);
+                    saw_any = true;
+                    continue;
+                }
                 TokenKind::Ident(name) if explicit.is_none() && !numeric_seen => {
                     match self.typedef_type(name) {
                         Some(ty) => {
@@ -509,6 +619,11 @@ impl Parser {
                     | Keyword::Noreturn,
                 ) => {
                     self.bump();
+                }
+                TokenKind::Keyword(Keyword::Alignas) => {
+                    let prev = self.last_alignas;
+                    let a = self.parse_alignas()?;
+                    self.last_alignas = Some(prev.map_or(a, |p| p.max(a)));
                 }
                 TokenKind::Keyword(Keyword::Void) => {
                     has_void = true;
@@ -636,6 +751,131 @@ impl Parser {
         Ok(ty)
     }
 
+    /// Parse `typeof ( type-name | expression )` / `typeof_unqual ( ... )`
+    /// (C23/GNU), yielding the operand's type. The expression is not evaluated,
+    /// only typed. `typeof_unqual` strips qualifiers, which this subset does not
+    /// model, so both spellings resolve to the same underlying type here.
+    fn parse_typeof(&mut self) -> PResult<CType> {
+        self.bump(); // typeof / typeof_unqual
+        // A nested type-name parse would clobber any pending `alignas`; preserve it.
+        let saved_alignas = self.last_alignas;
+        self.expect_punct(Punct::LParen, "'(' after typeof")?;
+        let ty = if self.at_type_specifier() {
+            self.parse_type_name()?
+        } else {
+            let e = self.parse_expr()?;
+            match self.expr_type(&e) {
+                Some(t) => t,
+                None => {
+                    return self.err("cannot determine the type of this `typeof` operand");
+                }
+            }
+        };
+        self.expect_punct(Punct::RParen, "')' after typeof operand")?;
+        self.last_alignas = saved_alignas;
+        Ok(ty)
+    }
+
+    /// Parse `_Alignas ( type-name | const-expr )` / `alignas ( ... )`
+    /// (C11/C23), returning the requested alignment in bytes.
+    fn parse_alignas(&mut self) -> PResult<u64> {
+        self.bump(); // _Alignas / alignas
+        self.expect_punct(Punct::LParen, "'(' after alignas")?;
+        let val = if self.at_type_specifier() {
+            let ty = self.parse_type_name()?;
+            layout::align_of(&self.records, &ty)
+        } else {
+            let n = self.parse_const_expr()?;
+            if n < 0 {
+                return self.err("alignment must be non-negative");
+            }
+            n as u64
+        };
+        self.expect_punct(Punct::RParen, "')' after alignas")?;
+        Ok(val.max(1))
+    }
+
+    /// The static type of an expression for `typeof`, computed without evaluating
+    /// it. Covers the forms a `typeof` operand realistically takes in this subset;
+    /// returns `None` when the parser cannot determine the type (e.g. a call to a
+    /// bare function name, whose signature the parser does not track).
+    fn expr_type(&self, e: &Expr) -> Option<CType> {
+        match &e.kind {
+            ExprKind::IntLit(_, ty) | ExprKind::FloatLit(_, ty) => Some(ty.clone()),
+            ExprKind::Ident(name) => {
+                if let Some(t) = self.var_type(name) {
+                    Some(t)
+                } else if self.enum_map.contains_key(name) {
+                    Some(CType::int())
+                } else {
+                    None
+                }
+            }
+            ExprKind::StrLit(bytes) => {
+                Some(CType::Array(Box::new(CType::Int(IntTy { width: 8, signed: true })), bytes.len() as u64 + 1))
+            }
+            ExprKind::Cast(ty, _) => Some(ty.clone()),
+            ExprKind::CompoundLiteral(ty, _) => Some(ty.clone()),
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) | ExprKind::AlignofType(_) => {
+                Some(size_t_ty())
+            }
+            ExprKind::Unary(op, inner) => {
+                let it = self.expr_type(inner)?;
+                match op {
+                    UnaryOp::Deref => deref_target(&it),
+                    UnaryOp::AddrOf => Some(CType::ptr_to(it)),
+                    UnaryOp::LNot => Some(CType::int()),
+                    UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => Some(promote_ty(&it)),
+                }
+            }
+            ExprKind::Binary(op, l, r) => {
+                let lt = self.expr_type(l)?;
+                let rt = self.expr_type(r)?;
+                binary_type(*op, &lt, &rt)
+            }
+            ExprKind::Assign(_, l, _) => self.expr_type(l),
+            ExprKind::Cond(_, t, f) => {
+                let tt = self.expr_type(t)?;
+                let ft = self.expr_type(f)?;
+                if tt.is_arithmetic() && ft.is_arithmetic() {
+                    Some(usual_arith_ty(&tt, &ft))
+                } else if tt.is_pointer() {
+                    Some(tt)
+                } else {
+                    Some(ft)
+                }
+            }
+            ExprKind::Comma(_, b) => self.expr_type(b),
+            ExprKind::PreInc(i) | ExprKind::PreDec(i) | ExprKind::PostInc(i)
+            | ExprKind::PostDec(i) => self.expr_type(i),
+            ExprKind::Index(base, _) => {
+                let bt = self.expr_type(base)?;
+                deref_target(&bt)
+            }
+            ExprKind::Member(base, name, arrow) => {
+                let bt = self.expr_type(base)?;
+                let rec = if *arrow { bt.pointee().cloned()? } else { bt };
+                if let CType::Record(id) = rec {
+                    layout::resolve_member(&self.records, id, name).map(|(_, ty)| ty)
+                } else {
+                    None
+                }
+            }
+            ExprKind::Call(callee, _) => {
+                let ct = self.expr_type(callee)?;
+                match ct {
+                    CType::Pointer(inner) => match *inner {
+                        CType::Func(ft) => Some(ft.ret),
+                        _ => None,
+                    },
+                    CType::Func(ft) => Some(ft.ret),
+                    _ => None,
+                }
+            }
+            ExprKind::Generic(..) => None,
+        }
+    }
+
     // --- declarators -------------------------------------------------------
 
     /// Parse a concrete declarator (must name something), returning the declared
@@ -759,12 +999,30 @@ impl Parser {
         let mut fields = Vec::new();
         while !self.is_punct(Punct::RBrace) && !self.at_eof() {
             let base = self.parse_decl_specs()?;
+            let align = self.last_alignas.take();
+            // A member declaration with no declarator: an anonymous struct/union
+            // member (an untagged `struct`/`union`, C11), or a nested tagged type
+            // declaration (which declares no member).
+            if self.is_punct(Punct::Semi) {
+                if let CType::Record(rid) = &base
+                    && self.records.get(*rid).tag.is_none()
+                {
+                    if !self.std.anonymous_members() {
+                        return self.err(
+                            "anonymous struct/union members are a C11 feature (use -std=c11 or later)",
+                        );
+                    }
+                    fields.push(Field { name: String::new(), ty: base.clone(), anonymous: true, align });
+                }
+                self.bump(); // ';'
+                continue;
+            }
             loop {
                 let (name, ty, _span) = self.parse_named_declarator(base.clone())?;
                 if self.is_punct(Punct::Colon) {
                     return self.err("bit-fields are not supported in this C subset");
                 }
-                fields.push(Field { name, ty });
+                fields.push(Field { name, ty, anonymous: false, align });
                 if !self.eat_punct(Punct::Comma) {
                     break;
                 }
@@ -839,6 +1097,7 @@ impl Parser {
             }
             ExprKind::Cast(_, inner) => self.eval_const_expr(inner),
             ExprKind::SizeofType(ty) => Some(layout::size_of(&self.records, ty) as i128),
+            ExprKind::AlignofType(ty) => Some(layout::align_of(&self.records, ty) as i128),
             _ => None,
         }
     }
@@ -851,6 +1110,14 @@ impl Parser {
         let mut stmts = Vec::new();
         let mut seen_stmt = false;
         while !self.is_punct(Punct::RBrace) && !self.at_eof() {
+            // Attribute specifier sequences may precede a declaration or statement.
+            if let Err(e) = self.skip_attributes() {
+                self.pop_scope();
+                return Err(e);
+            }
+            if self.is_punct(Punct::RBrace) || self.at_eof() {
+                break;
+            }
             // A file-scope-style `_Static_assert` may also appear in a block.
             if self.is_kw(Keyword::StaticAssert) {
                 self.parse_static_assert()?;
@@ -882,6 +1149,9 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // An attribute specifier sequence may precede a statement (e.g.
+        // `[[fallthrough]];`, `[[maybe_unused]] int x;`).
+        self.skip_attributes()?;
         let start = self.peek_span();
         // A named label `ident :` (its own namespace; may shadow a typedef name).
         if self.label_ahead() {
@@ -966,6 +1236,7 @@ impl Parser {
             return Ok(self.stmt(StmtKind::Expr(None), start));
         }
         let base = self.parse_decl_specs()?;
+        let align = self.last_alignas.take();
         self.consume_storage();
         // A bare `struct S { ... };` at block scope declares only a type.
         if self.is_punct(Punct::Semi) {
@@ -975,10 +1246,10 @@ impl Parser {
         let mut decls = Vec::new();
         loop {
             let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
-            self.declare_ordinary(&name);
+            self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            decls.push(VarDecl { name, ty, init, span: name_span });
+            decls.push(VarDecl { name, ty, init, align, span: name_span });
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
@@ -1191,6 +1462,20 @@ impl Parser {
             self.bump(); // (
             let ty = self.parse_type_name()?;
             self.expect_punct(Punct::RParen, "')' to close cast")?;
+            // `(type-name){ init }` is a compound literal (an lvalue), not a cast.
+            if self.is_punct(Punct::LBrace) {
+                if !self.std.compound_literals() {
+                    return self.err(
+                        "compound literals are a C99 feature (use -std=c99 or later)",
+                    );
+                }
+                let init = self.parse_init_list()?;
+                let span = start.merge(self.peek_span());
+                let lit =
+                    Expr { kind: ExprKind::CompoundLiteral(ty, Box::new(init)), span };
+                // A compound literal is a postfix-expression: `(int[]){1,2}[i]`.
+                return self.parse_postfix_tail(lit);
+            }
             let inner = self.parse_cast()?;
             let span = start.merge(inner.span);
             return Ok(Expr { kind: ExprKind::Cast(ty, Box::new(inner)), span });
@@ -1216,6 +1501,8 @@ impl Parser {
                 | Keyword::Const
                 | Keyword::Volatile
                 | Keyword::Restrict
+                | Keyword::Typeof
+                | Keyword::TypeofUnqual
                 | Keyword::Struct
                 | Keyword::Union
                 | Keyword::Enum,
@@ -1276,19 +1563,54 @@ impl Parser {
         Ok(Expr { kind: ExprKind::SizeofExpr(Box::new(inner)), span })
     }
 
-    /// `_Alignof ( type-name )`. For this scalar/pointer subset the alignment of a
-    /// type equals its size, so it reuses [`ExprKind::SizeofType`].
+    /// `_Alignof ( type-name )` / `alignof ( type-name )`: a `size_t` constant
+    /// equal to the type's alignment.
     fn parse_alignof(&mut self) -> PResult<Expr> {
         let start = self.peek_span();
-        self.bump(); // _Alignof
+        self.bump(); // _Alignof / alignof
         self.expect_punct(Punct::LParen, "'(' after _Alignof")?;
         let ty = self.parse_type_name()?;
         let end = self.expect_punct(Punct::RParen, "')' after _Alignof type")?;
-        Ok(Expr { kind: ExprKind::SizeofType(ty), span: start.merge(end) })
+        Ok(Expr { kind: ExprKind::AlignofType(ty), span: start.merge(end) })
+    }
+
+    /// `_Generic ( controlling-expr , assoc-list )` (C11): a generic selection.
+    /// Each association is `type-name : assign-expr` or `default : assign-expr`.
+    fn parse_generic(&mut self) -> PResult<Expr> {
+        let start = self.peek_span();
+        self.bump(); // _Generic
+        self.expect_punct(Punct::LParen, "'(' after _Generic")?;
+        let controlling = Box::new(self.parse_assign()?);
+        self.expect_punct(Punct::Comma, "',' after the _Generic controlling expression")?;
+        let mut assocs = Vec::new();
+        loop {
+            if self.eat_kw(Keyword::Default) {
+                self.expect_punct(Punct::Colon, "':' after 'default'")?;
+                let expr = self.parse_assign()?;
+                assocs.push(GenericAssoc { ty: None, expr });
+            } else {
+                let ty = self.parse_type_name()?;
+                self.expect_punct(Punct::Colon, "':' after a _Generic association type")?;
+                let expr = self.parse_assign()?;
+                assocs.push(GenericAssoc { ty: Some(ty), expr });
+            }
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        let end = self.expect_punct(Punct::RParen, "')' to close _Generic")?;
+        Ok(Expr { kind: ExprKind::Generic(controlling, assocs), span: start.merge(end) })
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
-        let mut expr = self.parse_primary()?;
+        let expr = self.parse_primary()?;
+        self.parse_postfix_tail(expr)
+    }
+
+    /// Apply postfix operators (`()`, `[]`, `.`/`->`, `++`/`--`) to an already
+    /// parsed primary or compound-literal head.
+    fn parse_postfix_tail(&mut self, expr: Expr) -> PResult<Expr> {
+        let mut expr = expr;
         loop {
             if self.is_punct(Punct::LParen) {
                 self.bump();
@@ -1363,9 +1685,7 @@ impl Parser {
                 }
                 Ok(Expr { kind: ExprKind::StrLit(bytes), span })
             }
-            TokenKind::Keyword(Keyword::Generic) => {
-                self.err("`_Generic` is not supported in this C subset")
-            }
+            TokenKind::Keyword(Keyword::Generic) => self.parse_generic(),
             _ => self.err("expected an expression"),
         }
     }
@@ -1422,6 +1742,71 @@ impl Parser {
         }
         self.expect_punct(Punct::Assign, "'=' after designator")?;
         Ok(chain)
+    }
+}
+
+/// `size_t` for this target: `unsigned long` (64-bit).
+fn size_t_ty() -> CType {
+    CType::Int(IntTy { width: 64, signed: false })
+}
+
+/// The integer promotion of a type (for `typeof` typing): `_Bool`/`char`/`short`
+/// become `int`; other types are unchanged.
+fn promote_ty(ty: &CType) -> CType {
+    match ty {
+        CType::Bool => CType::int(),
+        CType::Int(i) if i.width < 32 => CType::int(),
+        other => other.clone(),
+    }
+}
+
+/// The usual arithmetic conversions on two arithmetic types (for `typeof`).
+fn usual_arith_ty(a: &CType, b: &CType) -> CType {
+    if a.is_float() || b.is_float() {
+        let has_double =
+            a.float_ty() == Some(FloatTy::F64) || b.float_ty() == Some(FloatTy::F64);
+        return if has_double { CType::double() } else { CType::float() };
+    }
+    let a = promote_ty(a);
+    let b = promote_ty(b);
+    if a == b {
+        return a;
+    }
+    let (wa, sa) = (a.int_width().unwrap_or(32), a.is_signed());
+    let (wb, sb) = (b.int_width().unwrap_or(32), b.is_signed());
+    if sa == sb {
+        return if wa >= wb { a } else { b };
+    }
+    let (unsigned_t, uw, signed_t, sw) =
+        if !sa { (a.clone(), wa, b.clone(), wb) } else { (b.clone(), wb, a.clone(), wa) };
+    if uw >= sw { unsigned_t } else { signed_t }
+}
+
+/// The type of a binary expression, for `typeof` typing.
+fn binary_type(op: BinaryOp, lt: &CType, rt: &CType) -> Option<CType> {
+    match op {
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        | BinaryOp::LAnd | BinaryOp::LOr => Some(CType::int()),
+        BinaryOp::Shl | BinaryOp::Shr => Some(promote_ty(lt)),
+        BinaryOp::Add | BinaryOp::Sub => {
+            if lt.is_pointer() {
+                if rt.is_pointer() { Some(CType::long()) } else { Some(lt.clone()) }
+            } else if rt.is_pointer() {
+                Some(rt.clone())
+            } else {
+                Some(usual_arith_ty(lt, rt))
+            }
+        }
+        _ => Some(usual_arith_ty(lt, rt)),
+    }
+}
+
+/// The element type reached by dereferencing/indexing a pointer or array type.
+fn deref_target(ty: &CType) -> Option<CType> {
+    match ty {
+        CType::Pointer(p) => Some((**p).clone()),
+        CType::Array(e, _) => Some((**e).clone()),
+        _ => None,
     }
 }
 

@@ -499,3 +499,185 @@ fn calling_a_non_function_is_an_error() {
     let err = check_source("int main(){ int x=0; return x(1); }").unwrap_err();
     assert!(err.iter().any(|d| d.message.contains("not a function")));
 }
+
+// --- C11/C23 language features --------------------------------------------
+
+/// The (implicit-`Convert`-unwrapped) kind of a function's first `return` value.
+fn return_kind(prog: &crate::sema::Program) -> TExprKind {
+    let ret = prog.funcs[0]
+        .body
+        .iter()
+        .find_map(|s| if let TStmt::Return(Some(e)) = s { Some(e) } else { None })
+        .expect("a return statement");
+    unwrap_convert(&ret.kind).clone()
+}
+
+#[test]
+fn static_assert_true_compiles_false_diagnoses() {
+    check_source("_Static_assert(sizeof(int)==4, \"int is 4\"); int main(){ return 0; }")
+        .expect("a true _Static_assert compiles");
+    let err = check_source("_Static_assert(sizeof(int)==8, \"int must be 8\"); int main(){ return 0; }")
+        .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("static assertion failed: int must be 8")));
+}
+
+#[test]
+fn static_assert_c23_allows_no_message() {
+    check_std("int main(){ static_assert(1); return 0; }", CStd::C23)
+        .expect("C23 static_assert may omit the message");
+    // A block-scope false assertion is still diagnosed.
+    let err = check_std("int main(){ static_assert(0); return 0; }", CStd::C23).unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("static assertion failed")));
+}
+
+#[test]
+fn generic_selects_expression_by_controlling_type() {
+    // A controlling `int` selects the `int` association's value (7).
+    let prog = check_source("int f(){ int x=0; return _Generic((x), int: 7, double: 9, default: 0); }")
+        .unwrap();
+    assert!(matches!(return_kind(&prog), TExprKind::Const(7)));
+    // A controlling `double` selects the `double` association (9).
+    let prog = check_source("int f(){ double x=0; return _Generic((x), int: 7, double: 9, default: 0); }")
+        .unwrap();
+    assert!(matches!(return_kind(&prog), TExprKind::Const(9)));
+    // No exact match falls to `default`.
+    let prog = check_source("int f(){ char*p=0; return _Generic((p), int: 7, double: 9, default: 5); }")
+        .unwrap();
+    assert!(matches!(return_kind(&prog), TExprKind::Const(5)));
+}
+
+#[test]
+fn generic_without_match_or_default_is_an_error() {
+    let err = check_source("int f(){ int x=0; return _Generic((x), double: 1, char*: 2); }")
+        .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("no _Generic association matches")));
+}
+
+#[test]
+fn generic_duplicate_association_is_an_error() {
+    let err = check_source("int f(){ int x=0; return _Generic((x), int: 1, int: 2); }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("two associations for type")));
+}
+
+#[test]
+fn generic_is_rejected_before_c11() {
+    let err = check_std("int f(){ int x=0; return _Generic((x), int: 1, default: 0); }", CStd::C99)
+        .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("`_Generic` is a C11 feature")));
+}
+
+#[test]
+fn alignof_yields_type_alignment() {
+    let prog = check_source("int f(){ return _Alignof(double); }").unwrap();
+    assert!(matches!(return_kind(&prog), TExprKind::Const(8)));
+    // A struct's alignment is its widest member's alignment (int -> 4).
+    let prog = check_source("struct S{ char c; int x; }; int f(){ return _Alignof(struct S); }").unwrap();
+    assert!(matches!(return_kind(&prog), TExprKind::Const(4)));
+}
+
+#[test]
+fn alignof_alignas_keywords_are_c23() {
+    check_std("int f(){ return (int)alignof(int); }", CStd::C23).expect("alignof keyword under C23");
+    assert!(check_std("int f(){ return (int)alignof(int); }", CStd::C11).is_err());
+    check_std("int f(){ alignas(16) int x = 0; return x; }", CStd::C23).expect("alignas keyword under C23");
+}
+
+#[test]
+fn alignas_sets_local_alignment() {
+    // `_Alignas` is available under C11; it over-aligns the object's storage.
+    let prog = check_source("int f(){ _Alignas(16) int x = 3; return x; }").unwrap();
+    assert!(prog.funcs[0].locals.iter().any(|l| l.name == "x" && l.align == Some(16)));
+    // `_Alignas(type)` uses that type's alignment.
+    let prog = check_source("int f(){ _Alignas(double) int x = 3; return x; }").unwrap();
+    assert!(prog.funcs[0].locals.iter().any(|l| l.name == "x" && l.align == Some(8)));
+}
+
+#[test]
+fn typeof_declares_a_variable_of_the_operand_type() {
+    // `typeof(x)` (x a `long`) declares `y` as `long`.
+    let prog = check_source("int f(){ long x=5; typeof(x) y=10; return (int)(x+y); }").unwrap();
+    assert!(prog.funcs[0].locals.iter().any(|l| l.name == "y"
+        && matches!(l.ty, CType::Int(IntTy { width: 64, signed: true }))));
+    // `sizeof(typeof(expr))` is the operand type's size.
+    let prog = check_source("int f(){ double d=0; return sizeof(typeof(d)); }").unwrap();
+    assert!(matches!(return_kind(&prog), TExprKind::Const(8)));
+}
+
+#[test]
+fn typeof_keyword_is_rejected_in_strict_c11() {
+    // Under strict ISO C11 `typeof` is an ordinary identifier (not a keyword).
+    assert!(check_std("int f(){ int x=5; typeof(x) y=x; return y; }", CStd::C11).is_err());
+}
+
+#[test]
+fn compound_literal_lvalue_index_and_argument_lower() {
+    // As an argument (address taken), indexed, and used as an lvalue.
+    lower_ok(
+        "struct P{int x,y;}; int use(struct P*p){ return p->x*p->y; } \
+         int main(){ int i=2; return use(&(struct P){6,7}) + (int[]){1,2,3,4,5}[i]; }",
+    );
+    // Modifying a compound literal through its lvalue.
+    lower_ok("int main(){ struct Q{int a,b;} *q = &(struct Q){2,3}; q->a += 5; return q->a; }");
+}
+
+#[test]
+fn compound_literal_is_rejected_before_c99() {
+    let err = check_std("int f(){ return (int[]){1,2,3}[0]; }", CStd::C89).unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("compound literals are a C99 feature")));
+}
+
+#[test]
+fn anonymous_member_access_resolves_and_lowers() {
+    // A member of an anonymous union is accessed as a member of the enclosing.
+    lower_ok(
+        "struct S{ int a; union { int u; unsigned char b[4]; }; }; \
+         int main(){ struct S s; s.a=1; s.u=0; s.b[0]=2; return s.a+s.u; }",
+    );
+    // Offsets compose through nested anonymous members.
+    let prog = check_source(
+        "struct S{ union { long all; struct { int lo, hi; }; }; }; \
+         int main(){ struct S s; s.hi = 1; return s.hi; }",
+    )
+    .unwrap();
+    assert_eq!(prog.funcs.len(), 1);
+}
+
+#[test]
+fn anonymous_members_are_rejected_before_c11() {
+    let err = check_std(
+        "struct S{ int a; struct { int b; }; }; int f(){ struct S s; s.b=1; return s.b; }",
+        CStd::C99,
+    )
+    .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("anonymous struct/union members are a C11 feature")));
+}
+
+#[test]
+fn attributes_are_ignored_under_c23() {
+    check_std(
+        "[[nodiscard]] int f(void){ return 1; } \
+         int main(){ [[maybe_unused]] int x = 0; int y = 1; \
+         switch(y){ case 1: y = f(); [[fallthrough]]; case 2: break; } return x + y; }",
+        CStd::C23,
+    )
+    .expect("standard attributes are accepted and ignored under C23");
+}
+
+#[test]
+fn attributes_are_rejected_before_c23() {
+    let err = check_std("int main(){ [[maybe_unused]] int x = 0; return x; }", CStd::C11).unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("C23")));
+}
+
+#[test]
+fn noreturn_specifier_is_accepted() {
+    // `_Noreturn` (C11) and the `noreturn` keyword (C23) are accepted on a
+    // function declaration/definition.
+    check_source("_Noreturn void die(void); void die(void){ for(;;){} } int main(){ return 0; }")
+        .expect("_Noreturn is accepted");
+    check_std(
+        "noreturn void die(void); void die(void){ for(;;){} } int main(){ return 0; }",
+        CStd::C23,
+    )
+    .expect("the noreturn keyword is accepted under C23");
+}

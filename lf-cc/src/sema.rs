@@ -106,6 +106,9 @@ pub struct LocalInfo {
     pub name: String,
     /// The object's type.
     pub ty: CType,
+    /// An explicit `_Alignas`/`alignas` alignment override (over-aligning the
+    /// object's stack storage), if any.
+    pub align: Option<u64>,
 }
 
 /// A typed statement.
@@ -240,6 +243,11 @@ pub enum TExprKind {
     Decay(Box<TExpr>),
     /// A whole-aggregate copy `dst = src` (both lvalues), copying `size` bytes.
     CopyAssign { dst: Box<TExpr>, src: Box<TExpr>, size: u64 },
+    /// A compound literal (C99): an unnamed object `obj` initialized in place on
+    /// first evaluation (zero-filling `zero_size` bytes for an aggregate, then
+    /// performing the scalar `stores`). The expression designates that object (an
+    /// lvalue), so it lowers like [`TExprKind::Obj`] once initialized.
+    CompoundLiteral { obj: ObjId, zero_size: u64, stores: Vec<(u64, TExpr)> },
 }
 
 impl TExpr {
@@ -251,7 +259,11 @@ impl TExpr {
     pub fn is_lvalue(&self) -> bool {
         matches!(
             self.kind,
-            TExprKind::Obj(_) | TExprKind::Global(_) | TExprKind::Deref(_) | TExprKind::Field { .. }
+            TExprKind::Obj(_)
+                | TExprKind::Global(_)
+                | TExprKind::Deref(_)
+                | TExprKind::Field { .. }
+                | TExprKind::CompoundLiteral { .. }
         )
     }
 }
@@ -872,7 +884,7 @@ impl Checker {
             if ctx.scopes.last().unwrap().contains_key(&d.name) {
                 self.error(d.span, format!("redeclaration of '{}'", d.name));
             }
-            let id = ctx.add_object(&d.name, ty.clone());
+            let id = ctx.add_object_aligned(&d.name, ty.clone(), d.align);
             ctx.scopes.last_mut().unwrap().insert(d.name.clone(), id);
             match init_built {
                 Some(InitBuilt::Scalar(v)) => out.push(TStmt::InitLocal(id, v)),
@@ -1083,7 +1095,103 @@ impl Checker {
             ExprKind::Member(base, name, arrow) => {
                 self.check_member(ctx, base, name, *arrow, span)
             }
+            ExprKind::AlignofType(ty) => {
+                let a = layout::align_of(&self.records, ty) as i128;
+                Some(TExpr::new(TExprKind::Const(a), size_t(), span))
+            }
+            ExprKind::Generic(controlling, assocs) => {
+                self.check_generic(ctx, controlling, assocs, span)
+            }
+            ExprKind::CompoundLiteral(ty, init) => {
+                self.check_compound_literal(ctx, ty, init, span)
+            }
         }
+    }
+
+    /// Check a `_Generic` selection: type (but do not evaluate) the controlling
+    /// expression, select the association whose type matches its type after
+    /// lvalue/array/function conversion, and return that association's checked
+    /// expression as the result.
+    fn check_generic(
+        &mut self,
+        ctx: &mut FnCtx,
+        controlling: &Expr,
+        assocs: &[crate::ast::GenericAssoc],
+        span: Span,
+    ) -> Option<TExpr> {
+        // The controlling expression is typed (with lvalue/array/function
+        // conversion applied) but never evaluated.
+        let ctrl = self.check_rvalue(ctx, controlling)?;
+        let cty = ctrl.ty;
+        // Diagnose duplicate/compatible association types and multiple defaults.
+        let mut default_count = 0usize;
+        for (i, a) in assocs.iter().enumerate() {
+            match &a.ty {
+                None => default_count += 1,
+                Some(t) => {
+                    if assocs[..i].iter().any(|b| b.ty.as_ref() == Some(t)) {
+                        self.error(span, format!("_Generic has two associations for type '{t}'"));
+                    }
+                }
+            }
+        }
+        if default_count > 1 {
+            self.error(span, "_Generic has more than one 'default' association");
+        }
+        // Select an exact type match, else the default.
+        let mut selected: Option<usize> = None;
+        for (i, a) in assocs.iter().enumerate() {
+            if a.ty.as_ref() == Some(&cty) {
+                selected = Some(i);
+                break;
+            }
+        }
+        if selected.is_none() {
+            selected = assocs.iter().position(|a| a.ty.is_none());
+        }
+        match selected {
+            Some(i) => self.check_expr(ctx, &assocs[i].expr),
+            None => {
+                self.error(
+                    span,
+                    format!("no _Generic association matches the controlling type '{cty}'"),
+                );
+                None
+            }
+        }
+    }
+
+    /// Check a compound literal `(type-name){ init }`: create an unnamed object of
+    /// the (array-length-deduced) type, build its initializer, and yield an
+    /// lvalue that initializes the object in place when evaluated.
+    fn check_compound_literal(
+        &mut self,
+        ctx: &mut FnCtx,
+        ty: &CType,
+        init: &Init,
+        span: Span,
+    ) -> Option<TExpr> {
+        if matches!(ty, CType::Void) {
+            self.error(span, "compound literal cannot have type 'void'");
+            return None;
+        }
+        let cty = self.deduce_array_len(ty, init);
+        if let CType::Record(id) = &cty
+            && !self.records.get(*id).complete
+        {
+            self.error(span, "compound literal has incomplete struct/union type");
+            return None;
+        }
+        let obj = ctx.add_object("", cty.clone());
+        let (zero_size, stores) = if cty.is_aggregate() {
+            let mut stores = Vec::new();
+            self.build_agg_stores(ctx, &cty, init, 0, &mut stores, span)?;
+            (self.size_of(&cty), stores)
+        } else {
+            let v = self.build_scalar_init(ctx, &cty, init, span)?;
+            (0u64, vec![(0u64, v)])
+        };
+        Some(TExpr::new(TExprKind::CompoundLiteral { obj, zero_size, stores }, cty, span))
     }
 
     /// Check an expression and apply array-to-pointer decay (the "value of" an
@@ -1189,12 +1297,11 @@ impl Checker {
         };
         let CType::Record(id) = &record_lvalue.ty else { unreachable!() };
         let id = *id;
-        let Some((idx, field)) = self.records.field(id, name) else {
+        // Resolve the member, descending through anonymous struct/union members.
+        let Some((offset, fty)) = layout::resolve_member(&self.records, id, name) else {
             self.error(span, format!("no member named '{name}' in the struct/union"));
             return None;
         };
-        let fty = field.ty.clone();
-        let offset = layout::field_offset(&self.records, id, idx);
         Some(TExpr::new(
             TExprKind::Field { base: Box::new(record_lvalue), offset },
             fty,
@@ -1751,8 +1858,12 @@ struct FnCtx {
 
 impl FnCtx {
     fn add_object(&mut self, name: &str, ty: CType) -> ObjId {
+        self.add_object_aligned(name, ty, None)
+    }
+
+    fn add_object_aligned(&mut self, name: &str, ty: CType, align: Option<u64>) -> ObjId {
         let id = self.locals.len();
-        self.locals.push(LocalInfo { name: name.to_owned(), ty });
+        self.locals.push(LocalInfo { name: name.to_owned(), ty, align });
         id
     }
 
@@ -1813,6 +1924,7 @@ fn const_eval_with(e: &Expr, enums: &HashMap<String, i128>, recs: &Records) -> O
         }
         ExprKind::Cast(_, inner) => rec(inner),
         ExprKind::SizeofType(ty) => Some(layout::size_of(recs, ty) as i128),
+        ExprKind::AlignofType(ty) => Some(layout::align_of(recs, ty) as i128),
         _ => None,
     }
 }

@@ -142,9 +142,44 @@ impl CStd {
         self.is_c99()
     }
 
-    /// `_Static_assert` / `_Generic` / `_Alignof` / `_Noreturn` (C11+).
+    /// `_Static_assert` / `_Generic` / `_Alignof` / `_Alignas` / `_Noreturn`
+    /// (the underscore-spelled keywords, C11+).
     pub fn static_assert_generic(self) -> bool {
         self.is_c11()
+    }
+
+    /// Compound literals `(T){ ... }` (C99+, and a GNU extension everywhere).
+    pub fn compound_literals(self) -> bool {
+        self.is_c99() || self.is_gnu()
+    }
+
+    /// Anonymous `struct`/`union` members (C11+, and a GNU extension everywhere).
+    pub fn anonymous_members(self) -> bool {
+        self.is_c11() || self.is_gnu()
+    }
+
+    /// The keyword-spelled `alignof` / `alignas` / `static_assert` / `bool`
+    /// helpers that C23 promoted from `<stdalign.h>`/`<assert.h>` macros to real
+    /// keywords (`_Alignof`/`_Alignas`/`_Static_assert` remain available under
+    /// C11 via [`CStd::static_assert_generic`]).
+    pub fn keyword_alignas(self) -> bool {
+        self.is_c23()
+    }
+
+    /// The `noreturn` keyword spelling (C23; `_Noreturn` is the C11 spelling).
+    pub fn keyword_noreturn(self) -> bool {
+        self.is_c23()
+    }
+
+    /// `typeof` / `typeof_unqual` type specifiers (C23; `typeof` is also a GNU
+    /// extension available in every GNU dialect).
+    pub fn typeof_specifier(self) -> bool {
+        self.is_c23() || self.is_gnu()
+    }
+
+    /// Attribute specifier sequences `[[...]]` (C23).
+    pub fn attributes(self) -> bool {
+        self.is_c23()
     }
 
     /// The `bool` / `true` / `false` keywords (C23; earlier they are ordinary

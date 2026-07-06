@@ -159,13 +159,21 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
     // per-function builder (which cannot re-borrow the type context) can size its
     // `alloca`s.
     let mut agg_types: HashMap<CType, TypeId> = HashMap::new();
+    // Blob (`[i8 x N]`) types for over-aligned locals, keyed by blob length: an
+    // over-aligned object is allocated as a byte blob and its base rounded up.
+    let mut blob_types: HashMap<u64, TypeId> = HashMap::new();
     {
         let cx = module.types_mut();
+        let i8 = cx.int(8);
         for f in &program.funcs {
             for local in &f.locals {
                 if local.ty.is_aggregate() {
                     let id = layout::ir_type(cx, &program.records, &local.ty);
                     agg_types.insert(local.ty.clone(), id);
+                }
+                if let Some(a) = local.align.filter(|&a| a > 1) {
+                    let len = layout::size_of(&program.records, &local.ty) + a;
+                    blob_types.entry(len).or_insert_with(|| cx.array(i8, len));
                 }
             }
         }
@@ -190,6 +198,7 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             locals: &f.locals,
             tys,
             agg_types: &agg_types,
+            blob_types: &blob_types,
             records: &program.records,
             debug,
             linemap: &linemap,
@@ -285,6 +294,8 @@ struct FnLower<'a> {
     tys: Tys,
     /// Interned IR types of aggregate local/parameter types (for `alloca`).
     agg_types: &'a HashMap<CType, TypeId>,
+    /// Interned `[i8 x N]` blob types for over-aligned locals, keyed by length.
+    blob_types: &'a HashMap<u64, TypeId>,
     /// The struct/union registry, for layout queries during lowering.
     records: &'a Records,
     debug: bool,
@@ -302,8 +313,20 @@ impl FnLower<'_> {
         // Allocate storage for every object up front (in the entry block).
         self.slots = Vec::with_capacity(self.locals.len());
         for local in self.locals {
-            let ty = self.ir_of(&local.ty);
-            let slot = self.b.alloca(ty);
+            let slot = match local.align.filter(|&a| a > 1) {
+                // Over-aligned: allocate a byte blob and round its base up so the
+                // object's address meets the requested alignment (the framework's
+                // `alloca` only guarantees natural alignment, up to 8 bytes).
+                Some(a) => {
+                    let len = layout::size_of(self.records, &local.ty) + a;
+                    let raw = self.b.alloca(self.blob_types[&len]);
+                    self.align_ptr(raw, a)
+                }
+                None => {
+                    let ty = self.ir_of(&local.ty);
+                    self.b.alloca(ty)
+                }
+            };
             self.slots.push(slot);
         }
         // Store the incoming parameter values into their slots.
@@ -658,8 +681,41 @@ impl FnLower<'_> {
                 let a = self.lower_lvalue(base);
                 self.offset_ptr(a, *offset)
             }
+            TExprKind::CompoundLiteral { obj, zero_size, stores } => {
+                self.init_compound(*obj, *zero_size, stores);
+                self.slots[*obj]
+            }
             _ => unreachable!("lower_lvalue on a non-lvalue expression"),
         }
+    }
+
+    /// Initialize a compound literal's object in place: zero-fill an aggregate,
+    /// then perform its scalar stores.
+    fn init_compound(&mut self, obj: usize, zero_size: u64, stores: &[(u64, TExpr)]) {
+        let base = self.slots[obj];
+        if zero_size > 0 {
+            self.zero_fill(base, zero_size);
+        }
+        for (offset, value) in stores {
+            self.set_line(value.span);
+            let val = self.lower_rvalue(value);
+            let addr = self.offset_ptr(base, *offset);
+            let ty = self.tys.of(&value.ty);
+            let align = align_of(&value.ty);
+            self.b.store(ty, addr, val, align);
+        }
+    }
+
+    /// Round a pointer up to an alignment `a` (a power of two): compute
+    /// `(p + (a-1)) & ~(a-1)` in the integer domain and cast back to a pointer.
+    fn align_ptr(&mut self, raw: ValueId, a: u64) -> ValueId {
+        let i64t = self.tys.i64;
+        let raw_int = self.b.cast(CastOp::PtrToInt, raw, i64t);
+        let bias = self.b.const_i64(i64t, (a - 1) as i64);
+        let summed = self.b.bin(BinOp::Add, raw_int, bias, Flags::NONE);
+        let mask = self.b.const_i64(i64t, !((a - 1) as i64));
+        let masked = self.b.bin(BinOp::And, summed, mask, Flags::NONE);
+        self.b.cast(CastOp::IntToPtr, masked, self.tys.ptr)
     }
 
     /// Displace a pointer by a constant byte offset (in-bounds).
@@ -733,7 +789,8 @@ impl FnLower<'_> {
             TExprKind::Obj(_)
             | TExprKind::Global(_)
             | TExprKind::Deref(_)
-            | TExprKind::Field { .. } => {
+            | TExprKind::Field { .. }
+            | TExprKind::CompoundLiteral { .. } => {
                 let addr = self.lower_lvalue(e);
                 let ty = self.tys.of(&e.ty);
                 let align = align_of(&e.ty);

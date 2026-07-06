@@ -112,12 +112,18 @@ pub enum Keyword {
     Inline,
     /// `_Noreturn` (C11; accepted as a function specifier and ignored)
     Noreturn,
-    /// `_Alignof` (C11)
+    /// `_Alignof` (C11) / `alignof` (C23)
     Alignof,
-    /// `_Static_assert` (C11)
+    /// `_Alignas` (C11) / `alignas` (C23)
+    Alignas,
+    /// `_Static_assert` (C11) / `static_assert` (C23)
     StaticAssert,
     /// `_Generic` (C11)
     Generic,
+    /// `typeof` (C23 / GNU extension)
+    Typeof,
+    /// `typeof_unqual` (C23 / GNU extension)
+    TypeofUnqual,
 }
 
 /// The punctuators and operators recognized by the subset.

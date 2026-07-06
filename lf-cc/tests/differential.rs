@@ -11,6 +11,7 @@ use std::process::Command;
 
 use latticefoundry::link::write_executable;
 use latticefoundry::transform::pipeline::OptLevel;
+use lf_cc::{CStd, PpOptions};
 
 /// The corpus: `(name, source)`. Each `main` returns a value in `0..256`.
 fn programs() -> Vec<(&'static str, &'static str)> {
@@ -339,6 +340,122 @@ fn programs() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// C11/C23/C99 language-feature programs, each with the `--std` it must compile
+/// under. Both `lf-cc` and `gcc` are invoked with that same `-std`, so the two
+/// sides agree on which features are in scope. Each `main` returns `0..256`.
+fn std_programs() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        // _Generic (C11): a `TY(x)` macro selecting by controlling type, checked
+        // across several types (int/double/char*/long, and a non-matching float).
+        (
+            "generic_macro",
+            "c11",
+            "#define TY(x) _Generic((x), int:1, double:2, char*:3, long:4, default:0)\n\
+             int main(){ int i=0; double d=0; char*p=0; long l=0; float f=0; \
+             return TY(i)+TY(d)*3+TY(p)*7+TY(l)*11+TY(f)*13+3; }",
+        ),
+        // _Generic selecting different *expressions* (not just constants) by type.
+        (
+            "generic_select_expr",
+            "c11",
+            "int gi(void){return 10;} double gd(void){return 2.0;} \
+             int pick(int which){ double d=0; int i=0; \
+             return which ? _Generic((d), double: (int)gd(), default: 0) \
+                          : _Generic((i), int: gi(), default: 0); } \
+             int main(){ return pick(1)*4 + pick(0) + 2; }",
+        ),
+        // _Alignof (C11): alignment of scalar types.
+        (
+            "alignof_c11",
+            "c11",
+            "int main(){ return (int)_Alignof(double)+(int)_Alignof(int)*4 \
+             +(int)_Alignof(char)*2 + 18; }",
+        ),
+        // alignof keyword (C23): alignment of a struct (max member alignment).
+        (
+            "alignof_kw",
+            "c23",
+            "struct S{ char c; int x; double d; }; \
+             int main(){ return (int)alignof(struct S)*5 + (int)alignof(short) + 20; }",
+        ),
+        // _Alignas (C11): an over-aligned local; verify the address is aligned.
+        (
+            "alignas_c11",
+            "c11",
+            "int main(){ _Alignas(32) int x = 7; \
+             return (((unsigned long)&x) % 32 == 0) ? x + 35 : 0; }",
+        ),
+        // alignas keyword (C23) with a type operand: align a local like a double.
+        (
+            "alignas_kw",
+            "c23",
+            "int main(){ alignas(16) char buf[8]; \
+             return (((unsigned long)&buf[0]) % 16 == 0) ? 42 : 1; }",
+        ),
+        // typeof (C23): declare a variable of the operand's type; sizeof(typeof).
+        (
+            "typeof_decl",
+            "c23",
+            "int main(){ int a[4]={1,2,3,4}; typeof(a[0]) s=0; \
+             for(typeof(s) i=0;i<4;i++) s+=a[i]; \
+             return s*3 + (int)sizeof(typeof(s)) + 20; }",
+        ),
+        // typeof_unqual (C23): behaves as typeof here (qualifiers are unmodelled).
+        (
+            "typeof_unqual",
+            "c23",
+            "int main(){ double d=3.5; typeof_unqual(d) e=d*2.0; \
+             return (int)e + (int)sizeof(typeof_unqual(d)) + 27; }",
+        ),
+        // Compound literals (C99): as an lvalue (&), indexed, and passed to a fn.
+        (
+            "compound_literal",
+            "c99",
+            "struct P{int x,y;}; int use(struct P*p){ return p->x*p->y; } \
+             int main(){ int i=2; \
+             return use(&(struct P){6,7}) + (int[]){1,2,3,4,5}[i] - 3; }",
+        ),
+        // A compound literal modified through its lvalue then re-read.
+        (
+            "compound_literal_lvalue",
+            "c11",
+            "int main(){ int i=1; int r = ((int[]){10,20,30})[i]; \
+             struct Q{int a,b;} *q = &(struct Q){2,3}; q->a += 37; return r + q->a; }",
+        ),
+        // Anonymous union member (C11): accessed as if a member of the enclosing.
+        (
+            "anon_union",
+            "c11",
+            "struct S{ int a; union { int u; unsigned char b[4]; }; }; \
+             int main(){ struct S s; s.a=40; s.u=0; s.b[0]=2; return s.a+s.u; }",
+        ),
+        // Anonymous struct nested in an anonymous union (offsets compose).
+        (
+            "anon_struct_nested",
+            "c11",
+            "struct S{ union { long all; struct { int lo, hi; }; }; }; \
+             int main(){ struct S s; s.all=0; s.lo=42; s.hi=0; return (int)s.all; }",
+        ),
+        // C23 attributes: ignored, program still compiles and runs.
+        (
+            "attributes",
+            "c23",
+            "[[nodiscard]] int f(void){ return 30; } \
+             [[deprecated]] int g(void){ return 5; } \
+             int main(){ [[maybe_unused]] int unused = 99; int x = 1; \
+             switch(x){ case 1: x = f()+g(); [[fallthrough]]; case 2: break; default: x=0; } \
+             return x + 7; }",
+        ),
+        // _Noreturn (C11): accepted on a declaration/definition (here never called).
+        (
+            "noreturn_fn",
+            "c11",
+            "_Noreturn void fail(void); void fail(void){ for(;;){} } \
+             int dbl(int x){ return x*2; } int main(){ return dbl(20)+2; }",
+        ),
+    ]
+}
+
 struct Harness {
     dir: PathBuf,
     gcc: Option<String>,
@@ -346,7 +463,14 @@ struct Harness {
 
 impl Harness {
     fn new() -> Harness {
-        let dir = std::env::temp_dir().join(format!("lf-cc-difftest-{}", std::process::id()));
+        // A per-instance unique directory: the two differential tests run in
+        // parallel within one process, so keying only on the process id would let
+        // them share (and race on) the same scratch directory.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("lf-cc-difftest-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let gcc = which("gcc").or_else(|| which("cc"));
         Harness { dir, gcc }
@@ -376,6 +500,37 @@ impl Harness {
         assert!(status.success(), "gcc failed to compile '{name}'");
         Some(run_exit(&bin))
     }
+
+    /// Compile with lf-cc under an explicit `--std`, run, return the exit code.
+    fn lf_run_std(&self, name: &str, src: &str, opt: OptLevel, std: &str) -> i32 {
+        let input = format!("{name}.c");
+        let pp = PpOptions {
+            std: CStd::parse(std).expect("known --std"),
+            main_file_name: input.clone(),
+            ..PpOptions::default()
+        };
+        let image = lf_cc::build_image_with(src, &input, &pp, opt, false)
+            .unwrap_or_else(|e| panic!("lf-cc failed to build '{name}' (--std={std}): {e:?}"));
+        let bin = self.dir.join(format!("{name}.lf.{}", opt.name()));
+        write_executable(bin.to_str().unwrap(), &image).expect("write executable");
+        run_exit(&bin)
+    }
+
+    /// Compile with `gcc -std=<std> -O0` and run, if gcc is available.
+    fn gcc_run_std(&self, name: &str, src: &str, std: &str) -> Option<i32> {
+        let gcc = self.gcc.as_ref()?;
+        let c = self.dir.join(format!("{name}.c"));
+        std::fs::write(&c, src).expect("write source");
+        let bin = self.dir.join(format!("{name}.gcc"));
+        let status = Command::new(gcc)
+            .args(["-O0", "-w", &format!("-std={std}"), "-o"])
+            .arg(&bin)
+            .arg(&c)
+            .status()
+            .expect("run gcc");
+        assert!(status.success(), "gcc failed to compile '{name}' (-std={std})");
+        Some(run_exit(&bin))
+    }
 }
 
 fn which(prog: &str) -> Option<String> {
@@ -391,7 +546,11 @@ fn which(prog: &str) -> Option<String> {
 
 fn run_exit(bin: &Path) -> i32 {
     let status = Command::new(bin).status().expect("run binary");
-    status.code().expect("process returned an exit code")
+    if let Some(code) = status.code() {
+        return code;
+    }
+    use std::os::unix::process::ExitStatusExt;
+    panic!("{} killed by signal {:?}", bin.display(), status.signal());
 }
 
 #[test]
@@ -420,11 +579,34 @@ fn differential_against_gcc() {
         }
     }
 
+    // The C11/C23/C99 language-feature corpus, each under its required `--std`
+    // (see `std_programs`). These run in the same test — rather than a second
+    // parallel one — so two full compiler pipelines never contend for memory at
+    // once (which could OOM-kill a child), keeping the suite deterministic.
+    let std_total = std_programs().len();
+    for (name, std, src) in std_programs() {
+        let o0 = h.lf_run_std(name, src, OptLevel::O0, std);
+        let o2 = h.lf_run_std(name, src, OptLevel::O2, std);
+        ran += 1;
+        if o0 != o2 {
+            failures.push(format!("{name} (--std={std}): lf-cc -O0={o0} != -O2={o2}"));
+            continue;
+        }
+        if let Some(g) = h.gcc_run_std(name, src, std) {
+            if o0 != g {
+                failures.push(format!("{name} (--std={std}): lf-cc={o0} != gcc={g}"));
+                continue;
+            }
+            matched_gcc += 1;
+        }
+    }
+
     eprintln!(
-        "differential: {ran}/{total} programs ran; {matched_gcc} matched gcc's exit code \
+        "differential: {ran}/{} programs ran; {matched_gcc} matched gcc's exit code \
          (gcc {})",
+        total + std_total,
         if h.gcc.is_some() { "present" } else { "absent — comparison skipped" }
     );
     assert!(failures.is_empty(), "differential mismatches:\n{}", failures.join("\n"));
-    assert_eq!(ran, total, "every program should compile and run");
+    assert_eq!(ran, total + std_total, "every program should compile and run");
 }

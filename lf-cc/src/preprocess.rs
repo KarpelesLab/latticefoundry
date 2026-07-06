@@ -1273,8 +1273,19 @@ impl Pp {
             "inline" if self.std.inline_restrict() => Some(TokenKind::Keyword(Keyword::Inline)),
             "_Noreturn" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Noreturn, span),
             "_Alignof" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignof, span),
+            "_Alignas" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignas, span),
             "_Static_assert" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::StaticAssert, span),
             "_Generic" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Generic, span),
+            // C23 keyword spellings (plain identifiers under earlier standards).
+            "alignof" if self.std.keyword_alignas() => Some(TokenKind::Keyword(Keyword::Alignof)),
+            "alignas" if self.std.keyword_alignas() => Some(TokenKind::Keyword(Keyword::Alignas)),
+            "static_assert" if self.std.keyword_alignas() => Some(TokenKind::Keyword(Keyword::StaticAssert)),
+            "noreturn" if self.std.keyword_noreturn() => Some(TokenKind::Keyword(Keyword::Noreturn)),
+            // `typeof`/`typeof_unqual`: C23 keywords, also a GNU extension.
+            "typeof" if self.std.typeof_specifier() => Some(TokenKind::Keyword(Keyword::Typeof)),
+            "typeof_unqual" if self.std.typeof_specifier() => {
+                Some(TokenKind::Keyword(Keyword::TypeofUnqual))
+            }
             "bool" if self.std.bool_keyword() => Some(TokenKind::Keyword(Keyword::Bool)),
             "true" if self.std.bool_keyword() => Some(TokenKind::IntLit(1, CType::int())),
             "false" if self.std.bool_keyword() => Some(TokenKind::IntLit(0, CType::int())),

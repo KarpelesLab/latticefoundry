@@ -97,10 +97,16 @@ pub enum RecordKind {
 /// One member of a record.
 #[derive(Clone, Debug)]
 pub struct Field {
-    /// The member name.
+    /// The member name (empty for an anonymous struct/union member).
     pub name: String,
     /// The member type.
     pub ty: CType,
+    /// Whether this is an anonymous struct/union member (C11): its own members
+    /// are accessed as if they belonged to the enclosing record.
+    pub anonymous: bool,
+    /// An explicit `_Alignas`/`alignas` alignment override for this member, if
+    /// any (raising the member's alignment in [`crate::layout`]).
+    pub align: Option<u64>,
 }
 
 /// A `struct`/`union` definition. A forward declaration (`struct T;`) or a use
@@ -428,6 +434,26 @@ pub enum ExprKind {
     /// Member access: `base.name` (`arrow == false`) or `base->name`
     /// (`arrow == true`).
     Member(Box<Expr>, String, bool),
+    /// `_Alignof(type-name)` / `alignof(type-name)` (C11/C23): a `size_t`
+    /// constant equal to the type's alignment.
+    AlignofType(CType),
+    /// `_Generic(controlling, type1: e1, ..., default: ed)` (C11): generic
+    /// selection. The controlling expression is typed but not evaluated; the
+    /// association whose type matches supplies the result.
+    Generic(Box<Expr>, Vec<GenericAssoc>),
+    /// A compound literal `(type-name){ initializer-list }` (C99): an unnamed
+    /// object of the given type with the given initializer, usable as an lvalue.
+    CompoundLiteral(CType, Box<Init>),
+}
+
+/// One association of a `_Generic` selection: a type (`None` for `default`) and
+/// the expression selected when the controlling type matches it.
+#[derive(Clone, Debug)]
+pub struct GenericAssoc {
+    /// The association type, or `None` for the `default` association.
+    pub ty: Option<CType>,
+    /// The result expression for this association.
+    pub expr: Expr,
 }
 
 /// A C initializer: either a single expression or a brace-enclosed list whose
@@ -512,6 +538,8 @@ pub struct VarDecl {
     pub ty: CType,
     /// The initializer, if any.
     pub init: Option<Init>,
+    /// An explicit `_Alignas`/`alignas` alignment override, if any.
+    pub align: Option<u64>,
     /// The source span of the declarator.
     pub span: Span,
 }
