@@ -1012,17 +1012,47 @@ impl Parser {
                             "anonymous struct/union members are a C11 feature (use -std=c11 or later)",
                         );
                     }
-                    fields.push(Field { name: String::new(), ty: base.clone(), anonymous: true, align });
+                    fields.push(Field {
+                        name: String::new(),
+                        ty: base.clone(),
+                        anonymous: true,
+                        align,
+                        bit_width: None,
+                    });
                 }
                 self.bump(); // ';'
                 continue;
             }
+            // An unnamed bit-field: `type : const-expr ;` (including `: 0`), which
+            // has no declarator, only a colon and a width.
+            if self.is_punct(Punct::Colon) {
+                let bit_width = self.parse_bitfield_width(&base)?;
+                fields.push(Field {
+                    name: String::new(),
+                    ty: base.clone(),
+                    anonymous: false,
+                    align,
+                    bit_width: Some(bit_width),
+                });
+                self.expect_punct(Punct::Semi, "';' after bit-field")?;
+                continue;
+            }
             loop {
-                let (name, ty, _span) = self.parse_named_declarator(base.clone())?;
-                if self.is_punct(Punct::Colon) {
-                    return self.err("bit-fields are not supported in this C subset");
-                }
-                fields.push(Field { name, ty, anonymous: false, align });
+                let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
+                let bit_width = if self.is_punct(Punct::Colon) {
+                    let w = self.parse_bitfield_width(&ty)?;
+                    // A named bit-field of width 0 is a constraint violation.
+                    if w == 0 {
+                        return Err(Diagnostic::error(
+                            "named bit-field cannot have zero width",
+                        )
+                        .with_span(name_span));
+                    }
+                    Some(w)
+                } else {
+                    None
+                };
+                fields.push(Field { name, ty, anonymous: false, align, bit_width });
                 if !self.eat_punct(Punct::Comma) {
                     break;
                 }
@@ -1033,6 +1063,35 @@ impl Parser {
         self.records.defs[id].fields = fields;
         self.records.defs[id].complete = true;
         Ok(())
+    }
+
+    /// Parse the `: const-expr` of a bit-field declared with base type `ty` (the
+    /// leading `:` is at the cursor). Validate that `ty` is an integer type and
+    /// that the width is in `0..=bits(ty)` (where `_Bool` counts as one bit).
+    fn parse_bitfield_width(&mut self, ty: &CType) -> PResult<u32> {
+        let colon = self.expect_punct(Punct::Colon, "':' in bit-field")?;
+        if !ty.is_integer() {
+            return Err(Diagnostic::error("bit-field has a non-integer type").with_span(colon));
+        }
+        let width_span = self.peek_span();
+        let value = self.parse_const_expr()?;
+        if value < 0 {
+            return Err(Diagnostic::error("bit-field width must be non-negative")
+                .with_span(width_span));
+        }
+        // `_Bool` bit-fields hold a single value bit; other integer types allow up
+        // to their full storage width.
+        let max = match ty {
+            CType::Bool => 1u32,
+            _ => u32::from(ty.int_width().unwrap_or(32)),
+        };
+        if value as u128 > u128::from(max) {
+            return Err(Diagnostic::error(format!(
+                "width of bit-field ({value}) exceeds the width of its type ({max} bits)"
+            ))
+            .with_span(width_span));
+        }
+        Ok(value as u32)
     }
 
     /// Parse an `enum` specifier. An `enum` has type `int`; a body registers its

@@ -64,70 +64,180 @@ pub fn stride_of(recs: &Records, ty: &CType) -> u64 {
     round_up(size_of(recs, ty), align_of(recs, ty))
 }
 
-fn record_align(recs: &Records, id: RecordId) -> u64 {
+/// The placement of a bit-field within its storage unit, computed by the
+/// little-endian System V (Itanium) bit-field allocation. A bit-field is read
+/// and written through a load/read-modify-write store of an integer of
+/// `unit_bits` bits located at the member's byte offset; the field occupies
+/// `width` bits starting `bit_offset` bits above the storage unit's least
+/// significant bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitPlacement {
+    /// The storage unit's width in bits (the bit-field's declared type width;
+    /// `_Bool` uses an 8-bit unit).
+    pub unit_bits: u16,
+    /// The bit-field's least-significant-bit offset within the storage unit.
+    pub bit_offset: u32,
+    /// The bit-field's width in bits.
+    pub width: u32,
+    /// Whether the bit-field is signed (selecting sign vs. zero extension on read).
+    pub signed: bool,
+}
+
+/// The `(storage-unit bits, maximum declared width)` of a bit-field of declared
+/// type `ty`. The storage unit is the natural size of the declared type in bits
+/// (`_Bool` occupies an 8-bit unit but permits only a single value bit).
+fn bitfield_unit_bits(ty: &CType) -> u16 {
+    match ty {
+        CType::Bool => 8,
+        CType::Int(i) => i.width,
+        _ => 32,
+    }
+}
+
+/// The computed layout of one record: per-field byte offsets (for a bit-field,
+/// its storage unit's byte offset) and optional bit placements, plus the record's
+/// overall size and alignment.
+struct RecordLayout {
+    /// Byte offset of each field (the storage-unit offset for a bit-field).
+    offsets: Vec<u64>,
+    /// Bit placement of each field, `Some` only for bit-fields.
+    bits: Vec<Option<BitPlacement>>,
+    size: u64,
+    align: u64,
+}
+
+/// Compute a record's layout: byte offsets, bit-field placements, size, and
+/// alignment, following the little-endian System V bit-field rules gcc uses on
+/// x86-64 Linux (`-mno-ms-bitfields`).
+fn record_layout(recs: &Records, id: RecordId) -> RecordLayout {
     let def = recs.get(id);
-    def.fields.iter().map(|f| field_align(recs, f)).max().unwrap_or(1).max(1)
+    let n = def.fields.len();
+    let mut offsets = vec![0u64; n];
+    let mut bits: Vec<Option<BitPlacement>> = vec![None; n];
+    let mut align = 1u64;
+
+    match def.kind {
+        RecordKind::Struct => {
+            // The running offset is tracked in bits so bit-fields pack sub-byte.
+            let mut offset_bits = 0u64;
+            for (i, f) in def.fields.iter().enumerate() {
+                match f.bit_width {
+                    Some(0) => {
+                        // Unnamed `:0`: close the current unit by rounding to the
+                        // next storage-unit boundary of the declared type. It does
+                        // *not* raise the record's alignment (matching gcc).
+                        let unit = u64::from(bitfield_unit_bits(&f.ty));
+                        offset_bits = round_up(offset_bits, unit);
+                    }
+                    Some(w) => {
+                        let w = u64::from(w);
+                        let unit = u64::from(bitfield_unit_bits(&f.ty));
+                        // A bit-field starts a new unit rather than straddle an
+                        // aligned container of its declared type.
+                        if offset_bits % unit + w > unit {
+                            offset_bits = round_up(offset_bits, unit);
+                        }
+                        let unit_index = offset_bits / unit;
+                        let unit_start = unit_index * unit;
+                        offsets[i] = unit_start / 8;
+                        bits[i] = Some(BitPlacement {
+                            unit_bits: bitfield_unit_bits(&f.ty),
+                            bit_offset: (offset_bits - unit_start) as u32,
+                            width: w as u32,
+                            signed: f.ty.is_signed(),
+                        });
+                        align = align.max(align_of(recs, &f.ty));
+                        offset_bits += w;
+                    }
+                    None => {
+                        let a = field_align(recs, f);
+                        align = align.max(a);
+                        offset_bits = round_up(offset_bits, a * 8);
+                        offsets[i] = offset_bits / 8;
+                        offset_bits += size_of(recs, &f.ty) * 8;
+                    }
+                }
+            }
+            let size = round_up(offset_bits, align.max(1) * 8) / 8;
+            RecordLayout { offsets, bits, size: size.max(1), align: align.max(1) }
+        }
+        RecordKind::Union => {
+            // Every member (bit-field or not) overlays at offset 0.
+            let mut size = 0u64;
+            for (i, f) in def.fields.iter().enumerate() {
+                if let Some(w) = f.bit_width {
+                    if w > 0 {
+                        bits[i] = Some(BitPlacement {
+                            unit_bits: bitfield_unit_bits(&f.ty),
+                            bit_offset: 0,
+                            width: w,
+                            signed: f.ty.is_signed(),
+                        });
+                        align = align.max(align_of(recs, &f.ty));
+                    }
+                } else {
+                    align = align.max(field_align(recs, f));
+                }
+                size = size.max(size_of(recs, &f.ty));
+            }
+            let align = align.max(1);
+            RecordLayout { offsets, bits, size: round_up(size, align).max(1), align }
+        }
+    }
+}
+
+fn record_align(recs: &Records, id: RecordId) -> u64 {
+    record_layout(recs, id).align
 }
 
 fn record_size(recs: &Records, id: RecordId) -> u64 {
-    let def = recs.get(id);
-    match def.kind {
-        RecordKind::Struct => {
-            let mut offset = 0u64;
-            let mut align = 1u64;
-            for f in &def.fields {
-                let a = field_align(recs, f);
-                align = align.max(a);
-                offset = round_up(offset, a) + size_of(recs, &f.ty);
-            }
-            round_up(offset, align.max(1)).max(1)
-        }
-        RecordKind::Union => {
-            let mut size = 0u64;
-            for f in &def.fields {
-                size = size.max(size_of(recs, &f.ty));
-            }
-            round_up(size, record_align(recs, id)).max(1)
-        }
-    }
+    record_layout(recs, id).size
 }
 
 /// The byte offset of field `idx` within record `id` (`0` for every union
-/// member, cumulative with padding for a struct).
+/// member, cumulative with padding for a struct; the storage-unit offset for a
+/// bit-field).
 pub fn field_offset(recs: &Records, id: RecordId, idx: usize) -> u64 {
-    let def = recs.get(id);
-    if def.kind == RecordKind::Union {
-        return 0;
-    }
-    let mut offset = 0u64;
-    for (i, f) in def.fields.iter().enumerate() {
-        let a = field_align(recs, f);
-        offset = round_up(offset, a);
-        if i == idx {
-            return offset;
-        }
-        offset += size_of(recs, &f.ty);
-    }
-    offset
+    record_layout(recs, id).offsets[idx]
+}
+
+/// The byte offset and bit placement of field `idx` within record `id`. The bit
+/// placement is `Some` only for a bit-field member.
+pub fn field_placement(recs: &Records, id: RecordId, idx: usize) -> (u64, Option<BitPlacement>) {
+    let layout = record_layout(recs, id);
+    (layout.offsets[idx], layout.bits[idx])
 }
 
 /// Resolve a member `name` within record `id`, descending into anonymous
 /// `struct`/`union` members (C11). Returns the member's byte offset (composed
 /// through any enclosing anonymous members) and its type.
 pub fn resolve_member(recs: &Records, id: RecordId, name: &str) -> Option<(u64, CType)> {
+    resolve_member_bits(recs, id, name).map(|(off, ty, _)| (off, ty))
+}
+
+/// Like [`resolve_member`], but also returns the bit placement when the resolved
+/// member is a bit-field. The byte offset is composed through any enclosing
+/// anonymous members; the bit placement's `bit_offset` is unchanged (an
+/// anonymous member is always byte-aligned).
+pub fn resolve_member_bits(
+    recs: &Records,
+    id: RecordId,
+    name: &str,
+) -> Option<(u64, CType, Option<BitPlacement>)> {
+    let layout = record_layout(recs, id);
     let def = recs.get(id);
     // A directly-named member wins over descending into anonymous members.
     for (i, f) in def.fields.iter().enumerate() {
         if !f.anonymous && f.name == name {
-            return Some((field_offset(recs, id, i), f.ty.clone()));
+            return Some((layout.offsets[i], f.ty.clone(), layout.bits[i]));
         }
     }
     for (i, f) in def.fields.iter().enumerate() {
         if f.anonymous
             && let CType::Record(sub) = &f.ty
-            && let Some((off, ty)) = resolve_member(recs, *sub, name)
+            && let Some((off, ty, bp)) = resolve_member_bits(recs, *sub, name)
         {
-            return Some((field_offset(recs, id, i) + off, ty));
+            return Some((layout.offsets[i] + off, ty, bp));
         }
     }
     None
@@ -162,11 +272,12 @@ fn ir_record(cx: &mut TypeContext, recs: &Records, id: RecordId) -> TypeId {
     let def = recs.get(id);
     match def.kind {
         RecordKind::Struct => {
-            // A member with an explicit `alignas` can raise the struct's size and
-            // alignment past what a natural struct of the field types would give;
-            // model such a struct by a byte blob of the right size/alignment (as
-            // for unions) so the storage reserved by an `alloca` stays adequate.
-            if def.fields.iter().any(|f| f.align.is_some()) {
+            // A member with an explicit `alignas`, or any bit-field member (whose
+            // sub-word packing a struct-of-field-types cannot express), can make a
+            // natural struct of the field types mis-sized; model such a struct by a
+            // byte blob of the right size/alignment (as for unions) so the storage
+            // reserved by an `alloca` stays adequate.
+            if def.fields.iter().any(|f| f.align.is_some() || f.bit_width.is_some()) {
                 let size = record_size(recs, id);
                 let align = record_align(recs, id).min(8);
                 let head = cx.int((align * 8) as u32);

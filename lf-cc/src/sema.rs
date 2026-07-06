@@ -40,12 +40,25 @@ pub fn char_ty() -> CType {
 }
 
 /// The result of checking a variable's initializer: a single scalar value, or a
-/// list of `(byte offset, value)` scalar stores for an aggregate.
+/// list of scalar stores for an aggregate.
 enum InitBuilt {
     /// A scalar/pointer initializer already converted to the variable's type.
     Scalar(TExpr),
     /// Aggregate stores (offsets relative to the object's base).
-    Aggregate(Vec<(u64, TExpr)>),
+    Aggregate(Vec<AggStore>),
+}
+
+/// One scalar store emitted for an aggregate initializer: a value to write at a
+/// byte offset relative to the object's base, optionally targeting a bit-field
+/// (which requires a masked read-modify-write rather than a plain store).
+#[derive(Clone, Debug)]
+pub struct AggStore {
+    /// Byte offset within the object (the storage-unit offset for a bit-field).
+    pub offset: u64,
+    /// The value to store (already converted to the field/element type).
+    pub value: TExpr,
+    /// The bit placement, `Some` only when the target member is a bit-field.
+    pub bits: Option<crate::layout::BitPlacement>,
 }
 
 /// A function signature (a definition or a prototype).
@@ -166,7 +179,7 @@ pub enum TStmt {
         /// The object's size in bytes (the region to zero first).
         size: u64,
         /// The scalar stores, each already converted to its field/element type.
-        stores: Vec<(u64, TExpr)>,
+        stores: Vec<AggStore>,
     },
 }
 
@@ -238,6 +251,13 @@ pub enum TExprKind {
     IncDec { target: Box<TExpr>, inc: bool, post: bool, scale: u64 },
     /// A member lvalue: `base` (an aggregate lvalue) displaced by `offset` bytes.
     Field { base: Box<TExpr>, offset: u64 },
+    /// A bit-field lvalue: the storage unit lives at `base` (an aggregate lvalue)
+    /// displaced by `offset` bytes; the field occupies `bits.width` bits at
+    /// `bits.bit_offset` within a `bits.unit_bits`-wide unit. Read via a masked,
+    /// sign/zero-extended load; assigned via a read-modify-write store. Its C type
+    /// (the node's `ty`) is the bit-field's declared type. It is a modifiable
+    /// lvalue but is not addressable (`&` is a constraint violation).
+    BitField { base: Box<TExpr>, offset: u64, bits: crate::layout::BitPlacement },
     /// Array-to-pointer decay: yield the address of `inner` (an array lvalue) as
     /// a pointer to its first element.
     Decay(Box<TExpr>),
@@ -247,7 +267,7 @@ pub enum TExprKind {
     /// first evaluation (zero-filling `zero_size` bytes for an aggregate, then
     /// performing the scalar `stores`). The expression designates that object (an
     /// lvalue), so it lowers like [`TExprKind::Obj`] once initialized.
-    CompoundLiteral { obj: ObjId, zero_size: u64, stores: Vec<(u64, TExpr)> },
+    CompoundLiteral { obj: ObjId, zero_size: u64, stores: Vec<AggStore> },
 }
 
 impl TExpr {
@@ -263,8 +283,15 @@ impl TExpr {
                 | TExprKind::Global(_)
                 | TExprKind::Deref(_)
                 | TExprKind::Field { .. }
+                | TExprKind::BitField { .. }
                 | TExprKind::CompoundLiteral { .. }
         )
+    }
+
+    /// Whether this expression designates a bit-field (a modifiable lvalue that
+    /// is not addressable).
+    fn is_bitfield(&self) -> bool {
+        matches!(self.kind, TExprKind::BitField { .. })
     }
 }
 
@@ -506,10 +533,29 @@ impl Checker {
                 for item in items {
                     field_idx = self.apply_field_designators(id, &item.designators, field_idx);
                     let nfields = self.records.get(id).fields.len();
+                    // Unnamed bit-fields (padding, and `:0`) take no initializer.
+                    while field_idx < nfields && is_unnamed_bitfield(&self.records, id, field_idx) {
+                        field_idx += 1;
+                    }
                     if field_idx < nfields {
                         let fty = self.records.get(id).fields[field_idx].ty.clone();
-                        let foff = layout::field_offset(&self.records, id, field_idx);
-                        self.build_global_bytes(&fty, &item.init, off + foff, bytes, span);
+                        let (foff, bits) = layout::field_placement(&self.records, id, field_idx);
+                        match bits {
+                            // A bit-field initializer OR's its masked, shifted value
+                            // into the storage unit's bytes (the image is zeroed).
+                            Some(bp) => {
+                                match init_scalar_expr(&item.init).and_then(|e| self.const_eval(e)) {
+                                    Some(v) => write_bitfield_bytes(bytes, off + foff, v, bp),
+                                    None => self.error(
+                                        span,
+                                        "bit-field initializer must be a constant expression",
+                                    ),
+                                }
+                            }
+                            None => {
+                                self.build_global_bytes(&fty, &item.init, off + foff, bytes, span)
+                            }
+                        }
                     }
                     field_idx += 1;
                 }
@@ -957,7 +1003,7 @@ impl Checker {
         ty: &CType,
         init: &Init,
         base: u64,
-        out: &mut Vec<(u64, TExpr)>,
+        out: &mut Vec<AggStore>,
         span: Span,
     ) -> Option<()> {
         match ty {
@@ -969,7 +1015,11 @@ impl Checker {
                 {
                     for (i, &b) in s.iter().enumerate() {
                         if (i as u64) < *n {
-                            out.push((base + i as u64, self.char_const(i128::from(b), elem, span)));
+                            out.push(AggStore {
+                                offset: base + i as u64,
+                                value: self.char_const(i128::from(b), elem, span),
+                                bits: None,
+                            });
                         }
                     }
                     return Some(());
@@ -986,7 +1036,14 @@ impl Checker {
                 for item in items {
                     idx = apply_index_designators(&item.designators, idx);
                     if idx < *n {
-                        self.build_member_init(ctx, elem, &item.init, base + idx * stride, out, span)?;
+                        self.build_member_init(
+                            ctx,
+                            elem,
+                            &item.init,
+                            base + idx * stride,
+                            out,
+                            span,
+                        )?;
                     }
                     idx += 1;
                 }
@@ -1005,10 +1062,28 @@ impl Checker {
                 for item in items {
                     field_idx = self.apply_field_designators(id, &item.designators, field_idx);
                     let nfields = self.records.get(id).fields.len();
+                    // Unnamed bit-fields (padding, and `:0`) take no initializer.
+                    while field_idx < nfields && is_unnamed_bitfield(&self.records, id, field_idx) {
+                        field_idx += 1;
+                    }
                     if field_idx < nfields {
                         let fty = self.records.get(id).fields[field_idx].ty.clone();
-                        let foff = layout::field_offset(&self.records, id, field_idx);
-                        self.build_member_init(ctx, &fty, &item.init, base + foff, out, span)?;
+                        let (foff, bits) =
+                            layout::field_placement(&self.records, id, field_idx);
+                        match bits {
+                            // A bit-field member is always scalar: emit a masked
+                            // read-modify-write store directly.
+                            Some(bp) => {
+                                let v = self.build_scalar_init(ctx, &fty, &item.init, span)?;
+                                out.push(AggStore {
+                                    offset: base + foff,
+                                    value: v,
+                                    bits: Some(bp),
+                                });
+                            }
+                            None => self
+                                .build_member_init(ctx, &fty, &item.init, base + foff, out, span)?,
+                        }
                     }
                     field_idx += 1;
                 }
@@ -1018,22 +1093,22 @@ impl Checker {
         }
     }
 
-    /// Initialize one array element or struct member (a scalar store, or a
-    /// nested aggregate).
+    /// Initialize one (non-bit-field) array element or struct member: a scalar
+    /// store, or a nested aggregate.
     fn build_member_init(
         &mut self,
         ctx: &mut FnCtx,
         ty: &CType,
         init: &Init,
         base: u64,
-        out: &mut Vec<(u64, TExpr)>,
+        out: &mut Vec<AggStore>,
         span: Span,
     ) -> Option<()> {
         if ty.is_aggregate() {
             self.build_agg_stores(ctx, ty, init, base, out, span)
         } else {
             let v = self.build_scalar_init(ctx, ty, init, span)?;
-            out.push((base, v));
+            out.push(AggStore { offset: base, value: v, bits: None });
             Some(())
         }
     }
@@ -1189,7 +1264,7 @@ impl Checker {
             (self.size_of(&cty), stores)
         } else {
             let v = self.build_scalar_init(ctx, &cty, init, span)?;
-            (0u64, vec![(0u64, v)])
+            (0u64, vec![AggStore { offset: 0, value: v, bits: None }])
         };
         Some(TExpr::new(TExprKind::CompoundLiteral { obj, zero_size, stores }, cty, span))
     }
@@ -1298,15 +1373,15 @@ impl Checker {
         let CType::Record(id) = &record_lvalue.ty else { unreachable!() };
         let id = *id;
         // Resolve the member, descending through anonymous struct/union members.
-        let Some((offset, fty)) = layout::resolve_member(&self.records, id, name) else {
+        let Some((offset, fty, bits)) = layout::resolve_member_bits(&self.records, id, name) else {
             self.error(span, format!("no member named '{name}' in the struct/union"));
             return None;
         };
-        Some(TExpr::new(
-            TExprKind::Field { base: Box::new(record_lvalue), offset },
-            fty,
-            span,
-        ))
+        let kind = match bits {
+            Some(bits) => TExprKind::BitField { base: Box::new(record_lvalue), offset, bits },
+            None => TExprKind::Field { base: Box::new(record_lvalue), offset },
+        };
+        Some(TExpr::new(kind, fty, span))
     }
 
     fn check_ident(&mut self, ctx: &mut FnCtx, name: &str, span: Span) -> Option<TExpr> {
@@ -1410,6 +1485,10 @@ impl Checker {
                         TExprKind::Deref(inner) => Some(*inner),
                         other => Some(TExpr { kind: other, ty, span: sp }),
                     };
+                }
+                if te.is_bitfield() {
+                    self.error(span, "cannot take the address of a bit-field");
+                    return None;
                 }
                 if !te.is_lvalue() {
                     self.error(span, "cannot take the address of a non-lvalue");
@@ -1810,6 +1889,44 @@ impl Checker {
 /// `size_t` for this target: `unsigned long` (64-bit).
 fn size_t() -> CType {
     CType::Int(IntTy { width: 64, signed: false })
+}
+
+/// Whether field `idx` of record `id` is an unnamed bit-field (padding or a
+/// `:0` unit terminator), which takes no positional initializer.
+fn is_unnamed_bitfield(recs: &Records, id: RecordId, idx: usize) -> bool {
+    let f = &recs.get(id).fields[idx];
+    f.bit_width.is_some() && f.name.is_empty() && !f.anonymous
+}
+
+/// The scalar initializer expression of `init`: a bare expression, or the single
+/// element of a one-element brace list. Used for a bit-field global initializer.
+fn init_scalar_expr(init: &Init) -> Option<&Expr> {
+    match init {
+        Init::Expr(e) => Some(e),
+        Init::List(items) if items.len() == 1 => match &items[0].init {
+            Init::Expr(e) => Some(e),
+            Init::List(_) => None,
+        },
+        Init::List(_) => None,
+    }
+}
+
+/// OR a bit-field's constant value into a global's little-endian byte image: the
+/// low `width` bits of `v`, shifted to the field's bit offset within its storage
+/// unit at `unit_off`. The image is pre-zeroed, so an OR suffices.
+fn write_bitfield_bytes(bytes: &mut [u8], unit_off: u64, v: i128, bp: crate::layout::BitPlacement) {
+    let width = bp.width;
+    let mask: u128 = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+    let field = (v as u128 & mask) << bp.bit_offset;
+    let unit_bytes = (bp.unit_bits / 8) as u64;
+    let le = field.to_le_bytes();
+    for i in 0..unit_bytes {
+        if let (Some(dst), Some(src)) =
+            (bytes.get_mut((unit_off + i) as usize), le.get(i as usize))
+        {
+            *dst |= *src;
+        }
+    }
 }
 
 /// Convert a case constant to the switch's promoted controlling type, yielding

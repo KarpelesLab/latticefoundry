@@ -97,7 +97,8 @@ pub enum RecordKind {
 /// One member of a record.
 #[derive(Clone, Debug)]
 pub struct Field {
-    /// The member name (empty for an anonymous struct/union member).
+    /// The member name (empty for an anonymous struct/union member, or for an
+    /// unnamed bit-field).
     pub name: String,
     /// The member type.
     pub ty: CType,
@@ -107,6 +108,12 @@ pub struct Field {
     /// An explicit `_Alignas`/`alignas` alignment override for this member, if
     /// any (raising the member's alignment in [`crate::layout`]).
     pub align: Option<u64>,
+    /// If this is a bit-field (`type name : width`), its declared width in bits.
+    /// `Some(0)` marks an unnamed `:0` bit-field (which forces the next member to
+    /// the next storage-unit boundary of its declared type). `None` marks an
+    /// ordinary (non-bit-field) member. The concrete bit placement (storage-unit
+    /// byte offset, unit width, and bit offset) is computed in [`crate::layout`].
+    pub bit_width: Option<u32>,
 }
 
 /// A `struct`/`union` definition. A forward declaration (`struct T;`) or a use

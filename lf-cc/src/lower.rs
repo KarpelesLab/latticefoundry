@@ -20,7 +20,8 @@ use latticefoundry::support::puremp;
 
 use crate::ast::{BinaryOp, CType, FloatTy, Records};
 use crate::layout;
-use crate::sema::{LocalInfo, Program, TExpr, TExprKind, TFunc, TStmt};
+use crate::layout::BitPlacement;
+use crate::sema::{AggStore, LocalInfo, Program, TExpr, TExprKind, TFunc, TStmt};
 
 /// A precomputed set of the small, fixed set of IR types the frontend needs.
 #[derive(Clone, Copy, Debug)]
@@ -430,13 +431,20 @@ impl FnLower<'_> {
             TStmt::InitAggregate { obj, size, stores } => {
                 let base = self.slots[*obj];
                 self.zero_fill(base, *size);
-                for (offset, value) in stores {
-                    self.set_line(value.span);
-                    let val = self.lower_rvalue(value);
-                    let addr = self.offset_ptr(base, *offset);
-                    let ty = self.tys.of(&value.ty);
-                    let align = align_of(&value.ty);
-                    self.b.store(ty, addr, val, align);
+                for st in stores {
+                    self.set_line(st.value.span);
+                    let val = self.lower_rvalue(&st.value);
+                    let addr = self.offset_ptr(base, st.offset);
+                    match &st.bits {
+                        Some(bp) => {
+                            self.bitfield_write_at(addr, bp, val);
+                        }
+                        None => {
+                            let ty = self.tys.of(&st.value.ty);
+                            let align = align_of(&st.value.ty);
+                            self.b.store(ty, addr, val, align);
+                        }
+                    }
                 }
             }
             TStmt::If(cond, then, els) => self.lower_if(cond, then, els.as_deref()),
@@ -685,24 +693,35 @@ impl FnLower<'_> {
                 self.init_compound(*obj, *zero_size, stores);
                 self.slots[*obj]
             }
+            // A bit-field is not addressable; it is read/written through its
+            // storage unit by the dedicated bit-field paths, never as an lvalue
+            // address (`&` of a bit-field is rejected in sema).
+            TExprKind::BitField { .. } => unreachable!("bit-field has no address"),
             _ => unreachable!("lower_lvalue on a non-lvalue expression"),
         }
     }
 
     /// Initialize a compound literal's object in place: zero-fill an aggregate,
     /// then perform its scalar stores.
-    fn init_compound(&mut self, obj: usize, zero_size: u64, stores: &[(u64, TExpr)]) {
+    fn init_compound(&mut self, obj: usize, zero_size: u64, stores: &[AggStore]) {
         let base = self.slots[obj];
         if zero_size > 0 {
             self.zero_fill(base, zero_size);
         }
-        for (offset, value) in stores {
-            self.set_line(value.span);
-            let val = self.lower_rvalue(value);
-            let addr = self.offset_ptr(base, *offset);
-            let ty = self.tys.of(&value.ty);
-            let align = align_of(&value.ty);
-            self.b.store(ty, addr, val, align);
+        for st in stores {
+            self.set_line(st.value.span);
+            let val = self.lower_rvalue(&st.value);
+            let addr = self.offset_ptr(base, st.offset);
+            match &st.bits {
+                Some(bp) => {
+                    self.bitfield_write_at(addr, bp, val);
+                }
+                None => {
+                    let ty = self.tys.of(&st.value.ty);
+                    let align = align_of(&st.value.ty);
+                    self.b.store(ty, addr, val, align);
+                }
+            }
         }
     }
 
@@ -796,6 +815,10 @@ impl FnLower<'_> {
                 let align = align_of(&e.ty);
                 self.b.load(ty, addr, align)
             }
+            TExprKind::BitField { base, offset, bits } => {
+                let addr = self.bitfield_unit_addr(base, *offset);
+                self.bitfield_read_at(addr, bits)
+            }
             TExprKind::Decay(inner) => self.lower_lvalue(inner),
             TExprKind::CopyAssign { dst, src, size } => {
                 let d = self.lower_lvalue(dst);
@@ -871,12 +894,18 @@ impl FnLower<'_> {
             TExprKind::LogAnd(l, r) => self.lower_logical(l, r, true),
             TExprKind::LogOr(l, r) => self.lower_logical(l, r, false),
             TExprKind::Assign(lval, rval) => {
-                let addr = self.lower_lvalue(lval);
-                let v = self.lower_rvalue(rval);
-                let ty = self.tys.of(&lval.ty);
-                let align = align_of(&lval.ty);
-                self.b.store(ty, addr, v, align);
-                v
+                if let TExprKind::BitField { base, offset, bits } = &lval.kind {
+                    let addr = self.bitfield_unit_addr(base, *offset);
+                    let v = self.lower_rvalue(rval);
+                    self.bitfield_write_at(addr, bits, v)
+                } else {
+                    let addr = self.lower_lvalue(lval);
+                    let v = self.lower_rvalue(rval);
+                    let ty = self.tys.of(&lval.ty);
+                    let align = align_of(&lval.ty);
+                    self.b.store(ty, addr, v, align);
+                    v
+                }
             }
             TExprKind::Compound { lvalue, rhs, op, compute_ty } => {
                 self.lower_compound(lvalue, rhs, *op, compute_ty, &e.ty)
@@ -969,6 +998,36 @@ impl FnLower<'_> {
         compute_ty: &CType,
         result_ty: &CType,
     ) -> ValueId {
+        // A bit-field compound assignment reads through its storage unit, computes
+        // in `compute_ty`, and writes back with a masked read-modify-write.
+        if let TExprKind::BitField { base, offset, bits } = &lvalue.kind {
+            let unit_addr = self.bitfield_unit_addr(base, *offset);
+            let old = self.bitfield_read_at(unit_addr, bits);
+            let oldc = self.convert(old, &lvalue.ty, compute_ty);
+            let rv0 = self.lower_rvalue(rhs);
+            let res = if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                let amt = self.int_resize(
+                    rv0,
+                    width_of(&rhs.ty),
+                    rhs.ty.is_signed(),
+                    width_of(compute_ty),
+                );
+                let binop = match op {
+                    BinaryOp::Shl => BinOp::Shl,
+                    _ if compute_ty.is_signed() => BinOp::AShr,
+                    _ => BinOp::LShr,
+                };
+                self.b.bin(binop, oldc, amt, Flags::NONE)
+            } else {
+                let rc = self.convert(rv0, &rhs.ty, compute_ty);
+                let binop = arith_binop(op, compute_ty.is_signed());
+                self.b.bin(binop, oldc, rc, Flags::NONE)
+            };
+            let newv = self.convert(res, compute_ty, &lvalue.ty);
+            let _ = result_ty;
+            return self.bitfield_write_at(unit_addr, bits, newv);
+        }
+
         let addr = self.lower_lvalue(lvalue);
         let lty = self.tys.of(&lvalue.ty);
         let align = align_of(&lvalue.ty);
@@ -1021,6 +1080,21 @@ impl FnLower<'_> {
     }
 
     fn lower_incdec(&mut self, target: &TExpr, inc: bool, post: bool, scale: u64) -> ValueId {
+        // A bit-field `++`/`--` reads its (extended) value, adjusts by one, and
+        // writes back through a masked read-modify-write.
+        if let TExprKind::BitField { base, offset, bits } = &target.kind {
+            let unit_addr = self.bitfield_unit_addr(base, *offset);
+            let old = self.bitfield_read_at(unit_addr, bits);
+            let ty = self.tys.of(&target.ty);
+            let one = self.b.const_i64(ty, 1);
+            let new = if inc {
+                self.b.add(old, one, Flags::NONE)
+            } else {
+                self.b.sub(old, one, Flags::NONE)
+            };
+            let stored = self.bitfield_write_at(unit_addr, bits, new);
+            return if post { old } else { stored };
+        }
         let addr = self.lower_lvalue(target);
         let ty = self.tys.of(&target.ty);
         let align = align_of(&target.ty);
@@ -1043,6 +1117,85 @@ impl FnLower<'_> {
         };
         self.b.store(ty, addr, new, align);
         if post { old } else { new }
+    }
+
+    /// The address of a bit-field's storage unit: the base aggregate lvalue's
+    /// address displaced by the storage unit's byte offset.
+    fn bitfield_unit_addr(&mut self, base: &TExpr, offset: u64) -> ValueId {
+        let a = self.lower_lvalue(base);
+        self.offset_ptr(a, offset)
+    }
+
+    /// Read a bit-field from its storage unit at `addr`: load the native unit,
+    /// then isolate and sign/zero-extend the field to the storage-unit
+    /// (declared-type) width.
+    ///
+    /// The mask/shift arithmetic is performed in a work width of at least 32 bits
+    /// (the IR backend does not reliably truncate sub-word shift results), then
+    /// truncated back to the declared-type width.
+    fn bitfield_read_at(&mut self, addr: ValueId, bp: &BitPlacement) -> ValueId {
+        let unit_bits = bp.unit_bits;
+        let unit_ty = self.tys.for_int(unit_bits);
+        let align = u32::from(unit_bits / 8).max(1);
+        let raw = self.b.load(unit_ty, addr, align);
+        let w = work_bits(unit_bits);
+        // Zero-extend the loaded unit into the work width; the bits above the field
+        // are shifted out during extraction, so their value is irrelevant.
+        let raw_w = self.int_resize(raw, unit_bits, false, w);
+        let work_ty = self.tys.for_int(w);
+        let left = u32::from(w) - bp.bit_offset - bp.width;
+        let right = u32::from(w) - bp.width;
+        let lsh = self.b.const_i64(work_ty, i64::from(left));
+        let hi = self.b.bin(BinOp::Shl, raw_w, lsh, Flags::NONE);
+        let rsh = self.b.const_i64(work_ty, i64::from(right));
+        let op = if bp.signed { BinOp::AShr } else { BinOp::LShr };
+        let ext = self.b.bin(op, hi, rsh, Flags::NONE);
+        // Truncate the extracted (already sign/zero-extended) value back to the
+        // declared-type width, which equals the storage unit's width.
+        self.int_resize(ext, w, bp.signed, unit_bits)
+    }
+
+    /// Write `value` (already in the field's declared type) into a bit-field at
+    /// storage-unit address `addr` via a read-modify-write: clear the field's bits
+    /// in the loaded unit, insert the masked value, and store the unit back.
+    /// Returns the stored field value re-extended to the declared type (the value
+    /// of a bit-field assignment expression, which wraps modulo `2^width`).
+    ///
+    /// As in [`Self::bitfield_read_at`], the bit manipulation is done in a work
+    /// width of at least 32 bits and truncated to the unit width for the store.
+    fn bitfield_write_at(&mut self, addr: ValueId, bp: &BitPlacement, value: ValueId) -> ValueId {
+        let unit_bits = bp.unit_bits;
+        let unit_ty = self.tys.for_int(unit_bits);
+        let align = u32::from(unit_bits / 8).max(1);
+        let w = work_bits(unit_bits);
+        let work_ty = self.tys.for_int(w);
+
+        let old = self.b.load(unit_ty, addr, align);
+        let old_w = self.int_resize(old, unit_bits, false, w);
+        let value_w = self.int_resize(value, unit_bits, false, w);
+
+        let mask = self.b.const_i64(work_ty, bitfield_mask(bp.width, w));
+        let off = self.b.const_i64(work_ty, i64::from(bp.bit_offset));
+        let mask_sh = self.b.bin(BinOp::Shl, mask, off, Flags::NONE);
+        let all_ones = self.b.const_i64(work_ty, -1);
+        let inv = self.b.bin(BinOp::Xor, mask_sh, all_ones, Flags::NONE);
+        let cleared = self.b.bin(BinOp::And, old_w, inv, Flags::NONE);
+        let vmask = self.b.bin(BinOp::And, value_w, mask, Flags::NONE);
+        let vsh = self.b.bin(BinOp::Shl, vmask, off, Flags::NONE);
+        let newv_w = self.b.bin(BinOp::Or, cleared, vsh, Flags::NONE);
+        let newv = self.int_resize(newv_w, w, false, unit_bits);
+        self.b.store(unit_ty, addr, newv, align);
+
+        // The value of the assignment is the field read back: sign/zero-extend the
+        // masked low bits to the declared-type width.
+        let result_w = if bp.signed {
+            let sh = self.b.const_i64(work_ty, i64::from(u32::from(w) - bp.width));
+            let hi = self.b.bin(BinOp::Shl, vmask, sh, Flags::NONE);
+            self.b.bin(BinOp::AShr, hi, sh, Flags::NONE)
+        } else {
+            vmask
+        };
+        self.int_resize(result_w, w, bp.signed, unit_bits)
     }
 
     fn lower_call(&mut self, callee: &TExpr, args: &[TExpr], call: &TExpr) -> Option<ValueId> {
@@ -1222,6 +1375,23 @@ fn cmp_pred(op: BinaryOp, signed: bool) -> IntPred {
             }
         }
         _ => unreachable!("not a comparison operator: {op:?}"),
+    }
+}
+
+/// The work width (in bits) for a bit-field's mask/shift arithmetic: at least 32
+/// bits, since the IR backend does not reliably truncate sub-word shift results.
+fn work_bits(unit_bits: u16) -> u16 {
+    if unit_bits <= 32 { 32 } else { 64 }
+}
+
+/// The low-`width`-bits mask as an `i64` for a `work_bits`-wide compute value. A
+/// field as wide as the work width uses all-ones (`-1`), avoiding a
+/// `1 << work_bits` overflow.
+fn bitfield_mask(width: u32, work_bits: u16) -> i64 {
+    if width >= u32::from(work_bits) {
+        -1
+    } else {
+        ((1u64 << width) - 1) as i64
     }
 }
 
