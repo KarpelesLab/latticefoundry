@@ -503,9 +503,20 @@ impl X86_64Target {
 
         // Route each argument by class: integers into rdi.. (a separate counter
         // from) floats into xmm0.. — the SysV rule for mixed int/float calls.
+        //
+        // Materialize *every* argument value into a vreg FIRST, then move them all
+        // into the physical argument registers immediately before the call. If we
+        // instead materialized-and-moved one argument at a time, a later argument's
+        // materialization (e.g. loading a float constant, which lands in a fresh
+        // vreg) could be colored into an argument register already holding an
+        // earlier argument: the register allocator's fixed-register model is
+        // point-based, so it would not see that the argument register is live
+        // across the gap between its arg-move and the call. Emitting all the moves
+        // consecutively right before the call keeps each argument register's
+        // occupied range free of any competing vreg definition.
         let mut int_i = 0usize;
         let mut fp_i = 0usize;
-        let mut used_arg_regs: Vec<PReg> = Vec::with_capacity(args.len());
+        let mut moves: Vec<(PReg, VReg)> = Vec::with_capacity(args.len());
         for &arg in args {
             let r = lo.reg(arg);
             let areg = match lo.mf().vreg_class(r) {
@@ -520,8 +531,11 @@ impl X86_64Target {
                     a
                 }
             };
+            moves.push((areg, r));
+        }
+        let used_arg_regs: Vec<PReg> = moves.iter().map(|&(areg, _)| areg).collect();
+        for (areg, r) in moves {
             lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(areg), use_v(r)]));
-            used_arg_regs.push(areg);
         }
 
         // The return register follows the result type's class (xmm0 for a float

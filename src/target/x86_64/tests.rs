@@ -474,6 +474,38 @@ fn build_ffloat() -> (Module, StrInterner, FuncId) {
     (m, syms, f)
 }
 
+/// `double call_g() = g(1.5, 2.5)` where `double g(double,double)=a+b`. Passes
+/// two float *constants* directly as call arguments — a regression fixture for
+/// the arg-register clobber (the 2nd constant's materialization must not land in
+/// `xmm0`, which already holds arg0).
+fn build_fconst_args() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig_g = m.types_mut().func(vec![f64t, f64t], f64t, false);
+    let g = m.declare_function(syms.intern("g"), sig_g);
+    {
+        let mut b = m.build(g);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let s = b.bin(BinOp::FAdd, a, bb, Flags::NONE);
+        b.ret(Some(s));
+    }
+    let sig_c = m.types_mut().func(vec![], f64t, false);
+    let caller = m.declare_function(syms.intern("call_g"), sig_c);
+    {
+        let mut b = m.build(caller);
+        let _entry = b.create_entry_block();
+        let gref = b.func_ref(g);
+        let c1 = b.const_float(f64t, FloatBits::F64(1.5f64.to_bits()));
+        let c2 = b.const_float(f64t, FloatBits::F64(2.5f64.to_bits()));
+        let r = b.call(gref, &[c1, c2], f64t).expect("call has a result");
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
 /// `int lff2i(double x) = (int)(x*x)` — `fptosi` after an `fmul`.
 fn build_fptosi() -> (Module, StrInterner, FuncId) {
     let mut syms = StrInterner::new();
@@ -600,9 +632,20 @@ fn run_add() {
             return 0;
         }
     "#;
-    match compile_link_run(&m, &syms, "add", c) {
-        Some(code) => assert_eq!(code, 0, "lfadd produced wrong result (exit {code})"),
-        None => eprintln!("skipping run_add: no C compiler"),
+    if let Some(code) = compile_link_run(&m, &syms, "add", c) {
+        assert_eq!(code, 0, "lfadd checks failed (exit {code})");
+    }
+}
+
+#[test]
+fn run_float_constant_args() {
+    // Regression: `g(1.5, 2.5)` with both arguments passed as float constants.
+    // The second constant used to be materialized into xmm0, clobbering arg0, so
+    // g received (2.5, 2.5) and returned 5.0 instead of 4.0.
+    let (m, syms) = build_fconst_args();
+    let c = "extern double call_g(void); int main(void){ return call_g() == 4.0 ? 0 : 1; }";
+    if let Some(code) = compile_link_run(&m, &syms, "fconst", c) {
+        assert_eq!(code, 0, "call_g() != 4.0 — an argument register was clobbered");
     }
 }
 
