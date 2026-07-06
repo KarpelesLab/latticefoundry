@@ -1,10 +1,11 @@
 //! The **`Refinement`** verification tier (bet **B2**, tenet **T3**): every
 //! optimization is a *checked refinement*.
 //!
-//! This module is the first cut of the refinement checker. It takes a rewrite
-//! `src ⇒ tgt` — two functions with the same signature, each a single
-//! straight-line block of **pure** value-producing ops ending in `ret <value>`
-//! — encodes both into SMT-LIB2 **QF_BV**, and asks [`z3rs`](crate::verify::smt)
+//! This module is the refinement checker. It takes a rewrite `src ⇒ tgt` — two
+//! functions with the same signature, each an **acyclic** (loop-free) region of
+//! **pure** value-producing ops and control flow (`ret`/`br`/`cond_br`/`switch`/
+//! `unreachable`) — encodes both into SMT-LIB2 **QF_BV**, and asks
+//! [`z3rs`](crate::verify::smt)
 //! whether `tgt` refines `src`. `unsat` of the negated obligation means the
 //! rewrite is a sound refinement; `sat` yields a counterexample input; anything
 //! else (`unknown`, a solver error, an unsupported construct) is reported as a
@@ -69,21 +70,44 @@
 //!
 //! and we hand the solver its **negation**; `unsat` ⇒ the rewrite is sound.
 //!
-//! ## Scope of this first cut
+//! ## Multi-block (acyclic) control flow
+//!
+//! Beyond the single-block subset, an entire **DAG** function is encoded (loops —
+//! any back-edge — are detected and reported as `Unknown`, never encoded):
+//!
+//! - **Reachability guards.** Each block `b` gets a boolean `reach_b`
+//!   (`reach_entry = true`; otherwise the disjunction of its incoming edges). An
+//!   edge `s → t` is *taken* iff `reach_s` holds and the terminator's local guard
+//!   does: `br` is unconditional; `cond_br` takes the true edge iff the condition
+//!   bit is `1`; `switch` takes the matching case, else the default. Branching or
+//!   switching on a **poison** condition, and *reaching* an `unreachable`, are
+//!   **UB** (guarded by `reach_b`) — matching `ir::semantics`.
+//! - **Block parameters as merges.** A non-entry block parameter's `(val,poison)`
+//!   is a deterministic `ite` chain over its incoming taken edges (our SSA phi):
+//!   exactly one edge is taken on any concrete path, so the chain reads that
+//!   edge's argument. Entry parameters are the shared symbolic inputs.
+//! - **Per-block effect.** Instructions encode as in the single-block case, but a
+//!   block's UB conditions are guarded by `reach_b` (an unreachable op cannot
+//!   fault); unreachable values never flow into the result or a live merge.
+//! - **The result.** A value-returning function may `ret` from several blocks; the
+//!   observed result is the `ite` over the reachable `ret` blocks (exactly one is
+//!   reachable on any path).
+//!
+//! ## Scope
 //!
 //! In scope: integer (`Int(N)`) pure ops — `add`/`sub`/`mul`, `udiv`/`sdiv`/
 //! `urem`/`srem`, `and`/`or`/`xor`, `shl`/`lshr`/`ashr`, `icmp`, `select`,
-//! `freeze`, and the integer casts `trunc`/`zext`/`sext`; all their flags. Out
-//! of scope (cleanly reported as [`RefinementResult::Unknown`], never a false
-//! `Refines`): floating point, pointers/memory, `call`, multi-block control
-//! flow, and non-integer casts.
+//! `freeze`, and the integer casts `trunc`/`zext`/`sext`; all their flags; plus
+//! acyclic control flow with block-argument merges. Out of scope (cleanly
+//! reported as [`RefinementResult::Unknown`], never a false `Refines`): floating
+//! point, pointers/memory, `call`, **loops** (back-edges), and non-integer casts.
 
 use std::collections::HashMap;
 
 use crate::ir::inst::{BinOp, CastOp, Flags, InstData, InstKind, IntPred};
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ConstPool, ValueDef, ValueId};
-use crate::ir::{FuncId, Function, Module};
+use crate::ir::{BlockId, FuncId, Function, Module};
 
 use super::smt::z3rs;
 
@@ -140,7 +164,10 @@ pub fn check_refinement(
 ) -> RefinementResult {
     match build_query(types, consts, src, tgt) {
         Ok(query) => decide(&query.script, &query.input_names),
-        Err(EncErr(reason)) => RefinementResult::Unknown(format!("unsupported: {reason}")),
+        Err(EncErr::Unsupported(reason)) => {
+            RefinementResult::Unknown(format!("unsupported: {reason}"))
+        }
+        Err(EncErr::Loops) => RefinementResult::Unknown("loops unsupported".to_string()),
     }
 }
 
@@ -148,11 +175,18 @@ pub fn check_refinement(
 // Errors and small value types.
 // ---------------------------------------------------------------------------
 
-/// An out-of-scope construct was encountered while encoding.
-struct EncErr(String);
+/// Why encoding could not proceed (a *sound non-answer*, never a false proof).
+#[derive(Clone, Debug)]
+enum EncErr {
+    /// An out-of-scope construct was encountered while encoding.
+    Unsupported(String),
+    /// The function is not a DAG (it has a back-edge / loop). Unbounded loops are
+    /// deliberately not encoded; the check reports [`RefinementResult::Unknown`].
+    Loops,
+}
 
 fn unsupported(what: impl Into<String>) -> EncErr {
-    EncErr(what.into())
+    EncErr::Unsupported(what.into())
 }
 
 /// The encoded `(value, poison)` SMT terms of one SSA value, plus its width.
@@ -188,8 +222,8 @@ fn build_query(
     src: &Function,
     tgt: &Function,
 ) -> Result<Query, EncErr> {
-    let src_params = single_block_params_ret(src)?.0;
-    let tgt_params = single_block_params_ret(tgt)?.0;
+    let src_params = entry_params(src)?;
+    let tgt_params = entry_params(tgt)?;
 
     // Signatures must match: same parameter widths and same return width. We
     // compare the concrete entry-parameter types (the function's parameters).
@@ -255,26 +289,73 @@ fn or_terms(terms: &[String]) -> String {
     }
 }
 
-/// Require a function to be a single block ending in `ret <value>`; return its
-/// entry parameters and the returned value.
-fn single_block_params_ret(func: &Function) -> Result<(Vec<ValueId>, ValueId), EncErr> {
-    if func.block_count() != 1 {
-        return Err(unsupported("multiple blocks (control flow) not supported"));
-    }
+/// The function's parameters: its entry block's parameter list.
+fn entry_params(func: &Function) -> Result<Vec<ValueId>, EncErr> {
     let entry = func.entry().ok_or_else(|| unsupported("function has no body"))?;
-    let block = func.block(entry);
-    let term_id = block.terminator().ok_or_else(|| unsupported("block is not terminated"))?;
-    let term = func.inst(term_id);
-    match term.kind {
-        InstKind::Ret => {
-            let ops = term.operands();
-            if ops.len() != 1 {
-                return Err(unsupported("only value-returning `ret` is supported"));
-            }
-            Ok((block.params().to_vec(), ops[0]))
-        }
-        _ => Err(unsupported("terminator is not `ret`")),
+    Ok(func.block(entry).params().to_vec())
+}
+
+/// The integer width of a function's return type, or `None` if non-integer.
+fn func_ret_width(types: &TypeContext, func: &Function) -> Option<u32> {
+    match types.get(func.sig) {
+        Type::Func(ft) => int_width(types, ft.ret),
+        _ => None,
     }
+}
+
+/// A reverse-postorder over the blocks **reachable** from the entry (so every
+/// predecessor precedes its successors — a valid topological order for a DAG),
+/// or [`EncErr::Loops`] if a back-edge is found (the function is not acyclic).
+///
+/// Uses an iterative colored DFS: a successor still on the DFS stack (gray) marks
+/// a back-edge. Successor targets out of range are dropped (matching the CFG
+/// builder's tolerance; the structural verifier rejects them earlier).
+fn reverse_postorder(func: &Function) -> Result<Vec<BlockId>, EncErr> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    let n = func.block_count();
+    let entry = func.entry().ok_or_else(|| unsupported("function has no body"))?.index();
+    let mut color = vec![Color::White; n];
+    let mut post = Vec::new();
+    let mut stack: Vec<(usize, usize)> = vec![(entry, 0)];
+    color[entry] = Color::Gray;
+    while let Some(&(node, idx)) = stack.last() {
+        let succ: Vec<usize> = match func.block(BlockId::from_index(node)).terminator() {
+            Some(t) => func.inst(t).successors().into_iter().map(BlockId::index).filter(|&s| s < n).collect(),
+            None => return Err(unsupported("block is not terminated")),
+        };
+        if idx < succ.len() {
+            stack.last_mut().expect("nonempty").1 = idx + 1;
+            let next = succ[idx];
+            match color[next] {
+                Color::White => {
+                    color[next] = Color::Gray;
+                    stack.push((next, 0));
+                }
+                Color::Gray => return Err(EncErr::Loops),
+                Color::Black => {}
+            }
+        } else {
+            color[node] = Color::Black;
+            post.push(node);
+            stack.pop();
+        }
+    }
+    Ok(post.into_iter().rev().map(BlockId::from_index).collect())
+}
+
+/// One incoming CFG edge into a block: the boolean term for "this edge is taken"
+/// and the block arguments it supplies (matching the target's parameters).
+#[derive(Clone)]
+struct Edge {
+    /// SMT `Bool` term: `reach_src ∧ (the terminator's local guard)`.
+    taken: String,
+    /// The values passed on this edge, positionally matching the target's params.
+    args: Vec<ValueId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,32 +408,251 @@ impl Enc<'_> {
         Sym { val: vn, poison: pn, width }
     }
 
-    /// Encode a whole function's straight-line body over the shared `inputs`.
+    /// Encode a whole **acyclic** function over the shared `inputs`: reachability
+    /// guards, block-parameter merges, per-block pure ops, and the multi-`ret`
+    /// result. Returns [`EncErr::Loops`] if the function has a back-edge.
     fn encode_function(
         &mut self,
         func: &Function,
         prefix: &str,
         inputs: &[Sym],
     ) -> Result<EncodedFn, EncErr> {
-        let (params, ret_val) = single_block_params_ret(func)?;
-        let entry = func.entry().expect("checked above");
+        let entry = func.entry().ok_or_else(|| unsupported("function has no body"))?;
+        // Reachable blocks in topological order; also our loop check.
+        let order = reverse_postorder(func)?;
+        let mut reachable = vec![false; func.block_count()];
+        for &b in &order {
+            reachable[b.index()] = true;
+        }
 
         let mut map: HashMap<ValueId, Sym> = HashMap::new();
-        for (i, &p) in params.iter().enumerate() {
-            map.insert(p, inputs[i].clone());
+        let mut ub: Vec<String> = Vec::new();
+        // Incoming edges collected as predecessors are processed (topo order
+        // guarantees every predecessor is handled before its target).
+        let mut incoming: HashMap<usize, Vec<Edge>> = HashMap::new();
+        // The (reach, value) of each `ret` block, in encounter order.
+        let mut rets: Vec<(String, Sym)> = Vec::new();
+
+        for &b in &order {
+            let bi = b.index();
+            let block = func.block(b);
+            let edges = incoming.get(&bi).cloned().unwrap_or_default();
+
+            // 1. Reachability guard for this block.
+            let reach = self.bind_reach(prefix, bi, bi == entry.index(), &edges);
+
+            // 2. Block parameters: entry params are the inputs; others are merges.
+            if bi == entry.index() {
+                for (i, &p) in block.params().iter().enumerate() {
+                    map.insert(p, inputs[i].clone());
+                }
+            } else {
+                for (j, &p) in block.params().iter().enumerate() {
+                    let sym = self.merge_param(func, &mut map, prefix, p, j, &edges)?;
+                    map.insert(p, sym);
+                }
+            }
+
+            // 3. The block's pure instructions (UB guarded by reachability).
+            for &inst_id in block.insts() {
+                let inst = func.inst(inst_id);
+                if let Some(res) = inst.result() {
+                    let sym = self.encode_inst(func, prefix, inst, res, &mut map, &mut ub, &reach)?;
+                    map.insert(res, sym);
+                }
+            }
+
+            // 4. The terminator: outgoing edges, branch/switch UB, and `ret`s.
+            let term_id = block.terminator().ok_or_else(|| unsupported("block is not terminated"))?;
+            let term = func.inst(term_id).clone();
+            self.encode_terminator(
+                func, &term, &reach, &mut map, &mut incoming, &mut ub, &mut rets, &reachable,
+            )?;
         }
 
-        let mut ub = Vec::new();
-        for &inst_id in func.block(entry).insts() {
-            let inst = func.inst(inst_id);
-            if let Some(res) = inst.result() {
-                let sym = self.encode_inst(func, prefix, inst, res, &mut map, &mut ub)?;
-                map.insert(res, sym);
+        let ret = self.merge_rets(func, prefix, &rets)?;
+        Ok(EncodedFn { ret, ub })
+    }
+
+    /// Declare and define block `bi`'s reachability boolean, returning its name.
+    /// The entry is always reachable; any other block is reachable iff some
+    /// incoming edge is taken.
+    fn bind_reach(&mut self, prefix: &str, bi: usize, is_entry: bool, edges: &[Edge]) -> String {
+        let name = format!("{prefix}reach{bi}");
+        self.declare_bool(&name);
+        let def = if is_entry {
+            "true".to_string()
+        } else {
+            or_terms(&edges.iter().map(|e| e.taken.clone()).collect::<Vec<_>>())
+        };
+        self.assert(&format!("(= {name} {def})"));
+        name
+    }
+
+    /// Merge the `j`-th block parameter across its `incoming` edges as a
+    /// deterministic `ite` chain (an SSA phi): on any concrete path exactly one
+    /// edge is taken, so the chain reads that edge's argument. A parameter of an
+    /// (effectively) unreachable block with no encoded predecessors is bound to a
+    /// fresh unconstrained value that never reaches the observable result.
+    fn merge_param(
+        &mut self,
+        func: &Function,
+        map: &mut HashMap<ValueId, Sym>,
+        prefix: &str,
+        p: ValueId,
+        j: usize,
+        edges: &[Edge],
+    ) -> Result<Sym, EncErr> {
+        let w = int_width(self.types, func.value_type(p))
+            .ok_or_else(|| unsupported("non-integer block parameter"))?;
+        let vn = format!("{prefix}bv{}", p.index());
+        let pn = format!("{prefix}bp{}", p.index());
+        self.declare_bv(&vn, w);
+        self.declare_bool(&pn);
+        if edges.is_empty() {
+            let fresh = self.fresh_bv(w);
+            self.assert(&format!("(= {vn} {fresh})"));
+            self.assert(&format!("(= {pn} false)"));
+            return Ok(Sym { val: vn, poison: pn, width: w });
+        }
+        // Resolve each edge's j-th argument to a Sym, keeping the edge's guard.
+        let mut arms: Vec<(String, Sym)> = Vec::with_capacity(edges.len());
+        for e in edges {
+            let a = *e.args.get(j).ok_or_else(|| unsupported("edge argument arity mismatch"))?;
+            let sym = self.resolve(func, map, a)?;
+            arms.push((e.taken.clone(), sym));
+        }
+        let (val, poison) = ite_chain(&arms);
+        self.assert(&format!("(= {vn} {val})"));
+        self.assert(&format!("(= {pn} {poison})"));
+        Ok(Sym { val: vn, poison: pn, width: w })
+    }
+
+    /// Encode a terminator: register its outgoing (taken, args) edges on their
+    /// targets, contribute branch/switch/unreachable **UB** (guarded by `reach`),
+    /// and record `ret` blocks. Edges into (statically) unreachable targets are
+    /// dropped — their guard would be `false` anyway.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_terminator(
+        &mut self,
+        func: &Function,
+        term: &InstData,
+        reach: &str,
+        map: &mut HashMap<ValueId, Sym>,
+        incoming: &mut HashMap<usize, Vec<Edge>>,
+        ub: &mut Vec<String>,
+        rets: &mut Vec<(String, Sym)>,
+        reachable: &[bool],
+    ) -> Result<(), EncErr> {
+        let mut add_edge = |target: BlockId, taken: String, args: Vec<ValueId>| {
+            if reachable.get(target.index()).copied().unwrap_or(false) {
+                incoming.entry(target.index()).or_default().push(Edge { taken, args });
+            }
+        };
+        match &term.kind {
+            InstKind::Ret => {
+                let ops = term.operands();
+                match ops.len() {
+                    1 => {
+                        let sym = self.resolve(func, map, ops[0])?;
+                        rets.push((reach.to_string(), sym));
+                    }
+                    0 => return Err(unsupported("void `ret` (no value to refine)")),
+                    _ => return Err(unsupported("`ret` with multiple operands")),
+                }
+            }
+            InstKind::Br(target) => {
+                add_edge(*target, reach.to_string(), term.operands().to_vec());
+            }
+            InstKind::CondBr { if_true, if_false, true_args, false_args } => {
+                let ops = term.operands();
+                let cond = self.resolve(func, map, ops[0])?;
+                let nt = *true_args as usize;
+                let nf = *false_args as usize;
+                if 1 + nt + nf != ops.len() {
+                    return Err(unsupported("cond_br argument arity mismatch"));
+                }
+                let true_args_v = ops[1..1 + nt].to_vec();
+                let false_args_v = ops[1 + nt..].to_vec();
+                let cond_true = format!("(= {} (_ bv1 1))", cond.val);
+                // Branching on poison is UB (only where this block is reached).
+                ub.push(format!("(and {reach} {})", cond.poison));
+                add_edge(*if_true, format!("(and {reach} {cond_true})"), true_args_v);
+                add_edge(*if_false, format!("(and {reach} (not {cond_true}))"), false_args_v);
+            }
+            InstKind::Switch(data) => {
+                let ops = term.operands();
+                let cond = self.resolve(func, map, ops[0])?;
+                let w = cond.width;
+                // Operand layout: [cond, <default args>, <case0 args>, ...].
+                let mut off = 1usize;
+                let da = data.default_args as usize;
+                if off + da > ops.len() {
+                    return Err(unsupported("switch default argument arity mismatch"));
+                }
+                let default_args = ops[off..off + da].to_vec();
+                off += da;
+                // Switching on poison is UB.
+                ub.push(format!("(and {reach} {})", cond.poison));
+                let mut case_eqs: Vec<String> = Vec::with_capacity(data.cases.len());
+                for case in &data.cases {
+                    let ca = case.args as usize;
+                    if off + ca > ops.len() {
+                        return Err(unsupported("switch case argument arity mismatch"));
+                    }
+                    let args = ops[off..off + ca].to_vec();
+                    off += ca;
+                    let eq = format!("(= {} {})", cond.val, bv_lit(&case.value, w));
+                    add_edge(case.target, format!("(and {reach} {eq})"), args);
+                    case_eqs.push(eq);
+                }
+                let none = if case_eqs.is_empty() {
+                    "true".to_string()
+                } else {
+                    format!("(not (or {}))", case_eqs.join(" "))
+                };
+                add_edge(data.default, format!("(and {reach} {none})"), default_args);
+            }
+            // Reaching `unreachable` at runtime is UB (asserts the path is dead).
+            InstKind::Unreachable => ub.push(reach.to_string()),
+            _ => return Err(unsupported("non-terminator in the terminator slot")),
+        }
+        Ok(())
+    }
+
+    /// The observed function result: an `ite` over the reachable `ret` blocks
+    /// (exactly one is reachable on any concrete path). With no `ret` block every
+    /// path is UB or non-returning, so the (never-observed) result is fresh.
+    fn merge_rets(
+        &mut self,
+        func: &Function,
+        prefix: &str,
+        rets: &[(String, Sym)],
+    ) -> Result<Sym, EncErr> {
+        let vn = format!("{prefix}ret_v");
+        let pn = format!("{prefix}ret_p");
+        if rets.is_empty() {
+            let w = func_ret_width(self.types, func)
+                .ok_or_else(|| unsupported("no `ret` and non-integer return type"))?;
+            self.declare_bv(&vn, w);
+            self.declare_bool(&pn);
+            let fresh = self.fresh_bv(w);
+            self.assert(&format!("(= {vn} {fresh})"));
+            self.assert(&format!("(= {pn} false)"));
+            return Ok(Sym { val: vn, poison: pn, width: w });
+        }
+        let w = rets[0].1.width;
+        for (_, s) in rets {
+            if s.width != w {
+                return Err(unsupported("`ret` blocks disagree on return width"));
             }
         }
-
-        let ret = self.resolve(func, &mut map, ret_val)?;
-        Ok(EncodedFn { ret, ub })
+        self.declare_bv(&vn, w);
+        self.declare_bool(&pn);
+        let (val, poison) = ite_chain(rets);
+        self.assert(&format!("(= {vn} {val})"));
+        self.assert(&format!("(= {pn} {poison})"));
+        Ok(Sym { val: vn, poison: pn, width: w })
     }
 
     /// Resolve an operand to its [`Sym`], materializing (and caching) constants.
@@ -401,6 +701,10 @@ impl Enc<'_> {
     }
 
     /// Encode one value-producing instruction, returning its result [`Sym`].
+    ///
+    /// Any undefined-behavior condition the op contributes is guarded by `reach`:
+    /// an op in an unreachable block cannot fault (its effect is not observed).
+    #[allow(clippy::too_many_arguments)]
     fn encode_inst(
         &mut self,
         func: &Function,
@@ -409,6 +713,7 @@ impl Enc<'_> {
         res: ValueId,
         map: &mut HashMap<ValueId, Sym>,
         ub: &mut Vec<String>,
+        reach: &str,
     ) -> Result<Sym, EncErr> {
         let mut ops = Vec::with_capacity(inst.operands().len());
         for &o in inst.operands() {
@@ -417,8 +722,10 @@ impl Enc<'_> {
         let rw = int_width(self.types, inst.ty)
             .ok_or_else(|| unsupported("non-integer result type"))?;
 
+        // UB conditions are collected locally, then guarded by `reach`.
+        let mut inst_ub: Vec<String> = Vec::new();
         let (val, poison) = match &inst.kind {
-            InstKind::Bin(op) => enc_bin(*op, &inst.flags, &ops, rw, ub)?,
+            InstKind::Bin(op) => enc_bin(*op, &inst.flags, &ops, rw, &mut inst_ub)?,
             InstKind::ICmp(pred) => enc_icmp(*pred, &ops)?,
             InstKind::Select => enc_select(&ops)?,
             InstKind::Cast(op) => enc_cast(*op, &ops, rw)?,
@@ -440,8 +747,25 @@ impl Enc<'_> {
             | InstKind::Switch(_)
             | InstKind::Unreachable => return Err(unsupported("terminator in the body")),
         };
+        for cond in inst_ub {
+            ub.push(format!("(and {reach} {cond})"));
+        }
         Ok(self.bind(prefix, res, rw, &val, &poison))
     }
+}
+
+/// Build the `(val, poison)` `ite` chain that reads the arm whose guard holds,
+/// deterministically folding from the last arm (its default) backwards. Exactly
+/// one guard is true on any concrete path, so the choice is unambiguous there.
+fn ite_chain(arms: &[(String, Sym)]) -> (String, String) {
+    let (_, last) = arms.last().expect("ite_chain requires at least one arm");
+    let mut val = last.val.clone();
+    let mut poison = last.poison.clone();
+    for (guard, sym) in arms[..arms.len() - 1].iter().rev() {
+        val = format!("(ite {guard} {} {val})", sym.val);
+        poison = format!("(ite {guard} {} {poison})", sym.poison);
+    }
+    (val, poison)
 }
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ use super::{
     run_pipeline_certified,
 };
 use crate::ir::builder::FunctionBuilder;
-use crate::ir::inst::{BinOp, Flags};
+use crate::ir::inst::{BinOp, Flags, IntPred};
 use crate::ir::value::ValueId;
 use crate::ir::{FuncId, Module, TypeId};
 use crate::support::StrInterner;
@@ -45,16 +45,25 @@ impl Harness {
         id
     }
 
-    /// Build a two-block (out-of-subset) function that just forwards its argument.
-    fn build_multiblock(&mut self, name: &str) -> FuncId {
+    /// Build a function with a **loop** (a back-edge) that ultimately forwards its
+    /// argument. Loops are outside the acyclic refinement subset, so the checker
+    /// reports `Unknown` — an honest `Unproven` certificate.
+    fn build_loop(&mut self, name: &str) -> FuncId {
+        let ity = self.ity;
         let sym = self.syms.intern(name);
         let id = self.module.declare_function(sym, self.sig);
         {
             let mut b = self.module.build(id);
             let entry = b.create_entry_block();
             let x = b.block_params(entry)[0];
+            let header = b.create_block(&[]);
             let exit = b.create_block(&[]);
-            b.br(exit, &[]);
+            b.br(header, &[]);
+            b.switch_to(header);
+            let zero = b.const_i64(ity, 0);
+            let c = b.icmp(IntPred::Ne, x, zero);
+            // Back-edge header -> header keeps the CFG cyclic.
+            b.cond_br(c, header, &[], exit, &[]);
             b.switch_to(exit);
             b.ret(Some(x));
         }
@@ -218,8 +227,8 @@ fn swapped_source_function_is_rejected() {
 #[test]
 fn out_of_subset_yields_unproven_not_certified() {
     let mut h = Harness::unary_int(8);
-    let src = h.build_multiblock("mb_src");
-    let tgt = h.build_multiblock("mb_tgt");
+    let src = h.build_loop("loop_src");
+    let tgt = h.build_loop("loop_tgt");
 
     let cert = h.certify("noop", src, tgt);
     assert!(matches!(cert.verdict, Verdict::Unproven(_)), "got {:?}", cert.verdict);
