@@ -293,6 +293,90 @@ fn fxor(e: &mut Emitter, is_f64: bool, d: u8, a: u8, b: u8) {
     sse_rr(e, xor_pfx, false, 0x57, d, b); // xorpd/xorps d, b
 }
 
+/// Emit `and r64/r32, imm8` (sign-extended immediate) — `83 /4 ib`.
+fn and_ri8(e: &mut Emitter, reg: u8, imm8: i8, w: bool) {
+    if w || reg >= 8 {
+        e.u8(rex(w, false, false, reg >= 8));
+    }
+    e.u8(0x83);
+    e.u8(modrm(3, 4, reg)); // /4 selects AND
+    e.u8(imm8 as u8);
+}
+
+/// Emit the unsigned `u64 → f64`/`f32` conversion (`uitofp` from a 64-bit
+/// source). x86 has no unsigned int→float, so: if the source's sign bit is clear
+/// a direct `cvtsi2sd` is exact; otherwise convert `(s>>1)|(s&1)` — a halving
+/// that keeps a sticky low bit so round-to-nearest matches gcc/clang — and
+/// double the result. `s` is the 64-bit source GPR (preserved), `d` the xmm dest.
+///
+/// The two scratch GPRs are chosen to never collide with `s` or with a spilled
+/// operand's reload register: this op has a single GPR operand (`s`), so the
+/// allocator uses at most scratch index 0/1 (`r10`/`r11`) for it; `rbx` (index 2)
+/// is always free, and the other temp is whichever of `r10`/`r11` is not `s`.
+fn u64tof(e: &mut Emitter, d: u8, s: u8, is_f64: bool) {
+    let pfx = scalar_prefix(is_f64);
+    let t1 = regs::RBX as u8;
+    let t2 = if s == regs::R10 as u8 { regs::R11 as u8 } else { regs::R10 as u8 };
+    let neg = e.create_label();
+    let done = e.create_label();
+    alu_rr(e, 0x85, s, s, true); // test s, s  (64-bit: SF = bit 63)
+    e.u8(0x0F);
+    e.u8(0x88); // js neg
+    e.pcrel32(Ref::Label(neg), 0);
+    sse_rr(e, pfx, true, 0x2A, d, s); // cvtsi2sd/ss d, s  (in range ⇒ exact)
+    e.u8(0xE9); // jmp done
+    e.pcrel32(Ref::Label(done), 0);
+    e.bind_label(neg);
+    mov_rr(e, t1, s, true); // t1 = s
+    shift_imm(e, 5, t1, 1, true); // t1 >>= 1  (shr)
+    mov_rr(e, t2, s, true); // t2 = s
+    and_ri8(e, t2, 1, true); // t2 &= 1  (sticky low bit)
+    alu_rr(e, 0x09, t1, t2, true); // t1 |= t2
+    sse_rr(e, pfx, true, 0x2A, d, t1); // cvtsi2sd/ss d, t1
+    sse_rr(e, pfx, false, 0x58, d, d); // addsd/ss d, d  (× 2)
+    e.bind_label(done);
+}
+
+/// Emit the unsigned `f64`/`f32 → u64` conversion (`fptoui` to a 64-bit result),
+/// truncating toward zero. `cvttsd2si` is signed, so inputs ≥ 2^63 are converted
+/// as `x − 2^63` with the bias added back (bit 63 set via `xor`); inputs below
+/// 2^63 convert directly. `s` is the source xmm (preserved), `d` the dest GPR.
+///
+/// Scratch choice mirrors `u64tof`: `r11` is free (the single GPR operand, `d`,
+/// uses `r10` if spilled), `xmm15` is free (single xmm operand uses xmm13/xmm14),
+/// and the value temp is whichever of `xmm13`/`xmm14` is not `s`.
+fn fptou64(e: &mut Emitter, d: u8, s: u8, is_f64: bool) {
+    let pfx = scalar_prefix(is_f64);
+    let ucomi_pfx = if is_f64 { 0x66 } else { 0x00 };
+    let thresh: u64 = if is_f64 { 0x43E0_0000_0000_0000 } else { 0x5F00_0000 }; // 2^63
+    let t_thresh = 15u8;
+    let t_val = if s == 13 { 14u8 } else { 13u8 };
+    let tmp = regs::R11 as u8;
+    let big = e.create_label();
+    let done = e.create_label();
+    if is_f64 {
+        mov_ri(e, tmp, thresh); // movabs r11, 2^63
+        sse_rr(e, 0x66, true, 0x6E, t_thresh, tmp); // movq t_thresh, r11
+    } else {
+        mov_ri(e, tmp, thresh & 0xFFFF_FFFF); // mov r11d, 2^63f
+        sse_rr(e, 0x66, false, 0x6E, t_thresh, tmp); // movd t_thresh, r11d
+    }
+    sse_rr(e, ucomi_pfx, false, 0x2E, s, t_thresh); // ucomis s, 2^63
+    e.u8(0x0F);
+    e.u8(0x83); // jae big  (CF=0 ⇒ s ≥ 2^63)
+    e.pcrel32(Ref::Label(big), 0);
+    sse_rr(e, pfx, true, 0x2C, d, s); // cvttsd2si d, s  (in range)
+    e.u8(0xE9); // jmp done
+    e.pcrel32(Ref::Label(done), 0);
+    e.bind_label(big);
+    sse_rr(e, pfx, false, 0x10, t_val, s); // movsd/ss t_val, s
+    sse_rr(e, pfx, false, 0x5C, t_val, t_thresh); // subsd/ss t_val, 2^63
+    sse_rr(e, pfx, true, 0x2C, d, t_val); // cvttsd2si d, (x − 2^63)
+    mov_ri(e, tmp, 0x8000_0000_0000_0000); // movabs r11, 2^63
+    alu_rr(e, 0x31, d, tmp, true); // xor d, r11  (add the bias back)
+    e.bind_label(done);
+}
+
 /// Emit an 8-bit ALU `op r/m8, r8` (`opcode /r`), forcing a `REX` so `spl`-style
 /// and `r8b..r15b` low bytes are addressable.
 fn alu_byte(e: &mut Emitter, opcode: u8, rm: u8, reg: u8) {
@@ -665,6 +749,21 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             e.u8(modrm(0, d, 5));
             e.pcrel32(Ref::Symbol((ctx.global_name)(g)), 0);
         }
+        X86Op::FuncAddr => {
+            let d = rnum(&ops[0]);
+            let f = match ops[1] {
+                MachineOperand::Func(f) => f,
+                _ => panic!("FuncAddr expects a Func operand"),
+            };
+            // lea d, [rip + disp32] with a PC32 relocation to the function
+            // symbol — the same materialization as GlobalAddr, but naming a
+            // function. Taking a function's address for a function pointer; a
+            // *direct* call still uses `E8` + PLT32 (the `Call`/`Func` arm).
+            e.u8(rex(true, d >= 8, false, false));
+            e.u8(0x8D);
+            e.u8(modrm(0, d, 5));
+            e.pcrel32(Ref::Symbol((ctx.func_name)(f)), 0);
+        }
         X86Op::Call => match &ops[0] {
             MachineOperand::Func(idx) => {
                 e.u8(0xE8);
@@ -796,9 +895,14 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let s = rnum(&ops[1]); // xmm
             let src_w = iimm(&ops[2]);
             let flags = uimm(&ops[3]);
-            let pfx = scalar_prefix(src_w == 64);
-            let w = flags & 1 != 0;
-            sse_rr(e, pfx, w, 0x2C, d, s); // cvttsd2si/cvttss2si d(gpr), s(xmm)
+            if flags & 0b10 != 0 {
+                // Full unsigned float→u64 with the 2^63 fix-up.
+                fptou64(e, d, s, src_w == 64);
+            } else {
+                let pfx = scalar_prefix(src_w == 64);
+                let w = flags & 1 != 0;
+                sse_rr(e, pfx, w, 0x2C, d, s); // cvttsd2si/cvttss2si d(gpr), s(xmm)
+            }
         }
         X86Op::CvtSi2f => {
             let d = rnum(&ops[0]); // xmm
@@ -806,7 +910,10 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let dst_w = iimm(&ops[2]);
             let flags = uimm(&ops[3]);
             let pfx = scalar_prefix(dst_w == 64);
-            if flags & 0b10 != 0 {
+            if flags & 0b100 != 0 {
+                // Full unsigned u64→float with the halve-and-round fix-up.
+                u64tof(e, d, s, dst_w == 64);
+            } else if flags & 0b10 != 0 {
                 // Unsigned ≤32: zero-extend the source into r11, then a 64-bit
                 // signed conversion (the value fits in [0, 2^32) ⊂ i64).
                 let tmp = regs::R11 as u8;

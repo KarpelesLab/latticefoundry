@@ -15,6 +15,7 @@ use crate::ir::types::FloatKind;
 use crate::ir::value::FloatBits;
 use crate::ir::{FuncId, Module};
 use crate::mc::emit::Emitter;
+use crate::mc::object::RelocKind;
 use crate::support::StrInterner;
 
 // ===========================================================================
@@ -907,4 +908,273 @@ fn encoding_is_deterministic() {
     let a = compile_to_elf(&m, &syms);
     let b = compile_to_elf(&m, &syms);
     assert_eq!(a, b, "identical input must yield identical bytes");
+}
+
+// ===========================================================================
+// Function-address materialization + unsigned-64 conversions
+// ===========================================================================
+
+/// `long long fp_add7(long long)` = `callee(x)` reached *indirectly*: the address
+/// of `fp_callee` is taken (a `func_ref` used as a value), stored into a stack
+/// slot, loaded back as a plain pointer, and called through the register. The
+/// stored value forces the function's address to be materialized, and the loaded
+/// pointer forces an indirect `call` (not a direct `call @callee`).
+fn build_func_pointer() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let ptrt = m.types_mut().ptr();
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let callee = m.declare_function(syms.intern("fp_callee"), sig);
+    let caller = m.declare_function(syms.intern("fp_add7"), sig);
+    {
+        let mut b = m.build(callee);
+        let entry = b.create_entry_block();
+        let y = b.param(entry, 0);
+        let seven = b.const_i64(i64t, 7);
+        let r = b.mul(y, seven, Flags::NONE);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(caller);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let slot = b.alloca(ptrt);
+        // `func_ref` used as a VALUE: its address is stored to memory.
+        let fref = b.func_ref(callee);
+        b.store(ptrt, slot, fref, 8);
+        // Load the pointer back and call *through it* (indirect call).
+        let fp = b.load(ptrt, slot, 8);
+        let r = b.call(fp, &[x], i64t).expect("call has a result");
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn func_address_is_riprel_lea_with_reloc() {
+    // A function used as a value must materialize as a RIP-relative `lea` with a
+    // relocation to the function symbol — never `mov reg, 0`. `mov reg, 0` emits
+    // no relocation, so the presence of a PC32 reloc against `fp_callee` proves
+    // the address is real.
+    let (m, syms) = build_func_pointer();
+    let obj = compile_module(&m, &syms);
+
+    let mut found = None;
+    for r in obj.relocations() {
+        if obj.symbol(r.symbol).name == "fp_callee" && r.kind == RelocKind::Pc32 {
+            found = Some(*r);
+        }
+    }
+    let r = found.expect("expected a PC32 relocation to fp_callee (the taken address)");
+
+    // The reloc patches the disp32 of a `lea d, [rip + disp32]`: the three bytes
+    // just before it are `REX.W(0x48/0x4C) 8D modrm` with ModRM.mod=00, rm=101.
+    let bytes = &obj.section(r.section).bytes;
+    let at = r.offset as usize;
+    assert!(at >= 3, "relocation cannot sit at the very start of .text");
+    let rex = bytes[at - 3];
+    let opcode = bytes[at - 2];
+    let modrm = bytes[at - 1];
+    assert!(rex == 0x48 || rex == 0x4C, "expected a REX.W prefix, got {rex:#04x}");
+    assert_eq!(opcode, 0x8D, "expected the `lea` opcode 0x8D");
+    assert_eq!(modrm & 0b1100_0111, 0b0000_0101, "expected ModRM rip-relative (mod=00, rm=101)");
+}
+
+#[test]
+fn run_func_pointer() {
+    // Execution: the indirect call through the materialized address must reach
+    // `fp_callee` and return the right value (x * 7).
+    let (m, syms) = build_func_pointer();
+    let c = r#"
+        long long fp_add7(long long);
+        long long fp_callee(long long);
+        int main(void) {
+            if (fp_callee(6) != 42) return 1;
+            if (fp_add7(6) != 42) return 2;   /* 6 * 7, reached indirectly */
+            if (fp_add7(0) != 0) return 3;
+            if (fp_add7(-3) != -21) return 4;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "funcptr", c) {
+        Some(code) => assert_eq!(code, 0, "indirect call via taken address failed (exit {code})"),
+        None => eprintln!("skipping run_func_pointer: no C compiler"),
+    }
+}
+
+/// `f64 u2d(u64)` = `(double)(unsigned long)x` — `uitofp` from a 64-bit source.
+fn build_u64_to_f64() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig = m.types_mut().func(vec![i64t], f64t, false);
+    let f = m.declare_function(syms.intern("u2d"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let r = b.cast(CastOp::UiToFp, x, f64t);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `f32 u2f(u64)` = `(float)(unsigned long)x` — `uitofp` from 64 bits to `f32`.
+fn build_u64_to_f32() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let f32t = m.types_mut().float(FloatKind::F32);
+    let sig = m.types_mut().func(vec![i64t], f32t, false);
+    let f = m.declare_function(syms.intern("u2f"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let r = b.cast(CastOp::UiToFp, x, f32t);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `u64 d2u(f64)` = `(unsigned long)x` — `fptoui` to a 64-bit result (truncating).
+fn build_f64_to_u64() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig = m.types_mut().func(vec![f64t], i64t, false);
+    let f = m.declare_function(syms.intern("d2u"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let r = b.cast(CastOp::FpToUi, x, i64t);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `u64 f2u(f32)` = `(unsigned long)x` — `fptoui` from `f32` to a 64-bit result.
+fn build_f32_to_u64() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let f32t = m.types_mut().float(FloatKind::F32);
+    let sig = m.types_mut().func(vec![f32t], i64t, false);
+    let f = m.declare_function(syms.intern("f2u"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let r = b.cast(CastOp::FpToUi, x, i64t);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+#[test]
+fn run_uitofp_u64() {
+    // uitofp of unsigned 64-bit values, including the > 2^63 range, must match
+    // the C compiler's `(double)(unsigned long)` / `(float)(unsigned long)`
+    // (round-to-nearest), across boundary values.
+    let (m, syms, _) = build_u64_to_f64();
+    let c = r#"
+        double u2d(unsigned long);
+        static int eqd(double a, double b) { return a == b; }
+        int main(void) {
+            unsigned long xs[] = {
+                0UL, 1UL, 1024UL,
+                0x7FFFFFFFFFFFFFFFUL,           /* 2^63 - 1 (sign bit clear) */
+                0x8000000000000000UL,           /* 2^63     (sign bit set)   */
+                0x8000000000000001UL,           /* 2^63 + 1 (rounding)       */
+                0xFFFFFFFFFFFFFFFFUL,           /* 2^64 - 1                  */
+                1234567890123456789UL
+            };
+            for (int i = 0; i < 8; i++)
+                if (!eqd(u2d(xs[i]), (double)xs[i])) return i + 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "u2d", c) {
+        Some(code) => assert_eq!(code, 0, "u2d mismatch vs C (double)(unsigned long) (exit {code})"),
+        None => eprintln!("skipping run_uitofp_u64: no C compiler"),
+    }
+}
+
+#[test]
+fn run_uitofp_u64_to_f32() {
+    let (m, syms, _) = build_u64_to_f32();
+    let c = r#"
+        float u2f(unsigned long);
+        static int eqf(float a, float b) { return a == b; }
+        int main(void) {
+            unsigned long xs[] = {
+                0UL, 1UL, 0x7FFFFFFFFFFFFFFFUL, 0x8000000000000000UL,
+                0x8000000000000001UL, 0xFFFFFFFFFFFFFFFFUL, 1234567890123456789UL
+            };
+            for (int i = 0; i < 7; i++)
+                if (!eqf(u2f(xs[i]), (float)xs[i])) return i + 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "u2f", c) {
+        Some(code) => assert_eq!(code, 0, "u2f mismatch vs C (float)(unsigned long) (exit {code})"),
+        None => eprintln!("skipping run_uitofp_u64_to_f32: no C compiler"),
+    }
+}
+
+#[test]
+fn run_fptoui_u64() {
+    // fptoui to unsigned 64-bit, including values ≥ 2^63, must match the C
+    // compiler's `(unsigned long)` truncation. Values stay below 2^64 (≥ 2^64 is
+    // C UB).
+    let (m, syms, _) = build_f64_to_u64();
+    let c = r#"
+        unsigned long d2u(double);
+        int main(void) {
+            double xs[] = {
+                0.0, 1.5, 42.9,
+                4611686018427387904.0,      /* 2^62 */
+                9223372036854775808.0,      /* 2^63 (boundary) */
+                9223372036854775809.0,      /* just above 2^63 */
+                1.0e19,
+                1.8e19,                     /* < 2^64 ≈ 1.8446744e19 */
+                12345678901234.5
+            };
+            for (int i = 0; i < 9; i++)
+                if (d2u(xs[i]) != (unsigned long)xs[i]) return i + 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "d2u", c) {
+        Some(code) => assert_eq!(code, 0, "d2u mismatch vs C (unsigned long)double (exit {code})"),
+        None => eprintln!("skipping run_fptoui_u64: no C compiler"),
+    }
+}
+
+#[test]
+fn run_fptoui_u64_from_f32() {
+    let (m, syms, _) = build_f32_to_u64();
+    let c = r#"
+        unsigned long f2u(float);
+        int main(void) {
+            float xs[] = {
+                0.0f, 1.5f, 42.9f,
+                4611686018427387904.0f,     /* 2^62 */
+                9223372036854775808.0f,     /* 2^63 */
+                1.0e19f,
+                1.8e19f
+            };
+            for (int i = 0; i < 7; i++)
+                if (f2u(xs[i]) != (unsigned long)xs[i]) return i + 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "f2u", c) {
+        Some(code) => assert_eq!(code, 0, "f2u mismatch vs C (unsigned long)float (exit {code})"),
+        None => eprintln!("skipping run_fptoui_u64_from_f32: no C compiler"),
+    }
 }
