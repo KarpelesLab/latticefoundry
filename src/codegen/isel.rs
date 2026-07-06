@@ -51,6 +51,17 @@ pub trait TargetIsel: MachineTarget + Sized {
     /// outgoing edge's block arguments, then emit the branch/return.
     fn lower_term(&self, lo: &mut Lower<'_, Self>, inst: &InstData);
 
+    /// Lower the entry prologue: move each incoming parameter out of its ABI
+    /// location into the parameter's vreg. The default implementation
+    /// ([`Lower::default_prologue`]) draws each parameter from the next argument
+    /// register of its class (the scalar System V rule) — correct for every
+    /// target whose parameters each fit in one register. A target with aggregate
+    /// (by-value struct) parameters, a hidden `sret` pointer, or stack-passed
+    /// parameters overrides this to lay them out per its ABI.
+    fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
+        lo.default_prologue();
+    }
+
     /// Build a load-immediate `dst <- value`.
     fn li(&self, dst: VReg, value: Int) -> MachineInst;
 
@@ -101,6 +112,10 @@ pub struct Lower<'a, T: TargetIsel> {
     /// Source line of the IR instruction currently being lowered (`0` = none),
     /// stamped onto every [`MachineInst`] emitted for it (debug info).
     cur_line: u32,
+    /// A stack slot a target's prologue can stash an incoming hidden ABI pointer
+    /// into (the System V `sret` return pointer), to be recovered by the return
+    /// lowering. `None` unless a target uses it.
+    aux_slot: Option<StackSlot>,
 }
 
 /// Map an IR type to the register class that holds it.
@@ -150,6 +165,7 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             materialized: DetHashMap::default(),
             cur: entry,
             cur_line: 0,
+            aux_slot: None,
         }
     }
 
@@ -207,6 +223,24 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
     /// Allocate a fresh stack slot.
     pub fn new_slot(&mut self, size: u64, align: u64) -> StackSlot {
         self.mf.frame_mut().add_slot(size, align)
+    }
+
+    /// Record the slot a target's prologue stashed the incoming hidden ABI
+    /// pointer (System V `sret`) into, for the return lowering to recover.
+    pub fn set_aux_slot(&mut self, slot: StackSlot) {
+        self.aux_slot = Some(slot);
+    }
+
+    /// The slot set by [`Lower::set_aux_slot`], if any.
+    #[inline]
+    pub fn aux_slot(&self) -> Option<StackSlot> {
+        self.aux_slot
+    }
+
+    /// Reserve at least `bytes` of outgoing stack-argument space in the frame
+    /// (the running maximum over call sites); see [`crate::codegen::mir::Frame`].
+    pub fn reserve_outgoing(&mut self, bytes: u64) {
+        self.mf.frame_mut().reserve_outgoing(bytes);
     }
 
     /// The machine block for an IR block.
@@ -371,7 +405,7 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             let mb = self.block_map[bid.index()];
             self.cur = mb;
             if Some(bid) == entry {
-                self.prologue(t);
+                t.lower_prologue(self);
             }
             for &iid in block.insts() {
                 self.cur_line = f.inst_line(iid).unwrap_or(0);
@@ -385,9 +419,13 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
         }
     }
 
-    /// The entry prologue: move each incoming parameter out of its physical
-    /// argument register into the parameter's vreg.
-    fn prologue(&mut self, t: &'a T) {
+    /// The default entry prologue: move each incoming parameter out of its
+    /// physical argument register into the parameter's vreg. This is the scalar
+    /// System V rule (one register per parameter, integer and floating-point
+    /// counted independently); the [`TargetIsel::lower_prologue`] hook delegates
+    /// here unless a target overrides it for aggregate/`sret`/stack parameters.
+    pub fn default_prologue(&mut self) {
+        let t = self.target;
         let cc = t.call_conv();
         let params: Vec<VReg> = self.mf.block(self.cur).params.clone();
         // Integer/pointer and floating-point parameters draw from *separate*

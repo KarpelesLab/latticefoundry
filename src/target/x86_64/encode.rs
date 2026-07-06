@@ -503,7 +503,11 @@ pub fn layout_frame(mf: &MachineFunction, target: &X86_64Target) -> FrameLayout 
         *off_slot = -((cs_bytes as i64) + off) as i32;
     }
     let locals = off;
-    let total = cs_bytes as i64 + locals;
+    // The outgoing stack-argument area sits at the very bottom of the frame
+    // (`[rsp .. rsp + outgoing)`), below the spill/alloca locals. rsp is constant
+    // after the prologue, so isel addresses stack arguments as `[rsp + k]`.
+    let outgoing = mf.frame().outgoing() as i64;
+    let total = cs_bytes as i64 + locals + outgoing;
     let padded = align_up(total, 16);
     let sub_size = (padded - cs_bytes as i64) as i32;
 
@@ -898,6 +902,16 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::LeaRspRbp => {
             let k = uimm(&ops[0]) as i64;
             mem(e, &[0x8D], RSP as u8, RBP as u8, (-k) as i32, true, false);
+        }
+        X86Op::LeaRbpOff => {
+            let d = rnum(&ops[0]);
+            let off = iimm(&ops[1]) as i32;
+            mem(e, &[0x8D], d, RBP as u8, off, true, false); // lea d, [rbp + off]
+        }
+        X86Op::LeaRspOff => {
+            let d = rnum(&ops[0]);
+            let off = iimm(&ops[1]) as i32;
+            mem(e, &[0x8D], d, RSP as u8, off, true, false); // lea d, [rsp + off]
         }
 
         // --- SSE scalar floating-point ------------------------------------

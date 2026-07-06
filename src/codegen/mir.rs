@@ -277,10 +277,15 @@ pub struct VRegInfo {
     pub class: RegClass,
 }
 
-/// The stack frame of a [`MachineFunction`]: the spill/`alloca` slots.
+/// The stack frame of a [`MachineFunction`]: the spill/`alloca` slots, plus the
+/// size of the **outgoing argument area** a target reserves at the bottom of the
+/// frame for stack-passed call arguments (System V AMD64 aggregates or scalar
+/// register-exhaustion). Zero unless a target calls [`Frame::reserve_outgoing`],
+/// so existing targets are unaffected.
 #[derive(Clone, Default, Debug)]
 pub struct Frame {
     slots: Vec<SlotInfo>,
+    outgoing: u64,
 }
 
 impl Frame {
@@ -289,6 +294,20 @@ impl Frame {
         let id = StackSlot(self.slots.len() as u32);
         self.slots.push(SlotInfo { size, align });
         id
+    }
+
+    /// Reserve at least `bytes` of outgoing-argument space at the bottom of the
+    /// frame (the running maximum over every call site). A target that passes
+    /// call arguments on the stack calls this so frame layout can size the frame
+    /// and place the outgoing area at the lowest addresses (`rsp`-relative).
+    pub fn reserve_outgoing(&mut self, bytes: u64) {
+        self.outgoing = self.outgoing.max(bytes);
+    }
+
+    /// The reserved outgoing-argument area size in bytes (`0` if none).
+    #[inline]
+    pub fn outgoing(&self) -> u64 {
+        self.outgoing
     }
 
     /// The metadata of a slot.

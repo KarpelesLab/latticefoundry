@@ -36,6 +36,7 @@ use crate::codegen::mir::{
 };
 use crate::codegen::target::{CallConv, MachineTarget};
 use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
+use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{InstData, Module, ValueId};
 
@@ -169,6 +170,16 @@ pub enum X86Op {
     /// `[Def d, Use s, Imm src_w, Imm dst_w]` — zero-extend `s` (`src_w` bits)
     /// into `d` (`movzx`, or a 32-bit `mov`). Implements the IR `zext`.
     Movzx = 51,
+
+    // --- aggregate (by-value struct) ABI support --------------------------
+    /// `[Def d, Imm off]` — `lea d, [rbp + off]` (signed `off`). Materializes an
+    /// address relative to the frame pointer: used to address an incoming
+    /// stack-passed parameter's home (`[rbp + 16 + k]`, above the return address).
+    LeaRbpOff = 52,
+    /// `[Def d, Imm off]` — `lea d, [rsp + off]` (unsigned `off`). Materializes an
+    /// address in the reserved outgoing-argument area at the bottom of the frame
+    /// (`rsp` is constant after the prologue), for stack-passed call arguments.
+    LeaRspOff = 53,
 }
 
 impl X86Op {
@@ -181,12 +192,12 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 52] = [
+        const TABLE: [X86Op; 54] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
             StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
-            Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx,
+            Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff,
         ];
         TABLE[op.0 as usize]
     }
@@ -238,6 +249,114 @@ pub(crate) fn fcmp_pack(pred: FloatPred) -> Option<u64> {
         FloatPred::Uno => (0xA, false, 0), // setp
     };
     Some(u64::from(cc) | (u64::from(swap) << 8) | (u64::from(combine) << 9))
+}
+
+// ===========================================================================
+// System V AMD64 aggregate classification
+// ===========================================================================
+
+/// The class of one "eightbyte" of an aggregate under the System V AMD64 ABI:
+/// [`Eightbyte::Integer`] (holds integer/pointer data — passed in a GPR) or
+/// [`Eightbyte::Sse`] (holds only `float`/`double` data — passed in an XMM).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Eightbyte {
+    /// An INTEGER-class eightbyte (GPR: `rdi..r9` / `rax`, `rdx`).
+    Integer,
+    /// An SSE-class eightbyte (XMM: `xmm0..7` / `xmm0`, `xmm1`).
+    Sse,
+}
+
+/// How an aggregate crosses the ABI: in registers (one class per eightbyte,
+/// `len` 1 or 2) or entirely in memory (on the stack for arguments; via a hidden
+/// `sret` pointer for a return).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum AbiClass {
+    /// Passed/returned in registers, one entry per eightbyte.
+    Regs(Vec<Eightbyte>),
+    /// Passed on the stack / returned through a hidden pointer.
+    Memory,
+}
+
+/// Merge two eightbyte contributions per the SysV rule: any INTEGER wins,
+/// otherwise SSE; an absent (`None`) contribution defers to the other.
+fn merge_class(acc: Option<Eightbyte>, cls: Eightbyte) -> Option<Eightbyte> {
+    match (acc, cls) {
+        (None, c) => Some(c),
+        (Some(Eightbyte::Integer), _) | (_, Eightbyte::Integer) => Some(Eightbyte::Integer),
+        _ => Some(Eightbyte::Sse),
+    }
+}
+
+/// Fold the leaf fields of `ty` (placed at absolute byte `offset`) into the
+/// per-eightbyte class accumulators `ebs`.
+fn classify_into(types: &TypeContext, ty: TypeId, offset: u64, ebs: &mut [Option<Eightbyte>]) {
+    let cls = match types.get(ty) {
+        Type::Int(_) | Type::Ptr | Type::Func(_) => Some(Eightbyte::Integer),
+        Type::Float(_) => Some(Eightbyte::Sse),
+        Type::Struct(fields) => {
+            let n = fields.len();
+            for i in 0..n {
+                let (foff, fty) = types.field_offset(ty, i as u32);
+                classify_into(types, fty, offset + foff, ebs);
+            }
+            None
+        }
+        Type::Array(elem, len) => {
+            let (elem, len) = (*elem, *len);
+            let stride = types.stride(elem);
+            for k in 0..len {
+                classify_into(types, elem, offset + k * stride, ebs);
+            }
+            None
+        }
+        Type::Void => None,
+    };
+    if let Some(c) = cls {
+        let size = types.size_of(ty).max(1);
+        let first = (offset / 8) as usize;
+        let last = ((offset + size - 1) / 8) as usize;
+        for e in first..=last {
+            if e < ebs.len() {
+                ebs[e] = merge_class(ebs[e], c);
+            }
+        }
+    }
+}
+
+/// Classify an aggregate `ty` (a struct or array passed/returned by value) into
+/// its System V eightbyte classes, or [`AbiClass::Memory`] if it is larger than
+/// two eightbytes (16 bytes).
+pub(crate) fn classify_aggregate(types: &TypeContext, ty: TypeId) -> AbiClass {
+    let size = types.size_of(ty);
+    if size == 0 {
+        return AbiClass::Regs(Vec::new());
+    }
+    if size > 16 {
+        return AbiClass::Memory;
+    }
+    let n = size.div_ceil(8) as usize;
+    let mut ebs = vec![None; n];
+    classify_into(types, ty, 0, &mut ebs);
+    // A never-classified eightbyte (pure padding) is SSE per the ABI.
+    let classes = ebs.into_iter().map(|c| c.unwrap_or(Eightbyte::Sse)).collect();
+    AbiClass::Regs(classes)
+}
+
+/// Whether a type is an aggregate (struct/array) that this backend represents,
+/// at the codegen level, by a pointer to its in-memory storage.
+fn is_aggregate(types: &TypeContext, ty: TypeId) -> bool {
+    matches!(types.get(ty), Type::Struct(_) | Type::Array(_, _))
+}
+
+/// Round `v` up to a multiple of `align` (a power of two ≥ 1).
+fn align_up_u64(v: u64, align: u64) -> u64 {
+    v.div_ceil(align.max(1)) * align.max(1)
+}
+
+/// The number of INTEGER / SSE eightbytes in a register-classified aggregate.
+fn count_classes(ebs: &[Eightbyte]) -> (usize, usize) {
+    let int = ebs.iter().filter(|c| matches!(c, Eightbyte::Integer)).count();
+    (int, ebs.len() - int)
 }
 
 fn def(r: PReg) -> MachineOperand {
@@ -542,54 +661,186 @@ impl X86_64Target {
         }
     }
 
+    /// Materialize `base + off` (a byte displacement) into a fresh GPR, or return
+    /// `base` unchanged when `off == 0`.
+    fn add_off(&self, lo: &mut Lower<'_, Self>, base: VReg, off: u64) -> VReg {
+        if off == 0 {
+            return base;
+        }
+        let k = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(X86Op::MovRI.opcode(), vec![def_v(k), imm(off)]));
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(
+            X86Op::Add.opcode(),
+            vec![def_v(d), use_v(base), use_v(k), imm(64)],
+        ));
+        d
+    }
+
+    /// Emit `lea d, [rbp + off]` into a fresh GPR (addresses an incoming
+    /// stack-passed parameter, above the return address).
+    fn lea_rbp(&self, lo: &mut Lower<'_, Self>, off: u64) -> VReg {
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(X86Op::LeaRbpOff.opcode(), vec![def_v(d), imm(off)]));
+        d
+    }
+
+    /// Emit `lea d, [rsp + off]` into a fresh GPR (addresses the outgoing
+    /// stack-argument area at the bottom of the frame).
+    fn lea_rsp(&self, lo: &mut Lower<'_, Self>, off: u64) -> VReg {
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(X86Op::LeaRspOff.opcode(), vec![def_v(d), imm(off)]));
+        d
+    }
+
+    /// Copy `size` bytes from `[src]` to `[dst]` (both GPR pointer vregs) in
+    /// 8/4/2/1-byte chunks via a scratch GPR.
+    fn emit_memcpy(&self, lo: &mut Lower<'_, Self>, dst: VReg, src: VReg, size: u64) {
+        let mut o = 0u64;
+        while o < size {
+            let chunk = if size - o >= 8 {
+                8
+            } else if size - o >= 4 {
+                4
+            } else if size - o >= 2 {
+                2
+            } else {
+                1
+            };
+            let sp = self.add_off(lo, src, o);
+            let t = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(MachineInst::new(X86Op::Load.opcode(), vec![def_v(t), use_v(sp), imm(chunk)]));
+            let dp = self.add_off(lo, dst, o);
+            lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(t), imm(chunk)]));
+            o += chunk;
+        }
+    }
+
+    /// Lower a `call`, implementing the System V AMD64 ABI for by-value struct
+    /// arguments and returns on top of the existing scalar/float handling.
+    ///
+    /// A struct value is represented, at this codegen level, by a GPR vreg
+    /// holding a pointer to the struct's in-memory storage. A ≤16-byte struct
+    /// argument is loaded eightbyte-by-eightbyte from that storage into the
+    /// assigned integer/SSE argument registers; a MEMORY-class struct (or one
+    /// that no longer fits the remaining registers) is copied into the outgoing
+    /// stack area. A ≤16-byte struct result comes back in `rax`/`rdx` and/or
+    /// `xmm0`/`xmm1` and is stored into a fresh result slot; a MEMORY-class result
+    /// uses a hidden `sret` pointer (a caller-allocated slot passed in `rdi`).
     fn lower_call(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         let cc = &self.rf.cc;
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
 
-        // Route each argument by class: integers into rdi.. (a separate counter
-        // from) floats into xmm0.. — the SysV rule for mixed int/float calls.
-        //
-        // Materialize *every* argument value into a vreg FIRST, then move them all
-        // into the physical argument registers immediately before the call. If we
-        // instead materialized-and-moved one argument at a time, a later argument's
-        // materialization (e.g. loading a float constant, which lands in a fresh
-        // vreg) could be colored into an argument register already holding an
-        // earlier argument: the register allocator's fixed-register model is
-        // point-based, so it would not see that the argument register is live
-        // across the gap between its arg-move and the call. Emitting all the moves
-        // consecutively right before the call keeps each argument register's
-        // occupied range free of any competing vreg definition.
+        // Return classification.
+        let ret_ty = inst.result().map(|r| lo.func().value_type(r));
+        let ret_agg = ret_ty.filter(|&t| is_aggregate(lo.types(), t));
+        let ret_class = ret_agg.map(|t| classify_aggregate(lo.types(), t));
+        let sret = matches!(ret_class, Some(AbiClass::Memory));
+
+        // `reg_moves`: the final `arg-reg <- value-vreg` moves, emitted as one
+        // consecutive run right before the `call` so no competing vreg definition
+        // sits in the gap between an argument register's write and the call (the
+        // register allocator's fixed-register liveness reasons point-to-point).
+        let mut reg_moves: Vec<(PReg, VReg)> = Vec::new();
         let mut int_i = 0usize;
         let mut fp_i = 0usize;
-        let mut moves: Vec<(PReg, VReg)> = Vec::with_capacity(args.len());
-        for &arg in args {
-            let r = self.oper(lo, arg);
-            let areg = match lo.mf().vreg_class(r) {
-                RegClass::Gpr => {
-                    let a = cc.arg_regs[int_i];
-                    int_i += 1;
-                    a
-                }
-                RegClass::Fp => {
-                    let a = cc.fp_arg_regs[fp_i];
-                    fp_i += 1;
-                    a
-                }
-            };
-            moves.push((areg, r));
+
+        // A MEMORY-class return: allocate the return slot and pass its address as
+        // the hidden first integer argument (`rdi`); the callee writes through it.
+        let mut ret_slot = None;
+        if sret {
+            let t = ret_agg.unwrap();
+            let size = align_up_u64(lo.byte_size(t).max(8), 8);
+            let align = lo.types().align_of(t).max(8);
+            let slot = lo.new_slot(size, align);
+            ret_slot = Some(slot);
+            let ptr = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(self.frame_addr(ptr, slot));
+            reg_moves.push((cc.arg_regs[0], ptr));
+            int_i = 1;
         }
-        let used_arg_regs: Vec<PReg> = moves.iter().map(|&(areg, _)| areg).collect();
-        for (areg, r) in moves {
+
+        let mut stack_off = 0u64;
+        for &arg in args {
+            let ty = lo.func().value_type(arg);
+            if is_aggregate(lo.types(), ty) {
+                if let AbiClass::Regs(ebs) = classify_aggregate(lo.types(), ty) {
+                    let (need_int, need_sse) = count_classes(&ebs);
+                    if int_i + need_int <= cc.arg_regs.len()
+                        && fp_i + need_sse <= cc.fp_arg_regs.len()
+                    {
+                        let ptr = self.oper(lo, arg);
+                        for (k, c) in ebs.iter().enumerate() {
+                            let (cls, areg) = match c {
+                                Eightbyte::Integer => {
+                                    let a = cc.arg_regs[int_i];
+                                    int_i += 1;
+                                    (RegClass::Gpr, a)
+                                }
+                                Eightbyte::Sse => {
+                                    let a = cc.fp_arg_regs[fp_i];
+                                    fp_i += 1;
+                                    (RegClass::Fp, a)
+                                }
+                            };
+                            let sp = self.add_off(lo, ptr, 8 * k as u64);
+                            let d = lo.fresh_vreg(cls);
+                            lo.emit(MachineInst::new(
+                                X86Op::Load.opcode(),
+                                vec![def_v(d), use_v(sp), imm(8)],
+                            ));
+                            reg_moves.push((areg, d));
+                        }
+                        continue;
+                    }
+                }
+                // MEMORY class, or not enough registers left: pass the whole
+                // aggregate in the outgoing stack area.
+                let size = lo.byte_size(ty);
+                let align = lo.types().align_of(ty).max(8);
+                stack_off = align_up_u64(stack_off, align);
+                let ptr = self.oper(lo, arg);
+                let dst = self.lea_rsp(lo, stack_off);
+                self.emit_memcpy(lo, dst, ptr, size);
+                stack_off += align_up_u64(size, 8);
+            } else {
+                // Scalar / pointer / float argument.
+                let v = self.oper(lo, arg);
+                let is_fp = lo.mf().vreg_class(v) == RegClass::Fp;
+                let has_reg = if is_fp { fp_i < cc.fp_arg_regs.len() } else { int_i < cc.arg_regs.len() };
+                if has_reg {
+                    let a = if is_fp {
+                        let a = cc.fp_arg_regs[fp_i];
+                        fp_i += 1;
+                        a
+                    } else {
+                        let a = cc.arg_regs[int_i];
+                        int_i += 1;
+                        a
+                    };
+                    reg_moves.push((a, v));
+                } else {
+                    let sz = lo.byte_size(ty);
+                    let dp = self.lea_rsp(lo, stack_off);
+                    lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(sz)]));
+                    stack_off += 8;
+                }
+            }
+        }
+        if stack_off > 0 {
+            lo.reserve_outgoing(align_up_u64(stack_off, 16));
+        }
+
+        let used_arg_regs: Vec<PReg> = reg_moves.iter().map(|&(areg, _)| areg).collect();
+        for (areg, r) in reg_moves {
             lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(areg), use_v(r)]));
         }
 
-        // The return register follows the result type's class (xmm0 for a float
-        // return, rax otherwise).
-        let ret_is_fp = inst
-            .result()
-            .is_some_and(|r| lo.types().get(lo.func().value_type(r)).is_float());
+        // The primary return register (`rax`/`xmm0`); struct results reclaim their
+        // eightbytes from `rax`/`rdx`/`xmm0`/`xmm1`, all covered by the clobber set.
+        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float());
         let ret_reg = if ret_is_fp { cc.fp_ret_reg } else { cc.ret_reg };
 
         let mut operands = Vec::new();
@@ -611,9 +862,154 @@ impl X86_64Target {
         }
         lo.emit(MachineInst::new(X86Op::Call.opcode(), operands));
 
-        if inst.result().is_some() {
-            let d = lo.result_reg(inst);
-            lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(ret_reg)]));
+        match &ret_class {
+            Some(AbiClass::Memory) => {
+                // The result already sits in the caller-allocated sret slot.
+                let d = lo.result_reg(inst);
+                lo.emit(self.frame_addr(d, ret_slot.unwrap()));
+            }
+            Some(AbiClass::Regs(ebs)) => {
+                // Rescue every returned eightbyte register into a vreg (one
+                // consecutive run right after the call), then store them into a
+                // fresh result slot whose address becomes the result value.
+                let ebs = ebs.clone();
+                let mut ic = 0usize;
+                let mut sc = 0usize;
+                let mut saved: Vec<(usize, VReg)> = Vec::with_capacity(ebs.len());
+                for (k, c) in ebs.iter().enumerate() {
+                    let (cls, r) = match c {
+                        Eightbyte::Integer => {
+                            let r = if ic == 0 { cc.ret_reg } else { regs::gpr(regs::RDX) };
+                            ic += 1;
+                            (RegClass::Gpr, r)
+                        }
+                        Eightbyte::Sse => {
+                            let r = if sc == 0 { cc.fp_ret_reg } else { regs::xmm(1) };
+                            sc += 1;
+                            (RegClass::Fp, r)
+                        }
+                    };
+                    let v = lo.fresh_vreg(cls);
+                    lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
+                    saved.push((k, v));
+                }
+                let t = ret_agg.unwrap();
+                let size = align_up_u64(lo.byte_size(t).max(8), 8);
+                let align = lo.types().align_of(t).max(8);
+                let slot = lo.new_slot(size, align);
+                let d = lo.result_reg(inst);
+                lo.emit(self.frame_addr(d, slot));
+                for (k, v) in saved {
+                    let dp = self.add_off(lo, d, 8 * k as u64);
+                    lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
+                }
+            }
+            None => {
+                if inst.result().is_some() {
+                    let d = lo.result_reg(inst);
+                    lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(ret_reg)]));
+                }
+            }
+        }
+    }
+
+    /// Lower the entry prologue with System V aggregate/`sret`/stack-parameter
+    /// support. A register-passed struct parameter is stored into a private home
+    /// slot (so the body sees it in memory) and its vreg is that slot's address; a
+    /// stack-passed struct/scalar is addressed in place at `[rbp + 16 + off]`; a
+    /// MEMORY-class return reserves the hidden `sret` pointer (in `rdi`) into an
+    /// aux slot for the return lowering.
+    fn lower_prologue_x86(&self, lo: &mut Lower<'_, Self>) {
+        let cc = &self.rf.cc;
+        let entry = lo.mf().entry().expect("a function being lowered has an entry block");
+        let param_vregs: Vec<VReg> = lo.mf().block(entry).params.clone();
+        let (sig_params, ret_ty) = match lo.types().get(lo.func().sig) {
+            Type::Func(ft) => (ft.params.clone(), ft.ret),
+            _ => (Vec::new(), lo.func().sig),
+        };
+        let sret = is_aggregate(lo.types(), ret_ty)
+            && matches!(classify_aggregate(lo.types(), ret_ty), AbiClass::Memory);
+
+        let mut int_i = 0usize;
+        let mut fp_i = 0usize;
+        if sret {
+            // The hidden return pointer arrives in rdi; stash it for `ret`.
+            let slot = lo.new_slot(8, 8);
+            lo.set_aux_slot(slot);
+            lo.emit(MachineInst::new(
+                X86Op::StoreFrame.opcode(),
+                vec![use_p(cc.arg_regs[0]), MachineOperand::Frame(slot)],
+            ));
+            int_i = 1;
+        }
+
+        let mut stack_in = 16u64; // first incoming stack arg, above the return address
+        for (i, &pv) in param_vregs.iter().enumerate() {
+            let ty = sig_params[i];
+            if is_aggregate(lo.types(), ty) {
+                let size = lo.byte_size(ty);
+                let align = lo.types().align_of(ty).max(8);
+                if let AbiClass::Regs(ebs) = classify_aggregate(lo.types(), ty) {
+                    let (need_int, need_sse) = count_classes(&ebs);
+                    if int_i + need_int <= cc.arg_regs.len()
+                        && fp_i + need_sse <= cc.fp_arg_regs.len()
+                    {
+                        let home = lo.new_slot(align_up_u64(size.max(8), 8), align);
+                        lo.emit(self.frame_addr(pv, home));
+                        for (k, c) in ebs.iter().enumerate() {
+                            let (cls, areg) = match c {
+                                Eightbyte::Integer => {
+                                    let a = cc.arg_regs[int_i];
+                                    int_i += 1;
+                                    (RegClass::Gpr, a)
+                                }
+                                Eightbyte::Sse => {
+                                    let a = cc.fp_arg_regs[fp_i];
+                                    fp_i += 1;
+                                    (RegClass::Fp, a)
+                                }
+                            };
+                            let v = lo.fresh_vreg(cls);
+                            lo.emit(MachineInst::new(
+                                X86Op::MovRR.opcode(),
+                                vec![def_v(v), use_p(areg)],
+                            ));
+                            let dp = self.add_off(lo, pv, 8 * k as u64);
+                            lo.emit(MachineInst::new(
+                                X86Op::Store.opcode(),
+                                vec![use_v(dp), use_v(v), imm(8)],
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                // MEMORY class or register exhaustion: the caller placed a copy on
+                // the stack; address it in place.
+                stack_in = align_up_u64(stack_in, align);
+                let d = self.lea_rbp(lo, stack_in);
+                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(pv), use_v(d)]));
+                stack_in += align_up_u64(size, 8);
+            } else {
+                let is_fp = lo.mf().vreg_class(pv) == RegClass::Fp;
+                let has_reg = if is_fp { fp_i < cc.fp_arg_regs.len() } else { int_i < cc.arg_regs.len() };
+                if has_reg {
+                    let a = if is_fp {
+                        let a = cc.fp_arg_regs[fp_i];
+                        fp_i += 1;
+                        a
+                    } else {
+                        let a = cc.arg_regs[int_i];
+                        int_i += 1;
+                        a
+                    };
+                    lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(pv), use_p(a)]));
+                } else {
+                    let sz = lo.byte_size(ty);
+                    let p = self.lea_rbp(lo, stack_in);
+                    lo.emit(MachineInst::new(X86Op::Load.opcode(), vec![def_v(pv), use_v(p), imm(sz)]));
+                    stack_in += 8;
+                }
+            }
         }
     }
 }
@@ -701,6 +1097,10 @@ impl TargetIsel for X86_64Target {
         )
     }
 
+    fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
+        self.lower_prologue_x86(lo);
+    }
+
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
@@ -783,12 +1183,66 @@ impl TargetIsel for X86_64Target {
     fn lower_term(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
             InstKind::Ret => {
-                if let Some(&v) = inst.operands().first() {
+                let cc = &self.rf.cc;
+                let ret_ty = match lo.types().get(lo.func().sig) {
+                    Type::Func(ft) => ft.ret,
+                    _ => lo.func().sig,
+                };
+                if is_aggregate(lo.types(), ret_ty) {
+                    // The return operand is a pointer to the struct's storage.
+                    let src = self.oper(lo, inst.operands()[0]);
+                    match classify_aggregate(lo.types(), ret_ty) {
+                        AbiClass::Memory => {
+                            // Copy the struct through the hidden `sret` pointer
+                            // (saved to the aux slot in the prologue) and return it.
+                            let size = lo.byte_size(ret_ty);
+                            let slot = lo.aux_slot().expect("sret pointer saved by the prologue");
+                            let dst = lo.fresh_vreg(RegClass::Gpr);
+                            lo.emit(MachineInst::new(
+                                X86Op::LoadFrame.opcode(),
+                                vec![def_v(dst), MachineOperand::Frame(slot)],
+                            ));
+                            self.emit_memcpy(lo, dst, src, size);
+                            lo.emit(MachineInst::new(
+                                X86Op::MovRR.opcode(),
+                                vec![def(cc.ret_reg), use_v(dst)],
+                            ));
+                        }
+                        AbiClass::Regs(ebs) => {
+                            // Place each eightbyte in rax/rdx (INTEGER) or
+                            // xmm0/xmm1 (SSE). Compute all source pointers first so
+                            // the loads into the return registers are consecutive.
+                            let ptrs: Vec<VReg> = (0..ebs.len())
+                                .map(|k| self.add_off(lo, src, 8 * k as u64))
+                                .collect();
+                            let mut ic = 0usize;
+                            let mut sc = 0usize;
+                            for (k, c) in ebs.iter().enumerate() {
+                                let r = match c {
+                                    Eightbyte::Integer => {
+                                        let r = if ic == 0 { cc.ret_reg } else { regs::gpr(regs::RDX) };
+                                        ic += 1;
+                                        r
+                                    }
+                                    Eightbyte::Sse => {
+                                        let r = if sc == 0 { cc.fp_ret_reg } else { regs::xmm(1) };
+                                        sc += 1;
+                                        r
+                                    }
+                                };
+                                lo.emit(MachineInst::new(
+                                    X86Op::Load.opcode(),
+                                    vec![def(r), use_v(ptrs[k]), imm(8)],
+                                ));
+                            }
+                        }
+                    }
+                } else if let Some(&v) = inst.operands().first() {
                     let r = self.oper(lo, v);
                     // A float return goes in xmm0, an integer/pointer return in rax.
                     let ret = match lo.mf().vreg_class(r) {
-                        RegClass::Fp => self.rf.cc.fp_ret_reg,
-                        RegClass::Gpr => self.rf.cc.ret_reg,
+                        RegClass::Fp => cc.fp_ret_reg,
+                        RegClass::Gpr => cc.ret_reg,
                     };
                     lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(ret), use_v(r)]));
                 }

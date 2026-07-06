@@ -1228,3 +1228,369 @@ fn run_fptoui_u64_from_f32() {
         None => eprintln!("skipping run_fptoui_u64_from_f32: no C compiler"),
     }
 }
+
+// ===========================================================================
+// By-value struct passing / returning (System V AMD64 aggregate ABI)
+//
+// A struct value is represented at the codegen level by a pointer to its
+// in-memory storage, so the IR reads/writes its fields with `ptr_add`+`load`/
+// `store` off the struct value used as a pointer, and returns an `alloca`'d
+// struct by its address. The backend implements the eightbyte classification,
+// register/stack argument placement, and register/`sret` return. Each program
+// is linked against a gcc-compiled C driver using the *same* struct type, so a
+// correct ABI must interoperate exactly.
+// ===========================================================================
+
+/// `struct P { int x, y; }` (8 bytes → one INTEGER eightbyte): `addP` returns
+/// `{a.x+b.x, a.y+b.y}`. Args in `rdi`/`rsi`, result in `rax`.
+fn build_struct_int() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let p = m.types_mut().struct_(vec![i32t, i32t]);
+    let sig = m.types_mut().func(vec![p, p], p, false);
+    let f = m.declare_function(syms.intern("addP"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let ax_p = b.struct_field(a, p, 0);
+        let ax = b.load(i32t, ax_p, 4);
+        let ay_p = b.struct_field(a, p, 1);
+        let ay = b.load(i32t, ay_p, 4);
+        let bx_p = b.struct_field(bb, p, 0);
+        let bx = b.load(i32t, bx_p, 4);
+        let by_p = b.struct_field(bb, p, 1);
+        let by = b.load(i32t, by_p, 4);
+        let sx = b.add(ax, bx, Flags::NONE);
+        let sy = b.add(ay, by, Flags::NONE);
+        let r = b.alloca(p);
+        let rx = b.struct_field(r, p, 0);
+        b.store(i32t, rx, sx, 4);
+        let ry = b.struct_field(r, p, 1);
+        b.store(i32t, ry, sy, 4);
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_struct_int() {
+    let (m, syms) = build_struct_int();
+    let c = r#"
+        struct P { int x, y; };
+        struct P addP(struct P, struct P);
+        int main(void) {
+            struct P r = addP((struct P){3, 4}, (struct P){10, 20});
+            if (r.x != 13 || r.y != 24) return 1;
+            struct P r2 = addP((struct P){-1, 100}, (struct P){1, -100});
+            if (r2.x != 0 || r2.y != 0) return 2;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "struct_int", c) {
+        Some(code) => assert_eq!(code, 0, "addP struct-by-value mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_struct_int: no C compiler"),
+    }
+}
+
+/// `struct V { double x, y; }` (16 bytes → two SSE eightbytes): `addV` returns
+/// `{a.x+b.x, a.y+b.y}`. Args in `xmm0..3`, result in `xmm0`/`xmm1`.
+fn build_struct_double() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let v = m.types_mut().struct_(vec![f64t, f64t]);
+    let sig = m.types_mut().func(vec![v, v], v, false);
+    let f = m.declare_function(syms.intern("addV"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let ax_p = b.struct_field(a, v, 0);
+        let ax = b.load(f64t, ax_p, 8);
+        let ay_p = b.struct_field(a, v, 1);
+        let ay = b.load(f64t, ay_p, 8);
+        let bx_p = b.struct_field(bb, v, 0);
+        let bx = b.load(f64t, bx_p, 8);
+        let by_p = b.struct_field(bb, v, 1);
+        let by = b.load(f64t, by_p, 8);
+        let sx = b.bin(BinOp::FAdd, ax, bx, Flags::NONE);
+        let sy = b.bin(BinOp::FAdd, ay, by, Flags::NONE);
+        let r = b.alloca(v);
+        let rx = b.struct_field(r, v, 0);
+        b.store(f64t, rx, sx, 8);
+        let ry = b.struct_field(r, v, 1);
+        b.store(f64t, ry, sy, 8);
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_struct_double() {
+    let (m, syms) = build_struct_double();
+    let c = r#"
+        struct V { double x, y; };
+        struct V addV(struct V, struct V);
+        int main(void) {
+            struct V r = addV((struct V){1.5, 2.25}, (struct V){0.5, 0.75});
+            if (r.x != 2.0 || r.y != 3.0) return 1;
+            struct V r2 = addV((struct V){-8.0, 0.5}, (struct V){8.0, -0.5});
+            if (r2.x != 0.0 || r2.y != 0.0) return 2;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "struct_double", c) {
+        Some(code) => assert_eq!(code, 0, "addV struct-by-value mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_struct_double: no C compiler"),
+    }
+}
+
+/// `struct M { int i; double d; }` (16 bytes → INTEGER + SSE): `addM` returns
+/// `{a.i+b.i, a.d+b.d}`. First arg `{rdi, xmm0}`, second `{rsi, xmm1}`, result
+/// `{rax, xmm0}` — exercises the independent integer/SSE eightbyte counters.
+fn build_struct_mixed() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let mm = m.types_mut().struct_(vec![i32t, f64t]);
+    let sig = m.types_mut().func(vec![mm, mm], mm, false);
+    let f = m.declare_function(syms.intern("addM"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let ai_p = b.struct_field(a, mm, 0);
+        let ai = b.load(i32t, ai_p, 4);
+        let ad_p = b.struct_field(a, mm, 1);
+        let ad = b.load(f64t, ad_p, 8);
+        let bi_p = b.struct_field(bb, mm, 0);
+        let bi = b.load(i32t, bi_p, 4);
+        let bd_p = b.struct_field(bb, mm, 1);
+        let bd = b.load(f64t, bd_p, 8);
+        let si = b.add(ai, bi, Flags::NONE);
+        let sd = b.bin(BinOp::FAdd, ad, bd, Flags::NONE);
+        let r = b.alloca(mm);
+        let ri = b.struct_field(r, mm, 0);
+        b.store(i32t, ri, si, 4);
+        let rd = b.struct_field(r, mm, 1);
+        b.store(f64t, rd, sd, 8);
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_struct_mixed() {
+    let (m, syms) = build_struct_mixed();
+    let c = r#"
+        struct M { int i; double d; };
+        struct M addM(struct M, struct M);
+        int main(void) {
+            struct M r = addM((struct M){3, 1.5}, (struct M){4, 2.25});
+            if (r.i != 7 || r.d != 3.75) return 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "struct_mixed", c) {
+        Some(code) => assert_eq!(code, 0, "addM mixed struct mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_struct_mixed: no C compiler"),
+    }
+}
+
+/// `struct Big { long a, b, c; }` (24 bytes > 16 → MEMORY): `addBig` returns the
+/// field-wise sum. Both arguments are passed on the stack and the result uses a
+/// hidden `sret` pointer (in `rdi`, returned in `rax`).
+fn build_struct_big() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let big = m.types_mut().struct_(vec![i64t, i64t, i64t]);
+    let sig = m.types_mut().func(vec![big, big], big, false);
+    let f = m.declare_function(syms.intern("addBig"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let r = b.alloca(big);
+        for k in 0..3u32 {
+            let ap = b.struct_field(a, big, k);
+            let av = b.load(i64t, ap, 8);
+            let bp = b.struct_field(bb, big, k);
+            let bv = b.load(i64t, bp, 8);
+            let s = b.add(av, bv, Flags::NONE);
+            let rp = b.struct_field(r, big, k);
+            b.store(i64t, rp, s, 8);
+        }
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_struct_big() {
+    let (m, syms) = build_struct_big();
+    let c = r#"
+        struct Big { long a, b, c; };
+        struct Big addBig(struct Big, struct Big);
+        int main(void) {
+            struct Big r = addBig((struct Big){1, 2, 3}, (struct Big){10, 20, 30});
+            if (r.a != 11 || r.b != 22 || r.c != 33) return 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "struct_big", c) {
+        Some(code) => assert_eq!(code, 0, "addBig large-struct (sret) mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_struct_big: no C compiler"),
+    }
+}
+
+/// Caller side, small struct: LF `double_it(struct P p)` computes `cadd(p, p)`
+/// (a gcc-compiled callee that returns `struct P`) and returns it. Exercises
+/// LF passing a struct argument in registers and reclaiming a register-returned
+/// struct result, plus returning it in turn.
+fn build_struct_caller_small() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let p = m.types_mut().struct_(vec![i32t, i32t]);
+    let sig = m.types_mut().func(vec![p, p], p, false);
+    let cadd = m.declare_function(syms.intern("cadd"), sig); // defined in C
+    let sig1 = m.types_mut().func(vec![p], p, false);
+    let f = m.declare_function(syms.intern("double_it"), sig1);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let pv = b.param(entry, 0);
+        let cref = b.func_ref(cadd);
+        let r = b.call(cref, &[pv, pv], p).expect("struct-returning call");
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_struct_caller_small() {
+    let (m, syms) = build_struct_caller_small();
+    let c = r#"
+        struct P { int x, y; };
+        struct P cadd(struct P a, struct P b) { return (struct P){a.x + b.x, a.y + b.y}; }
+        struct P double_it(struct P);
+        int main(void) {
+            struct P r = double_it((struct P){3, 4});
+            if (r.x != 6 || r.y != 8) return 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "struct_caller_small", c) {
+        Some(code) => assert_eq!(code, 0, "LF struct caller/return mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_struct_caller_small: no C compiler"),
+    }
+}
+
+/// Caller side, large struct: LF `double_big(struct Big b)` computes
+/// `cadd_big(b, b)` (gcc callee returning `struct Big`) and returns it.
+/// Exercises the caller allocating an `sret` return slot, passing two MEMORY
+/// arguments on the outgoing stack, and forwarding the sret result.
+fn build_struct_caller_big() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let big = m.types_mut().struct_(vec![i64t, i64t, i64t]);
+    let sig = m.types_mut().func(vec![big, big], big, false);
+    let cadd = m.declare_function(syms.intern("cadd_big"), sig); // defined in C
+    let sig1 = m.types_mut().func(vec![big], big, false);
+    let f = m.declare_function(syms.intern("double_big"), sig1);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let pv = b.param(entry, 0);
+        let cref = b.func_ref(cadd);
+        let r = b.call(cref, &[pv, pv], big).expect("struct-returning call");
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_struct_caller_big() {
+    let (m, syms) = build_struct_caller_big();
+    let c = r#"
+        struct Big { long a, b, c; };
+        struct Big cadd_big(struct Big a, struct Big b) {
+            return (struct Big){a.a + b.a, a.b + b.b, a.c + b.c};
+        }
+        struct Big double_big(struct Big);
+        int main(void) {
+            struct Big r = double_big((struct Big){1, 2, 3});
+            if (r.a != 2 || r.b != 4 || r.c != 6) return 1;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "struct_caller_big", c) {
+        Some(code) => assert_eq!(code, 0, "LF sret caller/forward mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_struct_caller_big: no C compiler"),
+    }
+}
+
+/// Struct argument mixed with scalar arguments that exhaust the integer
+/// registers: `mixfn(int a,b,c,d,e, struct P p, int f)` — `a..e` fill
+/// `rdi..r8`, `p` (one INTEGER eightbyte) takes `r9`, and `f` overflows onto the
+/// stack. Returns `a+b+c+d+e + p.x + p.y + f`.
+fn build_struct_scalar_mix() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let p = m.types_mut().struct_(vec![i32t, i32t]);
+    let sig = m.types_mut().func(vec![i32t, i32t, i32t, i32t, i32t, p, i32t], i32t, false);
+    let f = m.declare_function(syms.intern("mixfn"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let c1 = b.param(entry, 1);
+        let c2 = b.param(entry, 2);
+        let c3 = b.param(entry, 3);
+        let e = b.param(entry, 4);
+        let pv = b.param(entry, 5);
+        let fv = b.param(entry, 6);
+        let mut acc = b.add(a, c1, Flags::NONE);
+        acc = b.add(acc, c2, Flags::NONE);
+        acc = b.add(acc, c3, Flags::NONE);
+        acc = b.add(acc, e, Flags::NONE);
+        let px_p = b.struct_field(pv, p, 0);
+        let px = b.load(i32t, px_p, 4);
+        let py_p = b.struct_field(pv, p, 1);
+        let py = b.load(i32t, py_p, 4);
+        acc = b.add(acc, px, Flags::NONE);
+        acc = b.add(acc, py, Flags::NONE);
+        acc = b.add(acc, fv, Flags::NONE);
+        b.ret(Some(acc));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_struct_scalar_mix() {
+    let (m, syms) = build_struct_scalar_mix();
+    let c = r#"
+        struct P { int x, y; };
+        int mixfn(int, int, int, int, int, struct P, int);
+        int main(void) {
+            int r = mixfn(1, 2, 3, 4, 5, (struct P){6, 7}, 8);
+            if (r != 36) return 1;               /* 1+2+3+4+5 + 6+7 + 8 */
+            if (mixfn(0, 0, 0, 0, 0, (struct P){0, 0}, 100) != 100) return 2;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "struct_scalar_mix", c) {
+        Some(code) => assert_eq!(code, 0, "struct+scalar register-exhaustion mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_struct_scalar_mix: no C compiler"),
+    }
+}
