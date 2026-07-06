@@ -1594,3 +1594,365 @@ fn run_struct_scalar_mix() {
         None => eprintln!("skipping run_struct_scalar_mix: no C compiler"),
     }
 }
+
+// ===========================================================================
+// Variadic functions (System V AMD64)
+// ===========================================================================
+
+/// Emit an integer `va_arg` (reading one `i32`) against a `va_list` at `vl`,
+/// branching on `gp_offset < 48` between the register save area and the overflow
+/// area, and jumping to `cont` with `[acc, i, value]`. Helper for the loop body.
+///
+/// This mirrors exactly the sequence the C frontend's `va_arg` expands to,
+/// exercising the backend's register-save-area / overflow-area addresses.
+fn build_va_sum() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let i64t = m.types_mut().int(64);
+    let ptrt = m.types_mut().ptr();
+    let vlty = m.types_mut().struct_(vec![i32t, i32t, ptrt, ptrt]); // 24 bytes
+
+    // Frontend hooks: external `ptr @name()`.
+    let hook_sig = m.types_mut().func(vec![], ptrt, false);
+    let reg_save = m.declare_function(syms.intern("__lf_va_reg_save_area"), hook_sig);
+    let overflow = m.declare_function(syms.intern("__lf_va_overflow_area"), hook_sig);
+
+    // int sum(int n, ...)
+    let sig = m.types_mut().func(vec![i32t], i32t, true);
+    let sum = m.declare_function(syms.intern("sum"), sig);
+    {
+        let mut b = m.build(sum);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let vl = b.alloca(vlty);
+        let o0 = b.const_i64(i64t, 0);
+        let o4 = b.const_i64(i64t, 4);
+        let o8 = b.const_i64(i64t, 8);
+        let o16 = b.const_i64(i64t, 16);
+
+        // va_start: gp_offset = 8 (one named int arg), fp_offset = 48 (no fp).
+        let gp_ptr = b.ptr_add(vl, o0, true);
+        let v8 = b.const_i64(i32t, 8);
+        b.store(i32t, gp_ptr, v8, 4);
+        let fp_ptr = b.ptr_add(vl, o4, true);
+        let v48 = b.const_i64(i32t, 48);
+        b.store(i32t, fp_ptr, v48, 4);
+        let rsa_ref = b.func_ref(reg_save);
+        let rsa = b.call(rsa_ref, &[], ptrt).unwrap();
+        let rsa_slot = b.ptr_add(vl, o16, true);
+        b.store(ptrt, rsa_slot, rsa, 8);
+        let ov_ref = b.func_ref(overflow);
+        let ov = b.call(ov_ref, &[], ptrt).unwrap();
+        let ov_slot = b.ptr_add(vl, o8, true);
+        b.store(ptrt, ov_slot, ov, 8);
+
+        let header = b.create_block(&[i32t, i32t]);
+        let body = b.create_block(&[i32t, i32t]);
+        let from_reg = b.create_block(&[i32t, i32t, i32t]);
+        let from_ov = b.create_block(&[i32t, i32t]);
+        let cont = b.create_block(&[i32t, i32t, i32t]);
+        let exit = b.create_block(&[i32t]);
+
+        let zero = b.const_i64(i32t, 0);
+        b.br(header, &[zero, zero]);
+
+        b.switch_to(header);
+        let acc_h = b.param(header, 0);
+        let i_h = b.param(header, 1);
+        let cond = b.icmp(IntPred::Slt, i_h, n);
+        b.cond_br(cond, body, &[acc_h, i_h], exit, &[acc_h]);
+
+        b.switch_to(body);
+        let acc_b = b.param(body, 0);
+        let i_b = b.param(body, 1);
+        let gp_ptr2 = b.ptr_add(vl, o0, true);
+        let gp = b.load(i32t, gp_ptr2, 4);
+        let c48 = b.const_i64(i32t, 48);
+        let is_reg = b.icmp(IntPred::Ult, gp, c48);
+        b.cond_br(is_reg, from_reg, &[acc_b, i_b, gp], from_ov, &[acc_b, i_b]);
+
+        // register path: addr = reg_save_area + gp_offset; gp_offset += 8.
+        b.switch_to(from_reg);
+        let acc_r = b.param(from_reg, 0);
+        let i_r = b.param(from_reg, 1);
+        let gp_r = b.param(from_reg, 2);
+        let rsa_slot2 = b.ptr_add(vl, o16, true);
+        let rsa2 = b.load(ptrt, rsa_slot2, 8);
+        let gp64 = b.cast(CastOp::ZExt, gp_r, i64t);
+        let addr_r = b.ptr_add(rsa2, gp64, true);
+        let eight = b.const_i64(i32t, 8);
+        let new_gp = b.add(gp_r, eight, Flags::NONE);
+        let gp_ptr3 = b.ptr_add(vl, o0, true);
+        b.store(i32t, gp_ptr3, new_gp, 4);
+        let v_r = b.load(i32t, addr_r, 4);
+        b.br(cont, &[acc_r, i_r, v_r]);
+
+        // overflow path: addr = overflow_arg_area; overflow_arg_area += 8.
+        b.switch_to(from_ov);
+        let acc_o = b.param(from_ov, 0);
+        let i_o = b.param(from_ov, 1);
+        let ov_slot2 = b.ptr_add(vl, o8, true);
+        let ov2 = b.load(ptrt, ov_slot2, 8);
+        let new_ov = b.ptr_add(ov2, o8, true);
+        let ov_slot3 = b.ptr_add(vl, o8, true);
+        b.store(ptrt, ov_slot3, new_ov, 8);
+        let v_o = b.load(i32t, ov2, 4);
+        b.br(cont, &[acc_o, i_o, v_o]);
+
+        b.switch_to(cont);
+        let acc_c = b.param(cont, 0);
+        let i_c = b.param(cont, 1);
+        let v_c = b.param(cont, 2);
+        let new_acc = b.add(acc_c, v_c, Flags::NONE);
+        let one = b.const_i64(i32t, 1);
+        let new_i = b.add(i_c, one, Flags::NONE);
+        b.br(header, &[new_acc, new_i]);
+
+        b.switch_to(exit);
+        let acc_e = b.param(exit, 0);
+        b.ret(Some(acc_e));
+    }
+    (m, syms)
+}
+
+/// LF-compiled `int sum(int n, ...)` (register save area + overflow area,
+/// `va_arg` hand-lowered via the frame-address hooks) called from a gcc driver,
+/// which passes the varargs per SysV and sets `al`. Covers both the ≤6-register
+/// case and a >6-vararg case that spills to the overflow/stack area.
+#[test]
+fn run_va_sum() {
+    let (m, syms) = build_va_sum();
+    let c = r#"
+        extern int sum(int, ...);
+        int main(void) {
+            if (sum(4, 10, 20, 30, 40) != 100) return 1;   /* all in registers */
+            if (sum(9, 1,2,3,4,5,6,7,8,9) != 45) return 2; /* spills to overflow */
+            if (sum(0) != 0) return 3;                      /* no varargs */
+            if (sum(1, -7) != -7) return 4;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "va_sum", c) {
+        Some(code) => assert_eq!(code, 0, "LF variadic int-sum mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_va_sum: no C compiler"),
+    }
+}
+
+/// LF-compiled `double dsum(int n, ...)` summing `n` `double` varargs — exercises
+/// the SSE half of the register save area (`xmm0..7` at `fp_offset`) and the `al`
+/// vector count gcc sets at the call.
+fn build_va_dsum() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let i64t = m.types_mut().int(64);
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let ptrt = m.types_mut().ptr();
+    let vlty = m.types_mut().struct_(vec![i32t, i32t, ptrt, ptrt]);
+
+    let hook_sig = m.types_mut().func(vec![], ptrt, false);
+    let reg_save = m.declare_function(syms.intern("__lf_va_reg_save_area"), hook_sig);
+    let overflow = m.declare_function(syms.intern("__lf_va_overflow_area"), hook_sig);
+
+    let sig = m.types_mut().func(vec![i32t], f64t, true);
+    let dsum = m.declare_function(syms.intern("dsum"), sig);
+    {
+        let mut b = m.build(dsum);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let vl = b.alloca(vlty);
+        let o0 = b.const_i64(i64t, 0);
+        let o4 = b.const_i64(i64t, 4);
+        let o8 = b.const_i64(i64t, 8);
+        let o16 = b.const_i64(i64t, 16);
+
+        // va_start: gp_offset = 8 (named int `n`), fp_offset = 48 (no named fp).
+        let gp_ptr = b.ptr_add(vl, o0, true);
+        let v8 = b.const_i64(i32t, 8);
+        b.store(i32t, gp_ptr, v8, 4);
+        let fp_ptr = b.ptr_add(vl, o4, true);
+        let v48 = b.const_i64(i32t, 48);
+        b.store(i32t, fp_ptr, v48, 4);
+        let rsa_ref = b.func_ref(reg_save);
+        let rsa = b.call(rsa_ref, &[], ptrt).unwrap();
+        let rsa_slot = b.ptr_add(vl, o16, true);
+        b.store(ptrt, rsa_slot, rsa, 8);
+        let ov_ref = b.func_ref(overflow);
+        let ov = b.call(ov_ref, &[], ptrt).unwrap();
+        let ov_slot = b.ptr_add(vl, o8, true);
+        b.store(ptrt, ov_slot, ov, 8);
+
+        let header = b.create_block(&[f64t, i32t]);
+        let body = b.create_block(&[f64t, i32t]);
+        let from_reg = b.create_block(&[f64t, i32t, i32t]);
+        let from_ov = b.create_block(&[f64t, i32t]);
+        let cont = b.create_block(&[f64t, i32t, f64t]);
+        let exit = b.create_block(&[f64t]);
+
+        let z = b.const_float(f64t, FloatBits::F64(0.0f64.to_bits()));
+        let zero_i = b.const_i64(i32t, 0);
+        b.br(header, &[z, zero_i]);
+
+        b.switch_to(header);
+        let acc_h = b.param(header, 0);
+        let i_h = b.param(header, 1);
+        let cond = b.icmp(IntPred::Slt, i_h, n);
+        b.cond_br(cond, body, &[acc_h, i_h], exit, &[acc_h]);
+
+        b.switch_to(body);
+        let acc_b = b.param(body, 0);
+        let i_b = b.param(body, 1);
+        let fp_ptr2 = b.ptr_add(vl, o4, true);
+        let fp = b.load(i32t, fp_ptr2, 4);
+        let c176 = b.const_i64(i32t, 176);
+        let is_reg = b.icmp(IntPred::Ult, fp, c176);
+        b.cond_br(is_reg, from_reg, &[acc_b, i_b, fp], from_ov, &[acc_b, i_b]);
+
+        // register path: addr = reg_save_area + fp_offset; fp_offset += 16.
+        b.switch_to(from_reg);
+        let acc_r = b.param(from_reg, 0);
+        let i_r = b.param(from_reg, 1);
+        let fp_r = b.param(from_reg, 2);
+        let rsa_slot2 = b.ptr_add(vl, o16, true);
+        let rsa2 = b.load(ptrt, rsa_slot2, 8);
+        let fp64 = b.cast(CastOp::ZExt, fp_r, i64t);
+        let addr_r = b.ptr_add(rsa2, fp64, true);
+        let sixteen = b.const_i64(i32t, 16);
+        let new_fp = b.add(fp_r, sixteen, Flags::NONE);
+        let fp_ptr3 = b.ptr_add(vl, o4, true);
+        b.store(i32t, fp_ptr3, new_fp, 4);
+        let v_r = b.load(f64t, addr_r, 8);
+        b.br(cont, &[acc_r, i_r, v_r]);
+
+        // overflow path: addr = overflow_arg_area; overflow_arg_area += 8.
+        b.switch_to(from_ov);
+        let acc_o = b.param(from_ov, 0);
+        let i_o = b.param(from_ov, 1);
+        let ov_slot2 = b.ptr_add(vl, o8, true);
+        let ov2 = b.load(ptrt, ov_slot2, 8);
+        let new_ov = b.ptr_add(ov2, o8, true);
+        let ov_slot3 = b.ptr_add(vl, o8, true);
+        b.store(ptrt, ov_slot3, new_ov, 8);
+        let v_o = b.load(f64t, ov2, 8);
+        b.br(cont, &[acc_o, i_o, v_o]);
+
+        b.switch_to(cont);
+        let acc_c = b.param(cont, 0);
+        let i_c = b.param(cont, 1);
+        let v_c = b.param(cont, 2);
+        let new_acc = b.bin(BinOp::FAdd, acc_c, v_c, Flags::NONE);
+        let one = b.const_i64(i32t, 1);
+        let new_i = b.add(i_c, one, Flags::NONE);
+        b.br(header, &[new_acc, new_i]);
+
+        b.switch_to(exit);
+        let acc_e = b.param(exit, 0);
+        b.ret(Some(acc_e));
+    }
+    (m, syms)
+}
+
+/// LF-compiled `double dsum(int n, ...)` (SSE register save area + `al`) called
+/// from a gcc driver passing `double` varargs.
+#[test]
+fn run_va_dsum() {
+    let (m, syms) = build_va_dsum();
+    let c = r#"
+        extern double dsum(int, ...);
+        int main(void) {
+            double r = dsum(3, 1.5, 2.5, 3.0);
+            if (r != 7.0) return 1;
+            if (dsum(0) != 0.0) return 2;
+            if (dsum(5, 1.0, 2.0, 4.0, 8.0, 16.0) != 31.0) return 3;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "va_dsum", c) {
+        Some(code) => assert_eq!(code, 0, "LF variadic double-sum mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_va_dsum: no C compiler"),
+    }
+}
+
+/// LF as the *caller* of a variadic function: `long lf_call_ivsum()` calls the
+/// gcc-provided `long ivsum(int n, ...)` with integer varargs (`al` must be 0),
+/// and `double lf_call_dvsum()` calls `double dvsum(int n, ...)` with `double`
+/// varargs (`al` must be 3). Verifies the backend sets the SSE vector count `al`
+/// at a variadic call site.
+fn build_va_caller() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let i64t = m.types_mut().int(64);
+    let f64t = m.types_mut().float(FloatKind::F64);
+
+    // Variadic callees provided by the C driver.
+    let ivsum_sig = m.types_mut().func(vec![i32t], i64t, true);
+    let ivsum = m.declare_function(syms.intern("ivsum"), ivsum_sig);
+    let dvsum_sig = m.types_mut().func(vec![i32t], f64t, true);
+    let dvsum = m.declare_function(syms.intern("dvsum"), dvsum_sig);
+
+    // long lf_call_ivsum() = ivsum(3, 100, 200, 300)
+    let ret_i_sig = m.types_mut().func(vec![], i64t, false);
+    let call_i = m.declare_function(syms.intern("lf_call_ivsum"), ret_i_sig);
+    {
+        let mut b = m.build(call_i);
+        let _e = b.create_entry_block();
+        let n = b.const_i64(i32t, 3);
+        let a = b.const_i64(i64t, 100);
+        let c = b.const_i64(i64t, 200);
+        let d = b.const_i64(i64t, 300);
+        let r = b.func_ref(ivsum);
+        let res = b.call(r, &[n, a, c, d], i64t).unwrap();
+        b.ret(Some(res));
+    }
+
+    // double lf_call_dvsum() = dvsum(3, 1.5, 2.5, 3.0)
+    let ret_d_sig = m.types_mut().func(vec![], f64t, false);
+    let call_d = m.declare_function(syms.intern("lf_call_dvsum"), ret_d_sig);
+    {
+        let mut b = m.build(call_d);
+        let _e = b.create_entry_block();
+        let n = b.const_i64(i32t, 3);
+        let a = b.const_float(f64t, FloatBits::F64(1.5f64.to_bits()));
+        let c = b.const_float(f64t, FloatBits::F64(2.5f64.to_bits()));
+        let d = b.const_float(f64t, FloatBits::F64(3.0f64.to_bits()));
+        let r = b.func_ref(dvsum);
+        let res = b.call(r, &[n, a, c, d], f64t).unwrap();
+        b.ret(Some(res));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_va_caller() {
+    let (m, syms) = build_va_caller();
+    let c = r#"
+        #include <stdarg.h>
+        long ivsum(int n, ...) {
+            va_list ap; va_start(ap, n);
+            long s = 0;
+            for (int i = 0; i < n; i++) s += va_arg(ap, long);
+            va_end(ap);
+            return s;
+        }
+        double dvsum(int n, ...) {
+            va_list ap; va_start(ap, n);
+            double s = 0;
+            for (int i = 0; i < n; i++) s += va_arg(ap, double);
+            va_end(ap);
+            return s;
+        }
+        extern long lf_call_ivsum(void);
+        extern double lf_call_dvsum(void);
+        int main(void) {
+            if (lf_call_ivsum() != 600) return 1;
+            if (lf_call_dvsum() != 7.0) return 2;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "va_caller", c) {
+        Some(code) => assert_eq!(code, 0, "LF-as-caller variadic mismatch vs gcc (exit {code})"),
+        None => eprintln!("skipping run_va_caller: no C compiler"),
+    }
+}

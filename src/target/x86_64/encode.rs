@@ -1096,7 +1096,7 @@ fn encode_function_inner(
 /// isel → register allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
     let target = X86_64Target::new();
-    let mut mf = target.select(module, func);
+    let mut mf = target.select_with_syms(module, func, syms);
     regalloc::allocate(&mut mf, &target);
     let layout = layout_frame(&mf, &target);
     insert_prologue_epilogue(&mut mf, &layout);
@@ -1165,7 +1165,7 @@ pub fn compile_function_lines(
     syms: &StrInterner,
 ) -> (Emitted, Vec<(u64, u32)>) {
     let target = X86_64Target::new();
-    let mut mf = target.select(module, func);
+    let mut mf = target.select_with_syms(module, func, syms);
     regalloc::allocate(&mut mf, &target);
     let layout = layout_frame(&mf, &target);
     insert_prologue_epilogue(&mut mf, &layout);

@@ -29,6 +29,51 @@
 //! records the return register and the caller-saved clobbers as fixed defs, and
 //! moves the result out of `rax`; `ret` moves its value into `rax`. The prologue
 //! moves incoming parameters out of the argument registers (framework prologue).
+//!
+//! ## Variadic functions (System V AMD64)
+//!
+//! This backend implements the callee-side and caller-side ABI a C frontend
+//! needs to build `<stdarg.h>`; the frontend lowers `va_arg` itself as ordinary
+//! IR over the `va_list` struct, using the two frame-address intrinsics below.
+//!
+//! **`va_list`** is a 24-byte struct (one element of the array typedef):
+//!
+//! | offset | field              | type    |
+//! |--------|--------------------|---------|
+//! | 0      | `gp_offset`        | `u32`   |
+//! | 4      | `fp_offset`        | `u32`   |
+//! | 8      | `overflow_arg_area`| `void*` |
+//! | 16     | `reg_save_area`    | `void*` |
+//!
+//! **Register save area** — the prologue of any function whose signature is
+//! variadic reserves a 176-byte area and spills the incoming argument registers
+//! into it ([`X86_64Target::spill_va_regs`]): the 6 integer regs
+//! `rdi, rsi, rdx, rcx, r8, r9` at offsets `0, 8, .., 40`, then `xmm0..7` at
+//! offsets `48, 64, .., 160` (16-byte stride). The SSE saves are unconditional
+//! (no `test al,al` guard): reading `xmm0..7` is always safe.
+//!
+//! **`al` at variadic call sites** — when calling a function whose (direct)
+//! signature is variadic, the caller sets `al` to the number of SSE argument
+//! registers used (`mov eax, N`), per the psABI hidden-argument rule.
+//!
+//! **Frontend hooks** — two specially-named external functions are recognized by
+//! name and lowered to frame addresses (never emitted as real calls); they are
+//! only valid inside a variadic function:
+//!
+//! - `ptr @__lf_va_reg_save_area()` → the address of the register save area
+//!   (`va_list.reg_save_area`);
+//! - `ptr @__lf_va_overflow_area()` → the address of the first incoming stack
+//!   argument, past every named stack argument (`va_list.overflow_arg_area`).
+//!
+//! The frontend's `va_start` then fills the `va_list` as:
+//! `gp_offset = 8 * (named integer/pointer args in GPRs)` (≤ 48);
+//! `fp_offset = 48 + 16 * (named float/double args in XMMs)` (≤ 176);
+//! `reg_save_area = __lf_va_reg_save_area()`;
+//! `overflow_arg_area = __lf_va_overflow_area()`. Its `va_arg` reads an integer
+//! eightbyte from `reg_save_area + gp_offset` (then `gp_offset += 8`) while
+//! `gp_offset < 48`, an SSE one from `reg_save_area + fp_offset`
+//! (then `fp_offset += 16`) while `fp_offset < 176`, and otherwise from
+//! `overflow_arg_area` (then `overflow_arg_area += 8`).
 
 use crate::codegen::isel::{Lower, TargetIsel};
 use crate::codegen::mir::{
@@ -38,7 +83,8 @@ use crate::codegen::target::{CallConv, MachineTarget};
 use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ValueDef};
-use crate::ir::{InstData, Module, ValueId};
+use crate::ir::{FuncId, InstData, Module, ValueId};
+use crate::support::StrInterner;
 
 use puremp::Int;
 
@@ -375,6 +421,31 @@ fn imm(v: u64) -> MachineOperand {
     MachineOperand::Imm(Int::from_u64(v))
 }
 
+/// The two System V variadic frame-address intrinsics the x86-64 backend
+/// recognizes by name. The C frontend declares each as an external
+/// `ptr @name()` and calls it inside `va_start`; the backend replaces the call
+/// with the corresponding frame address (see the [`isel`](self) module docs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VaIntrinsic {
+    /// `ptr @__lf_va_reg_save_area()` — the address of this variadic function's
+    /// 176-byte register save area (`va_list.reg_save_area`).
+    RegSaveArea,
+    /// `ptr @__lf_va_overflow_area()` — the address of the first incoming stack
+    /// argument, past every named stack argument (`va_list.overflow_arg_area`).
+    OverflowArea,
+}
+
+impl VaIntrinsic {
+    /// The intrinsic named by a direct callee, if it is one.
+    fn from_name(name: &str) -> Option<VaIntrinsic> {
+        match name {
+            "__lf_va_reg_save_area" => Some(VaIntrinsic::RegSaveArea),
+            "__lf_va_overflow_area" => Some(VaIntrinsic::OverflowArea),
+            _ => None,
+        }
+    }
+}
+
 /// The x86-64 target: its register file/ABI plus the isel + encoding rules.
 #[derive(Debug)]
 pub struct X86_64Target {
@@ -398,6 +469,18 @@ impl X86_64Target {
         crate::codegen::isel::select(self, module, func)
     }
 
+    /// Like [`X86_64Target::select`], but threads the module's symbol interner so
+    /// the variadic frame-address intrinsics (`__lf_va_reg_save_area` /
+    /// `__lf_va_overflow_area`) can be recognized by name at their call sites.
+    pub fn select_with_syms(
+        &self,
+        module: &Module,
+        func: crate::ir::FuncId,
+        syms: &StrInterner,
+    ) -> crate::codegen::mir::MachineFunction {
+        crate::codegen::isel::select_with_syms(self, module, func, syms)
+    }
+
     /// Resolve a value operand to a register, but materialize a **function
     /// reference used as a value** (its address taken / stored / passed) into a
     /// GPR via a RIP-relative [`X86Op::FuncAddr`] `lea`, rather than the
@@ -415,6 +498,16 @@ impl X86_64Target {
             return d;
         }
         lo.reg(v)
+    }
+
+    /// Whether a call's callee is a variadic function. Detected from a *direct*
+    /// callee's function signature (`FuncType.variadic`); an indirect call
+    /// (through a pointer) carries no signature here, so it is treated as
+    /// non-variadic (the frontend passes such calls directly to known callees).
+    fn callee_is_variadic(lo: &Lower<'_, Self>, callee: ValueId) -> bool {
+        let Some(fidx) = lo.callee_func(callee) else { return false };
+        let fid = FuncId::from_index(fidx as usize);
+        matches!(lo.types().get(lo.module().function(fid).sig), Type::Func(ft) if ft.variadic)
     }
 
     /// If `v` is an integer constant operand, its value.
@@ -733,6 +826,35 @@ impl X86_64Target {
         let callee = ops[0];
         let args = &ops[1..];
 
+        // System V variadic frame-address intrinsics. A `call` to one of these
+        // specially-named external functions is not a real call: it materializes
+        // a frame address the C frontend's `va_start` needs (see the module
+        // documentation for the `va_list` layout and offset conventions). They are
+        // only valid inside a variadic function (the prologue set up the slots).
+        match lo.callee_name(callee).and_then(VaIntrinsic::from_name) {
+            Some(VaIntrinsic::RegSaveArea) => {
+                let d = lo.result_reg(inst);
+                let slot = lo
+                    .va_reg_save()
+                    .expect("__lf_va_reg_save_area called outside a variadic function");
+                lo.emit(self.frame_addr(d, slot));
+                return;
+            }
+            Some(VaIntrinsic::OverflowArea) => {
+                let d = lo.result_reg(inst);
+                let off = lo
+                    .va_overflow_off()
+                    .expect("__lf_va_overflow_area called outside a variadic function");
+                lo.emit(MachineInst::new(X86Op::LeaRbpOff.opcode(), vec![def_v(d), imm(off)]));
+                return;
+            }
+            None => {}
+        }
+
+        // Is this a call to a variadic function? Under System V the caller must
+        // then set `al` to the number of vector (SSE) argument registers used.
+        let variadic_call = Self::callee_is_variadic(lo, callee);
+
         // Return classification.
         let ret_ty = inst.result().map(|r| lo.func().value_type(r));
         let ret_agg = ret_ty.filter(|&t| is_aggregate(lo.types(), t));
@@ -833,9 +955,18 @@ impl X86_64Target {
             lo.reserve_outgoing(align_up_u64(stack_off, 16));
         }
 
-        let used_arg_regs: Vec<PReg> = reg_moves.iter().map(|&(areg, _)| areg).collect();
+        let mut used_arg_regs: Vec<PReg> = reg_moves.iter().map(|&(areg, _)| areg).collect();
         for (areg, r) in reg_moves {
             lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(areg), use_v(r)]));
+        }
+
+        // Variadic call: `al` = number of SSE argument registers used (0..=8).
+        // `mov eax, imm` sets it (and zeroes the rest of eax), matching gcc/clang.
+        // rax is added to the call's used registers so its value reaches the call.
+        if variadic_call {
+            let rax = regs::gpr(regs::RAX);
+            lo.emit(MachineInst::new(X86Op::MovRI.opcode(), vec![def(rax), imm(fp_i as u64)]));
+            used_arg_regs.push(rax);
         }
 
         // The primary return register (`rax`/`xmm0`); struct results reclaim their
@@ -923,12 +1054,18 @@ impl X86_64Target {
         let cc = &self.rf.cc;
         let entry = lo.mf().entry().expect("a function being lowered has an entry block");
         let param_vregs: Vec<VReg> = lo.mf().block(entry).params.clone();
-        let (sig_params, ret_ty) = match lo.types().get(lo.func().sig) {
-            Type::Func(ft) => (ft.params.clone(), ft.ret),
-            _ => (Vec::new(), lo.func().sig),
+        let (sig_params, ret_ty, variadic) = match lo.types().get(lo.func().sig) {
+            Type::Func(ft) => (ft.params.clone(), ft.ret, ft.variadic),
+            _ => (Vec::new(), lo.func().sig, false),
         };
         let sret = is_aggregate(lo.types(), ret_ty)
             && matches!(classify_aggregate(lo.types(), ret_ty), AbiClass::Memory);
+
+        // A variadic function spills its incoming argument registers into a
+        // register save area so `va_arg` can walk them (see [`Self::spill_va_regs`]).
+        if variadic {
+            self.spill_va_regs(lo);
+        }
 
         let mut int_i = 0usize;
         let mut fp_i = 0usize;
@@ -1010,6 +1147,68 @@ impl X86_64Target {
                     stack_in += 8;
                 }
             }
+        }
+
+        // `overflow_arg_area` starts just past the named stack arguments (which end
+        // at `[rbp + stack_in]`). For the common case — every named argument in a
+        // register — that is `rbp + 16`, right above the saved return address.
+        if variadic {
+            lo.set_va_overflow_off(stack_in);
+        }
+    }
+
+    /// Spill a variadic function's incoming System V argument registers into a
+    /// 176-byte register save area at the top of the prologue, and record the
+    /// slot for `__lf_va_reg_save_area`.
+    ///
+    /// Layout (matching the psABI so `va_arg`'s `gp_offset`/`fp_offset` walk is
+    /// correct): the 6 integer arg regs `rdi, rsi, rdx, rcx, r8, r9` at byte
+    /// offsets `0, 8, .., 40`, then the 8 SSE regs `xmm0..7` at offsets
+    /// `48, 64, .., 160` (16-byte stride; only the low 8 bytes of each — enough
+    /// for `double`/`float` varargs — are stored). The SSE registers are saved
+    /// unconditionally: reading `xmm0..7` is always safe, so no `test al,al`
+    /// guard (and no prologue control flow) is needed — a correct caller only
+    /// ever passes, and `va_arg` only ever reads, the registers it set up.
+    ///
+    /// Each incoming register is first copied into a fresh vreg (so the physical
+    /// argument registers become dead immediately and the address-computation
+    /// temporaries may reuse them), then stored into the save area.
+    fn spill_va_regs(&self, lo: &mut Lower<'_, Self>) {
+        let cc = &self.rf.cc;
+        // Capture the incoming registers while they are still live.
+        let gpr_vs: Vec<VReg> = (0..6)
+            .map(|i| {
+                let v = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(MachineInst::new(
+                    X86Op::MovRR.opcode(),
+                    vec![def_v(v), use_p(cc.arg_regs[i])],
+                ));
+                v
+            })
+            .collect();
+        let xmm_vs: Vec<VReg> = (0..8)
+            .map(|i| {
+                let v = lo.fresh_vreg(RegClass::Fp);
+                lo.emit(MachineInst::new(
+                    X86Op::MovRR.opcode(),
+                    vec![def_v(v), use_p(regs::xmm(i as u16))],
+                ));
+                v
+            })
+            .collect();
+
+        // Reserve the save area and store the captured registers into it.
+        let save = lo.new_slot(176, 16);
+        lo.set_va_reg_save(save);
+        let base = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(self.frame_addr(base, save));
+        for (i, v) in gpr_vs.into_iter().enumerate() {
+            let dp = self.add_off(lo, base, 8 * i as u64);
+            lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
+        }
+        for (i, v) in xmm_vs.into_iter().enumerate() {
+            let dp = self.add_off(lo, base, 48 + 16 * i as u64);
+            lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
         }
     }
 }

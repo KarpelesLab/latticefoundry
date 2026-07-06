@@ -31,7 +31,7 @@ use crate::codegen::target::MachineTarget;
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, FloatBits, ValueDef};
 use crate::ir::{Function, InstData, Module, ValueId};
-use crate::support::DetHashMap;
+use crate::support::{DetHashMap, StrInterner};
 
 use puremp::Int;
 
@@ -116,6 +116,21 @@ pub struct Lower<'a, T: TargetIsel> {
     /// into (the System V `sret` return pointer), to be recovered by the return
     /// lowering. `None` unless a target uses it.
     aux_slot: Option<StackSlot>,
+    /// The string interner backing the module's symbol names, when the caller
+    /// threads it through [`select_with_syms`]. Lets a target resolve a direct
+    /// callee's name (e.g. to recognize the System V variadic frame-address
+    /// intrinsics). `None` when lowered without it (names are then invisible).
+    syms: Option<&'a StrInterner>,
+    /// The stack slot holding a variadic function's System V register save area
+    /// (176 bytes: `rdi..r9` then `xmm0..7`), set by the target's prologue and
+    /// recovered when lowering the `__lf_va_reg_save_area` intrinsic. `None` in a
+    /// non-variadic function.
+    va_reg_save: Option<StackSlot>,
+    /// The `rbp`-relative displacement of a variadic function's first incoming
+    /// *stack* argument (past every named stack argument), set by the target's
+    /// prologue and recovered when lowering `__lf_va_overflow_area`. `None` in a
+    /// non-variadic function.
+    va_overflow_off: Option<u64>,
 }
 
 /// Map an IR type to the register class that holds it.
@@ -127,7 +142,13 @@ fn class_of(types: &TypeContext, ty: TypeId) -> RegClass {
 }
 
 impl<'a, T: TargetIsel> Lower<'a, T> {
-    fn new(target: &'a T, module: &'a Module, func: &'a Function, source: u32) -> Lower<'a, T> {
+    fn new(
+        target: &'a T,
+        module: &'a Module,
+        func: &'a Function,
+        source: u32,
+        syms: Option<&'a StrInterner>,
+    ) -> Lower<'a, T> {
         let types = module.types();
         let mut mf = MachineFunction::new(format!("f{source}"), source);
         let n = func.block_count();
@@ -166,6 +187,9 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             cur: entry,
             cur_line: 0,
             aux_slot: None,
+            syms,
+            va_reg_save: None,
+            va_overflow_off: None,
         }
     }
 
@@ -235,6 +259,43 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
     #[inline]
     pub fn aux_slot(&self) -> Option<StackSlot> {
         self.aux_slot
+    }
+
+    /// The name of a direct callee (a `ValueDef::Func` reference), when the module
+    /// interner was threaded through [`select_with_syms`]. `None` for an indirect
+    /// call, or when no interner is available. Targets use this to recognize the
+    /// System V variadic frame-address intrinsics (`__lf_va_reg_save_area` /
+    /// `__lf_va_overflow_area`) at their call sites.
+    pub fn callee_name(&self, v: ValueId) -> Option<&str> {
+        let syms = self.syms?;
+        match self.func.value(v).def {
+            ValueDef::Func(f) => Some(syms.resolve(self.module.function(f).name)),
+            _ => None,
+        }
+    }
+
+    /// Record the stack slot holding this variadic function's register save area
+    /// (see [`Lower::va_reg_save`]).
+    pub fn set_va_reg_save(&mut self, slot: StackSlot) {
+        self.va_reg_save = Some(slot);
+    }
+
+    /// The register-save-area slot set by [`Lower::set_va_reg_save`], if any.
+    #[inline]
+    pub fn va_reg_save(&self) -> Option<StackSlot> {
+        self.va_reg_save
+    }
+
+    /// Record the `rbp`-relative displacement of the first incoming stack argument
+    /// of this variadic function (see [`Lower::va_overflow_off`]).
+    pub fn set_va_overflow_off(&mut self, off: u64) {
+        self.va_overflow_off = Some(off);
+    }
+
+    /// The overflow-argument-area displacement set by [`Lower::set_va_overflow_off`].
+    #[inline]
+    pub fn va_overflow_off(&self) -> Option<u64> {
+        self.va_overflow_off
     }
 
     /// Reserve at least `bytes` of outgoing stack-argument space in the frame
@@ -464,8 +525,30 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
 /// function with no body yields an empty machine function. The resulting MIR
 /// records `func`'s index as its source, so direct calls resolve by `FuncId`.
 pub fn select<T: TargetIsel>(target: &T, module: &Module, func: crate::ir::FuncId) -> MachineFunction {
+    select_inner(target, module, func, None)
+}
+
+/// Like [`select`], but threads the module's symbol interner so the target can
+/// resolve direct-callee names (needed to recognize the System V variadic
+/// frame-address intrinsics). Backward-compatible: [`select`] still works with
+/// no interner, leaving callee names invisible.
+pub fn select_with_syms<T: TargetIsel>(
+    target: &T,
+    module: &Module,
+    func: crate::ir::FuncId,
+    syms: &StrInterner,
+) -> MachineFunction {
+    select_inner(target, module, func, Some(syms))
+}
+
+fn select_inner<T: TargetIsel>(
+    target: &T,
+    module: &Module,
+    func: crate::ir::FuncId,
+    syms: Option<&StrInterner>,
+) -> MachineFunction {
     let f = module.function(func);
-    let mut lo = Lower::new(target, module, f, func.index() as u32);
+    let mut lo = Lower::new(target, module, f, func.index() as u32, syms);
     if f.entry().is_some() {
         lo.run();
     }
