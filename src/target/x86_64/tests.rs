@@ -105,6 +105,23 @@ fn golden_setcc_and_cmp() {
 }
 
 #[test]
+fn golden_movsx_movzx() {
+    // movsxd rax, ecx = 48 63 c1  (32->64 sign-extend)
+    assert_eq!(enc(|e| movsx_rr(e, 0, 1, 32, 64)), vec![0x48, 0x63, 0xc1]);
+    // movsx eax, cl = 0f be c1  (8->32)
+    assert_eq!(enc(|e| movsx_rr(e, 0, 1, 8, 32)), vec![0x0f, 0xbe, 0xc1]);
+    // movsx rax, cx = 48 0f bf c1  (16->64)
+    assert_eq!(enc(|e| movsx_rr(e, 0, 1, 16, 64)), vec![0x48, 0x0f, 0xbf, 0xc1]);
+    // movzx eax, cl = 0f b6 c1  (8->zero-extend)
+    assert_eq!(enc(|e| movzx_rr(e, 0, 1, 8)), vec![0x0f, 0xb6, 0xc1]);
+    // movzx eax, cx = 0f b7 c1  (16->)
+    assert_eq!(enc(|e| movzx_rr(e, 0, 1, 16)), vec![0x0f, 0xb7, 0xc1]);
+    // zext of a 32-bit source is a plain 32-bit mov (zero-extends 32->64):
+    // mov eax, ecx = 89 c8
+    assert_eq!(enc(|e| movzx_rr(e, 0, 1, 32)), vec![0x89, 0xc8]);
+}
+
+#[test]
 fn golden_ret_via_emitter() {
     // ret = c3
     assert_eq!(enc(|e| e.u8(0xC3)), vec![0xc3]);
@@ -475,6 +492,29 @@ fn build_ffloat() -> (Module, StrInterner, FuncId) {
     (m, syms, f)
 }
 
+/// `widecmp(n)` sign-extends an `i32` to `i64` and returns whether it is negative
+/// (1/0). Regression for integer `sext`, which used to lower to a plain 64-bit
+/// `mov` — so a negative `i32` widened to a *positive* `i64` and `< 0` was false.
+fn build_sext_cmp() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i32t], i32t, false);
+    let f = m.declare_function(syms.intern("widecmp"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let w = b.cast(CastOp::SExt, n, i64t);
+        let zero = b.const_i64(i64t, 0);
+        let c = b.icmp(IntPred::Slt, w, zero);
+        let r = b.cast(CastOp::ZExt, c, i32t);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
 /// `double call_g() = g(1.5, 2.5)` where `double g(double,double)=a+b`. Passes
 /// two float *constants* directly as call arguments — a regression fixture for
 /// the arg-register clobber (the 2nd constant's materialization must not land in
@@ -635,6 +675,16 @@ fn run_add() {
     "#;
     if let Some(code) = compile_link_run(&m, &syms, "add", c) {
         assert_eq!(code, 0, "lfadd checks failed (exit {code})");
+    }
+}
+
+#[test]
+fn run_sext_negative() {
+    let (m, syms, _f) = build_sext_cmp();
+    // widecmp(-3) must be 1 (negative), widecmp(5) must be 0.
+    let c = "extern int widecmp(int); int main(void){ return (widecmp(-3)==1 && widecmp(5)==0) ? 0 : 1; }";
+    if let Some(code) = compile_link_run(&m, &syms, "sext", c) {
+        assert_eq!(code, 0, "sext of a negative i32 to i64 was not sign-extended");
     }
 }
 

@@ -163,6 +163,12 @@ pub enum X86Op {
     /// through [`X86Op::Call`] with a `Func` operand and a `Plt32` relocation;
     /// only a function used as a plain *value* reaches here.
     FuncAddr = 49,
+    /// `[Def d, Use s, Imm src_w, Imm dst_w]` — sign-extend `s` (`src_w` bits)
+    /// into `d` (`movsx`/`movsxd`). Implements the IR `sext`.
+    Movsx = 50,
+    /// `[Def d, Use s, Imm src_w, Imm dst_w]` — zero-extend `s` (`src_w` bits)
+    /// into `d` (`movzx`, or a 32-bit `mov`). Implements the IR `zext`.
+    Movzx = 51,
 }
 
 impl X86Op {
@@ -175,12 +181,12 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 50] = [
+        const TABLE: [X86Op; 52] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
             StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
-            Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr,
+            Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx,
         ];
         TABLE[op.0 as usize]
     }
@@ -521,7 +527,17 @@ impl X86_64Target {
                     vec![def_v(d), use_v(s), imm(u64::from(dst_w)), imm(flags)],
                 ));
             }
-            // Integer↔integer / ptr↔int / same-class bitcast: preserve low bits.
+            CastOp::SExt => lo.emit(MachineInst::new(
+                X86Op::Movsx.opcode(),
+                vec![def_v(d), use_v(s), imm(u64::from(src_w)), imm(u64::from(dst_w))],
+            )),
+            CastOp::ZExt => lo.emit(MachineInst::new(
+                X86Op::Movzx.opcode(),
+                vec![def_v(d), use_v(s), imm(u64::from(src_w)), imm(u64::from(dst_w))],
+            )),
+            // Truncation drops high bits, and ptr↔int / same-class bitcast preserve
+            // the bit pattern: a plain register copy is correct (consumers operate
+            // at the result's width).
             _ => lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(s)])),
         }
     }

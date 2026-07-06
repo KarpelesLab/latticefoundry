@@ -175,6 +175,63 @@ pub(crate) fn setcc(e: &mut Emitter, cc: u8, reg: u8) {
     e.u8(modrm(3, 0, reg));
 }
 
+/// Emit `movsx dst, src`: **sign**-extend a `src_w`-bit source into a `dst_w`-bit
+/// destination. `0F BE` (byte) / `0F BF` (word) / `movsxd` `63` (dword→qword).
+/// `REX.W` is set for a 64-bit destination.
+pub(crate) fn movsx_rr(e: &mut Emitter, dst: u8, src: u8, src_w: u32, dst_w: u32) {
+    let w = dst_w == 64;
+    match src_w {
+        8 => {
+            // A byte source `spl/bpl/sil/dil` (src>=4) needs any REX to be addressable.
+            if w || dst >= 8 || src >= 4 {
+                e.u8(rex(w, dst >= 8, false, src >= 8));
+            }
+            e.u8(0x0F);
+            e.u8(0xBE);
+            e.u8(modrm(3, dst, src));
+        }
+        16 => {
+            if w || dst >= 8 || src >= 8 {
+                e.u8(rex(w, dst >= 8, false, src >= 8));
+            }
+            e.u8(0x0F);
+            e.u8(0xBF);
+            e.u8(modrm(3, dst, src));
+        }
+        _ => {
+            // 32 → 64: `movsxd r64, r/m32` = REX.W 63 /r.
+            e.u8(rex(true, dst >= 8, false, src >= 8));
+            e.u8(0x63);
+            e.u8(modrm(3, dst, src));
+        }
+    }
+}
+
+/// Emit `movzx dst, src`: **zero**-extend a `src_w`-bit source. `0F B6` (byte) /
+/// `0F B7` (word) zero-extend into the full register; a 32-bit source uses a
+/// plain 32-bit `mov`, which zero-extends bits 32..63 automatically.
+pub(crate) fn movzx_rr(e: &mut Emitter, dst: u8, src: u8, src_w: u32) {
+    match src_w {
+        8 => {
+            if dst >= 8 || src >= 4 {
+                e.u8(rex(false, dst >= 8, false, src >= 8));
+            }
+            e.u8(0x0F);
+            e.u8(0xB6);
+            e.u8(modrm(3, dst, src));
+        }
+        16 => {
+            if dst >= 8 || src >= 8 {
+                e.u8(rex(false, dst >= 8, false, src >= 8));
+            }
+            e.u8(0x0F);
+            e.u8(0xB7);
+            e.u8(modrm(3, dst, src));
+        }
+        _ => mov_rr(e, dst, src, false),
+    }
+}
+
 /// Emit `movzx r32, r8` on the same register (`0F B6 /r`).
 pub(crate) fn movzx_byte(e: &mut Emitter, reg: u8) {
     if reg >= 8 {
@@ -763,6 +820,19 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             e.u8(0x8D);
             e.u8(modrm(0, d, 5));
             e.pcrel32(Ref::Symbol((ctx.func_name)(f)), 0);
+        }
+        X86Op::Movsx => {
+            let d = rnum(&ops[0]);
+            let s = rnum(&ops[1]);
+            let src_w = uimm(&ops[2]) as u32;
+            let dst_w = uimm(&ops[3]) as u32;
+            movsx_rr(e, d, s, src_w, dst_w);
+        }
+        X86Op::Movzx => {
+            let d = rnum(&ops[0]);
+            let s = rnum(&ops[1]);
+            let src_w = uimm(&ops[2]) as u32;
+            movzx_rr(e, d, s, src_w);
         }
         X86Op::Call => match &ops[0] {
             MachineOperand::Func(idx) => {
