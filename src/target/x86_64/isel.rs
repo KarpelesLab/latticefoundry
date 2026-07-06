@@ -35,7 +35,7 @@ use crate::codegen::mir::{
     MBlockId, MachineInst, MachineOperand, Opcode, PReg, Reg, RegClass, StackSlot, VReg,
 };
 use crate::codegen::target::{CallConv, MachineTarget};
-use crate::ir::inst::{BinOp, InstKind, IntPred};
+use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{InstData, Module, ValueId};
 
@@ -121,10 +121,41 @@ pub enum X86Op {
     SubRsp = 34,
     /// `[Imm k]` — `lea rsp, [rbp - k]`.
     LeaRspRbp = 35,
-    /// `[Use src, Frame slot]` — spill: `mov [rbp+slot], src`.
+    /// `[Use src, Frame slot]` — spill: `mov`/`movsd` `[rbp+slot], src` (the
+    /// mnemonic follows `src`'s register class).
     StoreFrame = 36,
-    /// `[Def dst, Frame slot]` — reload: `mov dst, [rbp+slot]`.
+    /// `[Def dst, Frame slot]` — reload: `mov`/`movsd` `dst, [rbp+slot]`.
     LoadFrame = 37,
+
+    // --- SSE scalar floating-point ----------------------------------------
+    /// `[Def d, Use a, Use b, Imm width]` — `d = a + b` (`addsd`/`addss`).
+    FAdd = 38,
+    /// `[Def d, Use a, Use b, Imm width]` — `d = a - b` (`subsd`/`subss`).
+    FSub = 39,
+    /// `[Def d, Use a, Use b, Imm width]` — `d = a * b` (`mulsd`/`mulss`).
+    FMul = 40,
+    /// `[Def d, Use a, Use b, Imm width]` — `d = a / b` (`divsd`/`divss`).
+    FDiv = 41,
+    /// `[Def d, Use a, Use b, Imm width]` — `d = a ^ b` (`xorpd`/`xorps`); used
+    /// with a sign-bit mask to implement `fneg`.
+    FXor = 42,
+    /// `[Def d, Imm bits, Imm width]` — materialize a float constant: load the
+    /// exact bit pattern via a scratch gpr (`mov r11, bits; movq/movd d, r11`).
+    LoadFConst = 43,
+    /// `[Def d, Use a, Use b, Imm packed, Imm width]` — `ucomis` + `setcc`
+    /// (+ parity fixup) computing the `i1` result of an `fcmp` into gpr `d`.
+    FCmpSet = 44,
+    /// `[Def d, Use s]` — `cvtsd2ss d, s` (F64→F32, `fptrunc`).
+    Cvtsd2ss = 45,
+    /// `[Def d, Use s]` — `cvtss2sd d, s` (F32→F64, `fpext`).
+    Cvtss2sd = 46,
+    /// `[Def d, Use s, Imm srcfloatwidth, Imm flags]` — `cvttsd2si`/`cvttss2si`
+    /// (float→int, truncating). `flags` bit0 = 64-bit gpr destination.
+    CvtF2si = 47,
+    /// `[Def d, Use s, Imm dstfloatwidth, Imm flags]` — `cvtsi2sd`/`cvtsi2ss`
+    /// (int→float). `flags` bit0 = 64-bit gpr source, bit1 = zero-extend a
+    /// 32-bit source first (unsigned).
+    CvtSi2f = 48,
 }
 
 impl X86Op {
@@ -137,11 +168,12 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 38] = [
+        const TABLE: [X86Op; 49] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
-            StoreFrame, LoadFrame,
+            StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
+            Cvtss2sd, CvtF2si, CvtSi2f,
         ];
         TABLE[op.0 as usize]
     }
@@ -161,6 +193,38 @@ pub(crate) fn cc_code(p: IntPred) -> u8 {
         IntPred::Slt => 0xC, // L
         IntPred::Sle => 0xE, // LE
     }
+}
+
+/// The `ucomis`+`setcc` plan for an `fcmp` predicate, packed into one immediate
+/// for [`X86Op::FCmpSet`]. Returns `None` for the constant predicates
+/// `False`/`True`, which the caller materializes directly.
+///
+/// After `ucomisd a, b` the flags are: `ZF=PF=CF=1` when unordered (a NaN
+/// operand), else `CF` = "below" (a<b), `ZF` = "equal", `PF` = 0. Packing:
+/// bits 0..8 = the primary `setcc` code; bit 8 = swap operands (`ucomis b, a`,
+/// realizing the `<`/`<=` orderings from `>`/`>=`); bits 9..11 = the combine
+/// step (`0` none, `1` AND `setnp`, `2` OR `setp`) that separates the ordered
+/// and unordered readings of equality.
+pub(crate) fn fcmp_pack(pred: FloatPred) -> Option<u64> {
+    // (primary cc, swap, combine): combine 0 = none, 1 = AND setnp, 2 = OR setp.
+    let (cc, swap, combine): (u8, bool, u8) = match pred {
+        FloatPred::False | FloatPred::True => return None,
+        FloatPred::Oeq => (0x4, false, 1), // sete AND setnp
+        FloatPred::One => (0x5, false, 0), // setne
+        FloatPred::Ogt => (0x7, false, 0), // seta
+        FloatPred::Oge => (0x3, false, 0), // setae
+        FloatPred::Olt => (0x7, true, 0),  // ucomis b,a; seta
+        FloatPred::Ole => (0x3, true, 0),  // ucomis b,a; setae
+        FloatPred::Ueq => (0x4, false, 0), // sete
+        FloatPred::Une => (0x5, false, 2), // setne OR setp
+        FloatPred::Ugt => (0x2, true, 0),  // ucomis b,a; setb
+        FloatPred::Uge => (0x6, true, 0),  // ucomis b,a; setbe
+        FloatPred::Ult => (0x2, false, 0), // setb
+        FloatPred::Ule => (0x6, false, 0), // setbe
+        FloatPred::Ord => (0xB, false, 0), // setnp
+        FloatPred::Uno => (0xA, false, 0), // setp
+    };
+    Some(u64::from(cc) | (u64::from(swap) << 8) | (u64::from(combine) << 9))
 }
 
 fn def(r: PReg) -> MachineOperand {
@@ -233,6 +297,24 @@ impl X86_64Target {
             ));
             return;
         }
+        // Scalar SSE floating-point arithmetic (F32/F64). The operand width comes
+        // from the float type (32 or 64); the encoder picks the ss/sd form.
+        let fop = match op {
+            BinOp::FAdd => Some(X86Op::FAdd),
+            BinOp::FSub => Some(X86Op::FSub),
+            BinOp::FMul => Some(X86Op::FMul),
+            BinOp::FDiv => Some(X86Op::FDiv),
+            _ => None,
+        };
+        if let Some(x) = fop {
+            let a = lo.reg(inst.operands()[0]);
+            let b = lo.reg(inst.operands()[1]);
+            lo.emit(MachineInst::new(
+                x.opcode(),
+                vec![def_v(d), use_v(a), use_v(b), imm(u64::from(width))],
+            ));
+            return;
+        }
         match op {
             BinOp::Shl => self.lower_shift(lo, X86Op::ShlI, X86Op::ShlCl, d, inst, width),
             BinOp::LShr => self.lower_shift(lo, X86Op::ShrI, X86Op::ShrCl, d, inst, width),
@@ -241,9 +323,13 @@ impl X86_64Target {
             BinOp::URem => self.lower_div(lo, X86Op::Div, false, true, d, inst, width),
             BinOp::SDiv => self.lower_div(lo, X86Op::Idiv, true, false, d, inst, width),
             BinOp::SRem => self.lower_div(lo, X86Op::Idiv, true, true, d, inst, width),
-            // Floating-point binops are outside the integer subset; keep the MIR
-            // well-formed with a zero placeholder (never executed in tests).
-            _ => lo.emit(MachineInst::new(X86Op::MovRI.opcode(), vec![def_v(d), imm(0)])),
+            // `frem` has no direct SSE form (it is an `fmod` libcall); it is a
+            // documented follow-up. `d` is an fp register, so keep the MIR
+            // well-formed with a zero float constant (never executed in tests).
+            _ => lo.emit(MachineInst::new(
+                X86Op::LoadFConst.opcode(),
+                vec![def_v(d), imm(0), imm(u64::from(width))],
+            )),
         }
     }
 
@@ -309,18 +395,141 @@ impl X86_64Target {
         lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(src)]));
     }
 
+    /// `fneg`: flip the IEEE sign bit (matching the reference semantics, which is
+    /// a sign flip, not `0 - x`). Materialize the sign mask
+    /// (`0x8000_0000_0000_0000` / `0x8000_0000`) in an xmm and `xorpd`/`xorps`.
+    fn lower_fneg(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        let d = lo.result_reg(inst);
+        let s = lo.reg(inst.operands()[0]);
+        let width = lo.int_width(inst.operands()[0]);
+        let mask_bits: u64 =
+            if width == 64 { 0x8000_0000_0000_0000 } else { 0x8000_0000 };
+        let mask = lo.fresh_vreg(RegClass::Fp);
+        lo.emit(MachineInst::new(
+            X86Op::LoadFConst.opcode(),
+            vec![def_v(mask), imm(mask_bits), imm(u64::from(width))],
+        ));
+        lo.emit(MachineInst::new(
+            X86Op::FXor.opcode(),
+            vec![def_v(d), use_v(s), use_v(mask), imm(u64::from(width))],
+        ));
+    }
+
+    /// `fcmp`: `ucomis` then `setcc` with the ordered/unordered parity fixup
+    /// packed by [`fcmp_pack`]. The result is an `i1` in a gpr.
+    fn lower_fcmp(&self, lo: &mut Lower<'_, Self>, pred: FloatPred, inst: &InstData) {
+        let d = lo.result_reg(inst);
+        match fcmp_pack(pred) {
+            None => {
+                // `False`/`True` are constants.
+                let v = u64::from(pred == FloatPred::True);
+                lo.emit(MachineInst::new(X86Op::MovRI.opcode(), vec![def_v(d), imm(v)]));
+            }
+            Some(packed) => {
+                let a = lo.reg(inst.operands()[0]);
+                let b = lo.reg(inst.operands()[1]);
+                let width = lo.int_width(inst.operands()[0]);
+                lo.emit(MachineInst::new(
+                    X86Op::FCmpSet.opcode(),
+                    vec![def_v(d), use_v(a), use_v(b), imm(packed), imm(u64::from(width))],
+                ));
+            }
+        }
+    }
+
+    /// Conversions. Float↔float and int↔float go through the SSE `cvt*` forms;
+    /// every other cast (integer width change, ptr↔int, bitcast within a class)
+    /// is a low-bits-preserving copy, matching the existing integer behavior.
+    fn lower_cast(&self, lo: &mut Lower<'_, Self>, op: CastOp, inst: &InstData) {
+        let d = lo.result_reg(inst);
+        let s = lo.reg(inst.operands()[0]);
+        let src_w = lo.int_width(inst.operands()[0]);
+        let dst_w = lo.types().bit_width(inst.ty).unwrap_or(64);
+        match op {
+            CastOp::FpTrunc => lo.emit(MachineInst::new(
+                X86Op::Cvtsd2ss.opcode(),
+                vec![def_v(d), use_v(s)],
+            )),
+            CastOp::FpExt => lo.emit(MachineInst::new(
+                X86Op::Cvtss2sd.opcode(),
+                vec![def_v(d), use_v(s)],
+            )),
+            CastOp::FpToSi => {
+                // bit0 of flags = 64-bit gpr destination.
+                let flags = u64::from(dst_w > 32);
+                lo.emit(MachineInst::new(
+                    X86Op::CvtF2si.opcode(),
+                    vec![def_v(d), use_v(s), imm(u64::from(src_w)), imm(flags)],
+                ));
+            }
+            CastOp::FpToUi => {
+                // Unsigned float→int via a 64-bit signed conversion: correct for
+                // results in `[0, 2^63)` (covers all u32 and small u64). Full
+                // unsigned-64 fix-ups above 2^63 are a documented follow-up.
+                lo.emit(MachineInst::new(
+                    X86Op::CvtF2si.opcode(),
+                    vec![def_v(d), use_v(s), imm(u64::from(src_w)), imm(1)],
+                ));
+            }
+            CastOp::SiToFp => {
+                // bit0 = 64-bit gpr source.
+                let flags = u64::from(src_w > 32);
+                lo.emit(MachineInst::new(
+                    X86Op::CvtSi2f.opcode(),
+                    vec![def_v(d), use_v(s), imm(u64::from(dst_w)), imm(flags)],
+                ));
+            }
+            CastOp::UiToFp => {
+                // Unsigned int→float: for a ≤32-bit source, zero-extend to 64 bits
+                // (flags bit1) then do a 64-bit signed conversion; a 64-bit source
+                // uses the signed path (exact below 2^63, a documented follow-up
+                // above it).
+                let flags: u64 = if src_w > 32 { 1 } else { 0b10 };
+                lo.emit(MachineInst::new(
+                    X86Op::CvtSi2f.opcode(),
+                    vec![def_v(d), use_v(s), imm(u64::from(dst_w)), imm(flags)],
+                ));
+            }
+            // Integer↔integer / ptr↔int / same-class bitcast: preserve low bits.
+            _ => lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(s)])),
+        }
+    }
+
     fn lower_call(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         let cc = &self.rf.cc;
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
-        let n_arg = args.len().min(cc.arg_regs.len());
-        debug_assert!(args.len() <= cc.arg_regs.len(), "stack-passed args are out of scope");
 
-        for (areg, &arg) in cc.arg_regs.iter().zip(args) {
+        // Route each argument by class: integers into rdi.. (a separate counter
+        // from) floats into xmm0.. — the SysV rule for mixed int/float calls.
+        let mut int_i = 0usize;
+        let mut fp_i = 0usize;
+        let mut used_arg_regs: Vec<PReg> = Vec::with_capacity(args.len());
+        for &arg in args {
             let r = lo.reg(arg);
-            lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(*areg), use_v(r)]));
+            let areg = match lo.mf().vreg_class(r) {
+                RegClass::Gpr => {
+                    let a = cc.arg_regs[int_i];
+                    int_i += 1;
+                    a
+                }
+                RegClass::Fp => {
+                    let a = cc.fp_arg_regs[fp_i];
+                    fp_i += 1;
+                    a
+                }
+            };
+            lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(areg), use_v(r)]));
+            used_arg_regs.push(areg);
         }
+
+        // The return register follows the result type's class (xmm0 for a float
+        // return, rax otherwise).
+        let ret_is_fp = inst
+            .result()
+            .is_some_and(|r| lo.types().get(lo.func().value_type(r)).is_float());
+        let ret_reg = if ret_is_fp { cc.fp_ret_reg } else { cc.ret_reg };
 
         let mut operands = Vec::new();
         match lo.callee_func(callee) {
@@ -330,20 +539,20 @@ impl X86_64Target {
                 operands.push(use_v(cr));
             }
         }
-        operands.push(def(cc.ret_reg));
+        operands.push(def(ret_reg));
         for &cs in &self.rf.caller_saved {
-            if cs != cc.ret_reg {
+            if cs != ret_reg {
                 operands.push(def(cs));
             }
         }
-        for &areg in &cc.arg_regs[..n_arg] {
+        for &areg in &used_arg_regs {
             operands.push(use_p(areg));
         }
         lo.emit(MachineInst::new(X86Op::Call.opcode(), operands));
 
         if inst.result().is_some() {
             let d = lo.result_reg(inst);
-            lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(cc.ret_reg)]));
+            lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(ret_reg)]));
         }
     }
 }
@@ -360,14 +569,14 @@ impl MachineTarget for X86_64Target {
     fn allocatable(&self, class: RegClass) -> &[PReg] {
         match class {
             RegClass::Gpr => &self.rf.allocatable,
-            RegClass::Fp => &self.rf.empty,
+            RegClass::Fp => &self.rf.allocatable_fp,
         }
     }
 
     fn scratch(&self, class: RegClass) -> &[PReg] {
         match class {
             RegClass::Gpr => &self.rf.scratch,
-            RegClass::Fp => &self.rf.empty,
+            RegClass::Fp => &self.rf.scratch_fp,
         }
     }
 
@@ -424,6 +633,13 @@ impl TargetIsel for X86_64Target {
         MachineInst::new(X86Op::GlobalAddr.opcode(), vec![def_v(dst), MachineOperand::Global(g)])
     }
 
+    fn float_const(&self, dst: VReg, bits: u64, width: u32) -> MachineInst {
+        MachineInst::new(
+            X86Op::LoadFConst.opcode(),
+            vec![def_v(dst), imm(bits), imm(u64::from(width))],
+        )
+    }
+
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
@@ -443,14 +659,7 @@ impl TargetIsel for X86_64Target {
                     ],
                 ));
             }
-            InstKind::Cast(_) => {
-                // Integer casts in the tested subset are width changes computed in
-                // registers; a plain copy preserves the low bits (zero/sign
-                // extension of narrow types is out of the executed subset).
-                let d = lo.result_reg(inst);
-                let s = lo.reg(inst.operands()[0]);
-                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
-            }
+            InstKind::Cast(op) => self.lower_cast(lo, *op, inst),
             InstKind::Alloca { elem_ty } => {
                 let d = lo.result_reg(inst);
                 let size = lo.byte_size(*elem_ty);
@@ -504,10 +713,8 @@ impl TargetIsel for X86_64Target {
                 lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
             }
             InstKind::Call => self.lower_call(lo, inst),
-            InstKind::Unary(_) | InstKind::FCmp(_) => {
-                let d = lo.result_reg(inst);
-                lo.emit(MachineInst::new(X86Op::MovRI.opcode(), vec![def_v(d), imm(0)]));
-            }
+            InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),
+            InstKind::FCmp(pred) => self.lower_fcmp(lo, *pred, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),
         }
     }
@@ -517,8 +724,12 @@ impl TargetIsel for X86_64Target {
             InstKind::Ret => {
                 if let Some(&v) = inst.operands().first() {
                     let r = lo.reg(v);
-                    let rax = self.rf.cc.ret_reg;
-                    lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(rax), use_v(r)]));
+                    // A float return goes in xmm0, an integer/pointer return in rax.
+                    let ret = match lo.mf().vreg_class(r) {
+                        RegClass::Fp => self.rf.cc.fp_ret_reg,
+                        RegClass::Gpr => self.rf.cc.ret_reg,
+                    };
+                    lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(ret), use_v(r)]));
                 }
                 lo.emit(MachineInst::new(X86Op::Ret.opcode(), Vec::new()));
             }

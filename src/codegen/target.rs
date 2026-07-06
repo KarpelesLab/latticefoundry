@@ -24,8 +24,15 @@ use crate::codegen::mir::{MachineInst, Opcode, PReg, Reg, RegClass, StackSlot};
 pub struct CallConv {
     /// Registers holding the leading integer/pointer arguments, in order.
     pub arg_regs: Vec<PReg>,
+    /// Registers holding the leading floating-point arguments, in order. On
+    /// System V these are `xmm0..xmm7` and are counted by a *separate* index
+    /// from [`CallConv::arg_regs`] (integer and float args do not share slots).
+    /// Empty for targets with no floating-point support in this phase.
+    pub fp_arg_regs: Vec<PReg>,
     /// The register holding an integer/pointer return value.
     pub ret_reg: PReg,
+    /// The register holding a floating-point return value (`xmm0` on System V).
+    pub fp_ret_reg: PReg,
     /// Whether the stack grows toward lower addresses (true on most machines).
     pub stack_grows_down: bool,
 }

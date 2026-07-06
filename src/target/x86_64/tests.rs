@@ -10,7 +10,9 @@
 //!   These are guarded: if no C compiler is present they are skipped.
 
 use super::encode::*;
-use crate::ir::inst::{Flags, IntPred};
+use crate::ir::inst::{BinOp, CastOp, Flags, FloatPred, IntPred};
+use crate::ir::types::FloatKind;
+use crate::ir::value::FloatBits;
 use crate::ir::{FuncId, Module};
 use crate::mc::emit::Emitter;
 use crate::support::StrInterner;
@@ -105,6 +107,134 @@ fn golden_setcc_and_cmp() {
 fn golden_ret_via_emitter() {
     // ret = c3
     assert_eq!(enc(|e| e.u8(0xC3)), vec![0xc3]);
+}
+
+// --- SSE golden byte encodings (hand-verified from the manual) --------------
+
+#[test]
+fn golden_sse_arith_reg_reg() {
+    // addsd xmm0, xmm1 = f2 0f 58 c1     (prefix, 0F, opcode, modrm reg=0 rm=1)
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, false, 0x58, 0, 1)), vec![0xf2, 0x0f, 0x58, 0xc1]);
+    // addss xmm0, xmm1 = f3 0f 58 c1
+    assert_eq!(enc(|e| sse_rr(e, 0xF3, false, 0x58, 0, 1)), vec![0xf3, 0x0f, 0x58, 0xc1]);
+    // subsd xmm0, xmm1 = f2 0f 5c c1
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, false, 0x5C, 0, 1)), vec![0xf2, 0x0f, 0x5c, 0xc1]);
+    // mulsd xmm0, xmm1 = f2 0f 59 c1
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, false, 0x59, 0, 1)), vec![0xf2, 0x0f, 0x59, 0xc1]);
+    // divsd xmm0, xmm1 = f2 0f 5e c1
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, false, 0x5E, 0, 1)), vec![0xf2, 0x0f, 0x5e, 0xc1]);
+    // movsd xmm0, xmm1 = f2 0f 10 c1
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, false, 0x10, 0, 1)), vec![0xf2, 0x0f, 0x10, 0xc1]);
+    // movss xmm0, xmm1 = f3 0f 10 c1
+    assert_eq!(enc(|e| sse_rr(e, 0xF3, false, 0x10, 0, 1)), vec![0xf3, 0x0f, 0x10, 0xc1]);
+    // ucomisd xmm0, xmm1 = 66 0f 2e c1
+    assert_eq!(enc(|e| sse_rr(e, 0x66, false, 0x2E, 0, 1)), vec![0x66, 0x0f, 0x2e, 0xc1]);
+    // xorpd xmm0, xmm1 = 66 0f 57 c1
+    assert_eq!(enc(|e| sse_rr(e, 0x66, false, 0x57, 0, 1)), vec![0x66, 0x0f, 0x57, 0xc1]);
+    // addsd xmm8, xmm1 = f2 44 0f 58 c1  (REX.R for the xmm8 destination)
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, false, 0x58, 8, 1)), vec![0xf2, 0x44, 0x0f, 0x58, 0xc1]);
+}
+
+#[test]
+fn golden_sse_convert_and_movq() {
+    // cvtsi2sd xmm0, rax = f2 48 0f 2a c0   (REX.W, xmm=reg, rax=rm)
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, true, 0x2A, 0, 0)), vec![0xf2, 0x48, 0x0f, 0x2a, 0xc0]);
+    // cvttsd2si rax, xmm0 = f2 48 0f 2c c0  (REX.W, rax=reg, xmm=rm)
+    assert_eq!(enc(|e| sse_rr(e, 0xF2, true, 0x2C, 0, 0)), vec![0xf2, 0x48, 0x0f, 0x2c, 0xc0]);
+    // movq xmm0, rax = 66 48 0f 6e c0
+    assert_eq!(enc(|e| sse_rr(e, 0x66, true, 0x6E, 0, 0)), vec![0x66, 0x48, 0x0f, 0x6e, 0xc0]);
+}
+
+#[test]
+fn golden_sse_mem() {
+    // movsd xmm0, [rbp-8] = f2 0f 10 45 f8
+    assert_eq!(enc(|e| sse_mem(e, 0xF2, 0x10, 0, 5, -8)), vec![0xf2, 0x0f, 0x10, 0x45, 0xf8]);
+    // movsd [rbp-8], xmm0 = f2 0f 11 45 f8
+    assert_eq!(enc(|e| sse_mem(e, 0xF2, 0x11, 0, 5, -8)), vec![0xf2, 0x0f, 0x11, 0x45, 0xf8]);
+    // movss xmm0, [rbp-8] = f3 0f 10 45 f8
+    assert_eq!(enc(|e| sse_mem(e, 0xF3, 0x10, 0, 5, -8)), vec![0xf3, 0x0f, 0x10, 0x45, 0xf8]);
+    // movsd xmm0, [rsp] = f2 0f 10 04 24  (SIB required for the rsp base)
+    assert_eq!(enc(|e| sse_mem(e, 0xF2, 0x10, 0, 4, 0)), vec![0xf2, 0x0f, 0x10, 0x04, 0x24]);
+}
+
+/// Assemble one AT&T-syntax instruction with `llvm-mc --show-encoding` and
+/// return its bytes, or `None` if `llvm-mc` is unavailable.
+fn llvm_mc_encode(att: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("llvm-mc")
+        .arg("--triple=x86_64")
+        .arg("--show-encoding")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(format!("{att}\n").as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Find the `# encoding: [0x..,0x..]` comment and parse its bytes.
+    let marker = "encoding: [";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..].find(']')? + start;
+    let mut bytes = Vec::new();
+    for tok in text[start..end].split(',') {
+        let t = tok.trim().trim_start_matches("0x");
+        if !t.is_empty() {
+            bytes.push(u8::from_str_radix(t, 16).ok()?);
+        }
+    }
+    Some(bytes)
+}
+
+#[test]
+fn differential_sse_vs_llvm_mc() {
+    // (AT&T `op src, dst`, our-encoder closure). AT&T reverses operand order.
+    type Case = (&'static str, Box<dyn Fn(&mut Emitter)>);
+    let cases: Vec<Case> = vec![
+        ("addsd %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0xF2, false, 0x58, 0, 1))),
+        ("addss %xmm3, %xmm2", Box::new(|e| sse_rr(e, 0xF3, false, 0x58, 2, 3))),
+        ("subsd %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0xF2, false, 0x5C, 0, 1))),
+        ("mulsd %xmm5, %xmm4", Box::new(|e| sse_rr(e, 0xF2, false, 0x59, 4, 5))),
+        ("divsd %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0xF2, false, 0x5E, 0, 1))),
+        ("movsd %xmm7, %xmm6", Box::new(|e| sse_rr(e, 0xF2, false, 0x10, 6, 7))),
+        ("movss %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0xF3, false, 0x10, 0, 1))),
+        ("ucomisd %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0x66, false, 0x2E, 0, 1))),
+        ("ucomiss %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0x00, false, 0x2E, 0, 1))),
+        ("xorpd %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0x66, false, 0x57, 0, 1))),
+        ("xorps %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0x00, false, 0x57, 0, 1))),
+        ("cvtsd2ss %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0xF2, false, 0x5A, 0, 1))),
+        ("cvtss2sd %xmm1, %xmm0", Box::new(|e| sse_rr(e, 0xF3, false, 0x5A, 0, 1))),
+        ("cvtsi2sd %rax, %xmm0", Box::new(|e| sse_rr(e, 0xF2, true, 0x2A, 0, 0))),
+        ("cvtsi2sd %eax, %xmm0", Box::new(|e| sse_rr(e, 0xF2, false, 0x2A, 0, 0))),
+        ("cvtsi2ss %rcx, %xmm2", Box::new(|e| sse_rr(e, 0xF3, true, 0x2A, 2, 1))),
+        ("cvttsd2si %xmm0, %rax", Box::new(|e| sse_rr(e, 0xF2, true, 0x2C, 0, 0))),
+        ("cvttss2si %xmm0, %eax", Box::new(|e| sse_rr(e, 0xF3, false, 0x2C, 0, 0))),
+        ("cvttsd2si %xmm2, %edx", Box::new(|e| sse_rr(e, 0xF2, false, 0x2C, 2, 2))),
+        ("movq %rax, %xmm0", Box::new(|e| sse_rr(e, 0x66, true, 0x6E, 0, 0))),
+        ("movd %eax, %xmm0", Box::new(|e| sse_rr(e, 0x66, false, 0x6E, 0, 0))),
+        ("addsd %xmm1, %xmm8", Box::new(|e| sse_rr(e, 0xF2, false, 0x58, 8, 1))),
+        ("addsd %xmm9, %xmm0", Box::new(|e| sse_rr(e, 0xF2, false, 0x58, 0, 9))),
+        ("movsd -8(%rbp), %xmm0", Box::new(|e| sse_mem(e, 0xF2, 0x10, 0, 5, -8))),
+        ("movsd %xmm0, -8(%rbp)", Box::new(|e| sse_mem(e, 0xF2, 0x11, 0, 5, -8))),
+        ("movss -8(%rbp), %xmm0", Box::new(|e| sse_mem(e, 0xF3, 0x10, 0, 5, -8))),
+        ("movsd (%rsp), %xmm0", Box::new(|e| sse_mem(e, 0xF2, 0x10, 0, 4, 0))),
+    ];
+
+    if llvm_mc_encode("addsd %xmm1, %xmm0").is_none() {
+        eprintln!("skipping differential_sse_vs_llvm_mc: no llvm-mc");
+        return;
+    }
+    let mut matched = 0usize;
+    for (att, build) in &cases {
+        let mine = enc(build);
+        let theirs = llvm_mc_encode(att).unwrap_or_else(|| panic!("llvm-mc failed on {att}"));
+        assert_eq!(mine, theirs, "encoding mismatch for `{att}`: ours={mine:x?} llvm={theirs:x?}");
+        matched += 1;
+    }
+    assert_eq!(matched, cases.len(), "all SSE instructions matched llvm-mc");
 }
 
 // ===========================================================================
@@ -300,6 +430,162 @@ fn build_mem() -> (Module, StrInterner, FuncId) {
     (m, syms, f)
 }
 
+/// `double lffd(double a, double b) = a*b + a/b - (a-b)` — F64 arithmetic.
+fn build_fdouble() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig = m.types_mut().func(vec![f64t, f64t], f64t, false);
+    let f = m.declare_function(syms.intern("lffd"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let mul = b.bin(BinOp::FMul, a, bb, Flags::NONE);
+        let div = b.bin(BinOp::FDiv, a, bb, Flags::NONE);
+        let s1 = b.bin(BinOp::FAdd, mul, div, Flags::NONE);
+        let sub = b.bin(BinOp::FSub, a, bb, Flags::NONE);
+        let r = b.bin(BinOp::FSub, s1, sub, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `float lffs(float a, float b) = a*b + a/b - (a-b)` — F32 arithmetic.
+fn build_ffloat() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f32t = m.types_mut().float(FloatKind::F32);
+    let sig = m.types_mut().func(vec![f32t, f32t], f32t, false);
+    let f = m.declare_function(syms.intern("lffs"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let mul = b.bin(BinOp::FMul, a, bb, Flags::NONE);
+        let div = b.bin(BinOp::FDiv, a, bb, Flags::NONE);
+        let s1 = b.bin(BinOp::FAdd, mul, div, Flags::NONE);
+        let sub = b.bin(BinOp::FSub, a, bb, Flags::NONE);
+        let r = b.bin(BinOp::FSub, s1, sub, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `int lff2i(double x) = (int)(x*x)` — `fptosi` after an `fmul`.
+fn build_fptosi() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let i32t = m.types_mut().int(32);
+    let sig = m.types_mut().func(vec![f64t], i32t, false);
+    let f = m.declare_function(syms.intern("lff2i"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let sq = b.bin(BinOp::FMul, x, x, Flags::NONE);
+        let r = b.cast(CastOp::FpToSi, sq, i32t);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `double lfi2f(int n) = (double)n / 2.0` — `sitofp` then an `fdiv` by a
+/// materialized float constant.
+fn build_sitofp() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let i32t = m.types_mut().int(32);
+    let sig = m.types_mut().func(vec![i32t], f64t, false);
+    let f = m.declare_function(syms.intern("lfi2f"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let nf = b.cast(CastOp::SiToFp, n, f64t);
+        let two = b.const_float(f64t, FloatBits::F64(2.0f64.to_bits()));
+        let r = b.bin(BinOp::FDiv, nf, two, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `double lffmax(double a, double b) = a > b ? a : b` — an `fcmp ogt` driving a
+/// branch, with the winner passed as an F64 block argument.
+fn build_fmax() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig = m.types_mut().func(vec![f64t, f64t], f64t, false);
+    let f = m.declare_function(syms.intern("lffmax"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let bb = b.param(entry, 1);
+        let then_b = b.create_block(&[]);
+        let else_b = b.create_block(&[]);
+        let join = b.create_block(&[f64t]);
+        let cond = b.fcmp(FloatPred::Ogt, a, bb, Flags::NONE);
+        b.cond_br(cond, then_b, &[], else_b, &[]);
+        b.switch_to(then_b);
+        b.br(join, &[a]);
+        b.switch_to(else_b);
+        b.br(join, &[bb]);
+        b.switch_to(join);
+        let r = b.param(join, 0);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `double lfmix(int a, double x, int b, double y) = (double)(a - b) + x*y` — a
+/// function mixing integer (rdi/rsi) and float (xmm0/xmm1) parameters and
+/// returning a double (xmm0).
+fn build_fmix() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let i32t = m.types_mut().int(32);
+    let sig = m.types_mut().func(vec![i32t, f64t, i32t, f64t], f64t, false);
+    let f = m.declare_function(syms.intern("lfmix"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let a = b.param(entry, 0);
+        let x = b.param(entry, 1);
+        let bb = b.param(entry, 2);
+        let y = b.param(entry, 3);
+        let diff = b.bin(BinOp::Sub, a, bb, Flags::NONE);
+        let difff = b.cast(CastOp::SiToFp, diff, f64t);
+        let prod = b.bin(BinOp::FMul, x, y, Flags::NONE);
+        let r = b.bin(BinOp::FAdd, difff, prod, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
+/// `double lfneg(double x) = -x` — `fneg` via the sign-bit `xorpd`.
+fn build_fneg() -> (Module, StrInterner, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let sig = m.types_mut().func(vec![f64t], f64t, false);
+    let f = m.declare_function(syms.intern("lfneg"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let r = b.fneg(x, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, syms, f)
+}
+
 // --- the execution tests ---------------------------------------------------
 
 #[test]
@@ -393,6 +679,151 @@ fn run_mem() {
     match compile_link_run(&m, &syms, "mem", c) {
         Some(code) => assert_eq!(code, 0, "lfmem produced wrong result (exit {code})"),
         None => eprintln!("skipping run_mem: no C compiler"),
+    }
+}
+
+#[test]
+fn run_fdouble() {
+    let (m, syms, _) = build_fdouble();
+    // Exact IEEE-754 bit equality: the C driver computes the same f64 ops.
+    let c = r#"
+        double lffd(double, double);
+        static int eq(double x, double y) { return x == y; }
+        int main(void) {
+            double cases[][2] = {{3.0,4.0},{1.5,-2.25},{100.0,7.0},{-8.0,0.5}};
+            for (int i = 0; i < 4; i++) {
+                double a = cases[i][0], b = cases[i][1];
+                double want = a*b + a/b - (a-b);
+                if (!eq(lffd(a, b), want)) return i + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "fdouble", c) {
+        Some(code) => assert_eq!(code, 0, "lffd produced wrong result (exit {code})"),
+        None => eprintln!("skipping run_fdouble: no C compiler"),
+    }
+}
+
+#[test]
+fn run_ffloat() {
+    let (m, syms, _) = build_ffloat();
+    let c = r#"
+        float lffs(float, float);
+        static int eq(float x, float y) { return x == y; }
+        int main(void) {
+            float cases[][2] = {{3.0f,4.0f},{1.5f,-2.25f},{100.0f,7.0f},{-8.0f,0.5f}};
+            for (int i = 0; i < 4; i++) {
+                float a = cases[i][0], b = cases[i][1];
+                float want = a*b + a/b - (a-b);
+                if (!eq(lffs(a, b), want)) return i + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "ffloat", c) {
+        Some(code) => assert_eq!(code, 0, "lffs produced wrong result (exit {code})"),
+        None => eprintln!("skipping run_ffloat: no C compiler"),
+    }
+}
+
+#[test]
+fn run_fptosi() {
+    let (m, syms, _) = build_fptosi();
+    let c = r#"
+        int lff2i(double);
+        int main(void) {
+            if (lff2i(3.0) != 9) return 1;
+            if (lff2i(2.5) != 6) return 2;   /* (int)6.25 */
+            if (lff2i(-4.0) != 16) return 3;
+            if (lff2i(10.9) != 118) return 4; /* (int)118.81 */
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "fptosi", c) {
+        Some(code) => assert_eq!(code, 0, "lff2i produced wrong result (exit {code})"),
+        None => eprintln!("skipping run_fptosi: no C compiler"),
+    }
+}
+
+#[test]
+fn run_sitofp() {
+    let (m, syms, _) = build_sitofp();
+    let c = r#"
+        double lfi2f(int);
+        static int eq(double x, double y) { return x == y; }
+        int main(void) {
+            if (!eq(lfi2f(10), 5.0)) return 1;
+            if (!eq(lfi2f(7), 3.5)) return 2;
+            if (!eq(lfi2f(-3), -1.5)) return 3;
+            if (!eq(lfi2f(0), 0.0)) return 4;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "sitofp", c) {
+        Some(code) => assert_eq!(code, 0, "lfi2f produced wrong result (exit {code})"),
+        None => eprintln!("skipping run_sitofp: no C compiler"),
+    }
+}
+
+#[test]
+fn run_fmax() {
+    let (m, syms, _) = build_fmax();
+    let c = r#"
+        double lffmax(double, double);
+        static int eq(double x, double y) { return x == y; }
+        int main(void) {
+            if (!eq(lffmax(3.0, 4.0), 4.0)) return 1;
+            if (!eq(lffmax(9.5, 2.0), 9.5)) return 2;
+            if (!eq(lffmax(-1.0, -5.0), -1.0)) return 3;
+            if (!eq(lffmax(7.0, 7.0), 7.0)) return 4;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "fmax", c) {
+        Some(code) => assert_eq!(code, 0, "lffmax produced wrong result (exit {code})"),
+        None => eprintln!("skipping run_fmax: no C compiler"),
+    }
+}
+
+#[test]
+fn run_fmix() {
+    let (m, syms, _) = build_fmix();
+    let c = r#"
+        double lfmix(int, double, int, double);
+        static int eq(double x, double y) { return x == y; }
+        int main(void) {
+            /* (double)(a-b) + x*y */
+            if (!eq(lfmix(10, 1.5, 4, 2.0), 9.0)) return 1;   /* 6 + 3.0 */
+            if (!eq(lfmix(0, -2.5, 5, 4.0), -15.0)) return 2; /* -5 + -10.0 */
+            if (!eq(lfmix(3, 0.5, 3, 8.0), 4.0)) return 3;    /* 0 + 4.0 */
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "fmix", c) {
+        Some(code) => assert_eq!(code, 0, "lfmix produced wrong result (exit {code})"),
+        None => eprintln!("skipping run_fmix: no C compiler"),
+    }
+}
+
+#[test]
+fn run_fneg() {
+    let (m, syms, _) = build_fneg();
+    let c = r#"
+        double lfneg(double);
+        static int eq(double x, double y) { return x == y; }
+        int main(void) {
+            if (!eq(lfneg(3.5), -3.5)) return 1;
+            if (!eq(lfneg(-2.0), 2.0)) return 2;
+            /* fneg is a sign flip, not 0-x: -0.0 has the sign bit set, so
+               1.0 / -0.0 is -inf (< 0). */
+            if (1.0 / lfneg(0.0) >= 0.0) return 3;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "fneg", c) {
+        Some(code) => assert_eq!(code, 0, "lfneg produced wrong result (exit {code})"),
+        None => eprintln!("skipping run_fneg: no C compiler"),
     }
 }
 

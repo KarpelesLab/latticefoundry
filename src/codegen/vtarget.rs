@@ -178,7 +178,9 @@ impl VirtualTarget {
         let callee_saved: Vec<PReg> = (8..=12).map(gpr).collect();
         let cc = CallConv {
             arg_regs: (0..=3).map(gpr).collect(),
+            fp_arg_regs: Vec::new(),
             ret_reg: gpr(0),
+            fp_ret_reg: PReg::new(RegClass::Fp, 0),
             stack_grows_down: true,
         };
         VirtualTarget {

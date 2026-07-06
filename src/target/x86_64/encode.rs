@@ -21,7 +21,7 @@
 //! The encoding tables are implemented from the published x86-64 instruction-set
 //! reference (tenet T1), not copied from any assembler.
 
-use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, StackSlot};
+use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, RegClass, StackSlot};
 use crate::codegen::regalloc;
 use crate::ir::Module;
 use crate::mc::emit::{Emitted, Emitter, Ref};
@@ -232,6 +232,85 @@ fn cmp_ri(e: &mut Emitter, reg: u8, value: i32, w: bool) {
     e.u32(value as u32);
 }
 
+// --- SSE (scalar floating-point) forms -------------------------------------
+
+/// Emit an SSE register-to-register instruction: an optional mandatory prefix
+/// (`0xF2`/`0xF3`/`0x66`; `0` means none), an optional `REX` (`.W` when `w`,
+/// `.R`/`.B` for `xmm8..15` and `r8..15`), the `0F` escape, the opcode, and a
+/// `ModRM` pairing the `reg` and `rm` register fields.
+pub(crate) fn sse_rr(e: &mut Emitter, prefix: u8, w: bool, opcode: u8, reg: u8, rm: u8) {
+    if prefix != 0 {
+        e.u8(prefix);
+    }
+    if w || reg >= 8 || rm >= 8 {
+        e.u8(rex(w, reg >= 8, false, rm >= 8));
+    }
+    e.u8(0x0F);
+    e.u8(opcode);
+    e.u8(modrm(3, reg, rm));
+}
+
+/// Emit an SSE memory-form instruction `prefix 0F opcode reg, [base + disp]`
+/// (used by `movss`/`movsd` load/store). The mandatory prefix precedes the `REX`
+/// that [`mem`] emits; SSE scalar moves never set `REX.W`.
+pub(crate) fn sse_mem(e: &mut Emitter, prefix: u8, opcode: u8, reg: u8, base: u8, disp: i32) {
+    if prefix != 0 {
+        e.u8(prefix);
+    }
+    mem(e, &[0x0F, opcode], reg, base, disp, false, false);
+}
+
+/// The mandatory SSE prefix for a scalar op of the given width: `F2` (double) or
+/// `F3` (single). Widths other than 64 use the single form.
+#[inline]
+fn scalar_prefix(is_f64: bool) -> u8 {
+    if is_f64 { 0xF2 } else { 0xF3 }
+}
+
+/// The two-address expansion of an SSE binary op `d = a OP b`. Like the integer
+/// ALU, the allocator gives `d`, `a`, `b` distinct registers, so a `movsd`/`movss`
+/// copy of `a` into `d` precedes the op; commutativity lets `d == b` reuse `a`.
+fn fbin(e: &mut Emitter, is_f64: bool, opcode: u8, d: u8, a: u8, b: u8, commutative: bool) {
+    let pfx = scalar_prefix(is_f64);
+    if d == a {
+        sse_rr(e, pfx, false, opcode, d, b);
+    } else if commutative && d == b {
+        sse_rr(e, pfx, false, opcode, d, a);
+    } else {
+        debug_assert!(d != b, "non-commutative SSE op needs a distinct destination");
+        sse_rr(e, pfx, false, 0x10, d, a); // movsd/movss d, a
+        sse_rr(e, pfx, false, opcode, d, b);
+    }
+}
+
+/// The two-address expansion of `d = a ^ b` (`xorpd`/`xorps`), used for `fneg`.
+fn fxor(e: &mut Emitter, is_f64: bool, d: u8, a: u8, b: u8) {
+    debug_assert!(d != b, "fneg mask must be distinct from the destination");
+    if d != a {
+        sse_rr(e, scalar_prefix(is_f64), false, 0x10, d, a); // movsd/movss d, a
+    }
+    let xor_pfx = if is_f64 { 0x66 } else { 0x00 };
+    sse_rr(e, xor_pfx, false, 0x57, d, b); // xorpd/xorps d, b
+}
+
+/// Emit an 8-bit ALU `op r/m8, r8` (`opcode /r`), forcing a `REX` so `spl`-style
+/// and `r8b..r15b` low bytes are addressable.
+fn alu_byte(e: &mut Emitter, opcode: u8, rm: u8, reg: u8) {
+    if rm >= 4 || reg >= 4 {
+        e.u8(rex(false, reg >= 8, false, rm >= 8));
+    }
+    e.u8(opcode);
+    e.u8(modrm(3, reg, rm));
+}
+
+/// The register class of a physical register operand.
+fn rclass(op: &MachineOperand) -> RegClass {
+    match op {
+        MachineOperand::Def(Reg::Physical(p)) | MachineOperand::Use(Reg::Physical(p)) => p.class,
+        other => panic!("expected a physical register operand, found {other:?}"),
+    }
+}
+
 // ===========================================================================
 // Frame layout + prologue/epilogue
 // ===========================================================================
@@ -434,6 +513,11 @@ fn encode_load(e: &mut Emitter, ops: &[MachineOperand]) {
     let d = rnum(&ops[0]);
     let ptr = rnum(&ops[1]);
     let size = uimm(&ops[2]);
+    if rclass(&ops[0]) == RegClass::Fp {
+        // movss (4-byte) / movsd (8-byte) load into an xmm register.
+        sse_mem(e, scalar_prefix(size != 4), 0x10, d, ptr, 0);
+        return;
+    }
     match size {
         1 => mem(e, &[0x0F, 0xB6], d, ptr, 0, false, false),
         2 => mem(e, &[0x0F, 0xB7], d, ptr, 0, false, false),
@@ -446,6 +530,11 @@ fn encode_store(e: &mut Emitter, ops: &[MachineOperand]) {
     let ptr = rnum(&ops[0]);
     let val = rnum(&ops[1]);
     let size = uimm(&ops[2]);
+    if rclass(&ops[1]) == RegClass::Fp {
+        // movss / movsd store from an xmm register (store opcode 0x11).
+        sse_mem(e, scalar_prefix(size != 4), 0x11, val, ptr, 0);
+        return;
+    }
     match size {
         1 => mem(e, &[0x88], val, ptr, 0, false, val >= 4),
         2 => {
@@ -464,7 +553,13 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::MovRR => {
             let d = rnum(&ops[0]);
             let s = rnum(&ops[1]);
-            if d != s {
+            if d == s {
+                // A self-move is a no-op regardless of class.
+            } else if rclass(&ops[0]) == RegClass::Fp {
+                // xmm↔xmm copy via `movsd` (copies the low 64 bits, which holds
+                // both f32 and f64 values exactly).
+                sse_rr(e, 0xF2, false, 0x10, d, s);
+            } else {
                 mov_rr(e, d, s, true);
             }
         }
@@ -541,12 +636,22 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::StoreFrame => {
             let src = rnum(&ops[0]);
             let slot = slot_index(&ops[1]);
-            mem(e, &[0x89], src, RBP as u8, ctx.layout.slot_off[slot], true, false);
+            let off = ctx.layout.slot_off[slot];
+            if rclass(&ops[0]) == RegClass::Fp {
+                sse_mem(e, 0xF2, 0x11, src, RBP as u8, off); // movsd [rbp+off], xmm
+            } else {
+                mem(e, &[0x89], src, RBP as u8, off, true, false);
+            }
         }
         X86Op::LoadFrame => {
             let dst = rnum(&ops[0]);
             let slot = slot_index(&ops[1]);
-            mem(e, &[0x8B], dst, RBP as u8, ctx.layout.slot_off[slot], true, false);
+            let off = ctx.layout.slot_off[slot];
+            if rclass(&ops[0]) == RegClass::Fp {
+                sse_mem(e, 0xF2, 0x10, dst, RBP as u8, off); // movsd xmm, [rbp+off]
+            } else {
+                mem(e, &[0x8B], dst, RBP as u8, off, true, false);
+            }
         }
         X86Op::GlobalAddr => {
             let d = rnum(&ops[0]);
@@ -624,6 +729,94 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::LeaRspRbp => {
             let k = uimm(&ops[0]) as i64;
             mem(e, &[0x8D], RSP as u8, RBP as u8, (-k) as i32, true, false);
+        }
+
+        // --- SSE scalar floating-point ------------------------------------
+        X86Op::FAdd => {
+            let w = iimm(&ops[3]) == 64;
+            fbin(e, w, 0x58, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), true);
+        }
+        X86Op::FSub => {
+            let w = iimm(&ops[3]) == 64;
+            fbin(e, w, 0x5C, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), false);
+        }
+        X86Op::FMul => {
+            let w = iimm(&ops[3]) == 64;
+            fbin(e, w, 0x59, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), true);
+        }
+        X86Op::FDiv => {
+            let w = iimm(&ops[3]) == 64;
+            fbin(e, w, 0x5E, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), false);
+        }
+        X86Op::FXor => {
+            let w = iimm(&ops[3]) == 64;
+            fxor(e, w, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+        }
+        X86Op::LoadFConst => {
+            let d = rnum(&ops[0]);
+            let bits = uimm(&ops[1]);
+            let width = iimm(&ops[2]);
+            let tmp = regs::R11 as u8;
+            if width == 64 {
+                mov_ri(e, tmp, bits); // movabs r11, bits
+                sse_rr(e, 0x66, true, 0x6E, d, tmp); // movq xmm, r11
+            } else {
+                mov_ri(e, tmp, bits & 0xFFFF_FFFF); // mov r11d, bits
+                sse_rr(e, 0x66, false, 0x6E, d, tmp); // movd xmm, r11d
+            }
+        }
+        X86Op::FCmpSet => {
+            let d = rnum(&ops[0]);
+            let a = rnum(&ops[1]);
+            let b = rnum(&ops[2]);
+            let packed = uimm(&ops[3]);
+            let width = iimm(&ops[4]);
+            let cc = (packed & 0xFF) as u8;
+            let swap = (packed >> 8) & 1 != 0;
+            let combine = (packed >> 9) & 0x3;
+            // ucomisd (prefix 66) / ucomiss (no prefix): opcode 0F 2E, reg,rm.
+            let pfx = if width == 64 { 0x66 } else { 0x00 };
+            let (reg, rm) = if swap { (b, a) } else { (a, b) };
+            sse_rr(e, pfx, false, 0x2E, reg, rm);
+            setcc(e, cc, d);
+            if combine != 0 {
+                let tmp = regs::R11 as u8;
+                debug_assert!(d != tmp, "fcmp parity temp must be distinct from the result");
+                // combine 1 = AND setnp (0x0B); combine 2 = OR setp (0x0A).
+                let (second_cc, alu) = if combine == 1 { (0x0B, 0x20) } else { (0x0A, 0x08) };
+                setcc(e, second_cc, tmp);
+                alu_byte(e, alu, d, tmp); // and/or d8, r11b
+            }
+            movzx_byte(e, d);
+        }
+        X86Op::Cvtsd2ss => sse_rr(e, 0xF2, false, 0x5A, rnum(&ops[0]), rnum(&ops[1])),
+        X86Op::Cvtss2sd => sse_rr(e, 0xF3, false, 0x5A, rnum(&ops[0]), rnum(&ops[1])),
+        X86Op::CvtF2si => {
+            let d = rnum(&ops[0]); // gpr
+            let s = rnum(&ops[1]); // xmm
+            let src_w = iimm(&ops[2]);
+            let flags = uimm(&ops[3]);
+            let pfx = scalar_prefix(src_w == 64);
+            let w = flags & 1 != 0;
+            sse_rr(e, pfx, w, 0x2C, d, s); // cvttsd2si/cvttss2si d(gpr), s(xmm)
+        }
+        X86Op::CvtSi2f => {
+            let d = rnum(&ops[0]); // xmm
+            let s = rnum(&ops[1]); // gpr
+            let dst_w = iimm(&ops[2]);
+            let flags = uimm(&ops[3]);
+            let pfx = scalar_prefix(dst_w == 64);
+            if flags & 0b10 != 0 {
+                // Unsigned ≤32: zero-extend the source into r11, then a 64-bit
+                // signed conversion (the value fits in [0, 2^32) ⊂ i64).
+                let tmp = regs::R11 as u8;
+                debug_assert!(s != tmp, "uitofp zero-extend temp must differ from the source");
+                alu_rr(e, 0x89, tmp, s, false); // mov r11d, s  (zero-extends)
+                sse_rr(e, pfx, true, 0x2A, d, tmp); // cvtsi2sd xmm, r11
+            } else {
+                let w = flags & 1 != 0;
+                sse_rr(e, pfx, w, 0x2A, d, s); // cvtsi2sd/ss xmm, gpr
+            }
         }
     }
 }

@@ -29,7 +29,7 @@
 use crate::codegen::mir::{MBlockId, MachineFunction, MachineInst, Reg, RegClass, StackSlot, VReg};
 use crate::codegen::target::MachineTarget;
 use crate::ir::types::{Type, TypeContext, TypeId};
-use crate::ir::value::{Const, ValueDef};
+use crate::ir::value::{Const, FloatBits, ValueDef};
 use crate::ir::{Function, InstData, Module, ValueId};
 use crate::support::DetHashMap;
 
@@ -62,6 +62,17 @@ pub trait TargetIsel: MachineTarget + Sized {
 
     /// Build "materialize the address of global `g` into `dst`".
     fn global_addr(&self, dst: VReg, g: u32) -> MachineInst;
+
+    /// Build "materialize the floating-point constant with raw IEEE bit pattern
+    /// `bits` (a `width`-bit value) into the floating-point register `dst`".
+    ///
+    /// The default falls back to [`TargetIsel::li`], which is only correct for
+    /// targets that do not model a separate floating-point file (they never
+    /// receive a float-typed value in practice); the x86-64 target overrides it
+    /// to load the exact bit pattern into an xmm register.
+    fn float_const(&self, dst: VReg, bits: u64, _width: u32) -> MachineInst {
+        self.li(dst, Int::from_u64(bits))
+    }
 }
 
 /// A resolved operand source during edge lowering: either a register value or an
@@ -245,9 +256,19 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             ValueDef::Const(c) => match self.module.consts().get(c).clone() {
                 Const::Int { value, .. } => target.li(d, value),
                 Const::Null(_) | Const::Poison(_) => target.li(d, Int::ZERO),
-                // Floats/aggregates are out of the integer subset; a zero
-                // placeholder keeps the MIR well-formed (never executed in tests).
-                Const::Float { .. } | Const::Aggregate { .. } => target.li(d, Int::ZERO),
+                // A float constant loads its exact IEEE bit pattern into the fp
+                // register `d` (whose class is `Fp`, since the value is float-typed).
+                Const::Float { bits, .. } => {
+                    let (raw, width) = match bits {
+                        FloatBits::F16(b) => (u64::from(b), 16),
+                        FloatBits::F32(b) => (u64::from(b), 32),
+                        FloatBits::F64(b) => (b, 64),
+                    };
+                    target.float_const(d, raw, width)
+                }
+                // Aggregates are out of the scalar subset; a zero placeholder
+                // keeps the MIR well-formed (never executed in tests).
+                Const::Aggregate { .. } => target.li(d, Int::ZERO),
             },
             ValueDef::Global(g) => target.global_addr(d, g.index() as u32),
             // A function used as a plain value (not a direct call target): a zero
@@ -369,12 +390,28 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
     fn prologue(&mut self, t: &'a T) {
         let cc = t.call_conv();
         let params: Vec<VReg> = self.mf.block(self.cur).params.clone();
-        debug_assert!(params.len() <= cc.arg_regs.len(), "more params than arg registers");
-        let moves: Vec<MachineInst> = params
-            .iter()
-            .zip(&cc.arg_regs)
-            .map(|(&p, &areg)| t.emit_move(Reg::Virtual(p), Reg::Physical(areg)))
-            .collect();
+        // Integer/pointer and floating-point parameters draw from *separate*
+        // argument-register sequences (SysV counts them independently): an
+        // integer param takes the next `arg_regs` slot, a float param the next
+        // `fp_arg_regs` slot.
+        let mut int_i = 0usize;
+        let mut fp_i = 0usize;
+        let mut moves: Vec<MachineInst> = Vec::with_capacity(params.len());
+        for &p in &params {
+            let areg = match self.mf.vreg_class(p) {
+                RegClass::Gpr => {
+                    let r = cc.arg_regs[int_i];
+                    int_i += 1;
+                    r
+                }
+                RegClass::Fp => {
+                    let r = cc.fp_arg_regs[fp_i];
+                    fp_i += 1;
+                    r
+                }
+            };
+            moves.push(t.emit_move(Reg::Virtual(p), Reg::Physical(areg)));
+        }
         for mv in moves {
             self.emit(mv);
         }

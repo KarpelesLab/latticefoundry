@@ -8,9 +8,15 @@
 //! lowering) — and emits into the Phase-6 machine-code layer
 //! ([`crate::mc::emit`] / [`crate::mc::object`] / [`crate::mc::elf`]).
 //!
-//! Scope is the integer subset sufficient to compile and *run* real functions:
-//! arithmetic/bitwise/shift/divide, comparisons and branches, loads/stores and
-//! `alloca`, and calls under the SysV ABI. Floating-point and SIMD are deferred.
+//! Scope covers the integer subset sufficient to compile and *run* real
+//! functions — arithmetic/bitwise/shift/divide, comparisons and branches,
+//! loads/stores and `alloca`, and calls under the SysV ABI — plus **scalar SSE
+//! floating-point** (F32/F64): `addsd`/…/`divsd` and the `ss` forms, `fneg` via
+//! a sign-bit `xorpd`, `fcmp` via `ucomis`+`setcc` (with the ordered/unordered
+//! parity fixup), the `cvt*` conversions, `movsd`/`movss` loads/stores/spills,
+//! and float argument/return passing in `xmm0..xmm7`/`xmm0`. F16 is widened or
+//! deferred (it is not an x86 scalar type); wider SIMD and AArch64 FP are
+//! follow-ups.
 //!
 //! Submodules:
 //!

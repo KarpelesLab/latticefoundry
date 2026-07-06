@@ -55,15 +55,32 @@ pub(crate) fn gpr(n: u16) -> PReg {
     PReg::new(RegClass::Gpr, n)
 }
 
+/// Construct an XMM (SSE floating-point) [`PReg`] from its hardware number. The
+/// `num` is the hardware xmm number 0..=15 (the value the encoder puts into
+/// `ModRM.reg`/`ModRM.rm` and, extended, into `REX.R`/`REX.B`).
+#[inline]
+pub(crate) fn xmm(n: u16) -> PReg {
+    PReg::new(RegClass::Fp, n)
+}
+
 /// The register-file and ABI sets, computed once and borrowed by the target.
+///
+/// The floating-point file is `xmm0..xmm15`. On System V *every* xmm is
+/// caller-saved (a `call` may clobber all of them). `xmm13..xmm15` are reserved
+/// as spill/reload scratch — three of them, so an SSE three-operand instruction
+/// whose destination and both sources all spill still has a distinct scratch per
+/// operand, mirroring the GPR `r10/r11/rbx` reservation. `xmm0..xmm12` are
+/// allocatable. Float/double arguments go in `xmm0..xmm7` (a counter separate
+/// from the integer `rdi..r9`), and a float/double return is in `xmm0`.
 #[derive(Debug)]
 pub(crate) struct RegFile {
     pub(crate) classes: Vec<RegClass>,
     pub(crate) allocatable: Vec<PReg>,
+    pub(crate) allocatable_fp: Vec<PReg>,
     pub(crate) scratch: Vec<PReg>,
+    pub(crate) scratch_fp: Vec<PReg>,
     pub(crate) caller_saved: Vec<PReg>,
     pub(crate) callee_saved: Vec<PReg>,
-    pub(crate) empty: Vec<PReg>,
     pub(crate) cc: CallConv,
 }
 
@@ -78,21 +95,32 @@ impl RegFile {
         // Three scratch registers: enough for one instruction whose dest and both
         // source operands are all spilled. None is an ABI-fixed operand.
         let scratch = [R10, R11, RBX].into_iter().map(gpr).collect();
-        let caller_saved =
+
+        // Floating-point file: xmm0..xmm12 allocatable, xmm13..xmm15 scratch.
+        let allocatable_fp = (0u16..=12).map(xmm).collect();
+        let scratch_fp = [13u16, 14, 15].into_iter().map(xmm).collect();
+
+        // Caller-saved: the volatile GPRs plus *all* xmm registers (SysV).
+        let mut caller_saved: Vec<PReg> =
             [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11].into_iter().map(gpr).collect();
+        caller_saved.extend((0u16..=15).map(xmm));
+
         let callee_saved = [RBX, R12, R13, R14, R15].into_iter().map(gpr).collect();
         let cc = CallConv {
             arg_regs: [RDI, RSI, RDX, RCX, R8, R9].into_iter().map(gpr).collect(),
+            fp_arg_regs: (0u16..=7).map(xmm).collect(),
             ret_reg: gpr(RAX),
+            fp_ret_reg: xmm(0),
             stack_grows_down: true,
         };
         RegFile {
-            classes: vec![RegClass::Gpr],
+            classes: vec![RegClass::Gpr, RegClass::Fp],
             allocatable,
+            allocatable_fp,
             scratch,
+            scratch_fp,
             caller_saved,
             callee_saved,
-            empty: Vec::new(),
             cc,
         }
     }

@@ -83,7 +83,11 @@ impl RegFile {
         let callee_saved = (19u16..=28).map(gpr).collect();
         let cc = CallConv {
             arg_regs: (0u16..=7).map(gpr).collect(),
+            // AArch64 floating-point (v0..v7 args, v0 return) is a follow-up; the
+            // scalar SSE work here is x86-only. No Fp registers are exposed yet.
+            fp_arg_regs: Vec::new(),
             ret_reg: gpr(X0),
+            fp_ret_reg: PReg::new(RegClass::Fp, 0),
             stack_grows_down: true,
         };
         RegFile {
