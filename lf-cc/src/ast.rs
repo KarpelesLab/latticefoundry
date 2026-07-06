@@ -13,7 +13,7 @@ use latticefoundry::support::diagnostics::Span;
 /// explicit width plus signedness), pointers, arrays, and aggregates
 /// (`struct`/`union`, referenced by index into a shared [`Records`] registry).
 ///
-/// Floating-point remains out of the subset.
+/// Floating-point types (`float`, `double`) are tracked as a [`FloatTy`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum CType {
     /// `void`.
@@ -22,6 +22,9 @@ pub enum CType {
     Bool,
     /// An integer type of a given width in bits and signedness.
     Int(IntTy),
+    /// A floating-point type (`float` → `F32`, `double` → `F64`). `long double`
+    /// is modelled as `F64` in this subset.
+    Float(FloatTy),
     /// `T *` — a pointer to `T`.
     Pointer(Box<CType>),
     /// `T[N]` — a fixed-length array of `N` elements of `T`. `N == 0` marks an
@@ -56,6 +59,26 @@ pub struct IntTy {
     pub width: u16,
     /// Whether the type is signed.
     pub signed: bool,
+}
+
+/// The precision of a floating-point type: `float` (IEEE binary32) or `double`
+/// (IEEE binary64). `long double` is treated as `F64` in this subset.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FloatTy {
+    /// Single precision (`float`, 4 bytes).
+    F32,
+    /// Double precision (`double`, 8 bytes).
+    F64,
+}
+
+impl FloatTy {
+    /// The width in bits of this format (32 or 64).
+    pub fn bits(self) -> u16 {
+        match self {
+            FloatTy::F32 => 32,
+            FloatTy::F64 => 64,
+        }
+    }
 }
 
 /// An index into a [`Records`] registry, naming one `struct`/`union` definition.
@@ -130,6 +153,16 @@ impl CType {
         CType::Int(IntTy { width: 64, signed: true })
     }
 
+    /// The `float` type (IEEE binary32).
+    pub fn float() -> CType {
+        CType::Float(FloatTy::F32)
+    }
+
+    /// The `double` type (IEEE binary64).
+    pub fn double() -> CType {
+        CType::Float(FloatTy::F64)
+    }
+
     /// A pointer to `pointee`.
     pub fn ptr_to(pointee: CType) -> CType {
         CType::Pointer(Box::new(pointee))
@@ -138,6 +171,24 @@ impl CType {
     /// Whether this is any integer type (including `_Bool`).
     pub fn is_integer(&self) -> bool {
         matches!(self, CType::Int(_) | CType::Bool)
+    }
+
+    /// Whether this is a floating-point type (`float`/`double`).
+    pub fn is_float(&self) -> bool {
+        matches!(self, CType::Float(_))
+    }
+
+    /// The floating-point precision of a float type, if this is one.
+    pub fn float_ty(&self) -> Option<FloatTy> {
+        match self {
+            CType::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Whether this is an arithmetic type (integer or floating-point).
+    pub fn is_arithmetic(&self) -> bool {
+        self.is_integer() || self.is_float()
     }
 
     /// Whether this is a pointer type.
@@ -165,9 +216,10 @@ impl CType {
         self.is_array() || self.is_record()
     }
 
-    /// Whether this is a scalar type usable in a condition (integer or pointer).
+    /// Whether this is a scalar type usable in a condition (integer, pointer, or
+    /// floating-point).
     pub fn is_scalar(&self) -> bool {
-        self.is_integer() || self.is_pointer()
+        self.is_integer() || self.is_pointer() || self.is_float()
     }
 
     /// The pointee type of a pointer, if this is one.
@@ -242,6 +294,8 @@ impl fmt::Display for CType {
                 };
                 write!(f, "{base}")
             }
+            CType::Float(FloatTy::F32) => write!(f, "float"),
+            CType::Float(FloatTy::F64) => write!(f, "double"),
             CType::Pointer(inner) => write!(f, "{inner} *"),
             CType::Array(elem, n) => write!(f, "{elem}[{n}]"),
             CType::Record(_) => write!(f, "struct/union"),
@@ -335,6 +389,9 @@ pub enum ExprKind {
     /// An integer (or character) constant with its C type derived from the
     /// literal's suffix/value.
     IntLit(i128, CType),
+    /// A floating-point constant (its exact value as `f64`, already rounded to
+    /// the target precision) with its C type (`float`/`double`).
+    FloatLit(f64, CType),
     /// An identifier reference.
     Ident(String),
     /// A prefix unary operation.

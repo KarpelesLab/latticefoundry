@@ -26,6 +26,9 @@ pub enum TokenKind {
     Ident(String),
     /// An integer or character constant, with the C type its literal implies.
     IntLit(i128, CType),
+    /// A floating-point constant (its exact value, already rounded to the target
+    /// precision) with the C type its suffix implies (`float`/`double`).
+    FloatLit(f64, CType),
     /// A string literal, carrying its already-decoded contents (produced by the
     /// preprocessor; the expression grammar of this subset rejects it, but
     /// directives such as `_Static_assert` accept one).
@@ -53,6 +56,10 @@ pub enum Keyword {
     Int,
     /// `long`
     Long,
+    /// `float`
+    Float,
+    /// `double`
+    Double,
     /// `signed`
     Signed,
     /// `unsigned`
@@ -173,6 +180,8 @@ fn keyword_from(word: &str) -> Option<Keyword> {
         "short" => Keyword::Short,
         "int" => Keyword::Int,
         "long" => Keyword::Long,
+        "float" => Keyword::Float,
+        "double" => Keyword::Double,
         "signed" => Keyword::Signed,
         "unsigned" => Keyword::Unsigned,
         "const" => Keyword::Const,
@@ -307,7 +316,9 @@ impl Lexer<'_> {
         if c == b'_' || c.is_ascii_alphabetic() {
             return Ok(self.lex_ident());
         }
-        if c.is_ascii_digit() {
+        // A digit, or a `.` immediately followed by a digit (e.g. `.5`), begins a
+        // numeric constant.
+        if c.is_ascii_digit() || (c == b'.' && self.peek2().is_some_and(|d| d.is_ascii_digit())) {
             return self.lex_number();
         }
         if c == b'\'' {
@@ -365,6 +376,15 @@ impl Lexer<'_> {
                 break;
             }
         }
+        // A `.`, an exponent (`e`/`E` for decimal, `p`/`P` for hex), or a float
+        // suffix makes this a floating constant; consume the rest and parse it.
+        let is_float = matches!(self.peek(), Some(b'.'))
+            || (radix == 10 && matches!(self.peek(), Some(b'e' | b'E')))
+            || (radix == 16 && matches!(self.peek(), Some(b'p' | b'P')));
+        if is_float {
+            return self.lex_float(start, radix == 16);
+        }
+
         let digits = std::str::from_utf8(&self.src[digits_start..self.pos]).unwrap_or("");
         // An "0" alone lexes with digits_start == pos for octal; treat as 0.
         let text = if radix == 8 && digits.is_empty() { "0" } else { digits };
@@ -405,6 +425,51 @@ impl Lexer<'_> {
         let _ = suffix_start;
         let ty = integer_literal_type(value, radix != 10, unsigned, long);
         Ok(Token { kind: TokenKind::IntLit(value, ty), span: self.span(start, self.pos) })
+    }
+
+    /// Finish lexing a floating constant that begins at `start` (the cursor sits
+    /// on the `.`, exponent marker, or already past the whole-number digits). The
+    /// lexer, unlike the preprocessor, is used only in unit tests, so hex floats
+    /// are accepted unconditionally here (the preprocessor gates them by `--std`).
+    fn lex_float(&mut self, start: usize, hex: bool) -> Result<Token, Diagnostic> {
+        // Fractional part.
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            while self
+                .peek()
+                .is_some_and(|c| if hex { c.is_ascii_hexdigit() } else { c.is_ascii_digit() })
+            {
+                self.pos += 1;
+            }
+        }
+        // Exponent (`eNN`/`pNN`, with optional sign).
+        let (lo, hi) = if hex { (b'p', b'P') } else { (b'e', b'E') };
+        if matches!(self.peek(), Some(c) if c == lo || c == hi) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        // One optional type suffix (`f`/`F`/`l`/`L`).
+        if matches!(self.peek(), Some(b'f' | b'F' | b'l' | b'L')) {
+            self.pos += 1;
+        }
+        // Reject a stray identifier/digit tail (e.g. `1.5fx`).
+        if let Some(c) = self.peek()
+            && (c == b'_' || c.is_ascii_alphanumeric())
+        {
+            return Err(self.error(start, self.pos + 1, "invalid suffix on floating constant"));
+        }
+        let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
+        match parse_float_literal(text, true) {
+            Ok((value, ty)) => {
+                Ok(Token { kind: TokenKind::FloatLit(value, ty), span: self.span(start, self.pos) })
+            }
+            Err(msg) => Err(self.error(start, self.pos, msg)),
+        }
     }
 
     fn lex_char(&mut self) -> Result<Token, Diagnostic> {
@@ -581,4 +646,72 @@ pub(crate) fn integer_literal_type(
     };
 
     CType::Int(IntTy { width, signed })
+}
+
+/// Whether a preprocessing-number spelling denotes a floating (as opposed to an
+/// integer) constant: it has a `.`, a decimal exponent (`e`/`E`, for non-hex),
+/// or a binary exponent (`p`/`P`, for hex). Digit separators must already be
+/// stripped by the caller.
+pub(crate) fn is_float_ppnumber(text: &str) -> bool {
+    let is_hex = text.len() >= 2 && matches!(&text.as_bytes()[..2], b"0x" | b"0X");
+    if text.contains('.') {
+        return true;
+    }
+    if is_hex {
+        text.contains(['p', 'P'])
+    } else {
+        text.contains(['e', 'E'])
+    }
+}
+
+/// Parse a floating constant spelling (decimal or hexadecimal, with an optional
+/// `f`/`F`/`l`/`L` suffix) into its exact value and C type. `long double` (`l`
+/// suffix) is modelled as `double`. A `float` (`f` suffix) value is rounded to
+/// binary32 and stored back as the exact `f64` of that binary32. `hex_float_ok`
+/// gates C99 hexadecimal floating constants.
+pub(crate) fn parse_float_literal(text: &str, hex_float_ok: bool) -> Result<(f64, CType), String> {
+    let (num, is_f32) = match text.as_bytes().last() {
+        Some(b'f' | b'F') => (&text[..text.len() - 1], true),
+        Some(b'l' | b'L') => (&text[..text.len() - 1], false),
+        _ => (text, false),
+    };
+    let is_hex = num.len() >= 2 && matches!(&num.as_bytes()[..2], b"0x" | b"0X");
+    let value = if is_hex {
+        if !hex_float_ok {
+            return Err(
+                "hexadecimal floating constants are a C99 feature (use -std=c99 or later)".to_owned(),
+            );
+        }
+        parse_hex_float(&num[2..])?
+    } else {
+        num.parse::<f64>().map_err(|_| "invalid floating constant".to_owned())?
+    };
+    let ty = if is_f32 { CType::float() } else { CType::double() };
+    // Round to the target precision so the stored value is bit-exact.
+    let value = if is_f32 { f64::from(value as f32) } else { value };
+    Ok((value, ty))
+}
+
+/// Parse the body of a hexadecimal floating constant (the text after `0x`):
+/// `[hexint][.hexfrac]p[±]decexp`, evaluating `mantissa × 2^exp` in `f64`.
+fn parse_hex_float(body: &str) -> Result<f64, String> {
+    let err = || "invalid hexadecimal floating constant".to_owned();
+    let (mant, exp) = body.split_once(['p', 'P']).ok_or_else(|| {
+        "hexadecimal floating constant requires a 'p' binary exponent".to_owned()
+    })?;
+    let (int_part, frac_part) = mant.split_once('.').unwrap_or((mant, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err(err());
+    }
+    let mut value = 0.0f64;
+    for c in int_part.chars() {
+        value = value * 16.0 + f64::from(c.to_digit(16).ok_or_else(err)?);
+    }
+    let mut scale = 1.0f64 / 16.0;
+    for c in frac_part.chars() {
+        value += f64::from(c.to_digit(16).ok_or_else(err)?) * scale;
+        scale /= 16.0;
+    }
+    let e: i32 = exp.parse().map_err(|_| err())?;
+    Ok(value * 2f64.powi(e))
 }

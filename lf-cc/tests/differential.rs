@@ -255,6 +255,87 @@ fn programs() -> Vec<(&'static str, &'static str)> {
              int apply(IntFn g,int v){ return g(v); } \
              int main(){ IntFn f=inc; return apply(f,41)+apply(neg,-1)+(apply(inc,0)); }",
         ),
+        // --- floating point (float / double) --------------------------------
+        // The IEEE operations below are exact, so lf-cc and gcc must agree
+        // bit-for-bit; each `main` returns an integral value in 0..256. Function
+        // arguments are passed through named variables (the natural C form).
+        //
+        // `double` arithmetic honoring precedence: 3.5*4 + 10/2.5 = 14 + 4 = 18.
+        ("dbl_arith", "int main(){ return (int)(3.5*4.0 + 10.0/2.5); }"),
+        // `float` arithmetic: (1.5f + 2.5f) * 10 = 40.
+        ("flt_arith", "int main(){ float a=1.5f, b=2.5f; return (int)((a+b)*10.0f); }"),
+        // Mixed int/double usual arithmetic conversions: 7/2.0 = 3.5, *10 = 35.
+        ("mix_int_double", "int main(){ int n=7; double r = n/2.0; return (int)(r*10); }"),
+        // Mixed float/int: (float)5 + 3 computed in float, *4 = 32.
+        ("mix_float_int", "int main(){ float f=5.0f; int n=3; return (int)((f+n)*4.0f); }"),
+        // A double `max` driving a branch (an ordered, NaN-free comparison).
+        (
+            "dbl_max_branch",
+            "double dmax(double a,double b){ if(a>b) return a; else return b; } \
+             int main(){ double x=3.25, y=9.5; return (int)dmax(x,y); }",
+        ),
+        // A chain of ordered comparisons yielding int 0/1 results.
+        (
+            "dbl_compare",
+            "int main(){ double a=2.5, b=7.5; \
+             return (a<b) + (b>a)*2 + (a<=a)*4 + (b>=b)*8 + (a!=b)*16 + (a==a)*32; }",
+        ),
+        // Conversions both ways: (int)3.9 == 3 truncates toward zero; (double)7 in
+        // arithmetic; total = 3 + 35 = 38.
+        (
+            "dbl_conversions",
+            "int main(){ int a=(int)3.9; double d=(double)7; return a + (int)(d/2.0*10); }",
+        ),
+        // float→double widening: 0.1f promoted to double keeps the binary32
+        // rounding, so (int)(d*1000) == 100 on both compilers.
+        ("float_to_double", "int main(){ float f=0.1f; double d=f; return (int)(d*1000); }"),
+        // A function taking several doubles (exercises xmm0..xmm5); sum = 21.
+        (
+            "many_doubles",
+            "double s6(double a,double b,double c,double d,double e,double f){ \
+             return a+b+c+d+e+f; } \
+             int main(){ double a=1.0,b=2.0,c=3.0,d=4.0,e=5.0,f=6.0; \
+             return (int)s6(a,b,c,d,e,f); }",
+        ),
+        // Mixed int and double parameters (the split integer/xmm ABI): the ints go
+        // in rdi/rdx, the doubles in xmm0/xmm1; 1 + 2.5 + 3 + 4.0 = 10.5 -> 10.
+        (
+            "mixed_abi",
+            "double mix(int a,double b,int c,double d){ return a+b+c+d; } \
+             int main(){ int p=1,q=3; double b=2.5,d=4.0; return (int)mix(p,b,q,d); }",
+        ),
+        // A float in a boolean/controlling context: 0.0 is false.
+        ("dbl_bool_if", "int main(){ double x=0.0; if(x) return 1; else return 2; }"),
+        // `!x`, `x && y`, `x || y` on doubles.
+        (
+            "dbl_bool_ops",
+            "int main(){ double x=0.0, y=3.0; \
+             return (!x)*1 + (!y)*10 + (x&&y ? 4 : 0) + (x||y ? 8 : 0) + (y && y ? 16 : 0); }",
+        ),
+        // A float used as a `while` condition, counting it down to zero.
+        (
+            "dbl_while",
+            "int main(){ double x=5.0; int n=0; while(x){ x-=1.0; n++; } return n*8; }",
+        ),
+        // A double global with an initializer, read and used: 2.5 * 16 = 40.
+        ("dbl_global", "double g = 2.5; int main(){ return (int)(g*16.0); }"),
+        // A float global with an initializer and a constant-expression init.
+        (
+            "flt_global",
+            "float g = 0.25f + 0.25f; int main(){ return (int)(g*84.0f); }",
+        ),
+        // sizeof(float)==4 && sizeof(double)==8.
+        (
+            "flt_sizeof",
+            "int main(){ return (sizeof(float)==4 && sizeof(double)==8) ? 42 : 0; }",
+        ),
+        // Unary minus / plus on doubles: -(-5.5) + 94.5 = 100.
+        ("dbl_unary", "int main(){ double x=5.5; return (int)(-(-x) + +94.5); }"),
+        // The conditional operator with double arms (usual arithmetic conversions).
+        (
+            "dbl_ternary",
+            "int main(){ int c=1; double a=12.5, b=3.0; return (int)((c ? a : b) * 4.0); }",
+        ),
     ]
 }
 

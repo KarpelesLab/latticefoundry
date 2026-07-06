@@ -35,6 +35,7 @@ fn render(toks: &[Token]) -> String {
             TokenKind::Ident(n) => s.push_str(n),
             TokenKind::Keyword(_) => s.push_str("<kw>"),
             TokenKind::IntLit(v, _) => s.push_str(&v.to_string()),
+            TokenKind::FloatLit(v, _) => s.push_str(&v.to_string()),
             TokenKind::Str(v) => {
                 s.push('"');
                 s.push_str(v);

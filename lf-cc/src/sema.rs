@@ -183,6 +183,8 @@ pub struct TExpr {
 pub enum TExprKind {
     /// An integer constant.
     Const(i128),
+    /// A floating-point constant (exact value, already rounded to its precision).
+    FConst(f64),
     /// An lvalue reference to a local/parameter object.
     Obj(ObjId),
     /// An lvalue reference to a global (index into [`Program::globals`]).
@@ -264,9 +266,16 @@ fn promote(ty: &CType) -> CType {
     }
 }
 
-/// The usual arithmetic conversions applied to two (already promoted) integer
-/// types, yielding their common type.
+/// The usual arithmetic conversions applied to two arithmetic types, yielding
+/// their common type. Floating types rank above every integer type: if either
+/// operand is `double` the result is `double`; else if either is `float` the
+/// result is `float`; otherwise the integer promotions and integer UAC apply.
 fn usual_arith(a: &CType, b: &CType) -> CType {
+    if a.is_float() || b.is_float() {
+        let has_double =
+            a.float_ty() == Some(crate::ast::FloatTy::F64) || b.float_ty() == Some(crate::ast::FloatTy::F64);
+        return if has_double { CType::double() } else { CType::float() };
+    }
     let a = promote(a);
     let b = promote(b);
     if a == b {
@@ -509,9 +518,20 @@ impl Checker {
                         return;
                     }
                 };
-                match self.const_eval(e) {
-                    Some(v) => write_int_bytes(bytes, off, v, self.size_of(ty)),
-                    None => self.error(e.span, "global initializer must be a constant expression"),
+                if let Some(fty) = ty.float_ty() {
+                    match const_eval_float(e, &self.enum_consts) {
+                        Some(v) => write_float_bytes(bytes, off, v, fty),
+                        None => {
+                            self.error(e.span, "global initializer must be a constant expression");
+                        }
+                    }
+                } else {
+                    match self.const_eval(e) {
+                        Some(v) => write_int_bytes(bytes, off, v, self.size_of(ty)),
+                        None => {
+                            self.error(e.span, "global initializer must be a constant expression");
+                        }
+                    }
                 }
             }
         }
@@ -1026,6 +1046,7 @@ impl Checker {
         let span = e.span;
         match &e.kind {
             ExprKind::IntLit(v, ty) => Some(TExpr::new(TExprKind::Const(*v), ty.clone(), span)),
+            ExprKind::FloatLit(v, ty) => Some(TExpr::new(TExprKind::FConst(*v), ty.clone(), span)),
             ExprKind::Ident(name) => self.check_ident(ctx, name, span),
             ExprKind::Unary(op, inner) => self.check_unary(ctx, *op, inner, span),
             ExprKind::Binary(op, l, r) => self.check_binary(ctx, *op, l, r, span),
@@ -1218,8 +1239,8 @@ impl Checker {
         match op {
             UnaryOp::Plus => {
                 let te = self.check_rvalue(ctx, inner)?;
-                if !te.ty.is_integer() {
-                    self.error(span, "unary '+' requires an integer operand");
+                if !te.ty.is_arithmetic() {
+                    self.error(span, "unary '+' requires an arithmetic operand");
                     return None;
                 }
                 let pt = promote(&te.ty);
@@ -1227,8 +1248,8 @@ impl Checker {
             }
             UnaryOp::Neg => {
                 let te = self.check_rvalue(ctx, inner)?;
-                if !te.ty.is_integer() {
-                    self.error(span, "unary '-' requires an integer operand");
+                if !te.ty.is_arithmetic() {
+                    self.error(span, "unary '-' requires an arithmetic operand");
                     return None;
                 }
                 let pt = promote(&te.ty);
@@ -1324,14 +1345,19 @@ impl Checker {
             return self.check_pointer_binary(op, lt, rt, span);
         }
 
-        // Both integer from here.
-        if !lt.ty.is_integer() || !rt.ty.is_integer() {
+        // Both arithmetic (integer or floating) from here.
+        if !lt.ty.is_arithmetic() || !rt.ty.is_arithmetic() {
             self.error(span, "invalid operands to binary operator");
             return None;
         }
+        let float_operand = lt.ty.is_float() || rt.ty.is_float();
 
         match op {
             BinaryOp::Shl | BinaryOp::Shr => {
+                if float_operand {
+                    self.error(span, "invalid operands to shift (integer operands required)");
+                    return None;
+                }
                 let lp = promote(&lt.ty);
                 let rp = promote(&rt.ty);
                 let lc = self.convert(lt, &lp);
@@ -1345,6 +1371,23 @@ impl Checker {
                 let lc = self.convert(lt, &common);
                 let rc = self.convert(rt, &common);
                 Some(TExpr::new(TExprKind::Cmp(op, Box::new(lc), Box::new(rc)), CType::int(), span))
+            }
+            // `%` and the bitwise operators forbid floating operands (a C
+            // constraint violation): `%` requires integers, and `& | ^` too.
+            BinaryOp::Rem | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+                if float_operand =>
+            {
+                let sym = match op {
+                    BinaryOp::Rem => "%",
+                    BinaryOp::BitAnd => "&",
+                    BinaryOp::BitOr => "|",
+                    _ => "^",
+                };
+                self.error(
+                    span,
+                    format!("invalid operands to binary '{sym}' (floating-point operands are not allowed)"),
+                );
+                None
             }
             _ => {
                 let common = usual_arith(&lt.ty, &rt.ty);
@@ -1483,8 +1526,22 @@ impl Checker {
                     }
                     target_ty.clone()
                 } else if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                    if target_ty.is_float() || rt.ty.is_float() {
+                        self.error(span, "invalid operands to shift (integer operands required)");
+                        return None;
+                    }
                     // A compound shift computes in the promoted left-operand type.
                     promote(&target_ty)
+                } else if matches!(
+                    op,
+                    BinaryOp::Rem | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+                ) && (target_ty.is_float() || rt.ty.is_float())
+                {
+                    self.error(
+                        span,
+                        "invalid operands to this compound assignment (floating-point operands are not allowed)",
+                    );
+                    return None;
                 } else {
                     usual_arith(&target_ty, &rt.ty)
                 };
@@ -1562,6 +1619,15 @@ impl Checker {
             self.error(span, "cannot cast a non-scalar value");
             return None;
         }
+        if !ty.is_scalar() {
+            self.error(span, "cannot cast to a non-scalar type");
+            return None;
+        }
+        // A pointer is never converted to or from a floating-point type.
+        if (ty.is_pointer() && te.ty.is_float()) || (ty.is_float() && te.ty.is_pointer()) {
+            self.error(span, "cannot cast between a pointer and a floating-point type");
+            return None;
+        }
         Some(self.convert(te, ty))
     }
 
@@ -1576,7 +1642,7 @@ impl Checker {
         let cond = self.check_cond(ctx, c)?;
         let tt = self.check_rvalue(ctx, t)?;
         let ft = self.check_rvalue(ctx, f)?;
-        let result_ty = if tt.ty.is_integer() && ft.ty.is_integer() {
+        let result_ty = if tt.ty.is_arithmetic() && ft.ty.is_arithmetic() {
             usual_arith(&tt.ty, &ft.ty)
         } else if tt.ty.is_pointer() {
             tt.ty.clone()
@@ -1748,6 +1814,73 @@ fn const_eval_with(e: &Expr, enums: &HashMap<String, i128>, recs: &Records) -> O
         ExprKind::Cast(_, inner) => rec(inner),
         ExprKind::SizeofType(ty) => Some(layout::size_of(recs, ty) as i128),
         _ => None,
+    }
+}
+
+/// Evaluate a constant expression to an `f64` for a floating-point global
+/// initializer: floating and integer literals, enumerators, unary `+`/`-`, the
+/// arithmetic operators `+ - * /`, casts, and the conditional operator.
+fn const_eval_float(e: &Expr, enums: &HashMap<String, i128>) -> Option<f64> {
+    let rec = |x: &Expr| const_eval_float(x, enums);
+    match &e.kind {
+        ExprKind::FloatLit(v, _) => Some(*v),
+        ExprKind::IntLit(v, _) => Some(*v as f64),
+        ExprKind::Ident(name) => enums.get(name).map(|&v| v as f64),
+        ExprKind::Unary(op, inner) => {
+            let v = rec(inner)?;
+            match op {
+                UnaryOp::Neg => Some(-v),
+                UnaryOp::Plus => Some(v),
+                _ => None,
+            }
+        }
+        ExprKind::Binary(op, l, r) => {
+            let a = rec(l)?;
+            let b = rec(r)?;
+            match op {
+                BinaryOp::Add => Some(a + b),
+                BinaryOp::Sub => Some(a - b),
+                BinaryOp::Mul => Some(a * b),
+                BinaryOp::Div => Some(a / b),
+                _ => None,
+            }
+        }
+        ExprKind::Cond(c, t, f) => {
+            if rec(c)? != 0.0 { rec(t) } else { rec(f) }
+        }
+        ExprKind::Cast(ty, inner) => {
+            // A cast to a float type rounds; a cast to an integer truncates.
+            let v = rec(inner)?;
+            match ty.float_ty() {
+                Some(crate::ast::FloatTy::F32) => Some(f64::from(v as f32)),
+                Some(crate::ast::FloatTy::F64) => Some(v),
+                None => Some(v.trunc()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Write a floating-point value into `bytes` at `off` as its little-endian IEEE
+/// bit pattern (binary32 for `float`, binary64 for `double`).
+fn write_float_bytes(bytes: &mut [u8], off: u64, v: f64, fty: crate::ast::FloatTy) {
+    match fty {
+        crate::ast::FloatTy::F32 => {
+            let le = (v as f32).to_le_bytes();
+            for (i, &src) in le.iter().enumerate() {
+                if let Some(dst) = bytes.get_mut(off as usize + i) {
+                    *dst = src;
+                }
+            }
+        }
+        crate::ast::FloatTy::F64 => {
+            let le = v.to_le_bytes();
+            for (i, &src) in le.iter().enumerate() {
+                if let Some(dst) = bytes.get_mut(off as usize + i) {
+                    *dst = src;
+                }
+            }
+        }
     }
 }
 

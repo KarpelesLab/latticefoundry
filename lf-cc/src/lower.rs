@@ -11,14 +11,14 @@
 use std::collections::HashMap;
 
 use latticefoundry::ir::builder::FunctionBuilder;
-use latticefoundry::ir::inst::{BinOp, CastOp, Flags, IntPred};
+use latticefoundry::ir::inst::{BinOp, CastOp, Flags, FloatPred, IntPred};
 use latticefoundry::ir::types::TypeId;
-use latticefoundry::ir::value::ValueId;
+use latticefoundry::ir::value::{FloatBits, ValueId};
 use latticefoundry::ir::{BlockId, Const, FuncId, GlobalId, Global, Module};
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::puremp;
 
-use crate::ast::{BinaryOp, CType, Records};
+use crate::ast::{BinaryOp, CType, FloatTy, Records};
 use crate::layout;
 use crate::sema::{LocalInfo, Program, TExpr, TExprKind, TFunc, TStmt};
 
@@ -32,6 +32,8 @@ struct Tys {
     i16: TypeId,
     i32: TypeId,
     i64: TypeId,
+    f32: TypeId,
+    f64: TypeId,
 }
 
 impl Tys {
@@ -52,6 +54,8 @@ impl Tys {
             CType::Void => self.void,
             CType::Bool => self.i8,
             CType::Int(i) => self.for_int(i.width),
+            CType::Float(FloatTy::F32) => self.f32,
+            CType::Float(FloatTy::F64) => self.f64,
             CType::Pointer(_) => self.ptr,
             CType::Array(..) | CType::Record(_) => self.ptr,
             CType::Func(_) => self.ptr,
@@ -100,6 +104,8 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             i16: cx.int(16),
             i32: cx.int(32),
             i64: cx.int(64),
+            f32: cx.float(latticefoundry::ir::types::FloatKind::F32),
+            f64: cx.float(latticefoundry::ir::types::FloatKind::F64),
         }
     };
 
@@ -120,6 +126,11 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
         let ty = layout::ir_type(module.types_mut(), &program.records, &g.ty);
         let init = if g.ty.is_pointer() {
             module.intern_const(Const::Null(ty))
+        } else if let Some(fty) = g.ty.float_ty() {
+            // A float global's storage bytes (its IEEE image) are emitted by the
+            // driver's `emit_globals`; this IR init only has to be well-typed.
+            let bits = decode_float_le(fty, &g.bytes);
+            module.intern_const(Const::Float { ty, bits })
         } else if g.ty.is_scalar() {
             let value = decode_le(&g.bytes);
             module.intern_const(Const::Int { ty, value: puremp::Int::from_i64(value) })
@@ -198,6 +209,60 @@ fn decode_le(bytes: &[u8]) -> i64 {
     i64::from_le_bytes(buf)
 }
 
+/// Decode a float global's little-endian IEEE image into [`FloatBits`].
+fn decode_float_le(fty: FloatTy, bytes: &[u8]) -> FloatBits {
+    match fty {
+        FloatTy::F32 => {
+            let mut buf = [0u8; 4];
+            for (i, b) in bytes.iter().take(4).enumerate() {
+                buf[i] = *b;
+            }
+            FloatBits::F32(u32::from_le_bytes(buf))
+        }
+        FloatTy::F64 => {
+            let mut buf = [0u8; 8];
+            for (i, b) in bytes.iter().take(8).enumerate() {
+                buf[i] = *b;
+            }
+            FloatBits::F64(u64::from_le_bytes(buf))
+        }
+    }
+}
+
+/// Build the IEEE [`FloatBits`] of value `v` in float C type `ty`.
+fn float_bits(ty: &CType, v: f64) -> FloatBits {
+    match ty.float_ty() {
+        Some(FloatTy::F32) => FloatBits::F32((v as f32).to_bits()),
+        _ => FloatBits::F64(v.to_bits()),
+    }
+}
+
+/// The IR floating-point binary opcode for a C arithmetic operator.
+fn float_binop(op: BinaryOp) -> BinOp {
+    match op {
+        BinaryOp::Add => BinOp::FAdd,
+        BinaryOp::Sub => BinOp::FSub,
+        BinaryOp::Mul => BinOp::FMul,
+        BinaryOp::Div => BinOp::FDiv,
+        _ => unreachable!("not a floating arithmetic operator: {op:?}"),
+    }
+}
+
+/// The ordered IR floating-point predicate for a C comparison operator. C
+/// comparisons are ordered (false if either operand is NaN) except `!=`, which
+/// is `une` (true if either operand is NaN, matching C's `!=`).
+fn fcmp_pred(op: BinaryOp) -> FloatPred {
+    match op {
+        BinaryOp::Eq => FloatPred::Oeq,
+        BinaryOp::Ne => FloatPred::Une,
+        BinaryOp::Lt => FloatPred::Olt,
+        BinaryOp::Le => FloatPred::Ole,
+        BinaryOp::Gt => FloatPred::Ogt,
+        BinaryOp::Ge => FloatPred::Oge,
+        _ => unreachable!("not a comparison operator: {op:?}"),
+    }
+}
+
 /// Per-function lowering state.
 struct FnLower<'a> {
     b: FunctionBuilder<'a>,
@@ -259,6 +324,8 @@ impl FnLower<'_> {
                     let ty = self.tys.of(other);
                     let zero = if other.is_pointer() {
                         self.b.null(ty)
+                    } else if other.is_float() {
+                        self.b.const_float(ty, float_bits(other, 0.0))
                     } else {
                         self.b.const_i64(ty, 0)
                     };
@@ -648,10 +715,20 @@ impl FnLower<'_> {
                 if e.ty.is_pointer() {
                     let ty = self.tys.ptr;
                     self.b.null(ty)
+                } else if e.ty.is_float() {
+                    // Only arises from an implicit `return;` zero in a float
+                    // function (see sema); materialize a float zero of that type.
+                    let ty = self.tys.of(&e.ty);
+                    self.b.const_float(ty, float_bits(&e.ty, *v as f64))
                 } else {
                     let ty = self.tys.of(&e.ty);
                     self.b.const_i64(ty, *v as i64)
                 }
+            }
+            TExprKind::FConst(v) => {
+                let ty = self.tys.of(&e.ty);
+                let bits = float_bits(&e.ty, *v);
+                self.b.const_float(ty, bits)
             }
             TExprKind::Obj(_)
             | TExprKind::Global(_)
@@ -676,7 +753,11 @@ impl FnLower<'_> {
             TExprKind::Arith(op, l, r) => {
                 let lv = self.lower_rvalue(l);
                 let rv = self.lower_rvalue(r);
-                let binop = arith_binop(*op, e.ty.is_signed());
+                let binop = if e.ty.is_float() {
+                    float_binop(*op)
+                } else {
+                    arith_binop(*op, e.ty.is_signed())
+                };
                 self.b.bin(binop, lv, rv, Flags::NONE)
             }
             TExprKind::Shift(op, l, r) => {
@@ -694,15 +775,23 @@ impl FnLower<'_> {
             TExprKind::Cmp(op, l, r) => {
                 let lv = self.lower_rvalue(l);
                 let rv = self.lower_rvalue(r);
-                let pred = cmp_pred(*op, l.ty.is_signed());
-                let bit = self.b.icmp(pred, lv, rv);
+                let bit = if l.ty.is_float() {
+                    self.b.fcmp(fcmp_pred(*op), lv, rv, Flags::NONE)
+                } else {
+                    let pred = cmp_pred(*op, l.ty.is_signed());
+                    self.b.icmp(pred, lv, rv)
+                };
                 self.b.cast(CastOp::ZExt, bit, self.tys.i32)
             }
             TExprKind::Neg(inner) => {
                 let v = self.lower_rvalue(inner);
-                let ty = self.tys.of(&e.ty);
-                let zero = self.b.const_i64(ty, 0);
-                self.b.sub(zero, v, Flags::NONE)
+                if e.ty.is_float() {
+                    self.b.fneg(v, Flags::NONE)
+                } else {
+                    let ty = self.tys.of(&e.ty);
+                    let zero = self.b.const_i64(ty, 0);
+                    self.b.sub(zero, v, Flags::NONE)
+                }
             }
             TExprKind::BitNot(inner) => {
                 let v = self.lower_rvalue(inner);
@@ -712,8 +801,14 @@ impl FnLower<'_> {
             }
             TExprKind::LogNot(inner) => {
                 let v = self.lower_rvalue(inner);
-                let zero = self.zero_of(&inner.ty);
-                let bit = self.b.icmp(IntPred::Eq, v, zero);
+                let bit = if inner.ty.is_float() {
+                    // `!x` is `x == 0.0`; NaN is not equal to 0, so `!NaN == 0`.
+                    let zero = self.fzero(&inner.ty);
+                    self.b.fcmp(FloatPred::Oeq, v, zero, Flags::NONE)
+                } else {
+                    let zero = self.zero_of(&inner.ty);
+                    self.b.icmp(IntPred::Eq, v, zero)
+                };
                 self.b.cast(CastOp::ZExt, bit, self.tys.i32)
             }
             TExprKind::LogAnd(l, r) => self.lower_logical(l, r, true),
@@ -853,7 +948,11 @@ impl FnLower<'_> {
                 self.b.bin(binop, oldc, amt, Flags::NONE)
             } else {
                 let rc = self.convert(rv0, &rhs.ty, compute_ty);
-                let binop = arith_binop(op, compute_ty.is_signed());
+                let binop = if compute_ty.is_float() {
+                    float_binop(op)
+                } else {
+                    arith_binop(op, compute_ty.is_signed())
+                };
                 self.b.bin(binop, oldc, rc, Flags::NONE)
             };
             self.convert(res, compute_ty, &lvalue.ty)
@@ -873,6 +972,10 @@ impl FnLower<'_> {
             let delta = if inc { scale as i64 } else { -(scale as i64) };
             let off = self.b.const_i64(self.tys.i64, delta);
             self.b.ptr_add(old, off, true)
+        } else if target.ty.is_float() {
+            let one = self.b.const_float(ty, float_bits(&target.ty, 1.0));
+            let op = if inc { BinOp::FAdd } else { BinOp::FSub };
+            self.b.bin(op, old, one, Flags::NONE)
         } else {
             let one = self.b.const_i64(ty, 1);
             if inc {
@@ -898,11 +1001,18 @@ impl FnLower<'_> {
         self.b.call(callee_val, &arg_vals, ret_ty)
     }
 
-    /// Evaluate a scalar expression and reduce it to an `i1` truth value.
+    /// Evaluate a scalar expression and reduce it to an `i1` truth value. In a
+    /// controlling context a float `x` means `x != 0.0`; `une` makes NaN true,
+    /// matching C's `!=`.
     fn truth_of(&mut self, e: &TExpr) -> ValueId {
         let v = self.lower_rvalue(e);
-        let zero = self.zero_of(&e.ty);
-        self.b.icmp(IntPred::Ne, v, zero)
+        if e.ty.is_float() {
+            let zero = self.fzero(&e.ty);
+            self.b.fcmp(FloatPred::Une, v, zero, Flags::NONE)
+        } else {
+            let zero = self.zero_of(&e.ty);
+            self.b.icmp(IntPred::Ne, v, zero)
+        }
     }
 
     fn zero_of(&mut self, ty: &CType) -> ValueId {
@@ -915,6 +1025,13 @@ impl FnLower<'_> {
         }
     }
 
+    /// A `+0.0` constant of the given float C type.
+    fn fzero(&mut self, ty: &CType) -> ValueId {
+        let t = self.tys.of(ty);
+        let bits = float_bits(ty, 0.0);
+        self.b.const_float(t, bits)
+    }
+
     // --- conversions -------------------------------------------------------
 
     /// Convert `v` (of C type `from`) to C type `to`, emitting the right IR cast.
@@ -925,14 +1042,41 @@ impl FnLower<'_> {
         match (from, to) {
             (_, CType::Void) => v,
             (_, CType::Bool) => {
-                let zero = self.zero_of(from);
-                let bit = self.b.icmp(IntPred::Ne, v, zero);
+                // `x != 0` in the source type; floats use an ordered `!=` (`une`).
+                let bit = if from.is_float() {
+                    let zero = self.fzero(from);
+                    self.b.fcmp(FloatPred::Une, v, zero, Flags::NONE)
+                } else {
+                    let zero = self.zero_of(from);
+                    self.b.icmp(IntPred::Ne, v, zero)
+                };
                 self.b.cast(CastOp::ZExt, bit, self.tys.i8)
             }
             (CType::Pointer(_), CType::Pointer(_)) => v,
             (CType::Pointer(_), CType::Int(t)) => {
                 let iv = self.b.cast(CastOp::PtrToInt, v, self.tys.i64);
                 self.int_resize(iv, 64, false, t.width)
+            }
+            // float ↔ float: extend to a wider format, or truncate (rounds).
+            (CType::Float(a), CType::Float(b)) => {
+                let to_ty = self.tys.of(to);
+                if b.bits() > a.bits() {
+                    self.b.cast(CastOp::FpExt, v, to_ty)
+                } else {
+                    self.b.cast(CastOp::FpTrunc, v, to_ty)
+                }
+            }
+            // float → integer: truncate toward zero, by the target's signedness.
+            (CType::Float(_), _) if to.is_integer() => {
+                let to_ty = self.tys.of(to);
+                let op = if to.is_signed() { CastOp::FpToSi } else { CastOp::FpToUi };
+                self.b.cast(op, v, to_ty)
+            }
+            // integer → float: convert by the source's signedness (rounds).
+            (_, CType::Float(_)) if from.is_integer() => {
+                let to_ty = self.tys.of(to);
+                let op = if from.is_signed() { CastOp::SiToFp } else { CastOp::UiToFp };
+                self.b.cast(op, v, to_ty)
             }
             (_, CType::Pointer(_)) => {
                 // integer (or bool) → pointer
@@ -1039,6 +1183,7 @@ fn align_of(ty: &CType) -> u32 {
     match ty {
         CType::Void | CType::Bool => 1,
         CType::Int(i) => (i.width / 8) as u32,
+        CType::Float(f) => u32::from(f.bits() / 8),
         CType::Pointer(_) => 8,
         CType::Array(..) | CType::Record(_) => 1,
         CType::Func(_) => 1,

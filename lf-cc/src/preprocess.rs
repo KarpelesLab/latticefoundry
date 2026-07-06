@@ -1181,7 +1181,13 @@ impl Pp {
         for t in toks {
             let item = match &t.kind {
                 PpKind::Number(s) => match eval_number(s, self.std) {
-                    Ok((v, _)) => EItem::Num(v),
+                    Ok(NumVal::Int(v, _)) => EItem::Num(v),
+                    Ok(NumVal::Float(..)) => {
+                        return Err(Diagnostic::error(
+                            "floating constant in a preprocessor `#if` expression",
+                        )
+                        .with_span(self.remap(t.span)));
+                    }
                     Err(m) => return Err(Diagnostic::error(m).with_span(self.remap(t.span))),
                 },
                 PpKind::Char(raw) => EItem::Num(eval_char(raw)),
@@ -1221,7 +1227,8 @@ impl Pp {
                     None => continue,
                 },
                 PpKind::Number(s) => match eval_number(s, self.std) {
-                    Ok((v, ty)) => TokenKind::IntLit(v, ty),
+                    Ok(NumVal::Int(v, ty)) => TokenKind::IntLit(v, ty),
+                    Ok(NumVal::Float(v, ty)) => TokenKind::FloatLit(v, ty),
                     Err(m) => {
                         self.diags.push(Diagnostic::error(m).with_span(span));
                         continue;
@@ -1461,6 +1468,8 @@ fn base_keyword(word: &str) -> Option<Keyword> {
         "short" => Keyword::Short,
         "int" => Keyword::Int,
         "long" => Keyword::Long,
+        "float" => Keyword::Float,
+        "double" => Keyword::Double,
         "signed" => Keyword::Signed,
         "unsigned" => Keyword::Unsigned,
         "const" => Keyword::Const,
@@ -1643,14 +1652,29 @@ fn eval_char(raw: &str) -> i128 {
     i128::from(bytes[0])
 }
 
-/// Parse a preprocessing number into an integer value and its C type, honoring
-/// C23 binary literals and digit separators (both gated by `std`).
-fn eval_number(text: &str, std: CStd) -> Result<(i128, CType), String> {
+/// A parsed preprocessing number: an integer or a floating constant, each with
+/// its C type.
+enum NumVal {
+    /// An integer constant value and its type.
+    Int(i128, CType),
+    /// A floating constant value (exact, already rounded to precision) and type.
+    Float(f64, CType),
+}
+
+/// Parse a preprocessing number into a value and its C type, honoring C23 binary
+/// literals and digit separators, and C99 (hex) floating constants (all gated by
+/// `std`).
+fn eval_number(text: &str, std: CStd) -> Result<NumVal, String> {
     if text.contains('\'') && !std.digit_separators() {
         return Err("digit separators are a C23 feature (use -std=c23)".to_owned());
     }
     let s: String =
         if std.digit_separators() { text.chars().filter(|&c| c != '\'').collect() } else { text.to_owned() };
+    // A `.`, an exponent, or a float suffix makes this a floating constant.
+    if lex::is_float_ppnumber(&s) {
+        let (v, ty) = lex::parse_float_literal(&s, std.is_c99())?;
+        return Ok(NumVal::Float(v, ty));
+    }
     let lower = s.to_ascii_lowercase();
     let b = s.as_bytes();
 
@@ -1680,15 +1704,6 @@ fn eval_number(text: &str, std: CStd) -> Result<(i128, CType), String> {
             i += 1;
         } else {
             break;
-        }
-    }
-
-    if let Some(&c) = b.get(i) {
-        let is_float = c == b'.'
-            || (radix == 10 && matches!(c, b'e' | b'E'))
-            || (radix == 16 && matches!(c, b'p' | b'P'));
-        if is_float {
-            return Err("floating-point constants are out of scope in this C subset".to_owned());
         }
     }
 
@@ -1722,7 +1737,7 @@ fn eval_number(text: &str, std: CStd) -> Result<(i128, CType), String> {
     }
     let value = i128::from_str_radix(for_parse, radix)
         .map_err(|_| "integer constant out of range".to_owned())?;
-    Ok((value, lex::integer_literal_type(value, radix != 10, unsigned, long)))
+    Ok(NumVal::Int(value, lex::integer_literal_type(value, radix != 10, unsigned, long)))
 }
 
 /// Match a punctuator at the start of `s`, returning its kind and byte length.

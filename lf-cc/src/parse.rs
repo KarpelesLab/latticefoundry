@@ -424,6 +424,8 @@ impl Parser {
                 | Keyword::Short
                 | Keyword::Int
                 | Keyword::Long
+                | Keyword::Float
+                | Keyword::Double
                 | Keyword::Signed
                 | Keyword::Unsigned
                 | Keyword::Const
@@ -451,6 +453,8 @@ impl Parser {
         let mut has_int = false;
         let mut has_void = false;
         let mut has_bool = false;
+        let mut has_float = false;
+        let mut has_double = false;
         let mut signed_spec: Option<bool> = None;
         let mut saw_any = false;
         let mut explicit: Option<CType> = None;
@@ -463,6 +467,8 @@ impl Parser {
                 || has_char
                 || has_short
                 || has_int
+                || has_float
+                || has_double
                 || longs > 0
                 || signed_spec.is_some();
             match self.peek() {
@@ -534,6 +540,16 @@ impl Parser {
                     saw_any = true;
                     self.bump();
                 }
+                TokenKind::Keyword(Keyword::Float) => {
+                    has_float = true;
+                    saw_any = true;
+                    self.bump();
+                }
+                TokenKind::Keyword(Keyword::Double) => {
+                    has_double = true;
+                    saw_any = true;
+                    self.bump();
+                }
                 TokenKind::Keyword(Keyword::Signed) => {
                     signed_spec = Some(true);
                     saw_any = true;
@@ -565,6 +581,18 @@ impl Parser {
         }
         if has_bool {
             return Ok(CType::Bool);
+        }
+        // Floating types. `float`, `double`, and `long double` (modelled as
+        // `double`); the numeric integer specifiers may not combine with them.
+        if has_float || has_double {
+            if has_char || has_short || has_int || has_bool || signed_spec.is_some()
+                || (has_float && (has_double || longs > 0))
+                || (has_double && longs > 1)
+            {
+                return Err(Diagnostic::error("invalid combination of type specifiers")
+                    .with_span(start));
+            }
+            return Ok(if has_double { CType::double() } else { CType::float() });
         }
         if has_char {
             // Plain `char` is signed on this target; `signed`/`unsigned` override.
@@ -1181,6 +1209,8 @@ impl Parser {
                 | Keyword::Short
                 | Keyword::Int
                 | Keyword::Long
+                | Keyword::Float
+                | Keyword::Double
                 | Keyword::Signed
                 | Keyword::Unsigned
                 | Keyword::Const
@@ -1308,6 +1338,10 @@ impl Parser {
             TokenKind::IntLit(value, ty) => {
                 let span = self.bump().span;
                 Ok(Expr { kind: ExprKind::IntLit(value, ty), span })
+            }
+            TokenKind::FloatLit(value, ty) => {
+                let span = self.bump().span;
+                Ok(Expr { kind: ExprKind::FloatLit(value, ty), span })
             }
             TokenKind::Ident(name) => {
                 let span = self.bump().span;

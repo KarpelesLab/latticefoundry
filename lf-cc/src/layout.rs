@@ -10,9 +10,9 @@
 //! IR [`TypeId`] for lowering. Keeping one implementation here guarantees sema's
 //! `sizeof`/offsets agree with the storage the backend reserves.
 
-use latticefoundry::ir::types::{TypeContext, TypeId};
+use latticefoundry::ir::types::{FloatKind, TypeContext, TypeId};
 
-use crate::ast::{CType, RecordId, RecordKind, Records};
+use crate::ast::{CType, FloatTy, RecordId, RecordKind, Records};
 
 /// Round `value` up to the next multiple of `align` (a power of two ≥ 1).
 fn round_up(value: u64, align: u64) -> u64 {
@@ -25,6 +25,7 @@ pub fn size_of(recs: &Records, ty: &CType) -> u64 {
         CType::Void => 1,
         CType::Bool => 1,
         CType::Int(i) => u64::from(i.width) / 8,
+        CType::Float(f) => u64::from(f.bits()) / 8,
         CType::Pointer(_) => 8,
         CType::Array(elem, n) => stride_of(recs, elem) * *n,
         CType::Record(id) => record_size(recs, *id),
@@ -39,6 +40,7 @@ pub fn align_of(recs: &Records, ty: &CType) -> u64 {
     match ty {
         CType::Void | CType::Bool => 1,
         CType::Int(i) => (u64::from(i.width) / 8).clamp(1, 8),
+        CType::Float(f) => u64::from(f.bits()) / 8,
         CType::Pointer(_) => 8,
         CType::Array(elem, _) => align_of(recs, elem),
         CType::Record(id) => record_align(recs, *id),
@@ -111,6 +113,8 @@ pub fn ir_type(cx: &mut TypeContext, recs: &Records, ty: &CType) -> TypeId {
         CType::Void => cx.void(),
         CType::Bool => cx.int(8),
         CType::Int(i) => cx.int(u32::from(i.width)),
+        CType::Float(FloatTy::F32) => cx.float(FloatKind::F32),
+        CType::Float(FloatTy::F64) => cx.float(FloatKind::F64),
         CType::Pointer(_) => cx.ptr(),
         CType::Array(elem, n) => {
             let e = ir_type(cx, recs, elem);

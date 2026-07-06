@@ -1,10 +1,73 @@
 //! Unit tests for the frontend: lexing, parsing/sema, and lowering/verify.
 
-use crate::ast::{CType, IntTy};
+use crate::ast::{CType, FloatTy, IntTy};
 use crate::sema::{TExprKind, TStmt};
 use crate::{CStd, check_source, compile_to_ir};
 
 use latticefoundry::verify::verify_module;
+
+// --- floating-constant lexing ---------------------------------------------
+
+/// Lex a single expression's worth of source and return the first token's kind.
+fn first_token(src: &str) -> crate::lex::TokenKind {
+    let toks = crate::lex::lex(src, latticefoundry::support::diagnostics::FileId::new(0))
+        .expect("should lex");
+    toks.into_iter().next().expect("a token").kind
+}
+
+#[test]
+fn lex_floating_constant_forms() {
+    use crate::lex::TokenKind::FloatLit;
+    // A `.`, a leading/trailing dot, an exponent, and a signed exponent all lex
+    // as double floating constants with the exact value.
+    for (src, want) in [("1.5", 1.5), (".5", 0.5), ("3.", 3.0), ("1e10", 1e10), ("2.5e-3", 2.5e-3)]
+    {
+        match first_token(src) {
+            FloatLit(v, ty) => {
+                assert_eq!(v, want, "value of {src}");
+                assert_eq!(ty, CType::double(), "type of {src}");
+            }
+            other => panic!("{src} should lex as a float, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn lex_float_suffix_selects_float_type() {
+    use crate::lex::TokenKind::FloatLit;
+    // `f`/`F` -> float (rounded to binary32); `l`/`L` -> long double (== double).
+    match first_token("0.1f") {
+        FloatLit(v, ty) => {
+            assert_eq!(ty, CType::Float(FloatTy::F32));
+            // 0.1f rounds to binary32, stored back as the exact f64 of that value.
+            assert_eq!(v, f64::from(0.1f32));
+        }
+        other => panic!("got {other:?}"),
+    }
+    assert!(matches!(first_token("2.0L"), FloatLit(_, ty) if ty == CType::double()));
+}
+
+#[test]
+fn lex_hex_floating_constant() {
+    use crate::lex::TokenKind::FloatLit;
+    // 0x1.8p3 = 1.5 * 2^3 = 12.0.
+    match first_token("0x1.8p3") {
+        FloatLit(v, ty) => {
+            assert_eq!(v, 12.0);
+            assert_eq!(ty, CType::double());
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn lex_integer_is_not_a_float() {
+    use crate::lex::TokenKind::{FloatLit, IntLit};
+    // A bare integer, and a hex integer with no `p`, stay integers.
+    assert!(matches!(first_token("42"), IntLit(42, _)));
+    assert!(matches!(first_token("0xff"), IntLit(255, _)));
+    assert!(!matches!(first_token("100"), FloatLit(..)));
+}
 
 // --- sema type-checking tests ---------------------------------------------
 
@@ -60,6 +123,91 @@ fn long_widens_mixed_expression() {
         ret_type("1L + 1")
     };
     assert!(matches!(ty, CType::Int(IntTy { width: 64, .. })));
+}
+
+// --- floating-point sema / conversions ------------------------------------
+
+#[test]
+fn float_usual_arithmetic_conversions() {
+    // int + double -> double; float + int -> float; float + double -> double.
+    assert_eq!(ret_type("1 + 2.0"), CType::double());
+    assert_eq!(ret_type("1 + 2.0f"), CType::float());
+    assert_eq!(ret_type("2.0f + 3.0"), CType::double());
+    assert_eq!(ret_type("3.5 * 2"), CType::double());
+}
+
+#[test]
+fn float_comparison_is_int() {
+    // A floating comparison yields `int` 0/1.
+    assert_eq!(ret_type("1.5 < 2.5"), CType::int());
+    assert_eq!(ret_type("1.5 == 1.5"), CType::int());
+}
+
+#[test]
+fn modulo_on_double_is_rejected() {
+    let err = check_source("int f(){ double a=1.0, b=2.0; return (int)(a % b); }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("floating-point operands are not allowed")));
+}
+
+#[test]
+fn double_array_size_is_rejected() {
+    let err = check_source("int f(){ double a[1.5]; return (int)a[0]; }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("constant integer expression")));
+}
+
+#[test]
+fn pointer_to_float_cast_is_rejected() {
+    let err = check_source("int f(){ int x=0; int*p=&x; return (int)(double)p; }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("pointer and a floating-point type")));
+}
+
+#[test]
+fn float_conversions_lower_and_verify() {
+    // int->double, double->int (truncation), float<->double, and a float in a
+    // boolean context all lower to well-typed IR.
+    lower_ok(
+        "int main(){ int n=7; double r = n/2.0; float f=0.1f; double d=f; \
+         if(d) return (int)(r*10) + (int)3.9; return 0; }",
+    );
+}
+
+#[test]
+fn float_function_args_and_return_lower() {
+    lower_ok(
+        "double add3(double a,double b,double c){ return a+b+c; } \
+         double mix(int a,double b){ return a+b; } \
+         int main(){ double x=1.0,y=2.0,z=3.0; return (int)add3(x,y,z) + (int)mix(4,5.0); }",
+    );
+}
+
+#[test]
+fn float_global_initializer_bytes() {
+    // A double global's initializer is materialized to its IEEE little-endian
+    // image (2.5 == 0x4004000000000000).
+    let prog = check_source("double g = 2.5; int main(){ return (int)g; }").unwrap();
+    let g = prog.globals.iter().find(|g| g.name == "g").expect("global g");
+    assert_eq!(g.bytes, 2.5f64.to_le_bytes());
+    assert_eq!(g.ty, CType::double());
+}
+
+#[test]
+fn float_sizeof() {
+    assert!(matches!(
+        &check_source("int f(){ return sizeof(float); }").unwrap().funcs[0].body[0],
+        TStmt::Return(Some(e)) if matches!(unwrap_convert(&e.kind), TExprKind::Const(4)),
+    ));
+    assert!(matches!(
+        &check_source("int f(){ return sizeof(double); }").unwrap().funcs[0].body[0],
+        TStmt::Return(Some(e)) if matches!(unwrap_convert(&e.kind), TExprKind::Const(8)),
+    ));
+}
+
+/// Unwrap a leading implicit `Convert` (e.g. `sizeof` → return type) node.
+fn unwrap_convert(k: &TExprKind) -> &TExprKind {
+    match k {
+        TExprKind::Convert(inner) => &inner.kind,
+        other => other,
+    }
 }
 
 #[test]
