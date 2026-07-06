@@ -10,17 +10,42 @@
 //! ordinary physical registers. It models one A64 op per step (e.g. `CmpCset` is
 //! evaluated as compare-then-set, `MovRI` as a load-immediate) rather than the
 //! encoder's multi-word expansion.
+//!
+//! ## The aggregate ABI model
+//!
+//! To validate by-value struct passing/returning ([`super::isel::classify_aggregate`])
+//! the interpreter models the AAPCS64 register/memory ABI faithfully:
+//!
+//! - **One shared flat address space.** Every activation's stack slots are bump-
+//!   allocated from a single [`Machine::mem`], so a pointer handed across a call
+//!   (a by-reference argument, or the `x8` indirect-result pointer) resolves in
+//!   the callee exactly as on hardware.
+//! - **Physical registers cross the call boundary by copy.** A call's inputs are
+//!   its `Use(physical)` operands (the argument registers `x0..x7`/`v0..v7` and
+//!   `x8`), copied into the callee activation; its outputs are the return
+//!   registers `x0`/`x1`/`v0..v3`, copied back. So a small aggregate returned in
+//!   `x0`/`x1`, an HFA returned in `v0..v3`, and a large aggregate written
+//!   through the `x8` slot are all reproduced abstractly.
 
-use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, RegClass, StackSlot};
+use crate::codegen::mir::{
+    MachineFunction, MachineInst, MachineOperand, PReg, Reg, RegClass, StackSlot,
+};
 use crate::codegen::target::MachineTarget;
 use crate::support::DetHashMap;
 
 use puremp::Int;
 
 use super::isel::{A64Op, AArch64Target};
+use super::regs::{fp, gpr};
 
 /// A cap on executed instructions, so a miscompiled loop fails fast.
 const STEP_BUDGET: u64 = 5_000_000;
+
+/// The physical registers a call returns results in: `x0`/`x1` (small aggregate
+/// or scalar) and `v0..v3` (HFA or scalar float).
+fn return_regs() -> [PReg; 6] {
+    [gpr(0), gpr(1), fp(0), fp(1), fp(2), fp(3)]
+}
 
 /// Run function `entry` of `funcs` with integer `args`, returning its return
 /// value. `Err` on any modeled fault (division by zero, an unsupported opcode,
@@ -31,27 +56,65 @@ pub(super) fn run(
     entry: usize,
     args: &[Int],
 ) -> Result<Option<Int>, String> {
-    let mut budget = STEP_BUDGET;
-    let mut interp = Interp { target, funcs, budget: &mut budget };
-    interp.call(entry, args)
+    let mut m = Machine { target, funcs, budget: STEP_BUDGET, mem: vec![0u8; 64], heap: 16 };
+
+    // Route each positional argument into its physical argument register by the
+    // entry parameter's register class: integers into x0.. and floats into v0..
+    // (separate counters). Entry parameters are scalar in the interpreter's
+    // fixtures; aggregate marshalling is exercised on the *internal* calls.
+    let mf = m.funcs.get(entry).ok_or_else(|| format!("no function #{entry}"))?;
+    let e = mf.entry().ok_or("call into a body-less function")?;
+    let params: Vec<_> = mf.block(e).params.clone();
+    let cc = target.call_conv();
+    let mut inputs: Vec<(PReg, Int)> = Vec::new();
+    let (mut int_i, mut fp_i) = (0usize, 0usize);
+    for (&p, val) in params.iter().zip(args) {
+        let areg = match mf.vreg_class(p) {
+            RegClass::Gpr => {
+                let r = cc.arg_regs[int_i];
+                int_i += 1;
+                r
+            }
+            RegClass::Fp => {
+                let r = cc.fp_arg_regs[fp_i];
+                fp_i += 1;
+                r
+            }
+        };
+        inputs.push((areg, val.clone()));
+    }
+    Ok(m.call(entry, &inputs)?.ret_val)
 }
 
-struct Interp<'a> {
+/// The whole-program interpreter state: a shared flat address space plus the
+/// function table and a global step budget.
+struct Machine<'a> {
     target: &'a AArch64Target,
     funcs: &'a [MachineFunction],
-    budget: &'a mut u64,
+    budget: u64,
+    /// The single flat address space every activation's slots live in.
+    mem: Vec<u8>,
+    /// The bump cursor for the next activation's slot region.
+    heap: u64,
 }
 
 /// One function activation's mutable state.
 struct Frame {
     regs: DetHashMap<Reg, Int>,
-    mem: Vec<u8>,
+    /// Absolute base address of each stack slot in the shared [`Machine::mem`].
     slot_base: Vec<u64>,
+    /// Spill/aux slots addressed by handle rather than memory address.
     slot_val: DetHashMap<StackSlot, Int>,
-    /// The most recent value moved into a physical return register (`x0` or `v0`).
-    /// The lowering writes the return value there immediately before `ret`, so
-    /// this captures a float return (in `v0`) as well as an integer one (`x0`).
+    /// The most recent value moved into a physical return register (`x0` or `v0`),
+    /// the primary scalar return.
     ret_val: Option<Int>,
+}
+
+/// What a completed call hands back: the primary scalar return and a snapshot of
+/// the return registers (for aggregate results reclaimed by the caller).
+struct CallOut {
+    ret_val: Option<Int>,
+    regs: Vec<(PReg, Int)>,
 }
 
 fn mask(v: &Int, width: u32) -> Int {
@@ -66,73 +129,74 @@ fn signed(bits: &Int, width: u32) -> Int {
     }
 }
 
+/// Round `v` up to a multiple of `align` (≥ 1).
+fn align_up(v: u64, align: u64) -> u64 {
+    let a = align.max(1);
+    v.div_ceil(a) * a
+}
+
 enum Flow {
     Next,
     Goto(crate::codegen::mir::MBlockId),
-    Return(Option<Int>),
+    Return,
 }
 
-impl Interp<'_> {
-    fn call(&mut self, fidx: usize, args: &[Int]) -> Result<Option<Int>, String> {
+impl Machine<'_> {
+    /// Invoke function `fidx` with `inputs` pre-loaded into physical registers,
+    /// running it to its `ret` and returning the primary scalar value plus the
+    /// return-register snapshot.
+    fn call(&mut self, fidx: usize, inputs: &[(PReg, Int)]) -> Result<CallOut, String> {
         let mf = self.funcs.get(fidx).ok_or_else(|| format!("no function #{fidx}"))?;
         let entry = mf.entry().ok_or("call into a body-less function")?;
 
+        // Bump-allocate this activation's slot region from the shared address
+        // space so slot addresses are globally unique (cross-call pointers work).
         let frame = mf.frame();
+        let mut base = align_up(self.heap, 16);
         let mut slot_base = vec![0u64; frame.len()];
-        let mut off = 16u64;
-        for (i, base) in slot_base.iter_mut().enumerate() {
+        for (i, b) in slot_base.iter_mut().enumerate() {
             let info = frame.slot(StackSlot::from_index(i));
-            let align = info.align.max(1);
-            off = off.div_ceil(align) * align;
-            *base = off;
-            off += info.size.max(1);
+            base = align_up(base, info.align.max(1));
+            *b = base;
+            base += info.size.max(1);
         }
+        self.heap = align_up(base, 16);
+        let need = self.heap as usize + 32;
+        if need > self.mem.len() {
+            self.mem.resize(need + 64, 0);
+        }
+
         let mut fr = Frame {
             regs: DetHashMap::default(),
-            mem: vec![0u8; (off + 32) as usize],
             slot_base,
             slot_val: DetHashMap::default(),
             ret_val: None,
         };
-
-        // Route each positional argument into its physical argument register by
-        // the parameter's register class: integers into x0.. and floats into
-        // v0.. (separate counters), matching the framework prologue.
-        let cc = self.target.call_conv();
-        let params: Vec<_> = mf.block(entry).params.clone();
-        let mut int_i = 0usize;
-        let mut fp_i = 0usize;
-        for (&p, val) in params.iter().zip(args) {
-            let areg = match mf.vreg_class(p) {
-                RegClass::Gpr => {
-                    let r = cc.arg_regs[int_i];
-                    int_i += 1;
-                    r
-                }
-                RegClass::Fp => {
-                    let r = cc.fp_arg_regs[fp_i];
-                    fp_i += 1;
-                    r
-                }
-            };
-            fr.regs.insert(Reg::Physical(areg), val.clone());
+        for (p, v) in inputs {
+            fr.regs.insert(Reg::Physical(*p), v.clone());
         }
 
         let mut block = entry;
         let mut ip = 0usize;
         loop {
-            *self.budget = self.budget.checked_sub(1).ok_or("step budget exhausted")?;
-            let insts = &mf.block(block).insts;
-            let inst = insts.get(ip).ok_or("fell off the end of a block")?;
-            match self.step(&mut fr, inst)? {
+            self.budget = self.budget.checked_sub(1).ok_or("step budget exhausted")?;
+            let insts = &self.funcs[fidx].block(block).insts;
+            let inst = insts.get(ip).ok_or("fell off the end of a block")?.clone();
+            match self.step(&mut fr, &inst)? {
                 Flow::Next => ip += 1,
                 Flow::Goto(b) => {
                     block = b;
                     ip = 0;
                 }
-                Flow::Return(v) => return Ok(v),
+                Flow::Return => break,
             }
         }
+
+        let regs = return_regs()
+            .into_iter()
+            .filter_map(|r| fr.regs.get(&Reg::Physical(r)).map(|v| (r, v.clone())))
+            .collect();
+        Ok(CallOut { ret_val: fr.ret_val, regs })
     }
 
     fn step(&mut self, fr: &mut Frame, inst: &MachineInst) -> Result<Flow, String> {
@@ -226,14 +290,14 @@ impl Interp<'_> {
                 let d = def(ops, 0)?;
                 let ptr = self.rd(fr, use_reg(ops, 1)?);
                 let size = imm_u32(ops, 2)? as usize;
-                let v = load_mem(&fr.mem, addr(&ptr)?, size);
+                let v = load_mem(&self.mem, addr(&ptr)?, size);
                 fr.regs.insert(d, v);
             }
             A64Op::Store => {
                 let ptr = self.rd(fr, use_reg(ops, 0)?);
                 let val = self.rd(fr, use_reg(ops, 1)?);
                 let size = imm_u32(ops, 2)? as usize;
-                store_mem(&mut fr.mem, addr(&ptr)?, size, &val);
+                store_mem(&mut self.mem, addr(&ptr)?, size, &val);
             }
             A64Op::FrameAddr => {
                 let d = def(ops, 0)?;
@@ -253,9 +317,9 @@ impl Interp<'_> {
             }
             A64Op::Call => return self.exec_call(fr, inst),
             A64Op::Ret => {
-                // The lowering moved the value into the class-appropriate return
-                // register (`x0` or `v0`) immediately before this `ret`.
-                return Ok(Flow::Return(fr.ret_val.clone()));
+                // Return registers (scalar `x0`/`v0`, aggregate `x0`/`x1`/`v0..v3`)
+                // are already set; the caller snapshots them.
+                return Ok(Flow::Return);
             }
             A64Op::B => return Ok(Flow::Goto(label(ops, 0)?)),
             A64Op::BrCond => {
@@ -280,6 +344,13 @@ impl Interp<'_> {
             }
             A64Op::GlobalAddr => return Err("global addressing is not modeled".into()),
             A64Op::Unreachable => return Err("reached an unreachable point (UB)".into()),
+            // Stack-relative addressing (`add d, sp/x29, #off`) needs a modeled
+            // stack pointer, which this pre-regalloc interpreter has none of. It
+            // only appears once the argument registers of a bank are exhausted;
+            // the fixtures stay within the register limits, so it is never reached.
+            A64Op::LeaSpOff | A64Op::LeaFpOff => {
+                return Err("stack-relative addressing is not modeled".into());
+            }
 
             // --- scalar floating-point ------------------------------------
             A64Op::FAdd | A64Op::FSub | A64Op::FMul | A64Op::FDiv => {
@@ -360,7 +431,6 @@ impl Interp<'_> {
     }
 
     fn exec_call(&mut self, fr: &mut Frame, inst: &MachineInst) -> Result<Flow, String> {
-        let cc = self.target.call_conv();
         let fidx = inst
             .operands
             .iter()
@@ -369,35 +439,22 @@ impl Interp<'_> {
                 _ => None,
             })
             .ok_or("indirect calls are not modeled")?;
-        // Reconstruct the positional argument list in *parameter order* by reading
-        // each callee parameter's physical argument register (x-regs and v-regs
-        // are counted separately, exactly as the argument-passing lowering did).
-        let callee_mf = self.funcs.get(fidx).ok_or_else(|| format!("no function #{fidx}"))?;
-        let params: Vec<_> =
-            callee_mf.entry().map(|e| callee_mf.block(e).params.clone()).unwrap_or_default();
-        let mut args = Vec::with_capacity(params.len());
-        let mut int_i = 0usize;
-        let mut fp_i = 0usize;
-        for &p in &params {
-            let areg = match callee_mf.vreg_class(p) {
-                RegClass::Gpr => {
-                    let r = cc.arg_regs[int_i];
-                    int_i += 1;
-                    r
-                }
-                RegClass::Fp => {
-                    let r = cc.fp_arg_regs[fp_i];
-                    fp_i += 1;
-                    r
-                }
-            };
-            args.push(self.rd(fr, Reg::Physical(areg)));
+        // The call's inputs are exactly its `Use(physical)` operands: the argument
+        // registers (`x0..x7`/`v0..v7`) and, for a by-reference return, `x8`.
+        let inputs: Vec<(PReg, Int)> = inst
+            .operands
+            .iter()
+            .filter_map(|o| match o {
+                MachineOperand::Use(Reg::Physical(p)) => Some((*p, self.rd(fr, Reg::Physical(*p)))),
+                _ => None,
+            })
+            .collect();
+        let out = self.call(fidx, &inputs)?;
+        // Copy the return registers back into the caller so it can reclaim a
+        // scalar (`x0`/`v0`) or an aggregate (`x0`/`x1` or `v0..v3`) result.
+        for (p, v) in out.regs {
+            fr.regs.insert(Reg::Physical(p), v);
         }
-        let ret = self.call(fidx, &args)?.unwrap_or(Int::ZERO);
-        // Deposit the result in both return registers; the caller's lowering reads
-        // exactly the class-appropriate one, and the value is identical.
-        fr.regs.insert(Reg::Physical(cc.ret_reg), ret.clone());
-        fr.regs.insert(Reg::Physical(cc.fp_ret_reg), ret);
         Ok(Flow::Next)
     }
 
@@ -519,21 +576,21 @@ fn eval_fcmp(packed: u64, a: &Int, b: &Int, width: u32) -> bool {
 /// Whether an A64 condition code holds for the given NZCV flags.
 fn cond_holds(cc: u8, n: bool, z: bool, c: bool, v: bool) -> bool {
     match cc {
-        0x0 => z,                 // EQ
-        0x1 => !z,                // NE
-        0x2 => c,                 // CS/HS
-        0x3 => !c,                // CC/LO
-        0x4 => n,                 // MI
-        0x5 => !n,                // PL
-        0x6 => v,                 // VS
-        0x7 => !v,                // VC
-        0x8 => c && !z,           // HI
-        0x9 => !c || z,           // LS
-        0xA => n == v,            // GE
-        0xB => n != v,            // LT
-        0xC => !z && (n == v),    // GT
-        0xD => z || (n != v),     // LE
-        _ => true,                // AL
+        0x0 => z,              // EQ
+        0x1 => !z,             // NE
+        0x2 => c,              // CS/HS
+        0x3 => !c,             // CC/LO
+        0x4 => n,              // MI
+        0x5 => !n,             // PL
+        0x6 => v,              // VS
+        0x7 => !v,             // VC
+        0x8 => c && !z,        // HI
+        0x9 => !c || z,        // LS
+        0xA => n == v,         // GE
+        0xB => n != v,         // LT
+        0xC => !z && (n == v), // GT
+        0xD => z || (n != v),  // LE
+        _ => true,             // AL
     }
 }
 
@@ -542,16 +599,16 @@ fn eval_cond(cc: u8, a: &Int, b: &Int, w: u32) -> bool {
     let (ua, ub) = (mask(a, w), mask(b, w));
     let (sa, sb) = (signed(&ua, w), signed(&ub, w));
     match cc {
-        0x0 => ua == ub,  // EQ
-        0x1 => ua != ub,  // NE
-        0x2 => ua >= ub,  // HS (unsigned >=)
-        0x3 => ua < ub,   // LO (unsigned <)
-        0x8 => ua > ub,   // HI (unsigned >)
-        0x9 => ua <= ub,  // LS (unsigned <=)
-        0xA => sa >= sb,  // GE (signed >=)
-        0xB => sa < sb,   // LT (signed <)
-        0xC => sa > sb,   // GT (signed >)
-        0xD => sa <= sb,  // LE (signed <=)
+        0x0 => ua == ub, // EQ
+        0x1 => ua != ub, // NE
+        0x2 => ua >= ub, // HS (unsigned >=)
+        0x3 => ua < ub,  // LO (unsigned <)
+        0x8 => ua > ub,  // HI (unsigned >)
+        0x9 => ua <= ub, // LS (unsigned <=)
+        0xA => sa >= sb, // GE (signed >=)
+        0xB => sa < sb,  // LT (signed <)
+        0xC => sa > sb,  // GT (signed >)
+        0xD => sa <= sb, // LE (signed <=)
         _ => false,
     }
 }
@@ -614,8 +671,13 @@ fn store_mem(mem: &mut Vec<u8>, addr: usize, size: usize, val: &Int) {
     if addr + size > mem.len() {
         mem.resize(addr + size + 16, 0);
     }
+    // Take the two's-complement low `size` bytes: masking to the store width
+    // yields a non-negative value whose bytes sign-extend a negative `val`
+    // correctly (a bare `div_2k_trunc` truncates toward zero and would drop the
+    // sign bytes).
+    let low = mask(val, 8 * size as u32);
     for i in 0..size {
-        let byte = val.div_2k_trunc(8 * i as u32).mod_2k(8).to_u64().unwrap_or(0) as u8;
+        let byte = low.div_2k_trunc(8 * i as u32).mod_2k(8).to_u64().unwrap_or(0) as u8;
         mem[addr + i] = byte;
     }
 }

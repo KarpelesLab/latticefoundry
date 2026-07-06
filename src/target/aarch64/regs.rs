@@ -34,6 +34,11 @@ use crate::codegen::target::CallConv;
 
 /// Hardware register numbers, named for readability in the isel/encoder.
 pub(crate) const X0: u16 = 0;
+/// The second integer argument/result register, `x1`.
+pub(crate) const X1: u16 = 1;
+/// The indirect-result-location register, `x8` (AAPCS64): a caller passes the
+/// address of the return slot for a by-reference (`> 16`-byte) result here.
+pub(crate) const X8: u16 = 8;
 pub(crate) const X9: u16 = 9;
 pub(crate) const X10: u16 = 10;
 pub(crate) const X11: u16 = 11;

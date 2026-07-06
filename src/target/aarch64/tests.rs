@@ -217,6 +217,9 @@ fn differential_encoding_matches_llvm_mc() {
         (sub_imm(1, 31, 31, 16), "sub sp, sp, #16"),
         (add_imm(1, 31, 31, 16), "add sp, sp, #16"),
         (add_imm(1, 29, 31, 0), "mov x29, sp"),
+        // aggregate-ABI stack addressing (A64Op::LeaSpOff / LeaFpOff)
+        (add_imm(1, 0, 31, 16), "add x0, sp, #16"),
+        (add_imm(1, 1, 29, 24), "add x1, x29, #24"),
     ];
 
     if llvm_mc("ret").is_none() {
@@ -968,4 +971,358 @@ fn fp_pipeline_disassembles() {
     for needle in ["fmul", "fdiv", "fadd", "ret"] {
         assert!(text.contains(needle), "expected `{needle}` in disassembly:\n{text}");
     }
+}
+
+// ===========================================================================
+// By-value struct passing / returning (AAPCS64 aggregate ABI)
+// ===========================================================================
+//
+// A struct value is represented at the codegen level by a pointer to its
+// in-memory storage. These fixtures build small caller/callee programs that
+// construct a struct (via `alloca` + field stores, or as a call result),
+// pass it by value, and return it by value — exercising the classifier
+// ([`super::isel::classify_aggregate`]) across the HFA, small-in-GPRs, and
+// large-by-reference cases. Because this host cannot execute AArch64, each is
+// validated on the A64-MIR interpreter, which models the register/`x8`/memory
+// ABI faithfully (see [`super::interp`]).
+
+/// Run entry function `f` of `m` on the interpreter with integer args.
+fn run_agg(m: &Module, f: FuncId, args: &[Int]) -> Int {
+    let (target, funcs) = lower_all(m);
+    interp::run(&target, &funcs, f.index(), args)
+        .expect("interpretation succeeds")
+        .expect("function returns a value")
+}
+
+/// A caller/callee program over `struct P { i64 x, y; }` (16 bytes → two
+/// general-register eightbytes, `x0`/`x1`). `mkP(a,b)` returns `{a,b}` (in
+/// `x0`/`x1`); `sumP(p) = p.x + p.y` takes it (in `x0`/`x1`). The interpreted
+/// `entry(a,b)` chains them, so the whole struct-in-registers round trip is
+/// checked. Returns the entry `FuncId`.
+fn build_struct_int_pass() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let p = m.types_mut().struct_(vec![i64t, i64t]);
+    let mk_sig = m.types_mut().func(vec![i64t, i64t], p, false);
+    let sum_sig = m.types_mut().func(vec![p], i64t, false);
+    let entry_sig = m.types_mut().func(vec![i64t, i64t], i64t, false);
+    let mkp = m.declare_function(syms.intern("mkP"), mk_sig);
+    let sump = m.declare_function(syms.intern("sumP"), sum_sig);
+    let entry = m.declare_function(syms.intern("entryP"), entry_sig);
+    {
+        let mut b = m.build(mkp);
+        let e = b.create_entry_block();
+        let a = b.param(e, 0);
+        let bb = b.param(e, 1);
+        let r = b.alloca(p);
+        let f0 = b.struct_field(r, p, 0);
+        b.store(i64t, f0, a, 8);
+        let f1 = b.struct_field(r, p, 1);
+        b.store(i64t, f1, bb, 8);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(sump);
+        let e = b.create_entry_block();
+        let pp = b.param(e, 0);
+        let f0 = b.struct_field(pp, p, 0);
+        let x = b.load(i64t, f0, 8);
+        let f1 = b.struct_field(pp, p, 1);
+        let y = b.load(i64t, f1, 8);
+        let s = b.add(x, y, Flags::NONE);
+        b.ret(Some(s));
+    }
+    {
+        let mut b = m.build(entry);
+        let e = b.create_entry_block();
+        let a = b.param(e, 0);
+        let bb = b.param(e, 1);
+        let c1 = b.func_ref(mkp);
+        let pv = b.call(c1, &[a, bb], p).unwrap();
+        let c2 = b.func_ref(sump);
+        let r = b.call(c2, &[pv], i64t).unwrap();
+        b.ret(Some(r));
+    }
+    (m, entry)
+}
+
+#[test]
+fn interp_struct_int_pass() {
+    let (m, f) = build_struct_int_pass();
+    for (a, b) in [(3i64, 4i64), (-2, 10), (0, 0), (1_000_000, 2_345)] {
+        assert_eq!(run_agg(&m, f, &[i(a), i(b)]), i(a + b), "entryP({a},{b})");
+    }
+}
+
+/// A caller/callee program over the HFA `struct V { double x, y; }` (two `f64`
+/// members → `v0`/`v1`). `mkV(a,b)` returns `{a,b}`; `sumV(v) = v.x + v.y`.
+/// The interpreted `entry(a,b)` chains them, checking the HFA is passed and
+/// returned in the SIMD/FP registers rather than `x0`/`x1`.
+fn build_hfa_double_pass() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let f64t = m.types_mut().float(FloatKind::F64);
+    let v = m.types_mut().struct_(vec![f64t, f64t]);
+    let mk_sig = m.types_mut().func(vec![f64t, f64t], v, false);
+    let sum_sig = m.types_mut().func(vec![v], f64t, false);
+    let entry_sig = m.types_mut().func(vec![f64t, f64t], f64t, false);
+    let mkv = m.declare_function(syms.intern("mkV"), mk_sig);
+    let sumv = m.declare_function(syms.intern("sumV"), sum_sig);
+    let entry = m.declare_function(syms.intern("entryV"), entry_sig);
+    {
+        let mut b = m.build(mkv);
+        let e = b.create_entry_block();
+        let a = b.param(e, 0);
+        let bb = b.param(e, 1);
+        let r = b.alloca(v);
+        let f0 = b.struct_field(r, v, 0);
+        b.store(f64t, f0, a, 8);
+        let f1 = b.struct_field(r, v, 1);
+        b.store(f64t, f1, bb, 8);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(sumv);
+        let e = b.create_entry_block();
+        let vv = b.param(e, 0);
+        let f0 = b.struct_field(vv, v, 0);
+        let x = b.load(f64t, f0, 8);
+        let f1 = b.struct_field(vv, v, 1);
+        let y = b.load(f64t, f1, 8);
+        let s = b.bin(BinOp::FAdd, x, y, Flags::NONE);
+        b.ret(Some(s));
+    }
+    {
+        let mut b = m.build(entry);
+        let e = b.create_entry_block();
+        let a = b.param(e, 0);
+        let bb = b.param(e, 1);
+        let c1 = b.func_ref(mkv);
+        let vv = b.call(c1, &[a, bb], v).unwrap();
+        let c2 = b.func_ref(sumv);
+        let r = b.call(c2, &[vv], f64t).unwrap();
+        b.ret(Some(r));
+    }
+    (m, entry)
+}
+
+#[test]
+fn interp_hfa_double_pass() {
+    let (m, f) = build_hfa_double_pass();
+    for (a, b) in [(1.5f64, 2.25f64), (-8.0, 0.5), (100.0, 7.0), (0.0, 0.0)] {
+        let got = run_agg(&m, f, &[fd(a), fd(b)]);
+        assert_eq!(as_f64(&got), a + b, "entryV({a},{b})");
+    }
+}
+
+/// A caller/callee program over `struct W { i64 a, b, c; }` (24 bytes → too big
+/// for registers → passed **by reference** to a caller-made copy, returned
+/// through the caller-allocated **indirect-result** slot whose address is passed
+/// in `x8`). `mkW(a,b,c)` returns `{a,b,c}`; `sumW(w) = a+b+c`. The interpreted
+/// `entry(a,b,c)` chains them, so both the `x8` return path and the by-reference
+/// argument path are exercised.
+fn build_large_ref_pass() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let w = m.types_mut().struct_(vec![i64t, i64t, i64t]);
+    let mk_sig = m.types_mut().func(vec![i64t, i64t, i64t], w, false);
+    let sum_sig = m.types_mut().func(vec![w], i64t, false);
+    let entry_sig = m.types_mut().func(vec![i64t, i64t, i64t], i64t, false);
+    let mkw = m.declare_function(syms.intern("mkW"), mk_sig);
+    let sumw = m.declare_function(syms.intern("sumW"), sum_sig);
+    let entry = m.declare_function(syms.intern("entryW"), entry_sig);
+    {
+        let mut b = m.build(mkw);
+        let e = b.create_entry_block();
+        let a = b.param(e, 0);
+        let bb = b.param(e, 1);
+        let c = b.param(e, 2);
+        let r = b.alloca(w);
+        let f0 = b.struct_field(r, w, 0);
+        b.store(i64t, f0, a, 8);
+        let f1 = b.struct_field(r, w, 1);
+        b.store(i64t, f1, bb, 8);
+        let f2 = b.struct_field(r, w, 2);
+        b.store(i64t, f2, c, 8);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(sumw);
+        let e = b.create_entry_block();
+        let ww = b.param(e, 0);
+        let f0 = b.struct_field(ww, w, 0);
+        let a = b.load(i64t, f0, 8);
+        let f1 = b.struct_field(ww, w, 1);
+        let bb = b.load(i64t, f1, 8);
+        let f2 = b.struct_field(ww, w, 2);
+        let c = b.load(i64t, f2, 8);
+        let s0 = b.add(a, bb, Flags::NONE);
+        let s = b.add(s0, c, Flags::NONE);
+        b.ret(Some(s));
+    }
+    {
+        let mut b = m.build(entry);
+        let e = b.create_entry_block();
+        let a = b.param(e, 0);
+        let bb = b.param(e, 1);
+        let c = b.param(e, 2);
+        let c1 = b.func_ref(mkw);
+        let ww = b.call(c1, &[a, bb, c], w).unwrap();
+        let c2 = b.func_ref(sumw);
+        let r = b.call(c2, &[ww], i64t).unwrap();
+        b.ret(Some(r));
+    }
+    (m, entry)
+}
+
+#[test]
+fn interp_large_ref_pass() {
+    let (m, f) = build_large_ref_pass();
+    for (a, b, c) in [(3i64, 4i64, 5i64), (-2, 10, -8), (0, 0, 0), (100, 200, 300)] {
+        assert_eq!(run_agg(&m, f, &[i(a), i(b), i(c)]), i(a + b + c), "entryW({a},{b},{c})");
+    }
+}
+
+/// A struct argument mixed with scalar arguments: `mix(i64 s0, P p, i64 s1) =
+/// s0 + p.x + p.y + s1`, where `P { i64 x, y }` occupies `x1`/`x2` between the
+/// scalars in `x0` and `x3`. The interpreted `entry(s0,a,b,s1)` builds `P` via
+/// `mkP` and calls `mix`, checking the interleaved register assignment.
+fn build_struct_mixed_scalars() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let p = m.types_mut().struct_(vec![i64t, i64t]);
+    let mk_sig = m.types_mut().func(vec![i64t, i64t], p, false);
+    let mix_sig = m.types_mut().func(vec![i64t, p, i64t], i64t, false);
+    let entry_sig = m.types_mut().func(vec![i64t, i64t, i64t, i64t], i64t, false);
+    let mkp = m.declare_function(syms.intern("mkP2"), mk_sig);
+    let mix = m.declare_function(syms.intern("mix"), mix_sig);
+    let entry = m.declare_function(syms.intern("entryMix"), entry_sig);
+    {
+        let mut b = m.build(mkp);
+        let e = b.create_entry_block();
+        let a = b.param(e, 0);
+        let bb = b.param(e, 1);
+        let r = b.alloca(p);
+        let f0 = b.struct_field(r, p, 0);
+        b.store(i64t, f0, a, 8);
+        let f1 = b.struct_field(r, p, 1);
+        b.store(i64t, f1, bb, 8);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(mix);
+        let e = b.create_entry_block();
+        let s0 = b.param(e, 0);
+        let pp = b.param(e, 1);
+        let s1 = b.param(e, 2);
+        let f0 = b.struct_field(pp, p, 0);
+        let x = b.load(i64t, f0, 8);
+        let f1 = b.struct_field(pp, p, 1);
+        let y = b.load(i64t, f1, 8);
+        let t0 = b.add(s0, x, Flags::NONE);
+        let t1 = b.add(t0, y, Flags::NONE);
+        let r = b.add(t1, s1, Flags::NONE);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(entry);
+        let e = b.create_entry_block();
+        let s0 = b.param(e, 0);
+        let a = b.param(e, 1);
+        let bb = b.param(e, 2);
+        let s1 = b.param(e, 3);
+        let c1 = b.func_ref(mkp);
+        let pv = b.call(c1, &[a, bb], p).unwrap();
+        let c2 = b.func_ref(mix);
+        let r = b.call(c2, &[s0, pv, s1], i64t).unwrap();
+        b.ret(Some(r));
+    }
+    (m, entry)
+}
+
+#[test]
+fn interp_struct_mixed_scalars() {
+    let (m, f) = build_struct_mixed_scalars();
+    for (s0, a, b, s1) in [(1i64, 2i64, 3i64, 4i64), (-5, 10, -20, 7), (0, 0, 0, 0)] {
+        // The result comes back as the 64-bit-masked (unsigned) bit pattern, so
+        // compare against the same masking of the mathematical result.
+        let want = i(s0 + a + b + s1).mod_2k(64);
+        assert_eq!(run_agg(&m, f, &[i(s0), i(a), i(b), i(s1)]), want, "entryMix");
+    }
+}
+
+/// The classifier assigns each shape to the right ABI class.
+#[test]
+fn classify_aggregate_shapes() {
+    use super::isel::{AbiClass, classify_aggregate};
+    let mut m = Module::new("t");
+    let i32t = m.types_mut().int(32);
+    let i64t = m.types_mut().int(64);
+    let f32t = m.types_mut().float(FloatKind::F32);
+    let f64t = m.types_mut().float(FloatKind::F64);
+
+    let one_int = m.types_mut().struct_(vec![i32t, i32t]); // 8 bytes → Regs(1)
+    let two_int = m.types_mut().struct_(vec![i64t, i64t]); // 16 bytes → Regs(2)
+    let big = m.types_mut().struct_(vec![i64t, i64t, i64t]); // 24 bytes → Reference
+    let hfa2d = m.types_mut().struct_(vec![f64t, f64t]); // HFA {f64;2}
+    let hfa4f = m.types_mut().struct_(vec![f32t, f32t, f32t, f32t]); // HFA {f32;4}
+    let hfa5f = m.types_mut().struct_(vec![f32t, f32t, f32t, f32t, f32t]); // 20B, >4 → Reference
+    let mixed = m.types_mut().struct_(vec![i64t, f64t]); // not homogeneous → Regs(2)
+
+    let t = m.types();
+    assert_eq!(classify_aggregate(t, one_int), AbiClass::Regs(1));
+    assert_eq!(classify_aggregate(t, two_int), AbiClass::Regs(2));
+    assert_eq!(classify_aggregate(t, big), AbiClass::Reference);
+    assert_eq!(classify_aggregate(t, hfa2d), AbiClass::Hfa { width: 64, count: 2 });
+    assert_eq!(classify_aggregate(t, hfa4f), AbiClass::Hfa { width: 32, count: 4 });
+    assert_eq!(classify_aggregate(t, hfa5f), AbiClass::Reference);
+    assert_eq!(classify_aggregate(t, mixed), AbiClass::Regs(2));
+}
+
+/// The full struct-passing pipeline (isel → regalloc → frame → encode) survives
+/// for every function of a by-reference program and round-trips through
+/// `llvm-mc` disassembly to the expected A64 idioms (`x8` usage, `ldr`/`str`
+/// memory traffic, `bl` calls, `ret`).
+#[test]
+fn struct_pipeline_disassembles() {
+    let (m, _) = build_large_ref_pass();
+    let syms = {
+        let mut s = StrInterner::new();
+        s.intern("mkW");
+        s.intern("sumW");
+        s.intern("entryW");
+        s
+    };
+    // Every function must compile without panicking.
+    let mut all = Vec::new();
+    for i in 0..3 {
+        all.push(compile_function(&m, FuncId::from_index(i), &syms));
+    }
+    // The by-reference caller (`entryW`) uses the indirect-result register x8.
+    let Some(text) = llvm_disasm(&all[2].bytes) else {
+        eprintln!("skipping struct_pipeline_disassembles: no llvm-mc");
+        return;
+    };
+    for needle in ["x8", "ldr", "str", "bl", "ret"] {
+        assert!(text.contains(needle), "expected `{needle}` in disassembly:\n{text}");
+    }
+}
+
+/// Struct-passing lowering is deterministic through the full pipeline.
+#[test]
+fn struct_encoding_is_deterministic() {
+    let (m, _) = build_large_ref_pass();
+    let syms = {
+        let mut s = StrInterner::new();
+        s.intern("mkW");
+        s.intern("sumW");
+        s.intern("entryW");
+        s
+    };
+    let a = compile_function(&m, FuncId::from_index(0), &syms);
+    let b = compile_function(&m, FuncId::from_index(0), &syms);
+    assert_eq!(a, b, "identical struct input must yield identical bytes");
 }

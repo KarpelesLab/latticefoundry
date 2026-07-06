@@ -382,13 +382,18 @@ pub fn layout_frame(mf: &MachineFunction, target: &AArch64Target) -> FrameLayout
         RegClass::Fp => used_fp[p.num as usize],
     };
     let cs_regs: Vec<PReg> = callee.into_iter().filter(is_used).collect();
-    // Callee-saved live at the bottom of the `extra` region, 8 bytes each.
-    let cs_off: Vec<u32> = (0..cs_regs.len()).map(|i| (i * 8) as u32).collect();
+    // The outgoing stack-argument area sits at the very bottom of the frame
+    // (`[sp .. sp + outgoing)`), addressed `add d, sp, #off` (`A64Op::LeaSpOff`).
+    // `sp` is constant after the prologue. Zero unless a call passed arguments on
+    // the stack, so scalar/FP functions are unaffected.
+    let outgoing = align_up(mf.frame().outgoing(), 16);
+    // Callee-saved live just above the outgoing area, 8 bytes each.
+    let cs_off: Vec<u32> = (0..cs_regs.len()).map(|i| (outgoing + (i * 8) as u64) as u32).collect();
     let cs_bytes = (cs_regs.len() * 8) as u64;
 
     // Local slots (spills/allocas) sit above the callee-saved region. Over-align
     // every slot to 8 bytes so scaled `ldr`/`str [sp,#off]` addressing is valid.
-    let mut off = cs_bytes;
+    let mut off = outgoing + cs_bytes;
     let mut slot_off = vec![0u32; mf.frame().len()];
     for (i, off_slot) in slot_off.iter_mut().enumerate() {
         let info = mf.frame().slot(StackSlot::from_index(i));
@@ -886,6 +891,20 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 ucvtf(sf, ptype, rnum(&ops[0]), rnum(&ops[1]))
             };
             b.word(word);
+        }
+
+        // --- aggregate ABI stack addressing -------------------------------
+        A64Op::LeaSpOff => {
+            // add d, sp, #off — address the outgoing stack-argument area.
+            let d = rnum(&ops[0]);
+            let off = uimm(&ops[1]) as u32;
+            b.word(add_imm(1, d, SP.into(), off));
+        }
+        A64Op::LeaFpOff => {
+            // add d, x29, #off — address an incoming stack-passed parameter.
+            let d = rnum(&ops[0]);
+            let off = uimm(&ops[1]) as u32;
+            b.word(add_imm(1, d, FP.into(), off));
         }
     }
 }

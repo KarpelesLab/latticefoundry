@@ -28,12 +28,13 @@ use crate::codegen::mir::{
 };
 use crate::codegen::target::{CallConv, MachineTarget};
 use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
+use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{InstData, Module, ValueId};
 
 use puremp::Int;
 
-use super::regs::RegFile;
+use super::regs::{self, RegFile};
 
 /// The A64 MIR opcode vocabulary. Operand layouts are documented per variant;
 /// `Def`/`Use` are register operands, the rest are immediates, frame slots,
@@ -155,6 +156,17 @@ pub enum A64Op {
     /// `[Def d, Use s, Imm dst_flt_w, Imm src_int_w]` — `ucvtf d, s` (unsigned
     /// int→float).
     Ucvtf = 51,
+
+    // --- aggregate (by-value struct) ABI support --------------------------
+    /// `[Def d, Imm off]` — `add d, sp, #off` (unsigned `off`). Materializes an
+    /// address in the reserved outgoing-argument area at the bottom of the frame
+    /// (`sp` is constant after the prologue), for stack-passed call arguments.
+    LeaSpOff = 52,
+    /// `[Def d, Imm off]` — `add d, x29, #off` (unsigned `off`). Materializes an
+    /// address relative to the frame pointer: used to address an incoming
+    /// stack-passed parameter's home (`[x29 + 16 + k]`, above the saved
+    /// frame-pointer/link-register pair).
+    LeaFpOff = 53,
 }
 
 impl A64Op {
@@ -167,12 +179,12 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 52] = [
+        const TABLE: [A64Op; 54] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
             AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
-            Fcvtzs, Fcvtzu, Scvtf, Ucvtf,
+            Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff,
         ];
         TABLE[op.0 as usize]
     }
@@ -293,6 +305,99 @@ fn use_v(v: VReg) -> MachineOperand {
 }
 fn imm(v: u64) -> MachineOperand {
     MachineOperand::Imm(Int::from_u64(v))
+}
+
+// ===========================================================================
+// AAPCS64 aggregate classification
+// ===========================================================================
+
+/// How an aggregate (a struct/array passed or returned by value) crosses the
+/// AAPCS64 ABI. The three cases are mutually exclusive and computed by
+/// [`classify_aggregate`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum AbiClass {
+    /// A Homogeneous Floating-point Aggregate: `1..=4` elements that are all the
+    /// same floating-point type. Passed one element per consecutive SIMD/FP
+    /// register (`v0..v7` for arguments; `v0..v3` for a return). `width` is the
+    /// element bit width (32 or 64); `count` the flattened element count.
+    Hfa { width: u32, count: u32 },
+    /// A small aggregate (`≤ 16` bytes, not an HFA): passed as `len` consecutive
+    /// general-register eightbytes (`x0..x7` for arguments; `x0`/`x1` for a
+    /// return). `len` is 0, 1, or 2.
+    Regs(usize),
+    /// A large aggregate (`> 16` bytes, not an HFA): passed **by reference** to a
+    /// caller-made copy (a pointer in the next general register); returned
+    /// through an **indirect result** pointer supplied by the caller in `x8`.
+    Reference,
+}
+
+/// Whether a type is an aggregate this backend represents, at the codegen level,
+/// by a pointer to its in-memory storage.
+fn is_aggregate(types: &TypeContext, ty: TypeId) -> bool {
+    matches!(types.get(ty), Type::Struct(_) | Type::Array(_, _))
+}
+
+/// If every leaf of `ty` is a floating-point value of one identical width, that
+/// width and the flattened leaf count; `None` if any leaf is not a float or the
+/// float widths differ. (An HFA additionally requires `1..=4` leaves — the
+/// caller enforces that bound.)
+fn homogeneous_float(types: &TypeContext, ty: TypeId) -> Option<(u32, u32)> {
+    fn walk(types: &TypeContext, ty: TypeId, width: &mut Option<u32>, count: &mut u32) -> bool {
+        match types.get(ty) {
+            Type::Float(k) => {
+                let bw = k.bit_width();
+                match *width {
+                    None => *width = Some(bw),
+                    Some(x) if x == bw => {}
+                    Some(_) => return false,
+                }
+                *count += 1;
+                true
+            }
+            Type::Struct(fields) => {
+                let n = fields.len();
+                (0..n).all(|i| {
+                    let (_, fty) = types.field_offset(ty, i as u32);
+                    walk(types, fty, width, count)
+                })
+            }
+            Type::Array(elem, len) => {
+                let (elem, len) = (*elem, *len);
+                (0..len).all(|_| walk(types, elem, width, count))
+            }
+            _ => false,
+        }
+    }
+    let (mut width, mut count) = (None, 0u32);
+    if walk(types, ty, &mut width, &mut count) {
+        width.map(|w| (w, count))
+    } else {
+        None
+    }
+}
+
+/// Classify an aggregate `ty` under AAPCS64: an HFA (in FP registers), a small
+/// aggregate (in general registers), or a large one (by reference / `x8`).
+pub(crate) fn classify_aggregate(types: &TypeContext, ty: TypeId) -> AbiClass {
+    if let Some((width, count)) = homogeneous_float(types, ty)
+        && (1..=4).contains(&count)
+    {
+        return AbiClass::Hfa { width, count };
+    }
+    let size = types.size_of(ty);
+    if size == 0 {
+        return AbiClass::Regs(0);
+    }
+    if size > 16 {
+        return AbiClass::Reference;
+    }
+    AbiClass::Regs(size.div_ceil(8) as usize)
+}
+
+/// Round `v` up to a multiple of `align` (a power of two ≥ 1).
+fn align_up_u64(v: u64, align: u64) -> u64 {
+    let a = align.max(1);
+    v.div_ceil(a) * a
 }
 
 /// The AArch64 target: its register file/ABI plus the isel + encoding rules.
@@ -522,48 +627,237 @@ impl AArch64Target {
         ));
     }
 
+    /// Materialize `base + off` (a byte displacement) into a fresh GPR, or return
+    /// `base` unchanged when `off == 0`. Uses the `add #imm12` form for a small
+    /// offset, otherwise a `movz`-materialized register add.
+    fn add_off(&self, lo: &mut Lower<'_, Self>, base: VReg, off: u64) -> VReg {
+        if off == 0 {
+            return base;
+        }
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        if off <= 0xFFF {
+            lo.emit(MachineInst::new(
+                A64Op::AddI.opcode(),
+                vec![def_v(d), use_v(base), imm(off), imm(64)],
+            ));
+        } else {
+            let k = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(MachineInst::new(A64Op::MovRI.opcode(), vec![def_v(k), imm(off)]));
+            lo.emit(MachineInst::new(
+                A64Op::Add.opcode(),
+                vec![def_v(d), use_v(base), use_v(k), imm(64)],
+            ));
+        }
+        d
+    }
+
+    /// Emit `add d, sp, #off` into a fresh GPR (addresses the outgoing
+    /// stack-argument area at the bottom of the frame).
+    fn lea_sp(&self, lo: &mut Lower<'_, Self>, off: u64) -> VReg {
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(A64Op::LeaSpOff.opcode(), vec![def_v(d), imm(off)]));
+        d
+    }
+
+    /// Emit `add d, x29, #off` into a fresh GPR (addresses an incoming
+    /// stack-passed parameter, above the saved fp/lr pair).
+    fn lea_fp(&self, lo: &mut Lower<'_, Self>, off: u64) -> VReg {
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(A64Op::LeaFpOff.opcode(), vec![def_v(d), imm(off)]));
+        d
+    }
+
+    /// Copy `size` bytes from `[src]` to `[dst]` (both GPR pointer vregs) in
+    /// 8/4/2/1-byte chunks via a scratch GPR.
+    fn emit_memcpy(&self, lo: &mut Lower<'_, Self>, dst: VReg, src: VReg, size: u64) {
+        let mut o = 0u64;
+        while o < size {
+            let chunk = if size - o >= 8 {
+                8
+            } else if size - o >= 4 {
+                4
+            } else if size - o >= 2 {
+                2
+            } else {
+                1
+            };
+            let sp = self.add_off(lo, src, o);
+            let t = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(MachineInst::new(A64Op::Load.opcode(), vec![def_v(t), use_v(sp), imm(chunk)]));
+            let dp = self.add_off(lo, dst, o);
+            lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(dp), use_v(t), imm(chunk)]));
+            o += chunk;
+        }
+    }
+
+    /// Copy an aggregate `arg` into the outgoing stack area at `stack_off` and
+    /// return the new running stack offset (used when the argument registers of
+    /// its bank are exhausted).
+    fn arg_on_stack(&self, lo: &mut Lower<'_, Self>, arg: ValueId, ty: TypeId, stack_off: u64) -> u64 {
+        let size = lo.byte_size(ty);
+        let align = lo.types().align_of(ty).max(8);
+        let at = align_up_u64(stack_off, align);
+        let src = lo.reg(arg);
+        let dst = self.lea_sp(lo, at);
+        self.emit_memcpy(lo, dst, src, size);
+        at + align_up_u64(size, 8)
+    }
+
+    /// Lower a `call`, implementing the AAPCS64 ABI for by-value struct arguments
+    /// and returns on top of the existing scalar/float handling.
+    ///
+    /// A struct value is represented, at this codegen level, by a GPR vreg holding
+    /// a pointer to the struct's in-memory storage. An HFA argument is loaded
+    /// element-by-element into consecutive `v` registers; a small (`≤16`-byte)
+    /// aggregate is loaded eightbyte-by-eightbyte into consecutive `x` registers;
+    /// a large aggregate is copied into a fresh caller stack slot and passed by a
+    /// pointer. An HFA result comes back in `v0..v3`, a small result in `x0`/`x1`,
+    /// and a large result through the caller-allocated indirect-result slot whose
+    /// address is passed in `x8`.
     fn lower_call(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         let cc = &self.rf.cc;
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
 
-        // Route each argument by class: integer/pointer into x0.. (a separate
-        // counter from) float/double into v0.. — the AAPCS64 rule for mixed calls.
-        // Materialize *every* argument value into a vreg first, then move them all
-        // into the physical argument registers immediately before the call, so no
-        // later materialization is colored into an argument register already
-        // holding an earlier argument (the allocator's fixed-register model is
-        // point-based; see the x86-64 backend's note).
+        // Return classification.
+        let ret_ty = inst.result().map(|r| lo.func().value_type(r));
+        let ret_agg = ret_ty.filter(|&t| is_aggregate(lo.types(), t));
+        let ret_class = ret_agg.map(|t| classify_aggregate(lo.types(), t));
+        let indirect_ret = matches!(ret_class, Some(AbiClass::Reference));
+
+        // The final `arg-reg <- value-vreg` moves, emitted as one consecutive run
+        // right before the `call` so no competing vreg definition sits in the gap
+        // between an argument register's write and the call (the allocator's
+        // fixed-register liveness reasons point-to-point).
+        let mut reg_moves: Vec<(PReg, VReg)> = Vec::new();
         let mut int_i = 0usize;
         let mut fp_i = 0usize;
-        let mut moves: Vec<(PReg, VReg)> = Vec::with_capacity(args.len());
-        for &arg in args {
-            let r = lo.reg(arg);
-            let areg = match lo.mf().vreg_class(r) {
-                RegClass::Gpr => {
-                    let a = cc.arg_regs[int_i];
-                    int_i += 1;
-                    a
-                }
-                RegClass::Fp => {
-                    let a = cc.fp_arg_regs[fp_i];
-                    fp_i += 1;
-                    a
-                }
-            };
-            moves.push((areg, r));
+        let mut stack_off = 0u64;
+
+        // A by-reference return: allocate the indirect-result slot and pass its
+        // address in `x8` (a register outside the ordinary argument banks).
+        let mut ret_slot = None;
+        if indirect_ret {
+            let t = ret_agg.unwrap();
+            let size = align_up_u64(lo.byte_size(t).max(8), 8);
+            let align = lo.types().align_of(t).max(8);
+            let slot = lo.new_slot(size, align);
+            ret_slot = Some(slot);
+            let ptr = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(self.frame_addr(ptr, slot));
+            reg_moves.push((regs::gpr(regs::X8), ptr));
         }
-        let used_arg_regs: Vec<PReg> = moves.iter().map(|&(areg, _)| areg).collect();
-        for (areg, r) in moves {
+
+        for &arg in args {
+            let ty = lo.func().value_type(arg);
+            if is_aggregate(lo.types(), ty) {
+                match classify_aggregate(lo.types(), ty) {
+                    AbiClass::Hfa { width, count } => {
+                        if fp_i + count as usize <= cc.fp_arg_regs.len() {
+                            let ptr = lo.reg(arg);
+                            let bytes = u64::from(width / 8);
+                            for k in 0..count as usize {
+                                let sp = self.add_off(lo, ptr, bytes * k as u64);
+                                let d = lo.fresh_vreg(RegClass::Fp);
+                                lo.emit(MachineInst::new(
+                                    A64Op::Load.opcode(),
+                                    vec![def_v(d), use_v(sp), imm(bytes)],
+                                ));
+                                let areg = cc.fp_arg_regs[fp_i];
+                                fp_i += 1;
+                                reg_moves.push((areg, d));
+                            }
+                            continue;
+                        }
+                        stack_off = self.arg_on_stack(lo, arg, ty, stack_off);
+                    }
+                    AbiClass::Regs(n) => {
+                        if int_i + n <= cc.arg_regs.len() {
+                            if n > 0 {
+                                let ptr = lo.reg(arg);
+                                for k in 0..n {
+                                    let sp = self.add_off(lo, ptr, 8 * k as u64);
+                                    let d = lo.fresh_vreg(RegClass::Gpr);
+                                    lo.emit(MachineInst::new(
+                                        A64Op::Load.opcode(),
+                                        vec![def_v(d), use_v(sp), imm(8)],
+                                    ));
+                                    let areg = cc.arg_regs[int_i];
+                                    int_i += 1;
+                                    reg_moves.push((areg, d));
+                                }
+                            }
+                            continue;
+                        }
+                        stack_off = self.arg_on_stack(lo, arg, ty, stack_off);
+                    }
+                    AbiClass::Reference => {
+                        // Copy the struct into a fresh caller stack slot and pass a
+                        // pointer to that copy (the callee only sees the pointer).
+                        let size = lo.byte_size(ty);
+                        let align = lo.types().align_of(ty).max(8);
+                        let slot = lo.new_slot(align_up_u64(size.max(8), 8), align);
+                        let dst = lo.fresh_vreg(RegClass::Gpr);
+                        lo.emit(self.frame_addr(dst, slot));
+                        let src = lo.reg(arg);
+                        self.emit_memcpy(lo, dst, src, size);
+                        let p = lo.fresh_vreg(RegClass::Gpr);
+                        lo.emit(self.frame_addr(p, slot));
+                        if int_i < cc.arg_regs.len() {
+                            let areg = cc.arg_regs[int_i];
+                            int_i += 1;
+                            reg_moves.push((areg, p));
+                        } else {
+                            let dp = self.lea_sp(lo, stack_off);
+                            lo.emit(MachineInst::new(
+                                A64Op::Store.opcode(),
+                                vec![use_v(dp), use_v(p), imm(8)],
+                            ));
+                            stack_off += 8;
+                        }
+                    }
+                }
+            } else {
+                // Scalar / pointer / float argument.
+                let v = lo.reg(arg);
+                let is_fp = lo.mf().vreg_class(v) == RegClass::Fp;
+                let has_reg =
+                    if is_fp { fp_i < cc.fp_arg_regs.len() } else { int_i < cc.arg_regs.len() };
+                if has_reg {
+                    let areg = if is_fp {
+                        let a = cc.fp_arg_regs[fp_i];
+                        fp_i += 1;
+                        a
+                    } else {
+                        let a = cc.arg_regs[int_i];
+                        int_i += 1;
+                        a
+                    };
+                    reg_moves.push((areg, v));
+                } else {
+                    let sz = lo.byte_size(ty);
+                    let dp = self.lea_sp(lo, stack_off);
+                    lo.emit(MachineInst::new(
+                        A64Op::Store.opcode(),
+                        vec![use_v(dp), use_v(v), imm(sz)],
+                    ));
+                    stack_off += 8;
+                }
+            }
+        }
+        if stack_off > 0 {
+            lo.reserve_outgoing(align_up_u64(stack_off, 16));
+        }
+
+        let used_arg_regs: Vec<PReg> = reg_moves.iter().map(|&(areg, _)| areg).collect();
+        for (areg, r) in reg_moves {
             lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(areg), use_v(r)]));
         }
 
-        // The return register follows the result type's class (v0 for a float
-        // return, x0 otherwise).
-        let ret_is_fp = inst
-            .result()
-            .is_some_and(|r| lo.types().get(lo.func().value_type(r)).is_float());
+        // The primary return register (`x0`/`v0`); struct results reclaim their
+        // registers (`x0`/`x1` or `v0..v3`), all covered by the clobber set.
+        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float());
         let ret_reg = if ret_is_fp { cc.fp_ret_reg } else { cc.ret_reg };
 
         let mut operands = Vec::new();
@@ -585,10 +879,210 @@ impl AArch64Target {
         }
         lo.emit(MachineInst::new(A64Op::Call.opcode(), operands));
 
-        if inst.result().is_some() {
-            let d = lo.result_reg(inst);
-            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_p(ret_reg)]));
+        match &ret_class {
+            Some(AbiClass::Reference) => {
+                // The result already sits in the caller-allocated indirect slot.
+                let d = lo.result_reg(inst);
+                lo.emit(self.frame_addr(d, ret_slot.unwrap()));
+            }
+            Some(AbiClass::Hfa { width, count }) => {
+                let (width, count) = (*width, *count);
+                let bytes = u64::from(width / 8);
+                // Rescue each returned element from `v0..v3` (one consecutive run
+                // right after the call), then store them into a fresh result slot.
+                let mut saved: Vec<VReg> = Vec::with_capacity(count as usize);
+                for k in 0..count as usize {
+                    let r = regs::fp(k as u16);
+                    let v = lo.fresh_vreg(RegClass::Fp);
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
+                    saved.push(v);
+                }
+                let t = ret_agg.unwrap();
+                let size = align_up_u64(lo.byte_size(t).max(8), 8);
+                let align = lo.types().align_of(t).max(8);
+                let slot = lo.new_slot(size, align);
+                let d = lo.result_reg(inst);
+                lo.emit(self.frame_addr(d, slot));
+                for (k, v) in saved.into_iter().enumerate() {
+                    let dp = self.add_off(lo, d, bytes * k as u64);
+                    lo.emit(MachineInst::new(
+                        A64Op::Store.opcode(),
+                        vec![use_v(dp), use_v(v), imm(bytes)],
+                    ));
+                }
+            }
+            Some(AbiClass::Regs(n)) => {
+                let n = *n;
+                let mut saved: Vec<VReg> = Vec::with_capacity(n);
+                for k in 0..n {
+                    let r = if k == 0 { cc.ret_reg } else { regs::gpr(regs::X1) };
+                    let v = lo.fresh_vreg(RegClass::Gpr);
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
+                    saved.push(v);
+                }
+                let t = ret_agg.unwrap();
+                let size = align_up_u64(lo.byte_size(t).max(8), 8);
+                let align = lo.types().align_of(t).max(8);
+                let slot = lo.new_slot(size, align);
+                let d = lo.result_reg(inst);
+                lo.emit(self.frame_addr(d, slot));
+                for (k, v) in saved.into_iter().enumerate() {
+                    let dp = self.add_off(lo, d, 8 * k as u64);
+                    lo.emit(MachineInst::new(
+                        A64Op::Store.opcode(),
+                        vec![use_v(dp), use_v(v), imm(8)],
+                    ));
+                }
+            }
+            None => {
+                if inst.result().is_some() {
+                    let d = lo.result_reg(inst);
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_p(ret_reg)]));
+                }
+            }
         }
+    }
+
+    /// Lower the entry prologue with AAPCS64 aggregate / indirect-result /
+    /// stack-parameter support. A register-passed struct parameter is stored into
+    /// a private home slot (so the body sees it in memory) and its vreg is that
+    /// slot's address; a by-reference parameter is already a pointer; a stack-
+    /// passed parameter is addressed at `[x29 + 16 + off]`; a by-reference return
+    /// stashes the incoming `x8` pointer into an aux slot for the return lowering.
+    fn lower_prologue_aarch64(&self, lo: &mut Lower<'_, Self>) {
+        let cc = &self.rf.cc;
+        let entry = lo.mf().entry().expect("a function being lowered has an entry block");
+        let param_vregs: Vec<VReg> = lo.mf().block(entry).params.clone();
+        let (sig_params, ret_ty) = match lo.types().get(lo.func().sig) {
+            Type::Func(ft) => (ft.params.clone(), ft.ret),
+            _ => (Vec::new(), lo.func().sig),
+        };
+        let indirect_ret = is_aggregate(lo.types(), ret_ty)
+            && matches!(classify_aggregate(lo.types(), ret_ty), AbiClass::Reference);
+
+        let mut int_i = 0usize;
+        let mut fp_i = 0usize;
+        if indirect_ret {
+            // The indirect-result pointer arrives in x8; stash it for `ret`.
+            let slot = lo.new_slot(8, 8);
+            lo.set_aux_slot(slot);
+            lo.emit(MachineInst::new(
+                A64Op::StoreFrame.opcode(),
+                vec![use_p(regs::gpr(regs::X8)), MachineOperand::Frame(slot)],
+            ));
+        }
+
+        let mut stack_in = 16u64; // first incoming stack arg, above the saved fp/lr
+        for (i, &pv) in param_vregs.iter().enumerate() {
+            let ty = sig_params[i];
+            if is_aggregate(lo.types(), ty) {
+                match classify_aggregate(lo.types(), ty) {
+                    AbiClass::Hfa { width, count } => {
+                        if fp_i + count as usize <= cc.fp_arg_regs.len() {
+                            let size = align_up_u64(lo.byte_size(ty).max(8), 8);
+                            let align = lo.types().align_of(ty).max(8);
+                            let home = lo.new_slot(size, align);
+                            lo.emit(self.frame_addr(pv, home));
+                            let bytes = u64::from(width / 8);
+                            for k in 0..count as usize {
+                                let areg = cc.fp_arg_regs[fp_i];
+                                fp_i += 1;
+                                let v = lo.fresh_vreg(RegClass::Fp);
+                                lo.emit(MachineInst::new(
+                                    A64Op::MovRR.opcode(),
+                                    vec![def_v(v), use_p(areg)],
+                                ));
+                                let dp = self.add_off(lo, pv, bytes * k as u64);
+                                lo.emit(MachineInst::new(
+                                    A64Op::Store.opcode(),
+                                    vec![use_v(dp), use_v(v), imm(bytes)],
+                                ));
+                            }
+                            continue;
+                        }
+                        stack_in = self.param_from_stack(lo, pv, ty, stack_in);
+                    }
+                    AbiClass::Regs(n) => {
+                        if int_i + n <= cc.arg_regs.len() {
+                            let size = align_up_u64(lo.byte_size(ty).max(8), 8);
+                            let align = lo.types().align_of(ty).max(8);
+                            let home = lo.new_slot(size, align);
+                            lo.emit(self.frame_addr(pv, home));
+                            for k in 0..n {
+                                let areg = cc.arg_regs[int_i];
+                                int_i += 1;
+                                let v = lo.fresh_vreg(RegClass::Gpr);
+                                lo.emit(MachineInst::new(
+                                    A64Op::MovRR.opcode(),
+                                    vec![def_v(v), use_p(areg)],
+                                ));
+                                let dp = self.add_off(lo, pv, 8 * k as u64);
+                                lo.emit(MachineInst::new(
+                                    A64Op::Store.opcode(),
+                                    vec![use_v(dp), use_v(v), imm(8)],
+                                ));
+                            }
+                            continue;
+                        }
+                        stack_in = self.param_from_stack(lo, pv, ty, stack_in);
+                    }
+                    AbiClass::Reference => {
+                        // A by-reference parameter is just an incoming pointer.
+                        if int_i < cc.arg_regs.len() {
+                            let areg = cc.arg_regs[int_i];
+                            int_i += 1;
+                            lo.emit(MachineInst::new(
+                                A64Op::MovRR.opcode(),
+                                vec![def_v(pv), use_p(areg)],
+                            ));
+                        } else {
+                            let p = self.lea_fp(lo, stack_in);
+                            lo.emit(MachineInst::new(
+                                A64Op::Load.opcode(),
+                                vec![def_v(pv), use_v(p), imm(8)],
+                            ));
+                            stack_in += 8;
+                        }
+                    }
+                }
+            } else {
+                let is_fp = lo.mf().vreg_class(pv) == RegClass::Fp;
+                let has_reg =
+                    if is_fp { fp_i < cc.fp_arg_regs.len() } else { int_i < cc.arg_regs.len() };
+                if has_reg {
+                    let areg = if is_fp {
+                        let a = cc.fp_arg_regs[fp_i];
+                        fp_i += 1;
+                        a
+                    } else {
+                        let a = cc.arg_regs[int_i];
+                        int_i += 1;
+                        a
+                    };
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(pv), use_p(areg)]));
+                } else {
+                    let sz = lo.byte_size(ty);
+                    let p = self.lea_fp(lo, stack_in);
+                    lo.emit(MachineInst::new(
+                        A64Op::Load.opcode(),
+                        vec![def_v(pv), use_v(p), imm(sz)],
+                    ));
+                    stack_in += 8;
+                }
+            }
+        }
+    }
+
+    /// A stack-passed aggregate parameter: address the caller-placed copy in place
+    /// at `[x29 + 16 + off]` and bind the parameter vreg to that address. Returns
+    /// the new running incoming-stack offset.
+    fn param_from_stack(&self, lo: &mut Lower<'_, Self>, pv: VReg, ty: TypeId, stack_in: u64) -> u64 {
+        let size = lo.byte_size(ty);
+        let align = lo.types().align_of(ty).max(8);
+        let at = align_up_u64(stack_in, align);
+        let d = self.lea_fp(lo, at);
+        lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(pv), use_v(d)]));
+        at + align_up_u64(size, 8)
     }
 }
 
@@ -675,6 +1169,10 @@ impl TargetIsel for AArch64Target {
         )
     }
 
+    fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
+        self.lower_prologue_aarch64(lo);
+    }
+
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
@@ -754,12 +1252,65 @@ impl TargetIsel for AArch64Target {
     fn lower_term(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
             InstKind::Ret => {
-                if let Some(&v) = inst.operands().first() {
+                let cc = &self.rf.cc;
+                let ret_ty = match lo.types().get(lo.func().sig) {
+                    Type::Func(ft) => ft.ret,
+                    _ => lo.func().sig,
+                };
+                if is_aggregate(lo.types(), ret_ty) {
+                    // The return operand is a pointer to the struct's storage.
+                    let src = lo.reg(inst.operands()[0]);
+                    match classify_aggregate(lo.types(), ret_ty) {
+                        AbiClass::Reference => {
+                            // Copy the struct through the indirect-result pointer
+                            // (stashed to the aux slot by the prologue).
+                            let size = lo.byte_size(ret_ty);
+                            let slot = lo
+                                .aux_slot()
+                                .expect("indirect result pointer saved by the prologue");
+                            let dst = lo.fresh_vreg(RegClass::Gpr);
+                            lo.emit(MachineInst::new(
+                                A64Op::LoadFrame.opcode(),
+                                vec![def_v(dst), MachineOperand::Frame(slot)],
+                            ));
+                            self.emit_memcpy(lo, dst, src, size);
+                        }
+                        AbiClass::Hfa { width, count } => {
+                            // Place each element in `v0..v3`. Compute all source
+                            // pointers first so the loads into the return
+                            // registers are consecutive.
+                            let bytes = u64::from(width / 8);
+                            let ptrs: Vec<VReg> = (0..count as usize)
+                                .map(|k| self.add_off(lo, src, bytes * k as u64))
+                                .collect();
+                            for (k, &p) in ptrs.iter().enumerate() {
+                                let r = regs::fp(k as u16);
+                                lo.emit(MachineInst::new(
+                                    A64Op::Load.opcode(),
+                                    vec![def(r), use_v(p), imm(bytes)],
+                                ));
+                            }
+                        }
+                        AbiClass::Regs(n) => {
+                            // Place each eightbyte in `x0`/`x1`.
+                            let ptrs: Vec<VReg> = (0..n)
+                                .map(|k| self.add_off(lo, src, 8 * k as u64))
+                                .collect();
+                            for (k, &p) in ptrs.iter().enumerate() {
+                                let r = if k == 0 { cc.ret_reg } else { regs::gpr(regs::X1) };
+                                lo.emit(MachineInst::new(
+                                    A64Op::Load.opcode(),
+                                    vec![def(r), use_v(p), imm(8)],
+                                ));
+                            }
+                        }
+                    }
+                } else if let Some(&v) = inst.operands().first() {
                     let r = lo.reg(v);
                     // A float return goes in v0, an integer/pointer return in x0.
                     let ret = match lo.mf().vreg_class(r) {
-                        RegClass::Fp => self.rf.cc.fp_ret_reg,
-                        RegClass::Gpr => self.rf.cc.ret_reg,
+                        RegClass::Fp => cc.fp_ret_reg,
+                        RegClass::Gpr => cc.ret_reg,
                     };
                     lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(ret), use_v(r)]));
                 }
