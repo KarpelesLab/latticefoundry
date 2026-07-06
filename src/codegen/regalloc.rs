@@ -237,22 +237,101 @@ pub fn build_intervals(mf: &MachineFunction, liveness: &Liveness) -> Intervals {
     Intervals { per_vreg }
 }
 
-/// The points at which each physical register is fixed (defined or used).
-fn fixed_points(mf: &MachineFunction, liveness: &Liveness) -> DetHashMap<PReg, Vec<usize>> {
-    let mut map: DetHashMap<PReg, Vec<usize>> = DetHashMap::default();
+/// The live **intervals** of each physical register that appears as a fixed
+/// (`Reg::Physical`) def/use operand.
+///
+/// This replaces the old point-based model, which recorded only the discrete
+/// points a physical register was touched and was therefore *unsound*: a
+/// register live *across a gap* — e.g. an ABI argument register written by an
+/// arg-move and read later at the `call` — was marked at its def point and its
+/// use point but not across the span between them, so a vreg whose interval sat
+/// strictly inside that span was wrongly considered free to clobber it.
+///
+/// Instead we compute standard physical-register liveness for the pre-colored
+/// operands isel emits (ABI argument/return registers, call clobbers, div's
+/// `rax`/`rdx`, shift's `rcx`, ...): a register is live from a **definition** to
+/// its **last use before the next definition** of that same register. A `call`,
+/// which both reads an argument register and redefines it as the return
+/// register, closes the incoming range and opens a fresh one at that point. A
+/// use with no preceding definition in the function — an incoming convention
+/// such as an argument register read by the entry prologue — conservatively
+/// extends the interval back to the function start (point `0`); this is a sound
+/// over-approximation and, since every such use in this codegen sits at the very
+/// start, does not over-constrain in practice.
+///
+/// Determinism (tenet T5): each physical register's events are collected in
+/// ascending program-point order (blocks in arena order, instructions in list
+/// order) and its intervals are derived independently from that event list, so
+/// the result is a pure function of the MIR regardless of map iteration order.
+fn fixed_intervals(mf: &MachineFunction, liveness: &Liveness) -> DetHashMap<PReg, Vec<Interval>> {
+    // Per physical register, the touched points in ascending order, each tagged
+    // with whether that point defines and/or uses the register. Instructions are
+    // walked in point order, so each register's list is already sorted.
+    let mut events: DetHashMap<PReg, Vec<(usize, bool, bool)>> = DetHashMap::default();
     for b in 0..mf.num_blocks() {
         let bid = block_id(b);
         let base = liveness.block_start(b);
         for (j, inst) in mf.block(bid).insts.iter().enumerate() {
             let p = base + j;
-            for r in inst.defs().chain(inst.uses()) {
+            // Aggregate this instruction's physical def/use flags per register so
+            // a register touched by several operands (e.g. a `call` that both
+            // reads and redefines a register) yields a single event at this point.
+            let mut local: Vec<(PReg, bool, bool)> = Vec::new();
+            for (r, is_def) in inst.defs().map(|r| (r, true)).chain(inst.uses().map(|r| (r, false))) {
                 if let Reg::Physical(pr) = r {
-                    map.entry(pr).or_default().push(p);
+                    match local.iter_mut().find(|e| e.0 == pr) {
+                        Some(e) => {
+                            e.1 |= is_def;
+                            e.2 |= !is_def;
+                        }
+                        None => local.push((pr, is_def, !is_def)),
+                    }
                 }
+            }
+            for (pr, is_def, is_use) in local {
+                events.entry(pr).or_default().push((p, is_def, is_use));
             }
         }
     }
-    map
+
+    let mut out: DetHashMap<PReg, Vec<Interval>> = DetHashMap::default();
+    for (&pr, evs) in &events {
+        let mut ivs: Vec<Interval> = Vec::new();
+        // The start of the currently-open live range (`None` if none is open),
+        // and the last point that range was extended to.
+        let mut open_start: Option<usize> = None;
+        let mut last = 0usize;
+        for &(p, is_def, is_use) in evs {
+            if is_use {
+                // A use consumes the current value; if none is open it comes from
+                // before this region, so extend the range back to the start.
+                let start = open_start.unwrap_or(0);
+                if is_def {
+                    // The same point reads the old value and writes a new one
+                    // (a `call` using an argument register it also redefines):
+                    // close the incoming range and open a fresh one here.
+                    ivs.push(Interval { start, end: p });
+                    open_start = Some(p);
+                } else {
+                    open_start = Some(start);
+                }
+                last = p;
+            } else {
+                // A pure definition ends any open range at its last use and starts
+                // a new range at this point.
+                if let Some(s) = open_start {
+                    ivs.push(Interval { start: s, end: last });
+                }
+                open_start = Some(p);
+                last = p;
+            }
+        }
+        if let Some(s) = open_start {
+            ivs.push(Interval { start: s, end: last });
+        }
+        out.insert(pr, ivs);
+    }
+    out
 }
 
 fn block_id(index: usize) -> crate::codegen::mir::MBlockId {
@@ -265,7 +344,7 @@ fn block_id(index: usize) -> crate::codegen::mir::MBlockId {
 pub fn allocate(mf: &mut MachineFunction, target: &dyn MachineTarget) -> Allocation {
     let liveness = compute_liveness(mf);
     let intervals = build_intervals(mf, &liveness);
-    let fixed = fixed_points(mf, &liveness);
+    let fixed = fixed_intervals(mf, &liveness);
 
     // Precompute per-vreg class so the scan does not borrow `mf` immutably while
     // it mutates the frame for spill slots.
@@ -282,8 +361,12 @@ pub fn allocate(mf: &mut MachineFunction, target: &dyn MachineTarget) -> Allocat
     let mut active: Vec<(usize, VReg, PReg)> = Vec::new();
     let mut spills = 0usize;
 
+    // A vreg may take `pr` only if its interval `[s, e]` overlaps none of `pr`'s
+    // live intervals (range-based, not point membership: this is what catches a
+    // physical register live across a gap between its def and a distant use).
     let fixed_conflict = |pr: PReg, s: usize, e: usize| -> bool {
-        fixed.get(&pr).is_some_and(|pts| pts.iter().any(|&p| p >= s && p <= e))
+        let q = Interval { start: s, end: e };
+        fixed.get(&pr).is_some_and(|ivs| ivs.iter().any(|iv| iv.overlaps(q)))
     };
 
     for &(start, end, v) in &order {
@@ -395,5 +478,118 @@ fn rewrite(
             new_insts.append(&mut post);
         }
         mf.block_mut(bid).insts = new_insts;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, RegClass};
+    use crate::codegen::vtarget::{VOp, VirtualTarget};
+
+    use puremp::Int;
+
+    fn gpr(n: u16) -> PReg {
+        PReg::new(RegClass::Gpr, n)
+    }
+
+    fn def_phys(pr: PReg) -> MachineOperand {
+        MachineOperand::Def(Reg::Physical(pr))
+    }
+
+    fn use_phys(pr: PReg) -> MachineOperand {
+        MachineOperand::Use(Reg::Physical(pr))
+    }
+
+    fn def_v(v: VReg) -> MachineOperand {
+        MachineOperand::Def(Reg::Virtual(v))
+    }
+
+    fn use_v(v: VReg) -> MachineOperand {
+        MachineOperand::Use(Reg::Virtual(v))
+    }
+
+    fn imm(n: i64) -> MachineOperand {
+        MachineOperand::Imm(Int::from_i64(n))
+    }
+
+    fn inst(op: VOp, ops: Vec<MachineOperand>) -> MachineInst {
+        MachineInst::new(op.opcode(), ops)
+    }
+
+    /// Build the "live-across-a-gap" shape: a physical register `r0` is defined
+    /// early (point 0) and used late (point 3), while an independent vreg `mid`
+    /// is defined and used strictly inside that span (points 1..2). A later vreg
+    /// `late` (point 4) lies entirely after `r0`'s last use.
+    ///
+    /// Returns the function plus the vregs `(mid, mid2, out, late)`.
+    fn build_gap() -> (MachineFunction, VReg, VReg, VReg, VReg) {
+        let mut mf = MachineFunction::new("gap", 0);
+        let mid = mf.new_vreg(RegClass::Gpr);
+        let mid2 = mf.new_vreg(RegClass::Gpr);
+        let out = mf.new_vreg(RegClass::Gpr);
+        let late = mf.new_vreg(RegClass::Gpr);
+        let r0 = gpr(0);
+
+        let b = mf.add_block();
+        mf.set_entry(b);
+        let block = mf.block_mut(b);
+        // p0: r0 <- 1                        (physical def, opens r0's range)
+        block.insts.push(inst(VOp::Li, vec![def_phys(r0), imm(1)]));
+        // p1: mid <- 2                       (independent vreg def, inside the gap)
+        block.insts.push(inst(VOp::Li, vec![def_v(mid), imm(2)]));
+        // p2: mid2 = mid + mid               (uses mid, still inside the gap)
+        block.insts.push(inst(VOp::Add, vec![def_v(mid2), use_v(mid), use_v(mid), imm(64)]));
+        // p3: out <- r0                      (physical use, closes r0's range at 3)
+        block.insts.push(inst(VOp::Move, vec![def_v(out), use_phys(r0)]));
+        // p4: late <- 3                      (entirely after r0's last use)
+        block.insts.push(inst(VOp::Li, vec![def_v(late), imm(3)]));
+        // p5: ret out
+        block.insts.push(inst(VOp::Ret, vec![use_v(out)]));
+
+        (mf, mid, mid2, out, late)
+    }
+
+    #[test]
+    fn physical_register_live_range_spans_the_gap() {
+        let (mf, ..) = build_gap();
+        let liveness = compute_liveness(&mf);
+        let fixed = fixed_intervals(&mf, &liveness);
+        // r0 is one contiguous live interval from its def (0) to its last use (3),
+        // covering the gap — not just the two discrete endpoints.
+        assert_eq!(fixed.get(&gpr(0)).map(Vec::as_slice), Some(&[Interval { start: 0, end: 3 }][..]));
+    }
+
+    #[test]
+    fn vreg_in_the_gap_avoids_the_fixed_register() {
+        let (mut mf, mid, mid2, out, late) = build_gap();
+        let target = VirtualTarget::new();
+        let alloc = allocate(&mut mf, &target);
+        let r0 = gpr(0);
+
+        // The independent vregs whose intervals sit inside r0's live range must
+        // NOT be colored r0 — the old point-based model missed exactly this.
+        assert_ne!(alloc.color(mid), Some(r0), "mid overlaps r0's live range");
+        assert_ne!(alloc.color(mid2), Some(r0), "mid2 overlaps r0's live range");
+        // `out` is defined at the very point r0 is last used, so it overlaps too.
+        assert_ne!(alloc.color(out), Some(r0), "out overlaps r0's live range at its last use");
+        // `late` lies entirely after r0's last use, so r0 is free to be reused.
+        assert_eq!(alloc.color(late), Some(r0), "late must reuse r0 after its last use");
+
+        // Sanity: the gap vregs really do overlap the fixed range, confirming the
+        // avoidance above was meaningful and not vacuous.
+        let iv = alloc.intervals.get(mid).unwrap();
+        assert!(iv.overlaps(Interval { start: 0, end: 3 }));
+    }
+
+    #[test]
+    fn allocation_is_deterministic() {
+        let target = VirtualTarget::new();
+        let colors = || {
+            let (mut mf, mid, mid2, out, late) = build_gap();
+            let a = allocate(&mut mf, &target);
+            [a.color(mid), a.color(mid2), a.color(out), a.color(late)]
+        };
+        assert_eq!(colors(), colors(), "identical MIR yields an identical allocation");
     }
 }
