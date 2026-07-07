@@ -154,6 +154,20 @@ struct Macro {
     body: Vec<PpTok>,
 }
 
+/// The recognized parameters of a C23 `#embed` directive.
+#[derive(Default, Debug)]
+struct EmbedParams {
+    /// `limit(N)`: embed at most `N` bytes (`limit(0)` yields an empty resource).
+    limit: Option<i128>,
+    /// `prefix(tokens…)`: emitted before the bytes of a non-empty embed.
+    prefix: Option<Vec<PpTok>>,
+    /// `suffix(tokens…)`: emitted after the bytes of a non-empty embed.
+    suffix: Option<Vec<PpTok>>,
+    /// `if_empty(tokens…)`: emitted instead when the resource is empty (or
+    /// `limit(0)`), in place of the bytes and any prefix/suffix.
+    if_empty: Option<Vec<PpTok>>,
+}
+
 /// One frame of the conditional-inclusion stack.
 #[derive(Clone, Copy, Debug)]
 struct Cond {
@@ -631,6 +645,7 @@ impl Pp {
                 }
             }
             "include" => self.do_include(file_idx, dir, &line[2..], dspan),
+            "embed" => self.do_embed(dir, &line[2..], &line[0]),
             "error" => {
                 let msg = spell_line(&line[2..]);
                 self.error(format!("#error {msg}"), dspan);
@@ -773,6 +788,186 @@ impl Pp {
         self.depth -= 1;
         self.line_delta = saved_delta;
         self.file_override = saved_override;
+    }
+
+    /// Execute a C23 `#embed` directive: locate the resource (the same search as
+    /// `#include` — the including file's directory then `-I` for `"…"`, `-I` only
+    /// for `<…>`), read its raw bytes, and splice a comma-separated list of the
+    /// byte values (each `0..=255`) into the token stream. The optional parameters
+    /// `limit(N)`, `prefix(…)`, `suffix(…)`, and `if_empty(…)` are honored per the
+    /// standard (see [`EmbedParams`]).
+    fn do_embed(&mut self, dir: &Path, args: &[PpTok], site: &PpTok) {
+        let dspan = site.span;
+        if !self.std.is_c23() {
+            self.error("`#embed` is a C23 feature (use -std=c23 or later)", dspan);
+            return;
+        }
+        // A literal header name (`"…"` / `<…>`) is used verbatim, exactly like
+        // `#include`; anything else has the whole line macro-expanded first so a
+        // macro can produce the resource name or the parameters.
+        let work: Vec<PpTok> = match args.first().map(|t| &t.kind) {
+            Some(PpKind::Str(_) | PpKind::Punct(Punct::Lt)) => args.to_vec(),
+            _ => self.expand(args.to_vec()),
+        };
+        let Some((name, angled, rest)) = self.parse_embed_header(&work, dspan) else {
+            return;
+        };
+        let Some(params) = self.parse_embed_params(rest, dspan) else {
+            return;
+        };
+        let Some(path) = self.resolve_include(&name, angled, dir) else {
+            self.error(format!("cannot find embed resource {name:?}"), dspan);
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.error(format!("cannot read embed resource {path:?}: {e}"), dspan);
+                return;
+            }
+        };
+
+        // Apply `limit(N)` (a negative bound clamps to zero, an oversized one to
+        // the file length), then decide the empty vs non-empty expansion.
+        let limited: &[u8] = match params.limit {
+            Some(l) => {
+                let n = l.clamp(0, bytes.len() as i128) as usize;
+                &bytes[..n]
+            }
+            None => &bytes,
+        };
+
+        let mut result: Vec<PpTok> = Vec::new();
+        if limited.is_empty() {
+            if let Some(toks) = params.if_empty {
+                result.extend(toks);
+            }
+        } else {
+            if let Some(toks) = params.prefix {
+                result.extend(toks);
+            }
+            for (k, &b) in limited.iter().enumerate() {
+                if k != 0 {
+                    result.push(self.embed_tok(PpKind::Punct(Punct::Comma), site));
+                }
+                result.push(self.embed_tok(PpKind::Number(b.to_string()), site));
+            }
+            if let Some(toks) = params.suffix {
+                result.extend(toks);
+            }
+        }
+        // Rescan the spliced tokens like any other run so a `prefix`/`suffix`/
+        // `if_empty` macro is expanded (the byte numbers pass through untouched).
+        let expanded = self.expand(result);
+        self.out.extend(expanded);
+    }
+
+    /// A synthetic `#embed`-produced token, attributed to the directive site.
+    fn embed_tok(&self, kind: PpKind, site: &PpTok) -> PpTok {
+        PpTok {
+            kind,
+            line: site.line,
+            file: site.file,
+            bol: false,
+            space_before: true,
+            span: site.span,
+            hideset: BTreeSet::new(),
+        }
+    }
+
+    /// Split an `#embed` argument line into its header name and the remaining
+    /// parameter tokens. Returns `(name, angled, rest)`, or `None` after reporting
+    /// a diagnostic.
+    fn parse_embed_header<'a>(
+        &mut self,
+        args: &'a [PpTok],
+        dspan: Span,
+    ) -> Option<(String, bool, &'a [PpTok])> {
+        match args.first().map(|t| &t.kind) {
+            Some(PpKind::Str(raw)) => Some((decode_string(raw), false, &args[1..])),
+            Some(PpKind::Punct(Punct::Lt)) => {
+                let mut i = 1usize;
+                while i < args.len() && !matches!(args[i].kind, PpKind::Punct(Punct::Gt)) {
+                    i += 1;
+                }
+                if i >= args.len() {
+                    self.error("missing '>' in `#embed <...>`", dspan);
+                    return None;
+                }
+                Some((join_angle(&args[1..i]), true, &args[i + 1..]))
+            }
+            _ => {
+                self.error("`#embed` expects \"file\" or <file>", dspan);
+                None
+            }
+        }
+    }
+
+    /// Parse the `#embed` parameter sequence (`name` or `name(tokens…)`). Returns
+    /// the recognized parameters, or `None` after reporting a diagnostic.
+    fn parse_embed_params(&mut self, rest: &[PpTok], dspan: Span) -> Option<EmbedParams> {
+        let mut p = EmbedParams::default();
+        let mut i = 0usize;
+        while i < rest.len() {
+            let PpKind::Ident(name) = &rest[i].kind else {
+                self.error("expected an `#embed` parameter name", rest[i].span);
+                return None;
+            };
+            let name = name.clone();
+            let nspan = rest[i].span;
+            i += 1;
+            // An optional balanced parenthesized argument list.
+            let mut inner: Option<Vec<PpTok>> = None;
+            if matches!(rest.get(i).map(|t| &t.kind), Some(PpKind::Punct(Punct::LParen))) {
+                i += 1;
+                let start = i;
+                let mut depth = 1usize;
+                while i < rest.len() {
+                    match &rest[i].kind {
+                        PpKind::Punct(Punct::LParen) => depth += 1,
+                        PpKind::Punct(Punct::RParen) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if depth != 0 {
+                    self.error(format!("unterminated `{name}(...)` `#embed` parameter"), nspan);
+                    return None;
+                }
+                inner = Some(rest[start..i].to_vec());
+                i += 1; // consume ')'
+            }
+            match name.as_str() {
+                "limit" => {
+                    let toks = inner.unwrap_or_default();
+                    if toks.is_empty() {
+                        self.error("`#embed` `limit` requires a value", nspan);
+                        return None;
+                    }
+                    let expanded = self.expand(toks);
+                    match self.eval_const_expr(&expanded, dspan) {
+                        Ok(v) => p.limit = Some(v),
+                        Err(d) => {
+                            self.diags.push(d);
+                            return None;
+                        }
+                    }
+                }
+                "prefix" => p.prefix = Some(inner.unwrap_or_default()),
+                "suffix" => p.suffix = Some(inner.unwrap_or_default()),
+                "if_empty" => p.if_empty = Some(inner.unwrap_or_default()),
+                other => {
+                    self.error(format!("unsupported `#embed` parameter `{other}`"), nspan);
+                    return None;
+                }
+            }
+        }
+        Some(p)
     }
 
     /// Interpret the tokens after `#include` as a header name; macro-expand if it
