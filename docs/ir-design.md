@@ -130,6 +130,27 @@ cannot recover in the builder.
 and the accessed-type on `load`/`store` are the hooks that keep that door open
 without committing to it now.
 
+**Aggregate values are addresses (the struct-by-value convention).** A value of
+**aggregate type** (`Struct`/`Array`) *denotes the address of its storage* — its
+runtime representation is a pointer to that storage. This is the convention the
+backends already emit and gcc links against (see `build_struct_int` in the
+x86-64 backend tests): a struct passed/returned by value is an SSA value of
+struct type whose machine value is a pointer to the struct's bytes. Consequently
+aggregate types and `ptr` are **interchangeable**:
+
+- as the *base* of address arithmetic (`ptr_add`, and its `struct_field` /
+  `array_elem` helpers) and as the *address* operand of `load` / `store` — an
+  aggregate value is used directly as the base/address, and
+- across the *call / return* boundary — a `ptr` may be passed where an aggregate
+  parameter is declared, an aggregate value where a `ptr` parameter is declared,
+  and likewise for a returned value versus the function's return type.
+
+**Scalars stay strictly typed**; only the pointer ↔ aggregate pairing is
+relaxed. The verifier (`src/verify/structural.rs`) enforces exactly this: its
+`addr_compatible` predicate (equal, both `ptr`, or one `ptr` and the other an
+aggregate) gates the `call`/`ret` boundary, and the `ptr_add`/`load`/`store`
+base-and-address checks additionally accept an aggregate-typed operand.
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than

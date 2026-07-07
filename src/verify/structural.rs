@@ -28,6 +28,26 @@
 //! by `z3rs`) is layered on top later and is deliberately *not* implemented
 //! here; this module leaves the module untouched and only reads it, so that seam
 //! stays clean.
+//!
+//! ## Aggregate values are addresses (the struct-by-value convention)
+//!
+//! A value of **aggregate type** (`Struct`/`Array`) *denotes the address of its
+//! storage* — its runtime representation is a pointer to that storage. This is
+//! the convention the backends already emit and gcc links against (see
+//! `build_struct_int` in `src/target/x86_64/tests.rs`): a struct value is an SSA
+//! value of struct type whose machine value is a pointer. Concretely, aggregate
+//! types and `ptr` are **interchangeable**
+//!
+//! - as the *base* of address arithmetic (`ptr_add` / `struct_field` /
+//!   `array_elem`) and as the *address* operand of `load` / `store`, and
+//! - across the *call / return* boundary (a `ptr` may be passed where an
+//!   aggregate parameter is declared, an aggregate value where a `ptr` parameter
+//!   is declared, and likewise for `ret` vs. the return type).
+//!
+//! **Scalars stay strictly typed** — only the pointer ↔ aggregate pairing is
+//! newly compatible. The single predicate that encodes this is
+//! [`addr_compatible`]; the base / address sites use [`is_aggregate`] alongside
+//! [`is_ptr`].
 
 use crate::ir::inst::{BinOp, CastOp, InstData, InstId, InstKind, UnaryOp};
 use crate::ir::types::{FloatKind, Type, TypeId};
@@ -292,9 +312,9 @@ impl<'a> Ctx<'a> {
                     return;
                 }
                 let p = func.value_type(ops[0]);
-                if !is_ptr(module, p) {
+                if !is_ptr(module, p) && !is_aggregate(module, p) {
                     self.err(format!(
-                        "instruction #{}: load address operand must be a pointer, found {}",
+                        "instruction #{}: load address operand must be a pointer or an aggregate value, found {}",
                         inst.index(),
                         render_type(module, p),
                     ));
@@ -309,9 +329,9 @@ impl<'a> Ctx<'a> {
                     return;
                 }
                 let p = func.value_type(ops[0]);
-                if !is_ptr(module, p) {
+                if !is_ptr(module, p) && !is_aggregate(module, p) {
                     self.err(format!(
-                        "instruction #{}: store address operand must be a pointer, found {}",
+                        "instruction #{}: store address operand must be a pointer or an aggregate value, found {}",
                         inst.index(),
                         render_type(module, p),
                     ));
@@ -325,10 +345,15 @@ impl<'a> Ctx<'a> {
                 if !self.arity(inst, ops, 2) {
                     return;
                 }
-                if !is_ptr(module, func.value_type(ops[0])) {
+                // The base is an address: a pointer, or an aggregate value
+                // (which denotes the address of its storage — see the module
+                // docs on the struct-by-value convention).
+                let base = func.value_type(ops[0]);
+                if !is_ptr(module, base) && !is_aggregate(module, base) {
                     self.err(format!(
-                        "instruction #{}: ptr_add base must be a pointer",
-                        inst.index()
+                        "instruction #{}: ptr_add base must be a pointer or an aggregate value, found {}",
+                        inst.index(),
+                        render_type(module, base),
                     ));
                 }
                 let off = func.value_type(ops[1]);
@@ -461,7 +486,10 @@ impl<'a> Ctx<'a> {
                 }
                 for (i, (&a, &p)) in args.iter().zip(ft.params.iter()).enumerate() {
                     let at = func.value_type(a);
-                    if at != p {
+                    // A `ptr` and an aggregate type are interchangeable across
+                    // the ABI (the struct-by-value convention); scalars stay
+                    // strict.
+                    if !addr_compatible(module, at, p) {
                         let (x, y) = (render_type(module, at), render_type(module, p));
                         self.err(format!(
                             "instruction #{}: call argument #{i} has type {x} but callee expects {y}",
@@ -532,7 +560,9 @@ impl<'a> Ctx<'a> {
             ));
         } else {
             let rt = func.value_type(ops[0]);
-            if rt != ret {
+            // A `ptr` value satisfies an aggregate return type (and vice versa)
+            // under the struct-by-value convention; scalars stay strict.
+            if !addr_compatible(self.module, rt, ret) {
                 self.type_mismatch(inst, "returned value vs. return type", rt, ret);
             }
         }
@@ -962,6 +992,24 @@ fn is_ptr(m: &Module, t: TypeId) -> bool {
     matches!(m.types().get(t), Type::Ptr)
 }
 
+/// An aggregate type (`Struct`/`Array`). A value of such a type denotes the
+/// address of its storage, so it is usable as a pointer (see the module docs).
+fn is_aggregate(m: &Module, t: TypeId) -> bool {
+    matches!(m.types().get(t), Type::Struct(_) | Type::Array(..))
+}
+
+/// Whether types `a` and `b` are **address-compatible** under the struct-by-value
+/// convention: they are equal, both pointers, or one is `ptr` and the other an
+/// aggregate (whose value *is* an address). This is the *only* relaxation over
+/// exact type equality — scalars (`Int`/`Float`) remain strictly typed. Used at
+/// the ABI boundaries (`call` arguments and `ret`).
+fn addr_compatible(m: &Module, a: TypeId, b: TypeId) -> bool {
+    a == b
+        || (is_ptr(m, a) && is_ptr(m, b))
+        || (is_ptr(m, a) && is_aggregate(m, b))
+        || (is_aggregate(m, a) && is_ptr(m, b))
+}
+
 fn int_width(m: &Module, t: TypeId) -> Option<u32> {
     match m.types().get(t) {
         Type::Int(w) => Some(*w),
@@ -1024,5 +1072,151 @@ fn cast_name(op: CastOp) -> &'static str {
         CastOp::PtrToInt => "ptrtoint",
         CastOp::IntToPtr => "inttoptr",
         CastOp::Bitcast => "bitcast",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the struct-by-value (aggregate-value-as-address) convention.
+//
+// These prove the four relaxed sites accept the backend's gcc-ABI form (an
+// aggregate value used as an address / across the call & return boundary), while
+// a genuine scalar mismatch is still rejected — i.e. only pointer ↔ aggregate is
+// newly compatible.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod struct_by_value_tests {
+    use crate::ir::inst::Flags;
+    use crate::verify::verify_module;
+    use crate::ir::{FuncId, Module};
+    use crate::support::StrInterner;
+
+    /// `struct P { i32 x, y; } addP(struct P, struct P)` returning
+    /// `{a.x+b.x, a.y+b.y}`, exactly the shape of `build_struct_int` in the
+    /// x86-64 backend tests: reads each field via `struct_field` (whose base is
+    /// the struct-typed *parameter value*) + `load`, `alloca`s a result, stores
+    /// into it, and `ret`s the `alloca` pointer where the return type is the
+    /// struct. Exercises: `ptr_add`/`struct_field` base = aggregate, `load`
+    /// address = aggregate, `store` address = ptr, and `ret` ptr vs. aggregate.
+    fn build_addp() -> (Module, StrInterner, FuncId) {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let i32t = m.types_mut().int(32);
+        let p = m.types_mut().struct_(vec![i32t, i32t]);
+        let sig = m.types_mut().func(vec![p, p], p, false);
+        let f = m.declare_function(syms.intern("addP"), sig);
+        {
+            let mut b = m.build(f);
+            let entry = b.create_entry_block();
+            let a = b.param(entry, 0);
+            let bb = b.param(entry, 1);
+            let ax_p = b.struct_field(a, p, 0);
+            let ax = b.load(i32t, ax_p, 4);
+            let ay_p = b.struct_field(a, p, 1);
+            let ay = b.load(i32t, ay_p, 4);
+            let bx_p = b.struct_field(bb, p, 0);
+            let bx = b.load(i32t, bx_p, 4);
+            let by_p = b.struct_field(bb, p, 1);
+            let by = b.load(i32t, by_p, 4);
+            let sx = b.add(ax, bx, Flags::NONE);
+            let sy = b.add(ay, by, Flags::NONE);
+            let r = b.alloca(p);
+            let rx = b.struct_field(r, p, 0);
+            b.store(i32t, rx, sx, 4);
+            let ry = b.struct_field(r, p, 1);
+            b.store(i32t, ry, sy, 4);
+            b.ret(Some(r)); // ptr value, aggregate return type
+        }
+        (m, syms, f)
+    }
+
+    #[test]
+    fn struct_by_value_addp_verifies() {
+        let (m, _syms, _f) = build_addp();
+        assert!(
+            verify_module(&m).is_ok(),
+            "the gcc-ABI struct-by-value form must verify: {:?}",
+            verify_module(&m).err()
+        );
+    }
+
+    #[test]
+    fn ptr_passed_where_struct_param_expected_verifies() {
+        // A caller that `alloca`s two `P`s (pointers) and calls `addP` passing
+        // those pointers where the parameters are declared as the struct type —
+        // the call-argument ptr ↔ aggregate relaxation — then returns the struct
+        // result. Verifies clean.
+        let (mut m, mut syms, addp) = build_addp();
+        let i32t = m.types_mut().int(32);
+        let p = m.types_mut().struct_(vec![i32t, i32t]);
+        let sig = m.types_mut().func(vec![], p, false);
+        let caller = m.declare_function(syms.intern("call_addP"), sig);
+        {
+            let mut b = m.build(caller);
+            b.create_entry_block();
+            let a = b.alloca(p); // ptr
+            let bb = b.alloca(p); // ptr
+            let cref = b.func_ref(addp);
+            let r = b.call(cref, &[a, bb], p).expect("addP returns a value");
+            b.ret(Some(r));
+        }
+        assert!(verify_module(&m).is_ok(), "ptr-as-struct-arg must verify: {:?}", verify_module(&m).err());
+    }
+
+    #[test]
+    fn scalar_return_mismatch_still_rejected() {
+        // Returning an `i32` where the return type is `i64` is a real scalar
+        // mismatch — the relaxation must NOT cover it.
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let i32t = m.types_mut().int(32);
+        let i64t = m.types_mut().int(64);
+        let sig = m.types_mut().func(vec![], i64t, false);
+        let f = m.declare_function(syms.intern("bad_ret"), sig);
+        {
+            let mut b = m.build(f);
+            b.create_entry_block();
+            let c = b.const_i64(i32t, 7); // i32 constant
+            b.ret(Some(c));
+        }
+        let diags = verify_module(&m).expect_err("i32 vs i64 return must be rejected");
+        assert!(
+            diags.iter().any(|d| d.message.contains("returned value vs. return type")),
+            "expected a return-type mismatch, got: {:?}",
+            diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scalar_call_arg_mismatch_still_rejected() {
+        // Passing an `i32` where the callee expects an `i64` is a real scalar
+        // mismatch — still rejected.
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let i32t = m.types_mut().int(32);
+        let i64t = m.types_mut().int(64);
+        let callee_sig = m.types_mut().func(vec![i64t], i64t, false);
+        let callee = m.declare_function(syms.intern("callee"), callee_sig);
+        {
+            let mut b = m.build(callee);
+            let entry = b.create_entry_block();
+            let y = b.param(entry, 0);
+            b.ret(Some(y));
+        }
+        let caller_sig = m.types_mut().func(vec![], i64t, false);
+        let caller = m.declare_function(syms.intern("caller"), caller_sig);
+        {
+            let mut b = m.build(caller);
+            b.create_entry_block();
+            let bad = b.const_i64(i32t, 1); // i32 arg
+            let cref = b.func_ref(callee);
+            let r = b.call(cref, &[bad], i64t).expect("callee returns a value");
+            b.ret(Some(r));
+        }
+        let diags = verify_module(&m).expect_err("i32 arg vs i64 param must be rejected");
+        assert!(
+            diags.iter().any(|d| d.message.contains("call argument #0")),
+            "expected a call-argument type mismatch, got: {:?}",
+            diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
     }
 }
