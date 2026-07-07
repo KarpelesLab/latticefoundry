@@ -51,14 +51,54 @@ pub struct FuncType {
     pub variadic: bool,
 }
 
-/// The (width, signedness) of a C integer type. Width is in bits: 8 (`char`),
-/// 16 (`short`), 32 (`int`), 64 (`long`/`long long`).
+/// The (storage width, signedness) of a C integer type. Width is the *storage*
+/// width in bits: 8 (`char`), 16 (`short`), 32 (`int`), 64 (`long`/`long long`).
+///
+/// A C23 `_BitInt(N)` (bit-precise integer) is modelled here as an integer with
+/// exactly `N` value bits stored in the smallest standard width that holds it:
+/// `bitint == Some(N)`, and `width` is that storage width (8/16/32/64). For an
+/// ordinary integer type `bitint == None` and the value occupies the whole
+/// `width`. Two `_BitInt`s that differ only in `N` are distinct types (the
+/// `bitint` field participates in equality), and a `_BitInt(N)` is distinct from
+/// a standard type of the same storage width.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct IntTy {
-    /// Width in bits.
+    /// Storage width in bits (8/16/32/64).
     pub width: u16,
     /// Whether the type is signed.
     pub signed: bool,
+    /// For a `_BitInt(N)`, the number of value bits `N` (`N <= width`); `None`
+    /// for an ordinary integer type.
+    pub bitint: Option<u16>,
+}
+
+impl IntTy {
+    /// An ordinary integer type of `width` bits and the given signedness.
+    pub fn new(width: u16, signed: bool) -> IntTy {
+        IntTy { width, signed, bitint: None }
+    }
+
+    /// A `_BitInt(n)` of `n` value bits and the given signedness, stored in the
+    /// smallest standard width that holds it.
+    pub fn bit_int(n: u16, signed: bool) -> IntTy {
+        IntTy { width: bitint_storage_width(n), signed, bitint: Some(n) }
+    }
+
+    /// The number of *value* bits: `N` for a `_BitInt(N)`, else the storage width.
+    pub fn value_bits(self) -> u16 {
+        self.bitint.unwrap_or(self.width)
+    }
+}
+
+/// The smallest standard integer storage width (in bits) that holds an
+/// `N`-value-bit `_BitInt`: 8, 16, 32, or 64.
+pub fn bitint_storage_width(n: u16) -> u16 {
+    match n {
+        0..=8 => 8,
+        9..=16 => 16,
+        17..=32 => 32,
+        _ => 64,
+    }
 }
 
 /// The precision of a floating-point type: `float` (IEEE binary32) or `double`
@@ -153,17 +193,17 @@ impl Records {
 impl CType {
     /// The signed `int` type (`i32`).
     pub fn int() -> CType {
-        CType::Int(IntTy { width: 32, signed: true })
+        CType::Int(IntTy::new(32, true))
     }
 
     /// The `unsigned int` type.
     pub fn uint() -> CType {
-        CType::Int(IntTy { width: 32, signed: false })
+        CType::Int(IntTy::new(32, false))
     }
 
     /// The `long` type (`i64`, signed).
     pub fn long() -> CType {
-        CType::Int(IntTy { width: 64, signed: true })
+        CType::Int(IntTy::new(64, true))
     }
 
     /// The `float` type (IEEE binary32).
@@ -294,6 +334,13 @@ impl fmt::Display for CType {
             CType::Void => write!(f, "void"),
             CType::Bool => write!(f, "_Bool"),
             CType::Int(i) => {
+                if let Some(n) = i.bitint {
+                    return if i.signed {
+                        write!(f, "_BitInt({n})")
+                    } else {
+                        write!(f, "unsigned _BitInt({n})")
+                    };
+                }
                 let base = match (i.width, i.signed) {
                     (8, true) => "signed char",
                     (8, false) => "unsigned char",
@@ -626,4 +673,9 @@ pub struct TranslationUnit {
     pub records: Records,
     /// Enumerator constants (`name`, value), in declaration order.
     pub enum_consts: Vec<(String, i128)>,
+    /// C23 `constexpr` objects, modelled as named compile-time integer constants
+    /// (`name`, value already reduced to its type, declared type), in declaration
+    /// order. They are usable in constant-expression contexts and, being pure
+    /// constants, are not modifiable lvalues.
+    pub constexprs: Vec<(String, i128, CType)>,
 }

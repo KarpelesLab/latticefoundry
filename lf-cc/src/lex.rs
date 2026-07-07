@@ -651,7 +651,7 @@ pub(crate) fn integer_literal_type(
         true
     };
 
-    CType::Int(IntTy { width, signed })
+    CType::Int(IntTy::new(width, signed))
 }
 
 /// Whether a preprocessing-number spelling denotes a floating (as opposed to an

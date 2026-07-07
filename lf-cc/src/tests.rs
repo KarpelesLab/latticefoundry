@@ -602,7 +602,7 @@ fn typeof_declares_a_variable_of_the_operand_type() {
     // `typeof(x)` (x a `long`) declares `y` as `long`.
     let prog = check_source("int f(){ long x=5; typeof(x) y=10; return (int)(x+y); }").unwrap();
     assert!(prog.funcs[0].locals.iter().any(|l| l.name == "y"
-        && matches!(l.ty, CType::Int(IntTy { width: 64, signed: true }))));
+        && matches!(l.ty, CType::Int(IntTy { width: 64, signed: true, .. }))));
     // `sizeof(typeof(expr))` is the operand type's size.
     let prog = check_source("int f(){ double d=0; return sizeof(typeof(d)); }").unwrap();
     assert!(matches!(return_kind(&prog), TExprKind::Const(8)));

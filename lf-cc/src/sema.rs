@@ -36,7 +36,7 @@ pub struct Program {
 
 /// The plain `char` type on this target (signed 8-bit), used for string data.
 pub fn char_ty() -> CType {
-    CType::Int(IntTy { width: 8, signed: true })
+    CType::Int(IntTy::new(8, true))
 }
 
 /// The result of checking a variable's initializer: a single scalar value, or a
@@ -320,12 +320,41 @@ impl TExpr {
 }
 
 /// The integer promotion: `_Bool`/`char`/`short` become `int`; other types are
-/// unchanged.
+/// unchanged. A `_BitInt(N)` is *not* an integer-promotion candidate (C23): it
+/// keeps its own type even when narrower than `int`.
 fn promote(ty: &CType) -> CType {
     match ty {
         CType::Bool => CType::int(),
-        CType::Int(i) if i.width < 32 => CType::int(),
+        CType::Int(i) if i.bitint.is_none() && i.width < 32 => CType::int(),
         other => other.clone(),
+    }
+}
+
+/// The number of value bits of an integer type: `N` for a `_BitInt(N)`, else the
+/// storage width (`_Bool` counts as one bit).
+fn value_bits(ty: &CType) -> u16 {
+    match ty {
+        CType::Bool => 1,
+        CType::Int(i) => i.value_bits(),
+        _ => 32,
+    }
+}
+
+/// The integer conversion rank used by the usual arithmetic conversions, as a
+/// value where a greater number is a greater rank. Rank is dominated by the
+/// number of value bits; at equal value bits a standard integer type outranks a
+/// bit-precise (`_BitInt`) type (C23 6.3.1.1).
+fn int_rank(ty: &CType) -> u32 {
+    let standard = !matches!(ty, CType::Int(i) if i.bitint.is_some());
+    (u32::from(value_bits(ty)) << 1) | u32::from(standard)
+}
+
+/// The unsigned integer type corresponding to a signed integer type (same
+/// width / `_BitInt` value-bit count).
+fn to_unsigned(ty: &CType) -> CType {
+    match ty {
+        CType::Int(i) => CType::Int(IntTy { signed: false, ..*i }),
+        _ => CType::uint(),
     }
 }
 
@@ -344,28 +373,41 @@ fn usual_arith(a: &CType, b: &CType) -> CType {
     if a == b {
         return a;
     }
-    let (wa, sa) = (a.int_width().unwrap_or(32), a.is_signed());
-    let (wb, sb) = (b.int_width().unwrap_or(32), b.is_signed());
+    let sa = a.is_signed();
+    let sb = b.is_signed();
     if sa == sb {
-        // Same signedness: the wider rank wins.
-        return if wa >= wb { a } else { b };
+        // Same signedness: the greater rank wins.
+        return if int_rank(&a) >= int_rank(&b) { a } else { b };
     }
-    // Mixed signedness.
-    let (unsigned_t, uw, signed_t, sw) =
-        if !sa { (a.clone(), wa, b.clone(), wb) } else { (b.clone(), wb, a.clone(), wa) };
-    if uw >= sw {
-        unsigned_t
+    // Mixed signedness: identify the signed and unsigned operands.
+    let (u, s) = if sa { (b, a) } else { (a, b) };
+    if int_rank(&u) >= int_rank(&s) {
+        // Unsigned type has rank >= the signed type: convert to it.
+        u
+    } else if value_bits(&s) > value_bits(&u) {
+        // The signed type can represent every value of the unsigned type.
+        s
     } else {
-        // The signed type is strictly wider, so it represents all unsigned values.
-        signed_t
+        // Otherwise: the unsigned type corresponding to the signed operand.
+        to_unsigned(&s)
     }
 }
 
 /// Type-check a translation unit, producing a typed [`Program`] or diagnostics.
 pub fn check(unit: &TranslationUnit) -> Result<Program, Vec<Diagnostic>> {
+    // `constexpr` objects are named compile-time constants: they resolve as their
+    // (typed) value in expressions and as their integer value in constant
+    // expressions (alongside enumerators).
+    let mut enum_consts: HashMap<String, i128> = unit.enum_consts.iter().cloned().collect();
+    let mut constexprs: HashMap<String, (i128, CType)> = HashMap::new();
+    for (name, value, ty) in &unit.constexprs {
+        enum_consts.insert(name.clone(), *value);
+        constexprs.insert(name.clone(), (*value, ty.clone()));
+    }
     let mut checker = Checker {
         records: unit.records.clone(),
-        enum_consts: unit.enum_consts.iter().cloned().collect(),
+        enum_consts,
+        constexprs,
         ..Checker::default()
     };
     checker.run(unit);
@@ -393,6 +435,9 @@ struct Checker {
     records: Records,
     /// Enumerator constants resolvable as integer constant expressions.
     enum_consts: HashMap<String, i128>,
+    /// C23 `constexpr` objects: name → (reduced value, declared type). Resolved
+    /// as a typed compile-time constant in expressions.
+    constexprs: HashMap<String, (i128, CType)>,
     /// Deduplicated string-literal objects: bytes → global index.
     string_pool: HashMap<Vec<u8>, usize>,
 }
@@ -510,7 +555,7 @@ impl Checker {
                 // `char[] = "..."` writes the literal bytes directly.
                 if let Init::Expr(e) = init
                     && let ExprKind::StrLit(s) = &e.kind
-                    && matches!(**elem, CType::Int(IntTy { width: 8, .. }))
+                    && matches!(**elem, CType::Int(IntTy { width: 8, bitint: None, .. }))
                 {
                     write_string_bytes(bytes, off, s, *n);
                     return;
@@ -597,7 +642,11 @@ impl Checker {
                     }
                 } else {
                     match self.const_eval(e) {
-                        Some(v) => write_int_bytes(bytes, off, v, self.size_of(ty)),
+                        // Reduce to the type's range so a `_BitInt(N)` global holds
+                        // a valid N-bit pattern (loads do not re-normalize).
+                        Some(v) => {
+                            write_int_bytes(bytes, off, reduce_to_type(v, ty), self.size_of(ty))
+                        }
                         None => {
                             self.error(e.span, "global initializer must be a constant expression");
                         }
@@ -1039,7 +1088,7 @@ impl Checker {
                 // `char[]` initialized from a string literal.
                 if let Init::Expr(e) = init
                     && let ExprKind::StrLit(s) = &e.kind
-                    && matches!(**elem, CType::Int(IntTy { width: 8, .. }))
+                    && matches!(**elem, CType::Int(IntTy { width: 8, bitint: None, .. }))
                 {
                     for (i, &b) in s.iter().enumerate() {
                         if (i as u64) < *n {
@@ -1477,6 +1526,11 @@ impl Checker {
         if let Some(id) = ctx.lookup(name) {
             let ty = ctx.locals[id].ty.clone();
             return Some(TExpr::new(TExprKind::Obj(id), ty, span));
+        }
+        // A `constexpr` object resolves to its (typed) compile-time value; being a
+        // pure constant, it is not a modifiable lvalue (so assignment is rejected).
+        if let Some((value, ty)) = self.constexprs.get(name) {
+            return Some(TExpr::new(TExprKind::Const(*value), ty.clone(), span));
         }
         if let Some(&value) = self.enum_consts.get(name) {
             return Some(TExpr::new(TExprKind::Const(value), CType::int(), span));
@@ -1979,7 +2033,7 @@ impl Checker {
 
 /// `size_t` for this target: `unsigned long` (64-bit).
 fn size_t() -> CType {
-    CType::Int(IntTy { width: 64, signed: false })
+    CType::Int(IntTy::new(64, false))
 }
 
 /// Whether field `idx` of record `id` is an unnamed bit-field (padding or a
@@ -2210,6 +2264,26 @@ fn apply_index_designators(desigs: &[Designator], cur: u64) -> u64 {
     match desigs.first() {
         Some(Designator::Index(i)) => *i as u64,
         _ => cur,
+    }
+}
+
+/// Reduce an integer constant `v` to the representable value of integer type
+/// `ty`: mask to the type's value-bit count (`N` for a `_BitInt(N)`), then
+/// sign-extend for a signed type. Non-`_BitInt` types are returned unchanged
+/// (the byte-writer truncates them to their storage size anyway).
+fn reduce_to_type(v: i128, ty: &CType) -> i128 {
+    let CType::Int(i) = ty else { return v };
+    let Some(n) = i.bitint else { return v };
+    let bits = u32::from(n);
+    if bits == 0 || bits >= 128 {
+        return v;
+    }
+    let mask = (1i128 << bits) - 1;
+    let m = v & mask;
+    if i.signed && (m & (1i128 << (bits - 1))) != 0 {
+        m - (1i128 << bits)
+    } else {
+        m
     }
 }
 

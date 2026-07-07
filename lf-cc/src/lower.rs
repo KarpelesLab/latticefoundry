@@ -923,7 +923,8 @@ impl FnLower<'_> {
             }
             TExprKind::Convert(inner) => {
                 let v = self.lower_rvalue(inner);
-                self.convert(v, &inner.ty, &e.ty)
+                let c = self.convert(v, &inner.ty, &e.ty);
+                self.normalize_bitint(c, &e.ty)
             }
             TExprKind::Arith(op, l, r) => {
                 let lv = self.lower_rvalue(l);
@@ -933,7 +934,8 @@ impl FnLower<'_> {
                 } else {
                     arith_binop(*op, e.ty.is_signed())
                 };
-                self.b.bin(binop, lv, rv, Flags::NONE)
+                let res = self.b.bin(binop, lv, rv, Flags::NONE);
+                self.normalize_bitint(res, &e.ty)
             }
             TExprKind::Shift(op, l, r) => {
                 let lv = self.lower_rvalue(l);
@@ -945,7 +947,8 @@ impl FnLower<'_> {
                     _ if l.ty.is_signed() => BinOp::AShr,
                     _ => BinOp::LShr,
                 };
-                self.b.bin(binop, lv, rv, Flags::NONE)
+                let res = self.b.bin(binop, lv, rv, Flags::NONE);
+                self.normalize_bitint(res, &e.ty)
             }
             TExprKind::Cmp(op, l, r) => {
                 let lv = self.lower_rvalue(l);
@@ -965,14 +968,16 @@ impl FnLower<'_> {
                 } else {
                     let ty = self.tys.of(&e.ty);
                     let zero = self.b.const_i64(ty, 0);
-                    self.b.sub(zero, v, Flags::NONE)
+                    let res = self.b.sub(zero, v, Flags::NONE);
+                    self.normalize_bitint(res, &e.ty)
                 }
             }
             TExprKind::BitNot(inner) => {
                 let v = self.lower_rvalue(inner);
                 let ty = self.tys.of(&e.ty);
                 let ones = self.b.const_i64(ty, -1);
-                self.b.bin(BinOp::Xor, v, ones, Flags::NONE)
+                let res = self.b.bin(BinOp::Xor, v, ones, Flags::NONE);
+                self.normalize_bitint(res, &e.ty)
             }
             TExprKind::LogNot(inner) => {
                 let v = self.lower_rvalue(inner);
@@ -1258,6 +1263,8 @@ impl FnLower<'_> {
             };
             self.convert(res, compute_ty, &lvalue.ty)
         };
+        // A `_BitInt` lvalue wraps to its N-bit range before the write-back.
+        let new = self.normalize_bitint(new, &lvalue.ty);
         self.b.store(lty, addr, new, align);
         // The value of a compound assignment is the new value in the lvalue type.
         let _ = result_ty;
@@ -1294,11 +1301,12 @@ impl FnLower<'_> {
             self.b.bin(op, old, one, Flags::NONE)
         } else {
             let one = self.b.const_i64(ty, 1);
-            if inc {
+            let stepped = if inc {
                 self.b.add(old, one, Flags::NONE)
             } else {
                 self.b.sub(old, one, Flags::NONE)
-            }
+            };
+            self.normalize_bitint(stepped, &target.ty)
         };
         self.b.store(ty, addr, new, align);
         if post { old } else { new }
@@ -1547,6 +1555,40 @@ impl FnLower<'_> {
             self.b.cast(op, v, to_ty)
         } else {
             self.b.cast(CastOp::Trunc, v, to_ty)
+        }
+    }
+
+    /// Reduce a freshly-computed value to a valid `_BitInt(N)` bit pattern within
+    /// its standard storage container: for an unsigned `_BitInt(N)` mask to the
+    /// low `N` bits (`v & (2^N - 1)`); for a signed one sign-extend from bit `N`
+    /// (`(v << (W-N)) >>a (W-N)`). Ordinary integers, and a `_BitInt` whose value
+    /// bits fill the whole storage width (N == 8/16/32/64), need no masking (the
+    /// container wraps modulo `2^N` on its own). `v` is returned unchanged for a
+    /// non-`_BitInt` type.
+    fn normalize_bitint(&mut self, v: ValueId, ty: &CType) -> ValueId {
+        let CType::Int(i) = ty else { return v };
+        let Some(n) = i.bitint else { return v };
+        if n >= i.width {
+            return v;
+        }
+        if i.signed {
+            // Sign-extend from bit `n` via `shl; ashr` in a work width of at least
+            // 32 bits: the backend does not reliably truncate sub-word shifts (as
+            // the bit-field lowering also observes), so the shifts run in the work
+            // width and the result is resized back to the storage width.
+            let w = work_bits(i.width);
+            let wt = self.tys.for_int(w);
+            let vw = self.int_resize(v, i.width, true, w);
+            let sh = self.b.const_i64(wt, i64::from(w - n));
+            let hi = self.b.bin(BinOp::Shl, vw, sh, Flags::NONE);
+            let ext = self.b.bin(BinOp::AShr, hi, sh, Flags::NONE);
+            self.int_resize(ext, w, true, i.width)
+        } else {
+            // Mask to the low `n` bits (a plain `and`, reliable at any width).
+            let work = self.tys.for_int(i.width);
+            let mask = ((1u128 << n) - 1) as i64;
+            let m = self.b.const_i64(work, mask);
+            self.b.bin(BinOp::And, v, m, Flags::NONE)
         }
     }
 }

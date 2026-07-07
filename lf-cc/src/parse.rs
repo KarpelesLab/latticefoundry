@@ -33,14 +33,17 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         tags: HashMap::new(),
         enum_map: HashMap::new(),
         enum_consts: Vec::new(),
+        constexprs: Vec::new(),
         scopes: vec![HashMap::new()],
         last_alignas: None,
+        last_constexpr: false,
     };
     match parser.parse_unit() {
         Ok(items) => Ok(TranslationUnit {
             items,
             records: parser.records,
             enum_consts: parser.enum_consts,
+            constexprs: parser.constexprs,
         }),
         Err(d) => Err(vec![d]),
     }
@@ -69,11 +72,16 @@ struct Parser {
     enum_map: HashMap<String, i128>,
     /// Enumerator constants in declaration order, handed to sema.
     enum_consts: Vec<(String, i128)>,
+    /// C23 `constexpr` objects (`name`, reduced value, declared type), handed to
+    /// sema as named compile-time constants.
+    constexprs: Vec<(String, i128, CType)>,
     /// Scoped name bindings for typedef-name disambiguation.
     scopes: Vec<HashMap<String, NameKind>>,
     /// The pending `_Alignas`/`alignas` alignment from the declaration specifiers
     /// currently being parsed (consumed by the declarators they apply to).
     last_alignas: Option<u64>,
+    /// Whether the declaration specifiers just parsed included C23 `constexpr`.
+    last_constexpr: bool,
 }
 
 impl Parser {
@@ -288,7 +296,14 @@ impl Parser {
         }
         let base = self.parse_decl_specs()?;
         let align = self.last_alignas.take();
+        let is_constexpr = self.last_constexpr;
         self.consume_storage();
+
+        // A C23 `constexpr` object is a named compile-time constant (no storage).
+        if is_constexpr {
+            self.parse_constexpr_decls(base)?;
+            return Ok(Vec::new());
+        }
 
         // A bare `struct S { ... };` / `enum E { ... };` declares only a type.
         if self.eat_punct(Punct::Semi) {
@@ -543,7 +558,12 @@ impl Parser {
                 | Keyword::Enum
                 | Keyword::Typedef,
             ) => true,
-            TokenKind::Ident(name) => self.is_typedef_name(name),
+            // C23 `_BitInt`/`constexpr` are lexed as identifiers; treat them as
+            // declaration starts so a declaration using them is recognized (the
+            // C23 gate is applied in `parse_decl_specs`).
+            TokenKind::Ident(name) => {
+                name == "_BitInt" || name == "constexpr" || self.is_typedef_name(name)
+            }
             _ => false,
         }
     }
@@ -551,6 +571,7 @@ impl Parser {
     fn parse_decl_specs(&mut self) -> PResult<CType> {
         let start = self.peek_span();
         self.last_alignas = None;
+        self.last_constexpr = false;
         let mut longs = 0u8;
         let mut has_short = false;
         let mut has_char = false;
@@ -562,8 +583,55 @@ impl Parser {
         let mut signed_spec: Option<bool> = None;
         let mut saw_any = false;
         let mut explicit: Option<CType> = None;
+        // A pending `_BitInt(N)` value-bit count (the signedness is applied at the
+        // end, since `unsigned`/`signed` may appear on either side of `_BitInt`).
+        let mut bitint_n: Option<u16> = None;
 
         loop {
+            // C23 `constexpr` (a declaration specifier) and `_BitInt` (a type
+            // specifier) are lexed as ordinary identifiers (they are not global
+            // keywords); recognize them here and gate them on C23.
+            if let TokenKind::Ident(name) = self.peek() {
+                if name == "constexpr" {
+                    if !self.std.is_c23() {
+                        return self
+                            .err("`constexpr` is a C23 feature (use -std=c23 or later)");
+                    }
+                    self.bump();
+                    self.last_constexpr = true;
+                    saw_any = true;
+                    continue;
+                }
+                if name == "_BitInt" {
+                    if !self.std.is_c23() {
+                        return self
+                            .err("`_BitInt` is a C23 feature (use -std=c23 or later)");
+                    }
+                    if bitint_n.is_some() {
+                        return self.err("duplicate `_BitInt` type specifier");
+                    }
+                    let sp = self.peek_span();
+                    self.bump();
+                    self.expect_punct(Punct::LParen, "'(' after _BitInt")?;
+                    let n = self.parse_const_expr()?;
+                    self.expect_punct(Punct::RParen, "')' after _BitInt width")?;
+                    if n < 1 {
+                        return Err(Diagnostic::error(
+                            "the width of a `_BitInt` must be at least 1",
+                        )
+                        .with_span(sp));
+                    }
+                    if n > 64 {
+                        return Err(Diagnostic::error(format!(
+                            "`_BitInt({n})` is unsupported (>64-bit `_BitInt` is not implemented)"
+                        ))
+                        .with_span(sp));
+                    }
+                    bitint_n = Some(n as u16);
+                    saw_any = true;
+                    continue;
+                }
+            }
             // A `struct`/`union`/`enum` specifier, or a typedef-name, supplies the
             // whole type; it may not combine with the numeric specifiers.
             let numeric_seen = has_void
@@ -686,6 +754,25 @@ impl Parser {
         if let Some(ty) = explicit {
             return Ok(ty);
         }
+        // A `_BitInt(N)`: only `signed`/`unsigned` may accompany it.
+        if let Some(n) = bitint_n {
+            if has_void || has_bool || has_char || has_short || has_int || has_float
+                || has_double || longs > 0
+            {
+                return Err(Diagnostic::error(
+                    "`_BitInt` may not be combined with another type specifier",
+                )
+                .with_span(start));
+            }
+            let signed = signed_spec.unwrap_or(true);
+            if signed && n < 2 {
+                return Err(Diagnostic::error(
+                    "the width of a signed `_BitInt` must be at least 2 (one bit is the sign)",
+                )
+                .with_span(start));
+            }
+            return Ok(CType::Int(IntTy::bit_int(n, signed)));
+        }
         if longs >= 2 && !self.std.has_long_long() {
             return Err(Diagnostic::error(
                 "`long long` is a C99 feature (use -std=c99 or later)",
@@ -713,7 +800,7 @@ impl Parser {
         if has_char {
             // Plain `char` is signed on this target; `signed`/`unsigned` override.
             let signed = signed_spec.unwrap_or(true);
-            return Ok(CType::Int(IntTy { width: 8, signed }));
+            return Ok(CType::Int(IntTy::new(8, signed)));
         }
         // `int` is the default; `short`/`long` override the width.
         let _ = has_int;
@@ -725,7 +812,7 @@ impl Parser {
             32
         };
         let signed = signed_spec.unwrap_or(true);
-        Ok(CType::Int(IntTy { width, signed }))
+        Ok(CType::Int(IntTy::new(width, signed)))
     }
 
     /// Consume leading `*` (with optional qualifiers) and wrap `base`.
@@ -813,7 +900,7 @@ impl Parser {
                 }
             }
             ExprKind::StrLit(bytes) => {
-                Some(CType::Array(Box::new(CType::Int(IntTy { width: 8, signed: true })), bytes.len() as u64 + 1))
+                Some(CType::Array(Box::new(CType::Int(IntTy::new(8, true))), bytes.len() as u64 + 1))
             }
             ExprKind::Cast(ty, _) => Some(ty.clone()),
             ExprKind::CompoundLiteral(ty, _) => Some(ty.clone()),
@@ -1124,6 +1211,54 @@ impl Parser {
         Ok(CType::int())
     }
 
+    /// Parse the declarator list of a C23 `constexpr` declaration (`base` is the
+    /// already-parsed base type). Each object must be an integer-category type
+    /// with a constant-expression initializer; it is registered as a named
+    /// compile-time constant (usable in constant expressions and, having no
+    /// storage, not a modifiable lvalue) rather than emitted as an object.
+    fn parse_constexpr_decls(&mut self, base: CType) -> PResult<()> {
+        let (name, ty, span) = self.parse_named_declarator(base)?;
+        if !ty.is_integer() {
+            return Err(Diagnostic::error(format!(
+                "`constexpr` object '{name}' has type `{ty}`; only integer-category \
+                 `constexpr` objects are supported"
+            ))
+            .with_span(span));
+        }
+        if !self.eat_punct(Punct::Assign) {
+            return Err(Diagnostic::error(format!(
+                "`constexpr` object '{name}' requires a constant initializer"
+            ))
+            .with_span(span));
+        }
+        let init_span = self.peek_span();
+        let init = self.parse_initializer()?;
+        let Init::Expr(e) = init else {
+            return Err(Diagnostic::error(
+                "a `constexpr` integer object requires a scalar constant initializer",
+            )
+            .with_span(init_span));
+        };
+        let value = self.eval_const_expr(&e).ok_or_else(|| {
+            Diagnostic::error(format!(
+                "the initializer of `constexpr` object '{name}' is not a constant expression"
+            ))
+            .with_span(init_span)
+        })?;
+        let reduced = reduce_const_to_type(value, &ty);
+        // Register for constant-expression evaluation in later declarators,
+        // array sizes, `case` labels, `_Static_assert`, and sema.
+        self.enum_map.insert(name.clone(), reduced);
+        self.declare_ordinary(&name, Some(ty.clone()));
+        self.constexprs.push((name, reduced, ty));
+        // C23 allows only a single declarator with `constexpr` (matching gcc).
+        if self.is_punct(Punct::Comma) {
+            return self.err("`constexpr` may only be used with a single declarator");
+        }
+        self.expect_punct(Punct::Semi, "';' after constexpr declaration")?;
+        Ok(())
+    }
+
     /// Parse a constant expression (a conditional-expression) and fold it to an
     /// integer, resolving enumerator constants and `sizeof`.
     fn parse_const_expr(&mut self) -> PResult<i128> {
@@ -1300,7 +1435,14 @@ impl Parser {
         }
         let base = self.parse_decl_specs()?;
         let align = self.last_alignas.take();
+        let is_constexpr = self.last_constexpr;
         self.consume_storage();
+        // A C23 `constexpr` object is a named compile-time constant (no storage);
+        // it contributes no executable statement.
+        if is_constexpr {
+            self.parse_constexpr_decls(base)?;
+            return Ok(self.stmt(StmtKind::Expr(None), start));
+        }
         // A bare `struct S { ... };` at block scope declares only a type.
         if self.is_punct(Punct::Semi) {
             let end = self.bump().span;
@@ -1570,7 +1712,8 @@ impl Parser {
                 | Keyword::Union
                 | Keyword::Enum,
             ) => true,
-            TokenKind::Ident(name) => self.is_typedef_name(name),
+            // `sizeof(_BitInt(N))` / a `(_BitInt(N))` cast (C23).
+            TokenKind::Ident(name) => name == "_BitInt" || self.is_typedef_name(name),
             _ => false,
         }
     }
@@ -1852,15 +1995,38 @@ impl Parser {
 
 /// `size_t` for this target: `unsigned long` (64-bit).
 fn size_t_ty() -> CType {
-    CType::Int(IntTy { width: 64, signed: false })
+    CType::Int(IntTy::new(64, false))
+}
+
+/// Reduce an integer constant `v` to the representable value of integer type
+/// `ty`: mask to the type's value-bit count (`N` for a `_BitInt(N)`), then
+/// sign-extend for a signed type. `_Bool` normalizes to 0/1. Non-integer types
+/// are returned unchanged.
+fn reduce_const_to_type(v: i128, ty: &CType) -> i128 {
+    let (bits, signed) = match ty {
+        CType::Bool => return i128::from(v != 0),
+        CType::Int(i) => (u32::from(i.value_bits()), i.signed),
+        _ => return v,
+    };
+    if bits == 0 || bits >= 128 {
+        return v;
+    }
+    let mask = (1i128 << bits) - 1;
+    let m = v & mask;
+    if signed && (m & (1i128 << (bits - 1))) != 0 {
+        m - (1i128 << bits)
+    } else {
+        m
+    }
 }
 
 /// The integer promotion of a type (for `typeof` typing): `_Bool`/`char`/`short`
-/// become `int`; other types are unchanged.
+/// become `int`; other types (including `_BitInt`, which is not promoted) are
+/// unchanged.
 fn promote_ty(ty: &CType) -> CType {
     match ty {
         CType::Bool => CType::int(),
-        CType::Int(i) if i.width < 32 => CType::int(),
+        CType::Int(i) if i.bitint.is_none() && i.width < 32 => CType::int(),
         other => other.clone(),
     }
 }
