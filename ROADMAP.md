@@ -379,7 +379,7 @@ programs.
 | **M5**    | **Compile `.lf` → native executable that runs**          | 8     | ✅ **done** |
 | M6        | Certified tier: proof-carrying pipeline                  | 9     | ✅ done |
 | M7        | JIT, debug info, LTO                                     | 10    | 🔶 JIT + superopt done; DWARF/LTO/more targets pending |
-| M8        | `lf-cc` builds **gzip** from its own source (round-trips) | lf-cc | 🔶 in progress |
+| **M8**    | **`lf-cc` builds gzip from source → byte-identical to GNU gzip** | lf-cc | ✅ **done** |
 | **M9**    | **`lf-cc` compiles against the real `/usr/include`**     | lf-cc | ⬜ roadmap goal |
 
 ## 8. lf-cc: toward a bootstrap-capable C compiler
