@@ -192,13 +192,25 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
         let i8 = cx.int(8);
         for f in &program.funcs {
             for local in &f.locals {
-                if local.ty.is_aggregate() {
+                if local.ty.is_aggregate() && !agg_types.contains_key(&local.ty) {
                     let id = layout::ir_type(cx, &program.records, &local.ty);
                     agg_types.insert(local.ty.clone(), id);
                 }
                 if let Some(a) = local.align.filter(|&a| a > 1) {
                     let len = layout::size_of(&program.records, &local.ty) + a;
                     blob_types.entry(len).or_insert_with(|| cx.array(i8, len));
+                }
+            }
+        }
+        // A `struct`/`union` passed or returned by value at a call site needs its
+        // interned IR type too, even when no local of that type exists (e.g. the
+        // result of a struct-returning call is consumed directly). Cover every
+        // function signature's return type and parameters.
+        for sig in &program.sigs {
+            for ty in std::iter::once(&sig.ret).chain(sig.params.iter()) {
+                if ty.is_aggregate() && !agg_types.contains_key(ty) {
+                    let id = layout::ir_type(cx, &program.records, ty);
+                    agg_types.insert(ty.clone(), id);
                 }
             }
         }

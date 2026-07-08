@@ -76,7 +76,7 @@ pub fn check_source_with(
 ) -> Result<sema::Program, Vec<Diagnostic>> {
     let tokens = preprocess::preprocess(source, opts)?;
     let unit = parse::parse(tokens, opts.std)?;
-    sema::check(&unit)
+    sema::check(&unit, opts.std)
 }
 
 /// Why a full source-to-executable build failed.

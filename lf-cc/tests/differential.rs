@@ -21,6 +21,32 @@ fn programs() -> Vec<(&'static str, &'static str)> {
         ("gnu_inline", "static __inline__ int sq(int x){ return x*x; } int main(){ return sq(6) + 6; }"),
         ("gnu_attr_trailing", "int f(int) __attribute__((const)); int f(int x){ return x+1; } int main(){ return f(41); }"),
         ("gnu_restrict", "int add(int *__restrict a, int *__restrict b){ return *a + *b; } int main(){ int x=40,y=2; return add(&x,&y); }"),
+        // `register` on a prototype (not just K&R) parameter — bash's `__P((...))`
+        // prototypes carry it (e.g. `declare_internal __P((register WORD_LIST *,int))`).
+        (
+            "gnu_register_prototype",
+            "int f(register int); int f(register int x){ return x; } int main(){ return f(42); }",
+        ),
+        // A wide-character constant `L'c'`: its type is `wchar_t` (== `int`), value
+        // the character code. bash's glob/subst multibyte paths use `L'\\0'` etc.
+        ("gnu_wide_char", "int main(){ return L'*'; }"),
+        // `__builtin_expect(exp, c)`: the value is `exp` (no prediction at -O0).
+        (
+            "gnu_builtin_expect",
+            "int main(){ int x = 42; if (__builtin_expect(x == 42, 1)) return x; return 0; }",
+        ),
+        // `__builtin_constant_p(x)`: conservatively 0 for a non-constant operand
+        // (matches gcc for a runtime value).
+        (
+            "gnu_builtin_constant_p",
+            "int main(){ int x = 5; return __builtin_constant_p(x) ? 7 : 42; }",
+        ),
+        // `sizeof` of a file-scope array whose length is deduced from its
+        // initializer — bash computes `num_shell_builtins` this way.
+        (
+            "gnu_sizeof_global_array",
+            "int a[] = {1,2,3,4,5,6,7}; int main(){ return sizeof(a) / sizeof(a[0]) * 6; }",
+        ),
         // Arithmetic + precedence.
         ("precedence", "int main(){ return 2 + 3 * 4 - 10 / 2 + 7 % 4; }"),
         ("paren", "int main(){ return (2 + 3) * (4 - 1) + 1; }"),
@@ -613,6 +639,28 @@ fn std_programs() -> Vec<(&'static str, &'static str, &'static str)> {
             "gnu89",
             "int f(__const int *p){ __volatile int t = *p; return t; } \
              int main(){ __signed int v = 42; return f(&v); }",
+        ),
+        // Implicit `int` on a pre-C99 (K&R) function definition with no type
+        // specifier (bash's `initialize_job_control(force) int force; {...}`).
+        (
+            "gnu89_implicit_int",
+            "gnu89",
+            "foo(x) int x; { return x; } int main(){ return foo(42); }",
+        ),
+        // Implicit function declaration: calling a function before it is declared
+        // is accepted in pre-C99 dialects (bash calls `get_tty_state`, etc. this
+        // way). The callee is defined later in the same unit.
+        (
+            "gnu89_implicit_func_decl",
+            "gnu89",
+            "int main(){ return early(42); } int early(int x){ return x; }",
+        ),
+        // Declarations intermixed with statements: a GNU extension under gnu89
+        // (bash's lib/sh and lib/glob rely on it).
+        (
+            "gnu89_mixed_declarations",
+            "gnu89",
+            "int main(){ int a = 40; a += 1; int b = 1; return a + b; }",
         ),
     ]
 }

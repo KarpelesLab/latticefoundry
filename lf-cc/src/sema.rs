@@ -15,6 +15,7 @@ use crate::ast::{
     BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records, Stmt,
     StmtKind, Storage, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
+use crate::cstd::CStd;
 use crate::layout;
 
 /// A function-local object with storage (a parameter or a local variable),
@@ -423,7 +424,7 @@ fn usual_arith(a: &CType, b: &CType) -> CType {
 }
 
 /// Type-check a translation unit, producing a typed [`Program`] or diagnostics.
-pub fn check(unit: &TranslationUnit) -> Result<Program, Vec<Diagnostic>> {
+pub fn check(unit: &TranslationUnit, std: CStd) -> Result<Program, Vec<Diagnostic>> {
     // `constexpr` objects are named compile-time constants: they resolve as their
     // (typed) value in expressions and as their integer value in constant
     // expressions (alongside enumerators).
@@ -437,6 +438,7 @@ pub fn check(unit: &TranslationUnit) -> Result<Program, Vec<Diagnostic>> {
         records: unit.records.clone(),
         enum_consts,
         constexprs,
+        std,
         ..Checker::default()
     };
     checker.run(unit);
@@ -469,6 +471,8 @@ struct Checker {
     constexprs: HashMap<String, (i128, CType)>,
     /// Deduplicated string-literal objects: bytes → global index.
     string_pool: HashMap<Vec<u8>, usize>,
+    /// The active language dialect (gates implicit function declarations, etc.).
+    std: CStd,
 }
 
 impl Checker {
@@ -647,9 +651,13 @@ impl Checker {
         (bytes, relocs)
     }
 
-    /// Evaluate a constant integer expression, resolving enumerators.
+    /// Evaluate a constant integer expression, resolving enumerators. A map of
+    /// file-scope object types lets `sizeof <global>` (e.g. `sizeof table` for an
+    /// array whose length is deduced from its initializer) reduce to a constant.
     fn const_eval(&self, e: &Expr) -> Option<i128> {
-        const_eval_with(e, &self.enum_consts, &self.records)
+        let gtypes: HashMap<&str, &CType> =
+            self.globals.iter().map(|g| (g.name.as_str(), &g.ty)).collect();
+        const_eval_with(e, &self.enum_consts, &self.records, &gtypes)
     }
 
     /// Materialize an initializer to little-endian bytes at `off` within `bytes`
@@ -2197,6 +2205,27 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> Option<TExpr> {
+        // GNU `__builtin_<name>` calls that are not one of the specially-parsed
+        // forms (the `va_*` family become dedicated AST nodes in the parser) and
+        // that are not explicitly declared are treated as aliases for the
+        // library function `<name>` (e.g. `__builtin_memcpy` -> `memcpy`,
+        // `__builtin_alloca` -> `alloca`), plus a few pure-compiler builtins.
+        if let ExprKind::Ident(name) = &callee.kind
+            && !self.ident_in_scope(ctx, name)
+        {
+            if name.starts_with("__builtin_")
+                && let Some(t) = self.try_builtin_alias(ctx, name, callee.span, args, span)
+            {
+                return Some(t);
+            }
+            // Implicit function declaration: calling an undeclared function in a
+            // pre-C99 dialect (`c89`/`gnu89`, which gcc accepts) declares it
+            // implicitly as `extern int name()` — an unprototyped (K&R) function,
+            // modelled here as returning `int` with an unchecked argument list.
+            if !self.std.is_c99() {
+                self.register_sig(name, CType::int(), Vec::new(), true, false, false, callee.span);
+            }
+        }
         // The callee decays to a function pointer: a bare function designator
         // (direct call) or any pointer-to-function value (indirect call).
         let ct = self.check_rvalue(ctx, callee)?;
@@ -2232,6 +2261,73 @@ impl Checker {
             targs.push(conv);
         }
         Some(TExpr::new(TExprKind::Call(Box::new(ct), targs), ft.ret.clone(), span))
+    }
+
+    /// Whether `name` currently resolves to any ordinary identifier (a local or
+    /// `static` object, a `constexpr`, an enumerator, a file-scope object, or a
+    /// declared function). Used by `check_call` to detect a call to an
+    /// as-yet-undeclared function.
+    fn ident_in_scope(&self, ctx: &FnCtx, name: &str) -> bool {
+        ctx.lookup(name).is_some()
+            || self.constexprs.contains_key(name)
+            || self.enum_consts.contains_key(name)
+            || self.global_index.contains_key(name)
+            || self.sig_index.contains_key(name)
+    }
+
+    /// Handle a call to an undeclared `__builtin_<base>` identifier. The `va_*`
+    /// builtins never reach here (the parser lowers them to dedicated nodes), so
+    /// this covers the library-alias builtins and a couple of pure-compiler ones.
+    /// Returns `None` if `name` is not a builtin this frontend models (letting
+    /// the caller fall through to the normal "undeclared identifier" path).
+    fn try_builtin_alias(
+        &mut self,
+        ctx: &mut FnCtx,
+        name: &str,
+        callee_span: Span,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<TExpr> {
+        let base = name.strip_prefix("__builtin_")?;
+        match base {
+            // `__builtin_expect(exp, c)`: no branch-prediction hint at -O0; the
+            // value is `exp` (typed `long`, per the GCC prototype).
+            "expect" => {
+                let e = self.check_rvalue(ctx, args.first()?)?;
+                return Some(self.convert(e, &CType::long()));
+            }
+            // `__builtin_constant_p(x)`: conservatively 0 (not a constant).
+            "constant_p" => return Some(TExpr::new(TExprKind::Const(0), CType::int(), span)),
+            _ => {}
+        }
+        // Library-alias builtins: call the libc function `base`, declaring it
+        // implicitly if no prototype is in scope. Pointer-returning functions get
+        // a `void *` result so the value is usable as a pointer under LP64.
+        if !self.sig_index.contains_key(base) {
+            let ret = if matches!(
+                base,
+                "alloca"
+                    | "memcpy"
+                    | "memmove"
+                    | "memset"
+                    | "strcpy"
+                    | "strncpy"
+                    | "strcat"
+                    | "strncat"
+                    | "strchr"
+                    | "strrchr"
+                    | "strstr"
+                    | "strpbrk"
+                    | "strdup"
+            ) {
+                CType::ptr_to(CType::Void)
+            } else {
+                CType::int()
+            };
+            self.register_sig(base, ret, Vec::new(), true, false, false, callee_span);
+        }
+        let new_callee = Expr { kind: ExprKind::Ident(base.to_owned()), span: callee_span };
+        self.check_call(ctx, &new_callee, args, span)
     }
 
     fn check_cast(
@@ -2468,8 +2564,13 @@ impl FnCtx {
 
 /// A constant evaluator over the untyped AST for global initializers, resolving
 /// enumerator constants and `sizeof`.
-fn const_eval_with(e: &Expr, enums: &HashMap<String, i128>, recs: &Records) -> Option<i128> {
-    let rec = |x: &Expr| const_eval_with(x, enums, recs);
+fn const_eval_with(
+    e: &Expr,
+    enums: &HashMap<String, i128>,
+    recs: &Records,
+    gtypes: &HashMap<&str, &CType>,
+) -> Option<i128> {
+    let rec = |x: &Expr| const_eval_with(x, enums, recs, gtypes);
     match &e.kind {
         ExprKind::IntLit(v, _) => Some(*v),
         ExprKind::Ident(name) => enums.get(name).copied(),
@@ -2510,7 +2611,7 @@ fn const_eval_with(e: &Expr, enums: &HashMap<String, i128>, recs: &Records) -> O
         // is one whose type the AST fixes on its own (a string literal, a cast, a
         // nested `sizeof`, …) — see `ast_static_type`.
         ExprKind::SizeofExpr(inner) => {
-            ast_static_type(inner).map(|ty| layout::size_of(recs, &ty) as i128)
+            ast_static_type(inner, gtypes).map(|ty| layout::size_of(recs, &ty) as i128)
         }
         ExprKind::AlignofType(ty) => Some(layout::align_of(recs, ty) as i128),
         _ => None,
@@ -2522,7 +2623,7 @@ fn const_eval_with(e: &Expr, enums: &HashMap<String, i128>, recs: &Records) -> O
 /// constant initializer — string literals, casts, compound literals, and the
 /// literals/`sizeof` results whose type the node itself carries. Returns `None`
 /// when the type would require variable/typedef context the caller lacks.
-fn ast_static_type(e: &Expr) -> Option<CType> {
+fn ast_static_type(e: &Expr, gtypes: &HashMap<&str, &CType>) -> Option<CType> {
     match &e.kind {
         ExprKind::IntLit(_, ty) | ExprKind::FloatLit(_, ty) => Some(ty.clone()),
         ExprKind::StrLit(bytes) => {
@@ -2534,8 +2635,13 @@ fn ast_static_type(e: &Expr) -> Option<CType> {
         ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) | ExprKind::AlignofType(_) => {
             Some(size_t())
         }
-        ExprKind::Cond(_, t, f) => ast_static_type(t).or_else(|| ast_static_type(f)),
-        ExprKind::Comma(_, b) => ast_static_type(b),
+        // A file-scope object (typically `sizeof array` for a length-deduced
+        // global array), resolved via the global-type map.
+        ExprKind::Ident(name) => gtypes.get(name.as_str()).map(|t| (*t).clone()),
+        ExprKind::Cond(_, t, f) => {
+            ast_static_type(t, gtypes).or_else(|| ast_static_type(f, gtypes))
+        }
+        ExprKind::Comma(_, b) => ast_static_type(b, gtypes),
         _ => None,
     }
 }

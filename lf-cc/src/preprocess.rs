@@ -357,7 +357,38 @@ impl Pp {
             {
                 self.lex_ppnumber(bytes, &mut pos)
             } else if c == b'_' || c == b'$' || c.is_ascii_alphabetic() {
-                self.lex_ident(bytes, &mut pos)
+                let id = self.lex_ident(bytes, &mut pos);
+                // An encoding-prefixed character/string literal: `L'c'` / `L"s"`
+                // (wide), and `u'c'`/`U'c'`/`u8"s"` (Unicode). The prefix is an
+                // identifier immediately followed by a quote; keep it as part of
+                // the literal's spelling so `eval_char`/`decode_string` see it.
+                if let PpKind::Ident(p) = &id
+                    && matches!(p.as_str(), "L" | "u" | "U" | "u8")
+                    && let Some(&q) = bytes.get(pos)
+                    && (q == b'\'' || q == b'"')
+                {
+                    let prefix = p.clone();
+                    match self.lex_quoted(bytes, &mut pos, q) {
+                        Some(raw) => {
+                            let full = format!("{prefix}{raw}");
+                            if q == b'\'' { PpKind::Char(full) } else { PpKind::Str(full) }
+                        }
+                        None => {
+                            self.diags.push(
+                                Diagnostic::error("unterminated literal").with_span(
+                                    self.remap(Span::new(
+                                        FileId::new(file_idx),
+                                        start as u32,
+                                        pos as u32,
+                                    )),
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    id
+                }
             } else if c == b'"' {
                 match self.lex_quoted(bytes, &mut pos, b'"') {
                     Some(raw) => PpKind::Str(raw),
@@ -1882,7 +1913,22 @@ fn spell_line(toks: &[PpTok]) -> String {
 }
 
 /// Decode a string literal spelling (strip quotes, unescape) to text.
+/// Strip a leading encoding prefix (`L`, `u`, `U`, or `u8`) from a
+/// character/string-literal spelling, leaving the quoted body. A prefix is only
+/// recognised when it is immediately followed by a quote.
+fn strip_encoding_prefix(raw: &str) -> &str {
+    for p in ["u8", "L", "u", "U"] {
+        if let Some(rest) = raw.strip_prefix(p)
+            && (rest.starts_with('\'') || rest.starts_with('"'))
+        {
+            return rest;
+        }
+    }
+    raw
+}
+
 fn decode_string(raw: &str) -> String {
+    let raw = strip_encoding_prefix(raw);
     let inner = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
     unescape(inner)
 }
@@ -1891,6 +1937,7 @@ fn decode_string(raw: &str) -> String {
 /// interpret escapes). Unlike [`decode_string`], the result is byte-exact for
 /// high-byte octal/hex escapes (a C string literal is a byte array).
 fn decode_string_bytes(raw: &str) -> Vec<u8> {
+    let raw = strip_encoding_prefix(raw);
     let inner = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
     unescape_bytes(inner)
 }
@@ -1982,6 +2029,7 @@ fn escape_string(s: &str) -> String {
 
 /// Evaluate a character constant's spelling (including quotes) to its value.
 fn eval_char(raw: &str) -> i128 {
+    let raw = strip_encoding_prefix(raw);
     let inner = raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(raw);
     let bytes = inner.as_bytes();
     if bytes.is_empty() {

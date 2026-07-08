@@ -300,7 +300,7 @@ impl Parser {
         if self.eat_kw(Keyword::Typedef) {
             return self.parse_typedef();
         }
-        let base = self.parse_decl_specs()?;
+        let base = self.parse_decl_specs_impl(true)?;
         let align = self.last_alignas.take();
         let is_constexpr = self.last_constexpr;
         let storage = merge_storage(storage, self.consume_storage());
@@ -577,6 +577,10 @@ impl Parser {
                 variadic = true;
                 break;
             }
+            // A prototype parameter may carry the `register` storage-class
+            // specifier (the only one permitted on a parameter), e.g.
+            // `int f(register int x)`. Consume and ignore it.
+            self.consume_storage();
             let base = self.parse_decl_specs()?;
             let (name, ty, span) = self.declarator(base)?;
             // A trailing attribute on the parameter declarator, e.g.
@@ -710,6 +714,16 @@ impl Parser {
     }
 
     fn parse_decl_specs(&mut self) -> PResult<CType> {
+        self.parse_decl_specs_impl(false)
+    }
+
+    /// Parse declaration specifiers. When `allow_implicit_int` is set and no type
+    /// specifier is present, the type defaults to `int` (the pre-C99 / K&R
+    /// "implicit int" rule, a GNU extension retained in later dialects) provided
+    /// a declarator plausibly follows. Only declaration contexts (file scope and
+    /// K&R parameter declaration-lists) enable this, so parenthesised
+    /// expressions are never misread as casts.
+    fn parse_decl_specs_impl(&mut self, allow_implicit_int: bool) -> PResult<CType> {
         let start = self.peek_span();
         self.last_alignas = None;
         self.last_constexpr = false;
@@ -890,6 +904,19 @@ impl Parser {
         }
 
         if !saw_any {
+            // Implicit `int`: a pre-C99 declaration with no type specifier, e.g.
+            // the K&R function definition `foo(x) int x; { ... }`. Permitted only
+            // when a declarator plausibly follows (an identifier or `*`/`(`), and
+            // only in the pre-C99 dialects gcc accepts it in (`c89`/`gnu89`).
+            if allow_implicit_int
+                && !self.std.is_c99()
+                && matches!(
+                    self.peek(),
+                    TokenKind::Ident(_) | TokenKind::Punct(Punct::Star | Punct::LParen)
+                )
+            {
+                return Ok(CType::int());
+            }
             return Err(Diagnostic::error("expected a type").with_span(start));
         }
         if let Some(ty) = explicit {

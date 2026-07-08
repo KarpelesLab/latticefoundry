@@ -134,9 +134,10 @@ impl CStd {
         self.is_c99() || self.is_gnu()
     }
 
-    /// Declarations intermixed with statements in a block (C99+).
+    /// Declarations intermixed with statements in a block (C99+, and a GNU
+    /// extension in every GNU dialect — gcc accepts it under `-std=gnu89`).
     pub fn mixed_declarations(self) -> bool {
-        self.is_c99()
+        self.is_c99() || self.is_gnu()
     }
 
     /// A declaration in the `for` initializer clause (C99+).
