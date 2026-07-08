@@ -379,3 +379,47 @@ programs.
 | **M5**    | **Compile `.lf` → native executable that runs**          | 8     | ✅ **done** |
 | M6        | Certified tier: proof-carrying pipeline                  | 9     | ✅ done |
 | M7        | JIT, debug info, LTO                                     | 10    | 🔶 JIT + superopt done; DWARF/LTO/more targets pending |
+| M8        | `lf-cc` builds **gzip** from its own source (round-trips) | lf-cc | 🔶 in progress |
+| **M9**    | **`lf-cc` compiles against the real `/usr/include`**     | lf-cc | ⬜ roadmap goal |
+
+## 8. lf-cc: toward a bootstrap-capable C compiler
+
+`lf-cc` (the in-tree C frontend, a *consumer* of the framework) is the proof that
+LatticeFoundry can compile real-world C. The north star is **bootstrap
+capability**: compiling the dependency-free packages an LFS-style base system
+starts with — beginning with **gzip** (pure C, no dependencies, one of the first
+things a Linux From Scratch build compiles).
+
+Today `lf-cc` covers essentially the full C language surface through C23, has a
+`-c` object-emit mode, and links against the real libc via the system linker. The
+gap to a genuine bootstrap compiler is **the headers**.
+
+### M9 — Consume the real `/usr/include` (the headline goal)
+
+Real system builds `#include <stdio.h>` etc., and glibc's headers are dense with
+GNU/glibc constructs `lf-cc` does not yet accept. Making `lf-cc` a drop-in that
+consumes the actual `/usr/include` (rather than minimal hosted-header stubs)
+requires, roughly:
+
+- **GNU C extensions** the headers use pervasively: `__attribute__((...))` (parse
+  in every position, mostly ignore), `__extension__`, `__inline`/`__inline__`,
+  `__restrict`, `__asm__`/`asm` (incl. asm *labels* on declarations and
+  register-asm), statement expressions `({ ... })`, `__typeof__`, the `__builtin_*`
+  family used in macros, `__int128`, `_Float*`/`__float128`, computed `goto`,
+  `case a ... b` ranges, zero-length/flexible arrays.
+- **K&R old-style** function definitions/declarations (also needed by old gzip).
+- **Preprocessor completeness**: `#include_next` (glibc/`bits/*` layering),
+  `__has_include`/`__has_attribute`/`__has_builtin`, and the full set of
+  **predefined macros** the headers branch on (`__GNUC__`/`__GNUC_MINOR__`,
+  `__STDC_VERSION__`, `__SIZEOF_*__`, `__CHAR_BIT__`, `__WORDSIZE`, the
+  arch/ABI/endianness macros, feature-test handling of `_GNU_SOURCE` etc.).
+- **glibc idioms**: `__THROW`/`__nonnull`/`__wur`/`__BEGIN_DECLS` (all macros —
+  fall out once the above work), and enough of `<bits/*.h>` to type the public API.
+- The gcc-provided freestanding headers (`<stddef.h>`, `<stdarg.h>`, …) resolved
+  from gcc's own include dir or our builtins.
+
+This is a substantial multi-phase effort (a robust GNU-C-dialect front end), but
+it is what turns `lf-cc` from "compiles our programs" into "can build the base
+system." M8 (gzip via minimal stubs) is the on-ramp; M9 (real headers) is the
+goal; further LFS packages (`bzip2`, `make`, a shell, `coreutils`, eventually a
+C library and the compiler itself) are the horizon beyond it.
