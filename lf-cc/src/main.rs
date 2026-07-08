@@ -33,6 +33,7 @@ struct Options {
     opt: OptLevel,
     debug: bool,
     emit_lf: bool,
+    emit_obj: bool,
     std: CStd,
     include_dirs: Vec<PathBuf>,
     cmdline: Vec<MacroOp>,
@@ -82,6 +83,21 @@ fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    // `-c`: compile to a relocatable ELF object (for linking against libc with cc).
+    if opts.emit_obj {
+        let obj = lf_cc::build_object_with(&source, &opts.input, &pp, opts.opt, opts.debug)
+            .map_err(|e| match e {
+                BuildError::Frontend(diags) => render_diags(&opts.input, &source, &diags),
+                BuildError::Backend(msg) => msg,
+            })?;
+        let output = opts.output.clone().unwrap_or_else(|| {
+            let stem = Path::new(&opts.input).file_stem().and_then(|s| s.to_str()).unwrap_or("a");
+            format!("{stem}.o")
+        });
+        std::fs::write(&output, obj).map_err(|e| format!("cannot write {output}: {e}"))?;
+        return Ok(());
+    }
+
     // Full build: front end → IR → verify → optimize → codegen → link.
     let image = lf_cc::build_image_with(&source, &opts.input, &pp, opts.opt, opts.debug)
         .map_err(|e| match e {
@@ -100,6 +116,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut opt = OptLevel::O0;
     let mut debug = false;
     let mut emit_lf = false;
+    let mut emit_obj = false;
     let mut std = CStd::default();
     let mut include_dirs: Vec<PathBuf> = Vec::new();
     let mut cmdline: Vec<MacroOp> = Vec::new();
@@ -112,6 +129,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-o" => output = Some(it.next().ok_or("-o requires a path")?.clone()),
             "-g" | "--debug" => debug = true,
             "-S" | "--emit-lf" => emit_lf = true,
+            "-c" => emit_obj = true,
             "-nostdinc" => nostdinc = true,
             "-I" => include_dirs.push(PathBuf::from(it.next().ok_or("-I requires a directory")?)),
             "-D" => cmdline.push(MacroOp::Define(it.next().ok_or("-D requires a name")?.clone())),
@@ -140,7 +158,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     }
 
     let input = input.ok_or("no input file (see `lf-cc --help`)")?;
-    Ok(Options { input, output, opt, debug, emit_lf, std, include_dirs, cmdline, nostdinc })
+    Ok(Options { input, output, opt, debug, emit_lf, emit_obj, std, include_dirs, cmdline, nostdinc })
 }
 
 fn print_usage() {

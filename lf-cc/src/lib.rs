@@ -137,6 +137,44 @@ pub fn build_image_with(
         .map_err(|e| BuildError::Backend(format!("link error: {e}")))
 }
 
+/// Compile a translation unit to a **relocatable ELF object** (the `-c` mode).
+///
+/// Unlike [`build_image_with`], this stops before linking and returns the ELF
+/// `.o` bytes, so the object can be linked by an external linker against a real
+/// libc (calls to undefined symbols like `printf`/`malloc` become relocations
+/// the system linker resolves). This is how lf-cc-compiled hosted programs are
+/// tested.
+pub fn build_object_with(
+    source: &str,
+    input_name: &str,
+    opts: &PpOptions,
+    opt: OptLevel,
+    debug: bool,
+) -> Result<Vec<u8>, BuildError> {
+    let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
+    let (mut module, syms) = lower::lower(&program, source, input_name, debug);
+
+    verify_or(&module, "lowered")?;
+    pipeline::optimize(&mut module, opt);
+    if opt != OptLevel::O0 {
+        verify_or(&module, "optimized")?;
+    }
+
+    let mut obj = if debug {
+        let comp_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_default();
+        let source_desc = x86_64::DebugSource { file_name: input_name.to_owned(), comp_dir };
+        x86_64::compile_module_debug(&module, &syms, &source_desc)
+    } else {
+        x86_64::compile_module(&module, &syms)
+    };
+    emit_globals(&mut obj, &program.globals);
+
+    Ok(latticefoundry::mc::elf::write(&obj))
+}
+
 /// Verify a module (structural tier), mapping any errors to a [`BuildError`].
 fn verify_or(module: &Module, stage: &str) -> Result<(), BuildError> {
     verify::verify_module(module).map_err(|diags| {
