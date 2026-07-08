@@ -29,10 +29,9 @@ pub enum TokenKind {
     /// A floating-point constant (its exact value, already rounded to the target
     /// precision) with the C type its suffix implies (`float`/`double`).
     FloatLit(f64, CType),
-    /// A string literal, carrying its already-decoded contents (produced by the
-    /// preprocessor; the expression grammar of this subset rejects it, but
-    /// directives such as `_Static_assert` accept one).
-    Str(String),
+    /// A string literal, carrying its already-decoded C byte sequence (produced
+    /// by the preprocessor; octal/hex escapes and high bytes are byte-exact).
+    Str(Vec<u8>),
     /// A language keyword.
     Keyword(Keyword),
     /// A punctuator or operator.
@@ -72,6 +71,10 @@ pub enum Keyword {
     Extern,
     /// `static`
     Static,
+    /// `register` (accepted as a storage-class specifier and ignored)
+    Register,
+    /// `auto` (K&R/C89 storage-class specifier; accepted and ignored)
+    Auto,
     /// `if`
     If,
     /// `else`
@@ -194,6 +197,8 @@ fn keyword_from(word: &str) -> Option<Keyword> {
         "volatile" => Keyword::Volatile,
         "extern" => Keyword::Extern,
         "static" => Keyword::Static,
+        "register" => Keyword::Register,
+        "auto" => Keyword::Auto,
         "if" => Keyword::If,
         "else" => Keyword::Else,
         "while" => Keyword::While,
@@ -492,7 +497,6 @@ impl Lexer<'_> {
                     b'n' => 10,
                     b't' => 9,
                     b'r' => 13,
-                    b'0' => 0,
                     b'\\' => 92,
                     b'\'' => 39,
                     b'"' => 34,
@@ -500,6 +504,32 @@ impl Lexer<'_> {
                     b'b' => 8,
                     b'f' => 12,
                     b'v' => 11,
+                    b'?' => 63,
+                    // `\xhh…`: a hexadecimal escape, truncated to a single byte.
+                    b'x' => {
+                        let mut v: i128 = 0;
+                        while let Some(h) = self.peek().and_then(|c| (c as char).to_digit(16)) {
+                            v = (v * 16 + i128::from(h)) & 0xff;
+                            self.pos += 1;
+                        }
+                        v
+                    }
+                    // `\ooo`: an octal escape of one to three octal digits.
+                    b'0'..=b'7' => {
+                        let mut v = i128::from(esc - b'0');
+                        let mut n = 1;
+                        while n < 3 {
+                            match self.peek() {
+                                Some(o @ b'0'..=b'7') => {
+                                    v = v * 8 + i128::from(o - b'0');
+                                    self.pos += 1;
+                                    n += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        v & 0xff
+                    }
                     other => i128::from(other),
                 }
             }

@@ -26,7 +26,8 @@ pub use preprocess::{MacroOp, PpOptions};
 use latticefoundry::ir::Module;
 use latticefoundry::link::{self, ImageOptions};
 use latticefoundry::mc::object::{
-    ObjectModule, Section, SectionId, SectionKind, Symbol, SymbolBinding, SymbolType,
+    ObjectModule, RelocKind, Relocation, Section, SectionId, SectionKind, Symbol, SymbolBinding,
+    SymbolType,
 };
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::Diagnostic;
@@ -34,7 +35,7 @@ use latticefoundry::target::x86_64;
 use latticefoundry::transform::pipeline::{self, OptLevel};
 use latticefoundry::verify;
 
-use sema::TGlobal;
+use sema::{FuncSig, TGlobal};
 
 /// Compile C source text all the way to a lowered IR [`Module`] plus the symbol
 /// interner its names live in. Returns the collected diagnostics on any lex,
@@ -131,6 +132,7 @@ pub fn build_image_with(
         x86_64::compile_module(&module, &syms)
     };
     emit_globals(&mut obj, &program.globals);
+    apply_static_linkage(&mut obj, &program.sigs);
 
     let image_opts = ImageOptions { debug, ..ImageOptions::default() };
     link::link_executable(vec![obj], &image_opts)
@@ -171,8 +173,28 @@ pub fn build_object_with(
         x86_64::compile_module(&module, &syms)
     };
     emit_globals(&mut obj, &program.globals);
+    apply_static_linkage(&mut obj, &program.sigs);
 
     Ok(latticefoundry::mc::elf::write(&obj))
+}
+
+/// Give each `static` function definition internal linkage by rebinding its
+/// object symbol from `Global` to `Local` (the code backend always emits
+/// functions as global). This lets several translation units each define their
+/// own file-scope `static` helper of the same name without colliding at link.
+fn apply_static_linkage(obj: &mut ObjectModule, sigs: &[FuncSig]) {
+    for sig in sigs {
+        if sig.is_static
+            && sig.defined
+            && let Some(id) = obj.symbol_id(&sig.name)
+        {
+            let mut sym = obj.symbol(id).clone();
+            if sym.binding != SymbolBinding::Local {
+                sym.binding = SymbolBinding::Local;
+                obj.add_symbol(sym);
+            }
+        }
+    }
 }
 
 /// Verify a module (structural tier), mapping any errors to a [`BuildError`].
@@ -196,8 +218,18 @@ fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal]) {
     let mut rodata: Option<SectionId> = None;
     let mut data_bytes: Vec<u8> = Vec::new();
     let mut rodata_bytes: Vec<u8> = Vec::new();
+    // Address-valued fields inside globals become relocations, recorded here and
+    // added after the sections exist. Each entry is `(section, field-offset,
+    // target-symbol-name, addend)`.
+    let mut pending: Vec<(SectionId, u64, String, i64)> = Vec::new();
 
     for g in globals {
+        // A pure external reference (`extern T x;` with no definition here) emits
+        // no storage; a use of it elsewhere in this object creates the undefined
+        // symbol the linker resolves.
+        if !g.defined {
+            continue;
+        }
         let size = g.bytes.len().max(1);
         let align = size.next_power_of_two().clamp(1, 8);
         let (sec, bytes) = if g.readonly {
@@ -214,20 +246,32 @@ fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal]) {
         }
         let off = bytes.len() as u64;
         bytes.extend_from_slice(&g.bytes);
+        // A `static` object has internal linkage: its symbol is local.
+        let binding = if g.is_static { SymbolBinding::Local } else { SymbolBinding::Global };
         obj.add_symbol(Symbol::defined(
             g.name.clone(),
-            SymbolBinding::Global,
+            binding,
             SymbolType::Object,
             sec,
             off,
             g.bytes.len() as u64,
         ));
+        for r in &g.relocs {
+            pending.push((sec, off + r.offset, r.symbol.clone(), r.addend));
+        }
     }
     if let Some(sec) = data {
         obj.section_mut(sec).bytes = data_bytes;
     }
     if let Some(sec) = rodata {
         obj.section_mut(sec).bytes = rodata_bytes;
+    }
+    // Now that every defined global symbol exists, turn each recorded pointer
+    // field into an absolute 64-bit relocation against its target symbol
+    // (`reference_symbol` creates an undefined symbol for any not defined here).
+    for (section, offset, symbol, addend) in pending {
+        let sym = obj.reference_symbol(&symbol);
+        obj.add_relocation(Relocation { section, offset, symbol: sym, kind: RelocKind::Abs64, addend });
     }
 }
 

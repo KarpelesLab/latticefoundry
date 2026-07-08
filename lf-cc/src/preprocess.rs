@@ -1486,7 +1486,7 @@ impl Pp {
                     }
                 },
                 PpKind::Char(raw) => TokenKind::IntLit(eval_char(raw), CType::int()),
-                PpKind::Str(raw) => TokenKind::Str(decode_string(raw)),
+                PpKind::Str(raw) => TokenKind::Str(decode_string_bytes(raw)),
                 PpKind::Punct(p) => TokenKind::Punct(*p),
                 PpKind::Hash | PpKind::HashHash => {
                     self.diags.push(Diagnostic::error("stray '#' in program").with_span(span));
@@ -1738,6 +1738,8 @@ fn base_keyword(word: &str) -> Option<Keyword> {
         "volatile" => Keyword::Volatile,
         "extern" => Keyword::Extern,
         "static" => Keyword::Static,
+        "register" => Keyword::Register,
+        "auto" => Keyword::Auto,
         "if" => Keyword::If,
         "else" => Keyword::Else,
         "while" => Keyword::While,
@@ -1843,33 +1845,92 @@ fn spell_line(toks: &[PpTok]) -> String {
     s
 }
 
-/// Decode a string literal spelling (strip quotes, unescape).
+/// Decode a string literal spelling (strip quotes, unescape) to text.
 fn decode_string(raw: &str) -> String {
     let inner = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
     unescape(inner)
 }
 
-fn unescape(inner: &str) -> String {
-    let mut out = String::new();
-    let mut chars = inner.chars();
+/// Decode a string literal spelling to its exact C byte sequence (strip quotes,
+/// interpret escapes). Unlike [`decode_string`], the result is byte-exact for
+/// high-byte octal/hex escapes (a C string literal is a byte array).
+fn decode_string_bytes(raw: &str) -> Vec<u8> {
+    let inner = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
+    unescape_bytes(inner)
+}
+
+/// Decode a string-literal body to its exact C byte sequence, interpreting the
+/// escape sequences. Octal (`\ooo`) and hexadecimal (`\xhh…`) escapes yield the
+/// exact byte value; a source character outside ASCII contributes its raw UTF-8
+/// bytes (a C string literal is a byte array).
+fn unescape_bytes(inner: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            // A non-ASCII source character contributes its UTF-8 bytes verbatim.
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             continue;
         }
         match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some('"') => out.push('"'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('a') => out.push(7),
+            Some('b') => out.push(8),
+            Some('f') => out.push(12),
+            Some('v') => out.push(11),
+            Some('\\') => out.push(b'\\'),
+            Some('\'') => out.push(b'\''),
+            Some('"') => out.push(b'"'),
+            Some('?') => out.push(b'?'),
+            // `\xhh…`: a hexadecimal escape (one or more hex digits).
+            Some('x') => {
+                let mut v: u32 = 0;
+                let mut any = false;
+                while let Some(h) = chars.peek().and_then(|c| c.to_digit(16)) {
+                    v = v.wrapping_mul(16).wrapping_add(h);
+                    any = true;
+                    chars.next();
+                }
+                if any {
+                    out.push((v & 0xff) as u8);
+                } else {
+                    out.push(b'x');
+                }
+            }
+            // `\ooo`: an octal escape of one to three octal digits.
+            Some(d @ '0'..='7') => {
+                let mut v = d.to_digit(8).unwrap();
+                let mut n = 1;
+                while n < 3 {
+                    match chars.peek().and_then(|c| c.to_digit(8)) {
+                        Some(o) => {
+                            v = v * 8 + o;
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                out.push((v & 0xff) as u8);
+            }
+            Some(other) => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
         }
     }
     out
+}
+
+/// Decode a string-literal body to a `String` (lossily for non-UTF-8 bytes).
+/// Used where a textual value is needed (an `#include` filename, a `#pragma`
+/// argument): those are ASCII in practice.
+fn unescape(inner: &str) -> String {
+    String::from_utf8_lossy(&unescape_bytes(inner)).into_owned()
 }
 
 fn escape_string(s: &str) -> String {
@@ -1895,7 +1956,6 @@ fn eval_char(raw: &str) -> i128 {
             Some(b'n') => 10,
             Some(b't') => 9,
             Some(b'r') => 13,
-            Some(b'0') => 0,
             Some(b'\\') => 92,
             Some(b'\'') => 39,
             Some(b'"') => 34,
@@ -1903,9 +1963,28 @@ fn eval_char(raw: &str) -> i128 {
             Some(b'b') => 8,
             Some(b'f') => 12,
             Some(b'v') => 11,
+            Some(b'?') => 63,
+            // `\xhh…`: a hexadecimal escape (one or more hex digits), truncated
+            // to a single byte.
             Some(b'x') => {
                 let hex: String = inner[2..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-                i128::from_str_radix(&hex, 16).unwrap_or(0)
+                i128::from_str_radix(&hex, 16).unwrap_or(0) & 0xff
+            }
+            // `\ooo`: an octal escape of one to three octal digits (`\0` is the
+            // common case), truncated to a single byte.
+            Some(d @ b'0'..=b'7') => {
+                let mut val = i128::from(d - b'0');
+                let mut n = 2;
+                while n < 4 {
+                    match bytes.get(n).copied() {
+                        Some(o @ b'0'..=b'7') => {
+                            val = val * 8 + i128::from(o - b'0');
+                            n += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                val & 0xff
             }
             Some(other) => i128::from(other),
             None => 0,

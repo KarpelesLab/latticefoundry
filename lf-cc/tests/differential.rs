@@ -46,6 +46,42 @@ fn programs() -> Vec<(&'static str, &'static str)> {
              int is_even(int n){ if(n==0) return 1; return is_odd(n-1); } \
              int main(){ return is_even(17) + is_odd(17)*2; }",
         ),
+        // --- old-style (K&R) function definitions ---------------------------
+        // A K&R definition whose parameters are typed by a following
+        // declaration-list (`int a; int b;`), called through a prototype.
+        (
+            "knr_add",
+            "int add(a, b) int a; int b; { return a + b; } \
+             int main(){ return add(19, 23); }",
+        ),
+        // `register` on a K&R parameter declaration is accepted and ignored.
+        // (The default-to-`int` rule for an unlisted parameter is covered by a
+        // separate lf-cc unit test; modern gcc rejects implicit int.)
+        (
+            "knr_register_param",
+            "int f(a, b) register int a; register int b; { return a + b; } \
+             int main(){ return f(40, 2); }",
+        ),
+        // A K&R definition with a pointer parameter and a multi-name declaration.
+        (
+            "knr_ptr_param",
+            "int sum3(p, n) int *p; int n; \
+             { int s = 0, i; for (i = 0; i < n; i++) s += p[i]; return s; } \
+             int main(){ int a[3]; a[0]=10; a[1]=14; a[2]=18; return sum3(a, 3); }",
+        ),
+        // A K&R definition with two names declared in one declaration.
+        (
+            "knr_two_names_one_decl",
+            "int g(x, y) int x, y; { return x - y; } \
+             int main(){ return g(50, 8); }",
+        ),
+        // A K&R definition returning a non-int type, with a `char` parameter
+        // (default-argument-promoted at the call, truncated by the callee).
+        (
+            "knr_char_param",
+            "long scale(c, k) char c; long k; { return (long)c * k; } \
+             int main(){ return (int)scale('\\7', 6); }",
+        ),
         // Pointer to a local.
         ("ptr_local", "int main(){ int x=5, *p=&x; *p=7; return *p; }"),
         ("ptr_swap", "void swap(int*a,int*b){ int t=*a; *a=*b; *b=t; } int main(){ int x=3,y=100; swap(&x,&y); return y; }"),
@@ -78,6 +114,45 @@ fn programs() -> Vec<(&'static str, &'static str)> {
         ("sizeof", "int main(){ return sizeof(int) + sizeof(char)*4 + sizeof(long)*2; }"),
         // Globals.
         ("global_counter", "int counter = 40; int bump(){ counter += 1; return counter; } int main(){ bump(); bump(); return counter; }"),
+        // A `static` block-scope object keeps its value across calls (static
+        // storage duration), initialized once.
+        (
+            "static_local",
+            "int next(void){ static int n = 40; n++; return n; } \
+             int main(){ next(); next(); return next(); }",
+        ),
+        // A tentative definition followed by an initialized definition of the same
+        // object: they denote one object with the initialized value.
+        (
+            "tentative_then_def",
+            "int g; int g = 41; int main(){ return g + 1; }",
+        ),
+        // A `static` file-scope object initialized once, plus a same-name `static`
+        // local in another function (distinct objects — no linkage clash).
+        (
+            "static_file_and_local",
+            "static int s = 20; int addfile(int x){ return s + x; } \
+             int tick(void){ static int s = 1; s++; return s; } \
+             int main(){ tick(); return addfile(tick()) + 18; }",
+        ),
+        // A global pointer array initialized with string-literal addresses and a
+        // function-pointer global initialized with a function's address
+        // (data relocations); an octal escape carries a byte value.
+        (
+            "global_relocations",
+            "char *names[] = { \"ab\", \"cde\", 0 }; \
+             int sq(int x){ return x*x; } int (*fp)(int) = sq; \
+             char oct = '\\52'; \
+             int main(){ int n=0; char **p=names; while(*p){ n += (int)(*p)[0]; p++; } \
+             return n + fp(3) - 187 + (int)oct; }",
+        ),
+        // A string literal with a high-byte octal escape is byte-exact (not
+        // UTF-8-encoded): the two bytes 0x1f and 0x8b, read back individually.
+        (
+            "string_high_byte_escape",
+            "char magic[] = \"\\037\\213\"; \
+             int main(){ return (unsigned char)magic[0] + (unsigned char)magic[1] - 100; }",
+        ),
         // A larger mixed program.
         (
             "mixed",

@@ -13,7 +13,7 @@ use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
     BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records, Stmt,
-    StmtKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    StmtKind, Storage, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::layout;
 
@@ -77,6 +77,8 @@ pub struct FuncSig {
     pub variadic: bool,
     /// Whether a definition (body) was seen.
     pub defined: bool,
+    /// Whether the function has internal linkage (`static`): its symbol is local.
+    pub is_static: bool,
 }
 
 /// A global variable (or an anonymous string-literal object). Its initializer is
@@ -92,6 +94,33 @@ pub struct TGlobal {
     pub bytes: Vec<u8>,
     /// Whether the object belongs in read-only data (string literals).
     pub readonly: bool,
+    /// Whether this translation unit provides a *definition* (storage) for the
+    /// object. `false` marks a pure external reference (`extern T x;` with no
+    /// definition in this TU): no storage is emitted and the symbol is left
+    /// undefined for the linker to resolve.
+    pub defined: bool,
+    /// Whether the object has internal linkage (`static`): its symbol is local.
+    pub is_static: bool,
+    /// Whether the current definition is only *tentative* (a definition without
+    /// an initializer). A tentative definition may be superseded by a later
+    /// initialized definition; two initialized definitions collide.
+    pub tentative: bool,
+    /// Relocations that patch address-valued fields of the initializer image
+    /// (e.g. a pointer initialized with a string-literal or another object's
+    /// address). Each entry patches 8 bytes at `offset` to `symbol + addend`.
+    pub relocs: Vec<GlobalReloc>,
+}
+
+/// A relocation within a global's initializer image: the 8-byte field at
+/// `offset` holds the address of `symbol` plus `addend`.
+#[derive(Clone, Debug)]
+pub struct GlobalReloc {
+    /// The byte offset of the pointer field within the global's image.
+    pub offset: u64,
+    /// The name of the symbol whose address is stored.
+    pub symbol: String,
+    /// A constant byte addend added to the symbol's address.
+    pub addend: i64,
 }
 
 /// A defined function with a typed body.
@@ -463,7 +492,16 @@ impl Checker {
         let name = format!(".Lstr.{idx}");
         let ty = CType::Array(Box::new(char_ty()), bytes.len() as u64);
         self.string_pool.insert(bytes.clone(), idx);
-        self.globals.push(TGlobal { name, ty, bytes, readonly: true });
+        self.globals.push(TGlobal {
+            name,
+            ty,
+            bytes,
+            readonly: true,
+            defined: true,
+            is_static: true,
+            tentative: false,
+            relocs: Vec::new(),
+        });
         idx
     }
 
@@ -474,11 +512,15 @@ impl Checker {
             match item {
                 TopLevel::Proto(p) => {
                     let params = p.params.iter().map(|pp| pp.ty.clone()).collect();
-                    self.register_sig(&p.name, p.ret.clone(), params, p.variadic, false, p.span);
+                    self.register_sig(
+                        &p.name, p.ret.clone(), params, p.variadic, false, p.is_static, p.span,
+                    );
                 }
                 TopLevel::Func(f) => {
                     let params = f.params.iter().map(|pp| pp.ty.clone()).collect();
-                    self.register_sig(&f.name, f.ret.clone(), params, f.variadic, true, f.span);
+                    self.register_sig(
+                        &f.name, f.ret.clone(), params, f.variadic, true, f.is_static, f.span,
+                    );
                 }
                 TopLevel::Global(g) => self.register_global(g),
             }
@@ -491,6 +533,7 @@ impl Checker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_sig(
         &mut self,
         name: &str,
@@ -498,10 +541,16 @@ impl Checker {
         params: Vec<CType>,
         variadic: bool,
         defined: bool,
+        is_static: bool,
         span: Span,
     ) {
         if let Some(&idx) = self.sig_index.get(name) {
             let existing = &mut self.sigs[idx];
+            // Any `static` declaration of the name gives the whole entity internal
+            // linkage.
+            if is_static {
+                existing.is_static = true;
+            }
             if defined {
                 if existing.defined {
                     self.error(span, format!("redefinition of function '{name}'"));
@@ -515,31 +564,87 @@ impl Checker {
             return;
         }
         let idx = self.sigs.len();
-        self.sigs.push(FuncSig { name: name.to_owned(), ret, params, variadic, defined });
+        self.sigs.push(FuncSig { name: name.to_owned(), ret, params, variadic, defined, is_static });
         self.sig_index.insert(name.to_owned(), idx);
     }
 
     fn register_global(&mut self, g: &VarDecl) {
-        if self.global_index.contains_key(&g.name) {
-            self.error(g.span, format!("redefinition of global '{}'", g.name));
-            return;
-        }
         if matches!(g.ty, CType::Void) {
             self.error(g.span, "global cannot have type 'void'");
             return;
         }
+        // Classify this file-scope declaration by its storage class and whether it
+        // carries an initializer (C11 6.9.2):
+        //   - `extern T x;` (no init)        -> a *declaration* only (references a
+        //                                        definition elsewhere / later).
+        //   - `T x;` / `static T x;` (no init) -> a *tentative definition*.
+        //   - `... x = init;`                -> an external *definition*.
+        let has_init = g.init.is_some();
+        let is_decl_only = g.storage == Storage::Extern && !has_init;
+        let is_static = g.storage == Storage::Static;
+
         let mut ty = g.ty.clone();
         if let Some(init) = &g.init {
             ty = self.deduce_array_len(&ty, init);
         }
-        let size = self.size_of(&ty) as usize;
-        let mut bytes = vec![0u8; size];
-        if let Some(init) = &g.init {
-            self.build_global_bytes(&ty, init, 0, &mut bytes, g.span);
+
+        // Merge with any prior declaration of the same name.
+        if let Some(&idx) = self.global_index.get(&g.name) {
+            // A second full definition (both with initializers) is an error.
+            if has_init && self.globals[idx].defined && !self.globals[idx].tentative {
+                self.error(g.span, format!("redefinition of global '{}'", g.name));
+                return;
+            }
+            // Adopt a more complete type (e.g. `extern int a[];` then `int a[10];`).
+            if ty_is_more_complete(&ty, &self.globals[idx].ty) {
+                self.globals[idx].ty = ty.clone();
+            }
+            // A definition (initialized or tentative) upgrades a prior declaration
+            // and materializes the storage image.
+            if !is_decl_only {
+                let final_ty = self.globals[idx].ty.clone();
+                let (bytes, relocs) = self.materialize_global(&final_ty, g);
+                self.globals[idx].bytes = bytes;
+                self.globals[idx].relocs = relocs;
+                self.globals[idx].defined = true;
+                self.globals[idx].tentative = !has_init;
+            }
+            if is_static {
+                self.globals[idx].is_static = true;
+            }
+            return;
         }
+
+        // First declaration of this name.
+        let (bytes, relocs) = if is_decl_only {
+            (Vec::new(), Vec::new())
+        } else {
+            self.materialize_global(&ty, g)
+        };
         let idx = self.globals.len();
         self.global_index.insert(g.name.clone(), idx);
-        self.globals.push(TGlobal { name: g.name.clone(), ty, bytes, readonly: false });
+        self.globals.push(TGlobal {
+            name: g.name.clone(),
+            ty,
+            bytes,
+            readonly: false,
+            defined: !is_decl_only,
+            is_static,
+            tentative: !has_init && !is_decl_only,
+            relocs,
+        });
+    }
+
+    /// Build the little-endian storage image (and any address relocations) for a
+    /// defined global of type `ty` from its optional initializer.
+    fn materialize_global(&mut self, ty: &CType, g: &VarDecl) -> (Vec<u8>, Vec<GlobalReloc>) {
+        let size = self.size_of(ty) as usize;
+        let mut bytes = vec![0u8; size];
+        let mut relocs = Vec::new();
+        if let Some(init) = &g.init {
+            self.build_global_bytes(ty, init, 0, &mut bytes, &mut relocs, g.span);
+        }
+        (bytes, relocs)
     }
 
     /// Evaluate a constant integer expression, resolving enumerators.
@@ -548,8 +653,18 @@ impl Checker {
     }
 
     /// Materialize an initializer to little-endian bytes at `off` within `bytes`
-    /// (globals must have constant initializers).
-    fn build_global_bytes(&mut self, ty: &CType, init: &Init, off: u64, bytes: &mut [u8], span: Span) {
+    /// (globals must have constant initializers). Address-valued pointer fields
+    /// (a string literal or another object's address) append a [`GlobalReloc`] to
+    /// `relocs` instead of writing a numeric value.
+    fn build_global_bytes(
+        &mut self,
+        ty: &CType,
+        init: &Init,
+        off: u64,
+        bytes: &mut [u8],
+        relocs: &mut Vec<GlobalReloc>,
+        span: Span,
+    ) {
         match ty {
             CType::Array(elem, n) => {
                 // `char[] = "..."` writes the literal bytes directly.
@@ -572,7 +687,14 @@ impl Checker {
                 for item in items {
                     idx = apply_index_designators(&item.designators, idx);
                     if idx < *n {
-                        self.build_global_bytes(elem, &item.init, off + idx * stride, bytes, span);
+                        self.build_global_bytes(
+                            elem,
+                            &item.init,
+                            off + idx * stride,
+                            bytes,
+                            relocs,
+                            span,
+                        );
                     }
                     idx += 1;
                 }
@@ -609,9 +731,14 @@ impl Checker {
                                     ),
                                 }
                             }
-                            None => {
-                                self.build_global_bytes(&fty, &item.init, off + foff, bytes, span)
-                            }
+                            None => self.build_global_bytes(
+                                &fty,
+                                &item.init,
+                                off + foff,
+                                bytes,
+                                relocs,
+                                span,
+                            ),
                         }
                     }
                     field_idx += 1;
@@ -640,19 +767,97 @@ impl Checker {
                             self.error(e.span, "global initializer must be a constant expression");
                         }
                     }
-                } else {
-                    match self.const_eval(e) {
-                        // Reduce to the type's range so a `_BitInt(N)` global holds
-                        // a valid N-bit pattern (loads do not re-normalize).
-                        Some(v) => {
-                            write_int_bytes(bytes, off, reduce_to_type(v, ty), self.size_of(ty))
-                        }
-                        None => {
-                            self.error(e.span, "global initializer must be a constant expression");
-                        }
+                } else if let Some(v) = self.const_eval(e) {
+                    // Reduce to the type's range so a `_BitInt(N)` global holds a
+                    // valid N-bit pattern (loads do not re-normalize).
+                    write_int_bytes(bytes, off, reduce_to_type(v, ty), self.size_of(ty));
+                } else if ty.is_pointer()
+                    && let Some((sym, addend)) = self.const_addr(e)
+                {
+                    // An address constant (a string literal, or `&object` / a
+                    // decayed array or function name, plus a constant offset). The
+                    // pointer field is a relocation the linker fills in; `sym` is
+                    // `None` for a pure integer address (e.g. a null pointer), which
+                    // stays a plain numeric value.
+                    match sym {
+                        Some(symbol) => relocs.push(GlobalReloc { offset: off, symbol, addend }),
+                        None => write_int_bytes(bytes, off, addend as i128, self.size_of(ty)),
                     }
+                } else {
+                    self.error(e.span, "global initializer must be a constant expression");
                 }
             }
+        }
+    }
+
+    /// Evaluate an initializer expression as an address constant: `Some((symbol,
+    /// addend))` where `symbol` is the target object's symbol name (`None` for a
+    /// pure integer address such as a null pointer) and `addend` a constant byte
+    /// offset. Handles string literals, decayed array/function names, `&object`
+    /// (into a member or a constant array element), and casts. Returns `None` if
+    /// `e` is not an address constant.
+    fn const_addr(&mut self, e: &Expr) -> Option<(Option<String>, i64)> {
+        match &e.kind {
+            // An integer that is not otherwise a constant-expression (rare here):
+            // treat as a pure numeric address with no symbol.
+            ExprKind::IntLit(v, _) => Some((None, *v as i64)),
+            ExprKind::StrLit(bytes) => {
+                let idx = self.intern_string(bytes.clone());
+                Some((Some(self.globals[idx].name.clone()), 0))
+            }
+            // A cast does not change the represented address.
+            ExprKind::Cast(_, inner) => self.const_addr(inner),
+            // An identifier of array or function type decays to its address.
+            ExprKind::Ident(name) => {
+                if self.sig_index.contains_key(name) {
+                    return Some((Some(name.clone()), 0));
+                }
+                if let Some(&idx) = self.global_index.get(name)
+                    && matches!(self.globals[idx].ty, CType::Array(..))
+                {
+                    return Some((Some(self.globals[idx].name.clone()), 0));
+                }
+                None
+            }
+            // `&lvalue`: the address of a named object (optionally into a member or
+            // a constant array element).
+            ExprKind::Unary(UnaryOp::AddrOf, inner) => {
+                let (sym, off, _ty) = self.const_lvalue(inner)?;
+                Some((Some(sym), off))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve a constant lvalue designating part of a named object to its
+    /// `(symbol, byte-offset, type)`. Descends through constant array subscripts
+    /// and struct/union members from a root global identifier.
+    fn const_lvalue(&mut self, e: &Expr) -> Option<(String, i64, CType)> {
+        match &e.kind {
+            ExprKind::Ident(name) => {
+                let &idx = self.global_index.get(name)?;
+                Some((self.globals[idx].name.clone(), 0, self.globals[idx].ty.clone()))
+            }
+            ExprKind::Index(base, idx) => {
+                let (sym, off, bty) = self.const_lvalue(base)?;
+                let elem = match &bty {
+                    CType::Array(elem, _) | CType::Pointer(elem) => (**elem).clone(),
+                    _ => return None,
+                };
+                let n = self.const_eval(idx)? as i64;
+                let stride = layout::stride_of(&self.records, &elem) as i64;
+                Some((sym, off + n * stride, elem))
+            }
+            ExprKind::Member(base, field, false) => {
+                let (sym, off, bty) = self.const_lvalue(base)?;
+                if let CType::Record(id) = &bty {
+                    let (foff, fty) = layout::resolve_member(&self.records, *id, field)?;
+                    return Some((sym, off + foff as i64, fty));
+                }
+                None
+            }
+            ExprKind::Cast(_, inner) => self.const_lvalue(inner),
+            _ => None,
         }
     }
 
@@ -720,7 +925,7 @@ impl Checker {
             let id = ctx.add_object(&name, p.ty.clone());
             ctx.params.push(id);
             if !name.is_empty() {
-                ctx.scopes.last_mut().unwrap().insert(name, id);
+                ctx.scopes.last_mut().unwrap().insert(name, Binding::Local(id));
             }
         }
         let mut body = Vec::new();
@@ -983,6 +1188,17 @@ impl Checker {
             {
                 self.error(d.span, "variable has incomplete struct/union type");
             }
+            // A `static` block-scope object has static storage duration: it is
+            // backed by a program global (initialized once, at load), not by a
+            // stack slot, and its name resolves to that global.
+            if d.storage == Storage::Static {
+                if ctx.scopes.last().unwrap().contains_key(&d.name) {
+                    self.error(d.span, format!("redeclaration of '{}'", d.name));
+                }
+                let idx = self.make_static_local(&d.name, &ty, d);
+                ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Static(idx));
+                continue;
+            }
             // Check the initializer *before* the name is in scope (C scoping).
             let init_built = match &d.init {
                 Some(init) => self.build_init(ctx, &ty, init, d.span),
@@ -992,7 +1208,7 @@ impl Checker {
                 self.error(d.span, format!("redeclaration of '{}'", d.name));
             }
             let id = ctx.add_object_aligned(&d.name, ty.clone(), d.align);
-            ctx.scopes.last_mut().unwrap().insert(d.name.clone(), id);
+            ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Local(id));
             match init_built {
                 Some(InitBuilt::Scalar(v)) => out.push(TStmt::InitLocal(id, v)),
                 Some(InitBuilt::Aggregate(stores)) => {
@@ -1012,6 +1228,37 @@ impl Checker {
             1 => Some(out.pop().unwrap()),
             _ => Some(TStmt::Block(out)),
         }
+    }
+
+    /// Create the backing global for a `static` block-scope object of type `ty`,
+    /// returning its index in [`Program::globals`]. Its initializer must be a
+    /// constant expression (like a file-scope object); it is materialized to the
+    /// object's storage image once. The symbol is given a unique name and
+    /// internal linkage (it is not visible outside the function).
+    fn make_static_local(&mut self, name: &str, ty: &CType, d: &VarDecl) -> usize {
+        // Materialize the constant initializer first (it may intern string
+        // literals, which append globals), then take the next global index.
+        let size = self.size_of(ty) as usize;
+        let mut bytes = vec![0u8; size];
+        let mut relocs = Vec::new();
+        if let Some(init) = &d.init {
+            self.build_global_bytes(ty, init, 0, &mut bytes, &mut relocs, d.span);
+        }
+        let idx = self.globals.len();
+        // A unique, internally-linked symbol name (the index disambiguates two
+        // functions that each declare a `static` of the same source name).
+        let sym = format!("{name}.static.{idx}");
+        self.globals.push(TGlobal {
+            name: sym,
+            ty: ty.clone(),
+            bytes,
+            readonly: false,
+            defined: true,
+            is_static: true,
+            tentative: false,
+            relocs,
+        });
+        idx
     }
 
     /// Check an initializer against `ty`, producing either a single scalar value
@@ -1523,9 +1770,17 @@ impl Checker {
     }
 
     fn check_ident(&mut self, ctx: &mut FnCtx, name: &str, span: Span) -> Option<TExpr> {
-        if let Some(id) = ctx.lookup(name) {
-            let ty = ctx.locals[id].ty.clone();
-            return Some(TExpr::new(TExprKind::Obj(id), ty, span));
+        match ctx.lookup(name) {
+            Some(Binding::Local(id)) => {
+                let ty = ctx.locals[id].ty.clone();
+                return Some(TExpr::new(TExprKind::Obj(id), ty, span));
+            }
+            // A `static` block-scope object resolves to its backing global.
+            Some(Binding::Static(idx)) => {
+                let ty = self.globals[idx].ty.clone();
+                return Some(TExpr::new(TExprKind::Global(idx), ty, span));
+            }
+            None => {}
         }
         // A `constexpr` object resolves to its (typed) compile-time value; being a
         // pure constant, it is not a modifiable lvalue (so assignment is rejected).
@@ -2036,6 +2291,14 @@ fn size_t() -> CType {
     CType::Int(IntTy::new(64, false))
 }
 
+/// Whether type `new_ty` is a more complete version of `old_ty` for the purpose
+/// of merging redundant file-scope declarations: it replaces an incomplete
+/// array (`T[]`, modelled as length 0) with a sized one (`extern int a[];` then
+/// `int a[10];`).
+fn ty_is_more_complete(new_ty: &CType, old_ty: &CType) -> bool {
+    matches!((old_ty, new_ty), (CType::Array(_, 0), CType::Array(_, n)) if *n != 0)
+}
+
 /// Whether field `idx` of record `id` is an unnamed bit-field (padding or a
 /// `:0` unit terminator), which takes no positional initializer.
 fn is_unnamed_bitfield(recs: &Records, id: RecordId, idx: usize) -> bool {
@@ -2104,10 +2367,21 @@ struct SwitchCollector {
 }
 
 /// The per-function checking context: scopes and the object table.
+/// What a block-scope name denotes: an object with automatic storage (a stack
+/// local or parameter, by [`ObjId`]) or one with static storage duration (a
+/// `static` local, held as a program global by index).
+#[derive(Clone, Copy, Debug)]
+enum Binding {
+    /// A stack local or parameter.
+    Local(ObjId),
+    /// A `static` block-scope object: an index into [`Program::globals`].
+    Static(usize),
+}
+
 struct FnCtx {
     locals: Vec<LocalInfo>,
     params: Vec<ObjId>,
-    scopes: Vec<HashMap<String, ObjId>>,
+    scopes: Vec<HashMap<String, Binding>>,
     ret_ty: CType,
     loop_depth: u32,
     /// Nesting depth of enclosing `switch` statements (for `break` validity).
@@ -2137,10 +2411,10 @@ impl FnCtx {
         self.scopes.pop();
     }
 
-    fn lookup(&self, name: &str) -> Option<ObjId> {
+    fn lookup(&self, name: &str) -> Option<Binding> {
         for scope in self.scopes.iter().rev() {
-            if let Some(&id) = scope.get(name) {
-                return Some(id);
+            if let Some(&b) = scope.get(name) {
+                return Some(b);
             }
         }
         None

@@ -14,7 +14,7 @@ use latticefoundry::support::diagnostics::{Diagnostic, Span};
 use crate::ast::{
     BinaryOp, CType, Designator, Expr, ExprKind, Field, FloatTy, FuncDef, FuncProto, FuncType,
     GenericAssoc, Init, InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt,
-    StmtKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    StmtKind, Storage, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
 use crate::layout;
@@ -267,7 +267,7 @@ impl Parser {
             match self.peek().clone() {
                 TokenKind::Str(s) => {
                     self.bump();
-                    message = Some(s);
+                    message = Some(String::from_utf8_lossy(&s).into_owned());
                 }
                 _ => return self.err("expected a string message in _Static_assert"),
             }
@@ -288,16 +288,16 @@ impl Parser {
         if self.eat_kw(Keyword::Typedef) {
             return self.parse_typedef();
         }
-        // Storage-class specifiers (extern/static) are consumed and ignored for
-        // linkage purposes in this single-TU subset.
-        self.consume_storage();
+        // Storage-class specifiers (extern/static) determine a file-scope object's
+        // linkage; they may appear before and/or after the type specifiers.
+        let storage = self.consume_storage();
         if self.eat_kw(Keyword::Typedef) {
             return self.parse_typedef();
         }
         let base = self.parse_decl_specs()?;
         let align = self.last_alignas.take();
         let is_constexpr = self.last_constexpr;
-        self.consume_storage();
+        let storage = merge_storage(storage, self.consume_storage());
 
         // A C23 `constexpr` object is a named compile-time constant (no storage).
         if is_constexpr {
@@ -322,7 +322,7 @@ impl Parser {
             self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            items.push(TopLevel::Global(VarDecl { name, ty, init, align, span }));
+            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span }));
             while self.eat_punct(Punct::Comma) {
                 let (name, ty, span) = self.parse_named_declarator(base.clone())?;
                 self.declare_ordinary(&name, Some(ty.clone()));
@@ -331,7 +331,7 @@ impl Parser {
                 } else {
                     None
                 };
-                items.push(TopLevel::Global(VarDecl { name, ty, init, align, span }));
+                items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span }));
             }
             self.expect_punct(Punct::Semi, "';' after global declaration")?;
             return Ok(items);
@@ -342,6 +342,31 @@ impl Parser {
 
         if self.is_punct(Punct::LParen) {
             self.push_scope();
+            // An old-style (K&R) function definition opens with an *identifier
+            // list*: `ret name(id, id, ...) decl-list { body }`. We recognize it
+            // by the first token after `(` being an identifier that does not name
+            // a type (a typedef-name would begin a prototype parameter instead).
+            // Empty `()`, `(void)`, and prototype parameter lists are handled by
+            // the normal path below.
+            if self.at_kr_identifier_list() {
+                let params = self.parse_kr_definition_params()?;
+                for p in &params {
+                    if let Some(n) = &p.name {
+                        self.declare_ordinary(n, Some(p.ty.clone()));
+                    }
+                }
+                let body = self.parse_block_stmts()?;
+                self.pop_scope();
+                return Ok(vec![TopLevel::Func(FuncDef {
+                    name,
+                    ret: ty0,
+                    params,
+                    variadic: false,
+                    is_static: storage == Storage::Static,
+                    body,
+                    span: name_span,
+                })]);
+            }
             let (params, variadic) = self.parse_param_list()?;
             for p in &params {
                 if let Some(n) = &p.name {
@@ -356,6 +381,7 @@ impl Parser {
                     ret: ty0,
                     params,
                     variadic,
+                    is_static: storage == Storage::Static,
                     body,
                     span: name_span,
                 })]);
@@ -367,6 +393,7 @@ impl Parser {
                 ret: ty0,
                 params,
                 variadic,
+                is_static: storage == Storage::Static,
                 span: name_span,
             })]);
         }
@@ -376,13 +403,13 @@ impl Parser {
         let ty = self.parse_array_suffix(ty0)?;
         self.declare_ordinary(&name, Some(ty.clone()));
         let init = if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-        items.push(TopLevel::Global(VarDecl { name, ty, init, align, span: name_span }));
+        items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span: name_span }));
         while self.eat_punct(Punct::Comma) {
             let (name, ty, span) = self.parse_named_declarator(base.clone())?;
             self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            items.push(TopLevel::Global(VarDecl { name, ty, init, align, span }));
+            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span }));
         }
         self.expect_punct(Punct::Semi, "';' after global declaration")?;
         Ok(items)
@@ -485,24 +512,45 @@ impl Parser {
         }
     }
 
-    fn consume_storage(&mut self) {
-        while self.is_kw(Keyword::Extern)
-            || self.is_kw(Keyword::Static)
-            || self.is_kw(Keyword::Inline)
-            || self.is_kw(Keyword::Noreturn)
-        {
+    /// Consume any leading storage-class / function specifiers, returning the
+    /// linkage-affecting one (`extern`/`static`) if present. `register`, `auto`,
+    /// `inline`, and `_Noreturn` do not affect linkage and yield [`Storage::None`].
+    fn consume_storage(&mut self) -> Storage {
+        let mut storage = Storage::None;
+        loop {
+            if self.is_kw(Keyword::Extern) {
+                storage = Storage::Extern;
+            } else if self.is_kw(Keyword::Static) {
+                storage = Storage::Static;
+            } else if !(self.is_kw(Keyword::Register)
+                || self.is_kw(Keyword::Auto)
+                || self.is_kw(Keyword::Inline)
+                || self.is_kw(Keyword::Noreturn))
+            {
+                break;
+            }
             self.bump();
         }
+        storage
     }
 
     fn parse_param_list(&mut self) -> PResult<(Vec<Param>, bool)> {
         self.expect_punct(Punct::LParen, "'('")?;
         let mut params = Vec::new();
         let mut variadic = false;
+        // Empty parentheses `()` declare a function whose parameters are
+        // *unspecified* (an old-style / K&R declarator), NOT a function taking no
+        // arguments. Calls to it are unchecked and the arguments undergo the
+        // default argument promotions. We model this as an empty, variadic
+        // parameter list: `check_call` then imposes no arity or type constraints
+        // and applies the promotions, and the lowered IR function is variadic so
+        // the verifier accepts calls carrying arguments. An explicit `(void)`
+        // (below) is the distinct "takes no arguments" prototype.
         if self.eat_punct(Punct::RParen) {
-            return Ok((params, variadic));
+            return Ok((params, true));
         }
-        // `(void)` means an explicit empty parameter list.
+        // `(void)` means an explicit empty parameter list (a prototype taking no
+        // arguments); calls with any argument are rejected.
         if self.is_kw(Keyword::Void) && matches!(self.peek_at(1), TokenKind::Punct(Punct::RParen)) {
             self.bump();
             self.bump();
@@ -524,6 +572,78 @@ impl Parser {
         }
         self.expect_punct(Punct::RParen, "')' to close parameter list")?;
         Ok((params, variadic))
+    }
+
+    /// Whether the `(` at the cursor opens an old-style (K&R) identifier list —
+    /// the parameter names of an old-style function definition — rather than a
+    /// prototype parameter list. This holds when the first token after `(` is an
+    /// identifier that does not name a type (a typedef-name would begin a
+    /// prototype parameter). Empty `()` and `(void)` are not identifier lists.
+    fn at_kr_identifier_list(&self) -> bool {
+        matches!(self.peek_at(1),
+            TokenKind::Ident(n)
+                if !self.is_typedef_name(n) && n != "_BitInt" && n != "constexpr")
+    }
+
+    /// Parse the parameters of an old-style (K&R) function definition: the
+    /// identifier list `(id, id, ...)` at the cursor, followed by the
+    /// declaration-list that gives those identifiers their types. An identifier
+    /// that the declaration-list does not mention defaults to `int`. The
+    /// parameters are returned in identifier-list (declaration) order, with
+    /// array/function types decayed to pointers as for prototype parameters.
+    fn parse_kr_definition_params(&mut self) -> PResult<Vec<Param>> {
+        self.expect_punct(Punct::LParen, "'('")?;
+        let mut names: Vec<(String, Span)> = Vec::new();
+        loop {
+            let (n, sp) = self.expect_ident()?;
+            names.push((n, sp));
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RParen, "')' to close identifier list")?;
+        // The declaration-list types the named parameters. It runs until the
+        // function body's `{`. Each declaration may declare several parameters
+        // (`int a, b;`) and may carry a `register` storage-class specifier.
+        let mut types: HashMap<String, (CType, Span)> = HashMap::new();
+        while !self.is_punct(Punct::LBrace) && !self.at_eof() {
+            self.consume_storage();
+            let base = self.parse_decl_specs()?;
+            self.consume_storage();
+            if self.eat_punct(Punct::Semi) {
+                continue;
+            }
+            loop {
+                let (pname, pty, psp) = self.parse_named_declarator(base.clone())?;
+                let pty = pty.decayed().unwrap_or(pty);
+                if !names.iter().any(|(n, _)| *n == pname) {
+                    return Err(Diagnostic::error(format!(
+                        "'{pname}' is not one of the function's parameters"
+                    ))
+                    .with_span(psp));
+                }
+                if types.insert(pname.clone(), (pty, psp)).is_some() {
+                    return Err(Diagnostic::error(format!(
+                        "redeclaration of parameter '{pname}'"
+                    ))
+                    .with_span(psp));
+                }
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::Semi, "';' after parameter declaration")?;
+        }
+        // Assemble the parameters in identifier-list order; an undeclared
+        // identifier defaults to `int`.
+        let params = names
+            .into_iter()
+            .map(|(n, sp)| match types.remove(&n) {
+                Some((ty, tsp)) => Param { name: Some(n), ty, span: tsp },
+                None => Param { name: Some(n), ty: CType::int(), span: sp },
+            })
+            .collect();
+        Ok(params)
     }
 
     // --- types -------------------------------------------------------------
@@ -553,6 +673,8 @@ impl Parser {
                 | Keyword::TypeofUnqual
                 | Keyword::Extern
                 | Keyword::Static
+                | Keyword::Register
+                | Keyword::Auto
                 | Keyword::Struct
                 | Keyword::Union
                 | Keyword::Enum
@@ -1428,7 +1550,7 @@ impl Parser {
             self.parse_typedef()?;
             return Ok(self.stmt(StmtKind::Expr(None), start));
         }
-        self.consume_storage();
+        let storage = self.consume_storage();
         if self.eat_kw(Keyword::Typedef) {
             self.parse_typedef()?;
             return Ok(self.stmt(StmtKind::Expr(None), start));
@@ -1436,7 +1558,7 @@ impl Parser {
         let base = self.parse_decl_specs()?;
         let align = self.last_alignas.take();
         let is_constexpr = self.last_constexpr;
-        self.consume_storage();
+        let storage = merge_storage(storage, self.consume_storage());
         // A C23 `constexpr` object is a named compile-time constant (no storage);
         // it contributes no executable statement.
         if is_constexpr {
@@ -1454,7 +1576,7 @@ impl Parser {
             self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            decls.push(VarDecl { name, ty, init, align, span: name_span });
+            decls.push(VarDecl { name, ty, init, align, storage, span: name_span });
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
@@ -1928,7 +2050,7 @@ impl Parser {
                 let mut bytes = Vec::new();
                 let mut span = self.peek_span();
                 while let TokenKind::Str(s) = self.peek().clone() {
-                    bytes.extend_from_slice(s.as_bytes());
+                    bytes.extend_from_slice(&s);
                     span = span.merge(self.bump().span);
                 }
                 Ok(Expr { kind: ExprKind::StrLit(bytes), span })
@@ -2078,6 +2200,17 @@ fn deref_target(ty: &CType) -> Option<CType> {
         CType::Pointer(p) => Some((**p).clone()),
         CType::Array(e, _) => Some((**e).clone()),
         _ => None,
+    }
+}
+
+/// Combine two storage-class results from a declaration (specifiers may appear
+/// on either side of the type). A concrete class (`extern`/`static`) overrides
+/// [`Storage::None`]; if both are concrete the later one wins (a genuine
+/// conflict like `extern static` is ill-formed but not diagnosed here).
+fn merge_storage(a: Storage, b: Storage) -> Storage {
+    match (a, b) {
+        (s, Storage::None) => s,
+        (_, s) => s,
     }
 }
 

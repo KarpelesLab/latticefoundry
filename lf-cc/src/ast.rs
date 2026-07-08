@@ -593,6 +593,21 @@ pub enum StmtKind {
     Goto(String),
 }
 
+/// The storage-class specifier applied to a declaration, as far as it affects
+/// linkage at file scope. `register`/`auto`/`inline` do not change linkage and
+/// map to [`Storage::None`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Storage {
+    /// No linkage-affecting storage-class specifier.
+    #[default]
+    None,
+    /// `extern`: at file scope, a reference to an object with external linkage
+    /// (a definition unless it carries no initializer).
+    Extern,
+    /// `static`: internal linkage.
+    Static,
+}
+
 /// A single declared variable (in a local declaration or a global).
 #[derive(Clone, Debug)]
 pub struct VarDecl {
@@ -604,6 +619,8 @@ pub struct VarDecl {
     pub init: Option<Init>,
     /// An explicit `_Alignas`/`alignas` alignment override, if any.
     pub align: Option<u64>,
+    /// The storage-class specifier (linkage) this declaration carries.
+    pub storage: Storage,
     /// The source span of the declarator.
     pub span: Span,
 }
@@ -630,6 +647,8 @@ pub struct FuncDef {
     pub params: Vec<Param>,
     /// Whether the function is variadic (`...` after its named parameters).
     pub variadic: bool,
+    /// Whether the function has internal linkage (`static`).
+    pub is_static: bool,
     /// The function body (a list of statements).
     pub body: Vec<Stmt>,
     /// The source span of the function's declarator (its name).
@@ -647,6 +666,8 @@ pub struct FuncProto {
     pub params: Vec<Param>,
     /// Whether the prototype is variadic (`...`).
     pub variadic: bool,
+    /// Whether the function has internal linkage (`static`).
+    pub is_static: bool,
     /// The source span of the declarator.
     pub span: Span,
 }

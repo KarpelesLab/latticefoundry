@@ -87,6 +87,30 @@ fn ret_type(body: &str) -> CType {
     }
 }
 
+/// Octal (`\ooo`) and hexadecimal (`\xhh`) escape sequences in a character
+/// constant decode to their numeric value, not the digit characters. (The
+/// end-to-end preprocessor path is covered by the `knr_char_param` differential
+/// program.)
+#[test]
+fn char_octal_and_hex_escapes() {
+    use crate::lex::TokenKind;
+    for (src, want) in [
+        ("'\\7'", 7),
+        ("'\\0'", 0),
+        ("'\\101'", 65),
+        ("'\\377'", 255),
+        ("'\\x41'", 65),
+        ("'\\xff'", 255),
+        ("'\\n'", 10),
+        ("'A'", 65),
+    ] {
+        match first_token(src) {
+            TokenKind::IntLit(v, _) => assert_eq!(v, want, "char constant {src}"),
+            other => panic!("expected an integer literal for {src}, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn integer_literal_types() {
     let prog = check_source("int f() { return 1 + 2; }").unwrap();
@@ -222,6 +246,102 @@ fn call_arity_mismatch_is_an_error() {
     let src = "int g(int a, int b) { return a + b; } int f() { return g(1); }";
     let err = check_source(src).unwrap_err();
     assert!(err.iter().any(|d| d.message.contains("expects 2 argument")));
+}
+
+// --- old-style (K&R) functions --------------------------------------------
+
+/// A K&R function definition types its parameters from the following
+/// declaration-list; a parameter the list omits defaults to `int`. Here `b` is
+/// undeclared and so is an `int`, and the whole program lowers and verifies.
+#[test]
+fn knr_definition_default_int_param() {
+    lower_ok(
+        "int add(a, b) int a; { return a + b; } \
+         int main(){ return add(40, 2); }",
+    );
+}
+
+/// A K&R parameter declaration-list may carry a `register` storage-class
+/// specifier (accepted and ignored), and declare several names at once.
+#[test]
+fn knr_register_and_multi_name_params() {
+    lower_ok(
+        "int f(a, b, c) register int a, b; int c; { return a + b + c; } \
+         int main(){ return f(1, 2, 3); }",
+    );
+}
+
+/// An old-style declaration `int g()` leaves the parameters unspecified: unlike
+/// `g(void)`, a call to it may carry arguments (which are unchecked). Here `g`
+/// is only declared, so its unspecified signature reaches the call site.
+#[test]
+fn knr_empty_parens_permits_arguments() {
+    lower_ok("int g(); int main(){ return g(1, 2, 3); }");
+}
+
+/// `f(void)` is a prototype for a function taking no arguments — distinct from
+/// the old-style `f()` — so calling it with an argument is an error.
+#[test]
+fn void_prototype_rejects_arguments() {
+    let err = check_source("int h(void); int main(){ return h(1); }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("expects 0 argument")));
+}
+
+/// Naming a parameter in the K&R declaration-list that is not in the identifier
+/// list is an error.
+#[test]
+fn knr_declares_unknown_parameter_is_an_error() {
+    let err = check_source("int f(a) int a; int z; { return a; } int main(){ return f(1); }")
+        .unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("not one of the function's parameters")));
+}
+
+// --- storage class / linkage --------------------------------------------
+
+/// `extern T x;` (no initializer) is a declaration, not a definition: a later
+/// tentative or initialized definition of the same object is not a redefinition.
+#[test]
+fn extern_decl_then_definition_is_allowed() {
+    lower_ok("extern int g[]; int g[4]; int main(){ return g[0]; }");
+    lower_ok("extern int v; int v = 3; int main(){ return v; }");
+}
+
+/// Two tentative definitions collapse to one object; a following initialized
+/// definition supplies its value (still only one real definition).
+#[test]
+fn tentative_definitions_merge() {
+    lower_ok("int t; int t; int t = 5; int main(){ return t; }");
+}
+
+/// Two initialized definitions of the same object collide.
+#[test]
+fn two_initialized_definitions_is_an_error() {
+    let err = check_source("int g = 1; int g = 2; int main(){ return g; }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("redefinition of global")));
+}
+
+/// A `static` block-scope object is backed by a program global with internal
+/// linkage, not a stack slot, so it retains its value across calls.
+#[test]
+fn static_local_is_a_global() {
+    let prog = check_source(
+        "int f(void){ static int n = 7; n++; return n; } int main(){ return f(); }",
+    )
+    .unwrap();
+    // A backing global with a unique, internally-linked symbol exists.
+    assert!(prog.globals.iter().any(|g| g.name.starts_with("n.static.") && g.is_static));
+    lower_ok("int f(void){ static int n = 7; n++; return n; } int main(){ return f(); }");
+}
+
+/// A global pointer initialized with a function's or string's address records a
+/// relocation rather than failing constant evaluation.
+#[test]
+fn address_initializer_records_a_relocation() {
+    let prog =
+        check_source("int sq(int x){ return x*x; } int (*fp)(int) = sq; int main(){ return 0; }")
+            .unwrap();
+    let fp = prog.globals.iter().find(|g| g.name == "fp").expect("fp global");
+    assert!(fp.relocs.iter().any(|r| r.symbol == "sq"));
 }
 
 #[test]

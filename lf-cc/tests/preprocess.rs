@@ -38,7 +38,7 @@ fn render(toks: &[Token]) -> String {
             TokenKind::FloatLit(v, _) => s.push_str(&v.to_string()),
             TokenKind::Str(v) => {
                 s.push('"');
-                s.push_str(v);
+                s.push_str(&String::from_utf8_lossy(v));
                 s.push('"');
             }
             TokenKind::Punct(p) => s.push_str(punct(*p)),
