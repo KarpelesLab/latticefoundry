@@ -122,14 +122,16 @@ impl CStd {
         self.is_c99()
     }
 
-    /// `long long` (C99+).
+    /// `long long` (C99+, and a GNU extension in every GNU dialect — gcc accepts
+    /// it under `-std=gnu89` without a diagnostic).
     pub fn has_long_long(self) -> bool {
-        self.is_c99()
+        self.is_c99() || self.is_gnu()
     }
 
-    /// `restrict` / `inline` keywords (C99+).
+    /// `restrict` / `inline` keywords (C99+, and accepted in every GNU dialect —
+    /// gcc recognizes both under `-std=gnu89` as extensions).
     pub fn inline_restrict(self) -> bool {
-        self.is_c99()
+        self.is_c99() || self.is_gnu()
     }
 
     /// Declarations intermixed with statements in a block (C99+).

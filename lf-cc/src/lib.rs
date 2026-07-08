@@ -246,8 +246,19 @@ fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal]) {
         }
         let off = bytes.len() as u64;
         bytes.extend_from_slice(&g.bytes);
-        // A `static` object has internal linkage: its symbol is local.
-        let binding = if g.is_static { SymbolBinding::Local } else { SymbolBinding::Global };
+        // A `static` object has internal linkage: its symbol is local. A
+        // *tentative* definition (`T x;` with no initializer) may be emitted by
+        // several translation units — classically through a shared header — so it
+        // is bound *weakly*: the linker then merges the duplicates, and a strong
+        // (initialized) definition elsewhere wins. This matches the traditional
+        // `-fcommon` behavior that pre-C99-era sources such as make-3.82 rely on.
+        let binding = if g.is_static {
+            SymbolBinding::Local
+        } else if g.tentative {
+            SymbolBinding::Weak
+        } else {
+            SymbolBinding::Global
+        };
         obj.add_symbol(Symbol::defined(
             g.name.clone(),
             binding,

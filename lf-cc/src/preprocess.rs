@@ -275,6 +275,31 @@ impl Pp {
         for name in ["__x86_64__", "__amd64__", "__LP64__", "__linux__", "__unix__", "__ELF__"] {
             self.define_object(name, "1");
         }
+        // The compiler-provided type/size macros that real (GNU/glibc) headers
+        // build their own typedefs on, e.g. `typedef __SIZE_TYPE__ size_t;`.
+        // These are not GNU-gated — gcc predefines them under every dialect.
+        // Values are the x86-64 LP64 SysV choices.
+        for (name, val) in [
+            ("__SIZE_TYPE__", "long unsigned int"),
+            ("__PTRDIFF_TYPE__", "long int"),
+            ("__INTPTR_TYPE__", "long int"),
+            ("__UINTPTR_TYPE__", "long unsigned int"),
+            ("__INTMAX_TYPE__", "long int"),
+            ("__UINTMAX_TYPE__", "long unsigned int"),
+            ("__WCHAR_TYPE__", "int"),
+            ("__WINT_TYPE__", "unsigned int"),
+            ("__CHAR_BIT__", "8"),
+            ("__SIZEOF_SHORT__", "2"),
+            ("__SIZEOF_INT__", "4"),
+            ("__SIZEOF_LONG__", "8"),
+            ("__SIZEOF_LONG_LONG__", "8"),
+            ("__SIZEOF_POINTER__", "8"),
+            ("__SIZEOF_SIZE_T__", "8"),
+            ("__SIZEOF_PTRDIFF_T__", "8"),
+            ("__SIZEOF_WCHAR_T__", "4"),
+        ] {
+            self.define_object(name, val);
+        }
         self.define_object("__DATE__", "\"Jan  1 2020\"");
         self.define_object("__TIME__", "\"00:00:00\"");
         if self.std.is_gnu() {
@@ -331,7 +356,7 @@ impl Pp {
                 || (c == b'.' && bytes.get(pos + 1).is_some_and(u8::is_ascii_digit))
             {
                 self.lex_ppnumber(bytes, &mut pos)
-            } else if c == b'_' || c.is_ascii_alphabetic() {
+            } else if c == b'_' || c == b'$' || c.is_ascii_alphabetic() {
                 self.lex_ident(bytes, &mut pos)
             } else if c == b'"' {
                 match self.lex_quoted(bytes, &mut pos, b'"') {
@@ -471,7 +496,10 @@ impl Pp {
     fn lex_ident(&self, bytes: &[u8], pos: &mut usize) -> PpKind {
         let start = *pos;
         while let Some(&c) = bytes.get(*pos) {
-            if c == b'_' || c.is_ascii_alphanumeric() {
+            // GNU C accepts `$` as an identifier character (on by default, like
+            // gcc's -fdollars-in-identifiers); real headers use it in names such
+            // as VMS `<lib$routines.h>` inside conditional groups.
+            if c == b'_' || c == b'$' || c.is_ascii_alphanumeric() {
                 *pos += 1;
             } else {
                 break;
@@ -1527,6 +1555,9 @@ impl Pp {
             // (e.g. bzip2's `static __inline__ void ...`) parses in any mode.
             "__inline__" | "__inline" => Some(TokenKind::Keyword(Keyword::Inline)),
             "__restrict__" | "__restrict" => Some(TokenKind::Keyword(Keyword::Restrict)),
+            "__const__" | "__const" => Some(TokenKind::Keyword(Keyword::Const)),
+            "__volatile__" | "__volatile" => Some(TokenKind::Keyword(Keyword::Volatile)),
+            "__signed__" | "__signed" => Some(TokenKind::Keyword(Keyword::Signed)),
             "_Noreturn" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Noreturn, span),
             "_Alignof" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignof, span),
             "_Alignas" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignas, span),

@@ -1180,6 +1180,51 @@ impl Checker {
             if let Some(init) = &d.init {
                 ty = self.deduce_array_len(&ty, init);
             }
+            // A block-scope function declaration (`extern char *getlogin();`, or a
+            // bare `void foo(int);`) declares an external function, not an object.
+            // Register its signature — like a file-scope prototype — so calls to
+            // the name resolve to a function designator rather than a stack slot.
+            if let CType::Func(ft) = &ty {
+                self.register_sig(
+                    &d.name,
+                    ft.ret.clone(),
+                    ft.params.clone(),
+                    ft.variadic,
+                    false,
+                    false,
+                    d.span,
+                );
+                continue;
+            }
+            // A block-scope `extern` declaration references an object with
+            // external linkage defined elsewhere (C11 6.2.2p4). It gets no local
+            // storage: the name resolves to the shared program global, created
+            // declaration-only if not yet seen. An incomplete array type here
+            // (`extern char default_shell[];`) is legal — it is only a reference.
+            if d.storage == Storage::Extern {
+                let idx = if let Some(&i) = self.global_index.get(&d.name) {
+                    if ty_is_more_complete(&ty, &self.globals[i].ty) {
+                        self.globals[i].ty = ty.clone();
+                    }
+                    i
+                } else {
+                    let i = self.globals.len();
+                    self.global_index.insert(d.name.clone(), i);
+                    self.globals.push(TGlobal {
+                        name: d.name.clone(),
+                        ty: ty.clone(),
+                        bytes: Vec::new(),
+                        readonly: false,
+                        defined: false,
+                        is_static: false,
+                        tentative: false,
+                        relocs: Vec::new(),
+                    });
+                    i
+                };
+                ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Static(idx));
+                continue;
+            }
             if matches!(ty, CType::Array(_, 0)) {
                 self.error(d.span, "array size is required (variable-length arrays are unsupported)");
             }
@@ -2460,7 +2505,37 @@ fn const_eval_with(e: &Expr, enums: &HashMap<String, i128>, recs: &Records) -> O
         }
         ExprKind::Cast(_, inner) => rec(inner),
         ExprKind::SizeofType(ty) => Some(layout::size_of(recs, ty) as i128),
+        // `sizeof expr` is a constant expression: its operand is unevaluated and
+        // only its static type is measured. In a global initializer the operand
+        // is one whose type the AST fixes on its own (a string literal, a cast, a
+        // nested `sizeof`, …) — see `ast_static_type`.
+        ExprKind::SizeofExpr(inner) => {
+            ast_static_type(inner).map(|ty| layout::size_of(recs, &ty) as i128)
+        }
         ExprKind::AlignofType(ty) => Some(layout::align_of(recs, ty) as i128),
+        _ => None,
+    }
+}
+
+/// The static type of an expression, computed from the AST alone (no symbol
+/// table). Covers the operand forms `sizeof expr` realistically takes in a
+/// constant initializer — string literals, casts, compound literals, and the
+/// literals/`sizeof` results whose type the node itself carries. Returns `None`
+/// when the type would require variable/typedef context the caller lacks.
+fn ast_static_type(e: &Expr) -> Option<CType> {
+    match &e.kind {
+        ExprKind::IntLit(_, ty) | ExprKind::FloatLit(_, ty) => Some(ty.clone()),
+        ExprKind::StrLit(bytes) => {
+            Some(CType::Array(Box::new(CType::Int(IntTy::new(8, true))), bytes.len() as u64 + 1))
+        }
+        ExprKind::Cast(ty, _) | ExprKind::CompoundLiteral(ty, _) | ExprKind::VaArg(_, ty) => {
+            Some(ty.clone())
+        }
+        ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) | ExprKind::AlignofType(_) => {
+            Some(size_t())
+        }
+        ExprKind::Cond(_, t, f) => ast_static_type(t).or_else(|| ast_static_type(f)),
+        ExprKind::Comma(_, b) => ast_static_type(b),
         _ => None,
     }
 }

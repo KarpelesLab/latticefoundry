@@ -621,7 +621,13 @@ impl FnLower<'_> {
         nmarks: u32,
         body: &TStmt,
     ) {
-        let vv = self.lower_rvalue(value);
+        // Widen the controlling value to 64 bits (sign- or zero-extended per its
+        // type) so it matches on the full register the backend's switch lowering
+        // compares against — the case immediates are compared at 64-bit width, so
+        // e.g. a signed `int` value of `-1` must sit as `0xFFFF_FFFF_FFFF_FFFF`,
+        // not `0x0000_0000_FFFF_FFFF`, to hit `case -1:`.
+        let raw = self.lower_rvalue(value);
+        let vv = self.int_resize(raw, width_of(&value.ty), value.ty.is_signed(), 64);
         let blocks: Vec<BlockId> = (0..nmarks).map(|_| self.b.create_block(&[])).collect();
         let exit = self.b.create_block(&[]);
         let default_bb = match default {
@@ -765,6 +771,24 @@ impl FnLower<'_> {
             TExprKind::Comma(a, b) => {
                 self.lower_effect(a);
                 self.lower_effect(b);
+            }
+            // A conditional whose result is discarded — commonly a void-typed
+            // ternary such as `cond ? (void)0 : abort()` (the `assert` macro).
+            // Lower each arm for effect so a void-returning arm is not forced
+            // through the value path (which requires a result).
+            TExprKind::Cond(c, t, f) => {
+                let cond = self.truth_of(c);
+                let then_bb = self.b.create_block(&[]);
+                let else_bb = self.b.create_block(&[]);
+                let join_bb = self.b.create_block(&[]);
+                self.b.cond_br(cond, then_bb, &[], else_bb, &[]);
+                self.switch(then_bb);
+                self.lower_effect(t);
+                self.b.br(join_bb, &[]);
+                self.switch(else_bb);
+                self.lower_effect(f);
+                self.b.br(join_bb, &[]);
+                self.switch(join_bb);
             }
             _ => {
                 self.lower_rvalue(e);

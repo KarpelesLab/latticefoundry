@@ -32,6 +32,7 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         records: Records::default(),
         tags: HashMap::new(),
         enum_map: HashMap::new(),
+        enum_tag_signed: HashMap::new(),
         enum_consts: Vec::new(),
         constexprs: Vec::new(),
         scopes: vec![HashMap::new()],
@@ -70,6 +71,11 @@ struct Parser {
     tags: HashMap<String, RecordId>,
     /// Enumerator name → value, for constant-expression evaluation.
     enum_map: HashMap<String, i128>,
+    /// Enum tag → whether its underlying type is signed (`int`, i.e. it has a
+    /// negative enumerator) vs. unsigned (`unsigned int`). Lets a later tag-only
+    /// reference (`enum foo x : 2;`) recover the right signedness — important for
+    /// `enum`-typed bit-fields.
+    enum_tag_signed: HashMap<String, bool>,
     /// Enumerator constants in declaration order, handed to sema.
     enum_consts: Vec<(String, i128)>,
     /// C23 `constexpr` objects (`name`, reduced value, declared type), handed to
@@ -407,12 +413,18 @@ impl Parser {
         let ty = self.parse_array_suffix(ty0)?;
         self.declare_ordinary(&name, Some(ty.clone()));
         let init = if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
+        if let Some(i) = &init {
+            self.declare_ordinary(&name, Some(self.deduce_array_symbol_type(&ty, i)));
+        }
         items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span: name_span }));
         while self.eat_punct(Punct::Comma) {
             let (name, ty, span) = self.parse_named_declarator(base.clone())?;
             self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
+            if let Some(i) = &init {
+                self.declare_ordinary(&name, Some(self.deduce_array_symbol_type(&ty, i)));
+            }
             items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span }));
         }
         self.expect_punct(Punct::Semi, "';' after global declaration")?;
@@ -567,6 +579,9 @@ impl Parser {
             }
             let base = self.parse_decl_specs()?;
             let (name, ty, span) = self.declarator(base)?;
+            // A trailing attribute on the parameter declarator, e.g.
+            // `int desc __attribute__((unused))` (GNU) or `int x [[maybe_unused]]`.
+            self.skip_attributes()?;
             // A parameter of array or function type decays to a pointer.
             let ty = ty.decayed().unwrap_or(ty);
             params.push(Param { name, ty, span });
@@ -1315,15 +1330,21 @@ impl Parser {
     /// enumerator constants (auto-incrementing, or explicit `= const-expr`).
     fn parse_enum(&mut self) -> PResult<CType> {
         self.bump(); // enum
-        if let TokenKind::Ident(_) = self.peek() {
-            self.bump(); // tag (ignored; an enum is an int)
+        let mut tag: Option<String> = None;
+        if let TokenKind::Ident(name) = self.peek() {
+            tag = Some(name.clone());
+            self.bump(); // tag
         }
         if self.eat_punct(Punct::LBrace) {
             let mut next = 0i128;
+            let mut any_negative = false;
             while !self.is_punct(Punct::RBrace) && !self.at_eof() {
                 let (name, _span) = self.expect_ident()?;
                 if self.eat_punct(Punct::Assign) {
                     next = self.parse_const_expr()?;
+                }
+                if next < 0 {
+                    any_negative = true;
                 }
                 self.enum_map.insert(name.clone(), next);
                 self.enum_consts.push((name, next));
@@ -1333,8 +1354,22 @@ impl Parser {
                 }
             }
             self.expect_punct(Punct::RBrace, "'}' to close enum body")?;
+            // An enumerated type's underlying integer type, matching gcc: `int`
+            // when any enumerator is negative, otherwise `unsigned int`. This is
+            // observable in a `_Generic` selection and, crucially, in the sign of
+            // an `enum`-typed bit-field (a 2-bit field holding value 3 must read
+            // back as 3, not −1).
+            let signed = any_negative;
+            if let Some(t) = &tag {
+                self.enum_tag_signed.insert(t.clone(), signed);
+            }
+            return Ok(CType::Int(IntTy::new(32, signed)));
         }
-        Ok(CType::int())
+        // A tag-only reference (`enum foo x;`) without a visible body: recover the
+        // underlying signedness from the tag's definition if it has been seen,
+        // else fall back to plain `int`.
+        let signed = tag.as_deref().and_then(|t| self.enum_tag_signed.get(t)).copied().unwrap_or(true);
+        Ok(CType::Int(IntTy::new(32, signed)))
     }
 
     /// Parse the declarator list of a C23 `constexpr` declaration (`base` is the
@@ -1394,6 +1429,40 @@ impl Parser {
             .ok_or_else(|| Diagnostic::error("expected a constant integer expression").with_span(span))
     }
 
+    /// Complete an incomplete array type (`T x[] = …`) from its initializer, so
+    /// the parser's symbol table records the deduced length. A later `sizeof x`
+    /// in a constant expression (typically another object's array bound, e.g.
+    /// `char opts[sizeof switches / sizeof switches[0]]`) then measures the whole
+    /// array rather than a zero-length one.
+    fn deduce_array_symbol_type(&self, ty: &CType, init: &Init) -> CType {
+        if let CType::Array(elem, 0) = ty {
+            let n = match init {
+                Init::List(items) => {
+                    let mut pos: u64 = 0;
+                    let mut max: u64 = 0;
+                    for it in items {
+                        if let Some(Designator::Index(k)) = it.designators.first()
+                            && *k >= 0
+                        {
+                            pos = *k as u64;
+                        }
+                        pos += 1;
+                        max = max.max(pos);
+                    }
+                    max
+                }
+                Init::Expr(e) => match &e.kind {
+                    ExprKind::StrLit(bytes) => bytes.len() as u64 + 1,
+                    _ => 0,
+                },
+            };
+            if n > 0 {
+                return CType::Array(elem.clone(), n);
+            }
+        }
+        ty.clone()
+    }
+
     /// Fold a parsed expression to a constant integer, or `None` if it is not a
     /// constant expression the parser can evaluate.
     fn eval_const_expr(&self, e: &Expr) -> Option<i128> {
@@ -1421,6 +1490,13 @@ impl Parser {
             }
             ExprKind::Cast(_, inner) => self.eval_const_expr(inner),
             ExprKind::SizeofType(ty) => Some(layout::size_of(&self.records, ty) as i128),
+            // `sizeof expr` is a constant: the operand is not evaluated, only its
+            // static type measured (e.g. `sizeof arr / sizeof arr[0]`,
+            // `sizeof member.field`, `sizeof "literal"`).
+            ExprKind::SizeofExpr(inner) => {
+                let ty = self.expr_type(inner)?;
+                Some(layout::size_of(&self.records, &ty) as i128)
+            }
             ExprKind::AlignofType(ty) => Some(layout::align_of(&self.records, ty) as i128),
             _ => None,
         }

@@ -417,6 +417,66 @@ fn programs() -> Vec<(&'static str, &'static str)> {
             "dbl_ternary",
             "int main(){ int c=1; double a=12.5, b=3.0; return (int)((c ? a : b) * 4.0); }",
         ),
+        // --- constructs exposed by GNU make ---------------------------------
+        // A `switch` with a *negative* case label must select it (make dispatches
+        // on an `int` status whose success value is -1). The scrutinee is widened
+        // to match the backend's 64-bit case compare.
+        (
+            "switch_negative_case",
+            "int cls(int s){ switch(s){ case 1: return 11; case -1: return 42; \
+             case 2: return 22; default: return 99; } } int main(){ return cls(-1); }",
+        ),
+        // A `switch` scrutinee wider/narrower than int, still hitting a case.
+        (
+            "switch_char_neg",
+            "int cls(signed char s){ switch(s){ case -1: return 40; default: return 0; } } \
+             int main(){ signed char c=-1; return cls(c)+2; }",
+        ),
+        // An `enum`-typed bit-field: a non-negative enum is unsigned (gcc), so a
+        // 2-bit field holding value 3 reads back as 3, not -1 (make's
+        // `command_state`).
+        (
+            "enum_bitfield_unsigned",
+            "enum st{ s0,s1,s2,s3 }; struct f{ enum st cs:2; }; \
+             int main(){ struct f x; x.cs=s3; return (x.cs==s3) ? (int)x.cs+39 : 0; }",
+        ),
+        // `sizeof expr` is a constant usable in an array bound, including for an
+        // array whose own length was deduced from its initializer (make sizes
+        // `long_options[]` as `sizeof switches / sizeof switches[0]`).
+        (
+            "sizeof_expr_array_bound",
+            "static int sw[] = {1,2,3,4,5}; static char opt[sizeof sw / sizeof sw[0]]; \
+             int main(){ return sizeof(opt) + 37; }",
+        ),
+        // `sizeof` of a member lvalue and of a string literal as constants.
+        (
+            "sizeof_member_and_strlit",
+            "struct S{ char name[16]; }; struct S m; \
+             int main(){ char b[sizeof m.name + 1]; return (int)(sizeof b) + (int)sizeof(\"abc\") + 21; }",
+        ),
+        // A void-typed conditional evaluated as a statement (the `assert` idiom
+        // `cond ? (void)0 : abort_like()`), whose false arm is a void call.
+        (
+            "void_ternary_stmt",
+            "static int hits; static void note(void){ hits += 7; } \
+             int main(){ int c=0; c ? (void)0 : note(); return hits + 35; }",
+        ),
+        // A block-scope function declaration (as make declares `getlogin`): the
+        // name must resolve to a callable function, not a local object.
+        (
+            "block_scope_fn_decl",
+            "int helper(int); int helper(int x){ return x+1; } \
+             int main(){ { int helper(int); return helper(41); } }",
+        ),
+        // A block-scope `extern` reference to an object defined at file scope,
+        // including an incomplete array type (`extern char x[];`).
+        (
+            "block_scope_extern_obj",
+            "int shared = 42; char buf[8] = {1,2,3,4,5,6,7,8}; \
+             int main(){ extern int shared; extern char buf[]; return shared - buf[0]*0; }",
+        ),
+        // `$` is a valid identifier character under the GNU dialect (gcc default).
+        ("dollar_in_ident", "int a$b = 42; int main(){ return a$b; }"),
     ]
 }
 
@@ -532,6 +592,27 @@ fn std_programs() -> Vec<(&'static str, &'static str, &'static str)> {
             "c11",
             "_Noreturn void fail(void); void fail(void){ for(;;){} } \
              int dbl(int x){ return x*2; } int main(){ return dbl(20)+2; }",
+        ),
+        // `long long` is a GNU extension accepted under -std=gnu89 (gcc accepts it
+        // there without diagnostic) — make's bundled glob uses it.
+        (
+            "gnu89_long_long",
+            "gnu89",
+            "int main(){ long long x = 100; long long y = 58; return (int)(x + y - 116); }",
+        ),
+        // The `inline` keyword is likewise available under gnu89 (glob.c uses it).
+        (
+            "gnu89_inline_kw",
+            "gnu89",
+            "static inline int sq(int x){ return x*x; } int main(){ return sq(7) - 7; }",
+        ),
+        // The `__const` / `__volatile` / `__signed` GNU keyword spellings (used by
+        // glibc-style headers such as make's bundled glob.h).
+        (
+            "gnu_underscore_qualifiers",
+            "gnu89",
+            "int f(__const int *p){ __volatile int t = *p; return t; } \
+             int main(){ __signed int v = 42; return f(&v); }",
         ),
     ]
 }
