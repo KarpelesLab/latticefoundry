@@ -273,6 +273,15 @@ impl<'a> FunctionBuilder<'a> {
             .expect("alloca has a result")
     }
 
+    /// Dynamically allocate `n` bytes of stack storage, aligned to `align` (a
+    /// power of two); result is a pointer to the freshly allocated region, valid
+    /// until the function returns (C `alloca` lifetime). `n` is an integer value.
+    pub fn dyn_alloca(&mut self, n: ValueId, align: u32) -> ValueId {
+        let ptr = self.types.ptr();
+        self.emit(InstKind::DynAlloca { align }, vec![n], Flags::NONE, Some(ptr))
+            .expect("dyn_alloca has a result")
+    }
+
     /// Load a value of `ty` from `ptr` with the given alignment.
     pub fn load(&mut self, ty: TypeId, ptr: ValueId, align: u32) -> ValueId {
         self.emit(InstKind::Load { ty, align }, vec![ptr], Flags::NONE, Some(ty))

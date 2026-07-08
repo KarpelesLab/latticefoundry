@@ -167,8 +167,9 @@ impl AbstractDomain for Nullness {
 
         match &inst.kind {
             // A fresh stack slot is always a non-null, non-poison pointer valid
-            // for the activation (see `InstKind::Alloca`). Sound.
-            InstKind::Alloca { .. } => Nullness::NonNull,
+            // for the activation (see `InstKind::Alloca`). Sound. A dynamic
+            // (runtime-sized) allocation is likewise a fresh non-null pointer.
+            InstKind::Alloca { .. } | InstKind::DynAlloca { .. } => Nullness::NonNull,
 
             // `ptr_add base, off`.
             InstKind::PtrAdd { inbounds } => {

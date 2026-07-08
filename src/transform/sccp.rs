@@ -278,7 +278,13 @@ fn terminator_choice(
 
 /// Whether an opcode has a side effect that forbids dropping it (mirrors DCE).
 fn has_side_effect(kind: &InstKind) -> bool {
-    matches!(kind, InstKind::Alloca { .. } | InstKind::Store { .. } | InstKind::Call)
+    matches!(
+        kind,
+        InstKind::Alloca { .. }
+            | InstKind::DynAlloca { .. }
+            | InstKind::Store { .. }
+            | InstKind::Call
+    )
 }
 
 // ---------------------------------------------------------------------------

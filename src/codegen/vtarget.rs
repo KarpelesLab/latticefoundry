@@ -96,6 +96,10 @@ pub enum VOp {
     /// An operation outside the integer subset this target lowers (float ops):
     /// kept structurally well-formed but not executable.
     Unsupported = 30,
+    /// `[Def dst, Use n, Imm align]` — dynamic (runtime-sized) stack allocation
+    /// (`dyn_alloca`): bump-allocate `n` bytes of `align`-aligned frame memory and
+    /// put the base address in `dst`. Modeled by the interpreter's flat memory.
+    DynAlloca = 31,
 }
 
 impl VOp {
@@ -108,10 +112,10 @@ impl VOp {
     /// Decode a target [`Opcode`] back to a [`VOp`].
     pub fn decode(op: Opcode) -> VOp {
         use VOp::*;
-        const TABLE: [VOp; 31] = [
+        const TABLE: [VOp; 32] = [
             Li, Move, Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, ICmp,
             Select, Cast, Load, Store, FrameAddr, GlobalAddr, Call, Ret, Jmp, BrCond, Switch,
-            Unreachable, StackStore, StackLoad, Unsupported,
+            Unreachable, StackStore, StackLoad, Unsupported, DynAlloca,
         ];
         TABLE[op.0 as usize]
     }
@@ -417,6 +421,18 @@ impl TargetIsel for VirtualTarget {
                 let align = lo.types().align_of(*elem_ty);
                 let slot = lo.new_slot(size, align);
                 lo.emit(self.frame_addr(d, slot));
+            }
+            InstKind::DynAlloca { align } => {
+                let d = lo.result_reg(inst);
+                let n = lo.reg(inst.operands()[0]);
+                lo.emit(MachineInst::new(
+                    VOp::DynAlloca.opcode(),
+                    vec![
+                        MachineOperand::Def(Reg::Virtual(d)),
+                        MachineOperand::Use(Reg::Virtual(n)),
+                        MachineOperand::Imm(Int::from_u64(u64::from(*align))),
+                    ],
+                ));
             }
             InstKind::Load { ty, .. } => {
                 let d = lo.result_reg(inst);

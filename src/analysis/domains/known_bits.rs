@@ -301,7 +301,10 @@ impl AbstractDomain for KnownBits {
         // Stateful / opaque opcodes produce a value the domain cannot know.
         if matches!(
             inst.kind,
-            InstKind::Alloca { .. } | InstKind::Load { .. } | InstKind::Call
+            InstKind::Alloca { .. }
+                | InstKind::DynAlloca { .. }
+                | InstKind::Load { .. }
+                | InstKind::Call
         ) {
             return KnownBits::Top;
         }

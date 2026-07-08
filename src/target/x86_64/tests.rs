@@ -1956,3 +1956,340 @@ fn run_va_caller() {
         None => eprintln!("skipping run_va_caller: no C compiler"),
     }
 }
+
+// ===========================================================================
+// Dynamic (runtime-sized) stack allocation — execution tests
+// ===========================================================================
+
+/// `lfdyn(n)`: `dyn_alloca` `n` bytes, write `(unsigned char)i` across all `n`
+/// of them in a loop, then read them all back and return the checksum. Proves
+/// every one of the `n` bytes is writable/readable (no clobber of locals or the
+/// return address) for a runtime-varying `n`.
+fn build_dyn_checksum() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i8t = m.types_mut().int(8);
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("lfdyn"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let wloop = b.create_block(&[i64t]); // i
+        let wbody = b.create_block(&[i64t]); // i
+        let sinit = b.create_block(&[]);
+        let sloop = b.create_block(&[i64t, i64t]); // j, acc
+        let sbody = b.create_block(&[i64t, i64t]); // j, acc
+        let done = b.create_block(&[i64t]); // acc
+
+        let p = b.dyn_alloca(n, 16);
+        let z0 = b.const_i64(i64t, 0);
+        b.br(wloop, &[z0]);
+
+        b.switch_to(wloop);
+        let i = b.param(wloop, 0);
+        let c = b.icmp(IntPred::Ult, i, n);
+        b.cond_br(c, wbody, &[i], sinit, &[]);
+
+        b.switch_to(wbody);
+        let bi = b.param(wbody, 0);
+        let elem = b.ptr_add(p, bi, true);
+        let byte = b.cast(CastOp::Trunc, bi, i8t);
+        b.store(i8t, elem, byte, 1);
+        let one = b.const_i64(i64t, 1);
+        let bi2 = b.add(bi, one, Flags::NONE);
+        b.br(wloop, &[bi2]);
+
+        b.switch_to(sinit);
+        let z1 = b.const_i64(i64t, 0);
+        let z2 = b.const_i64(i64t, 0);
+        b.br(sloop, &[z1, z2]);
+
+        b.switch_to(sloop);
+        let j = b.param(sloop, 0);
+        let acc = b.param(sloop, 1);
+        let c2 = b.icmp(IntPred::Ult, j, n);
+        b.cond_br(c2, sbody, &[j, acc], done, &[acc]);
+
+        b.switch_to(sbody);
+        let sj = b.param(sbody, 0);
+        let sacc = b.param(sbody, 1);
+        let e2 = b.ptr_add(p, sj, true);
+        let bv = b.load(i8t, e2, 1);
+        let bz = b.cast(CastOp::ZExt, bv, i64t);
+        let acc2 = b.add(sacc, bz, Flags::NONE);
+        let one2 = b.const_i64(i64t, 1);
+        let sj2 = b.add(sj, one2, Flags::NONE);
+        b.br(sloop, &[sj2, acc2]);
+
+        b.switch_to(done);
+        let racc = b.param(done, 0);
+        b.ret(Some(racc));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_dyn_checksum() {
+    let (m, syms) = build_dyn_checksum();
+    let c = r#"
+        long long lfdyn(long long);
+        int main(void) {
+            long long ns[] = {0, 1, 100, 300, 1000};
+            for (int k = 0; k < 5; k++) {
+                long long n = ns[k];
+                long long expect = 0;
+                for (long long i = 0; i < n; i++) expect += (unsigned char)i;
+                if (lfdyn(n) != expect) return k + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "dynck", c) {
+        Some(code) => assert_eq!(code, 0, "lfdyn checksum mismatch (exit {code})"),
+        None => eprintln!("skipping run_dyn_checksum: no C compiler"),
+    }
+}
+
+/// `lfdc(n)`: `dyn_alloca` `n` bytes, store `n` into it, then call a 9-argument
+/// function (args 7/8/9 go on the stack) and add the reloaded value. Proves the
+/// dynamic alloca coexists with the rsp-relative outgoing stack-argument area.
+fn build_dyn_call() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig9 = m.types_mut().func(vec![i64t; 9], i64t, false);
+    let sum9 = m.declare_function(syms.intern("lfsum9"), sig9);
+    {
+        let mut b = m.build(sum9);
+        let entry = b.create_entry_block();
+        let mut acc = b.param(entry, 0);
+        for k in 1..9u32 {
+            let p = b.param(entry, k);
+            acc = b.add(acc, p, Flags::NONE);
+        }
+        b.ret(Some(acc));
+    }
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("lfdc"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let p = b.dyn_alloca(n, 16);
+        b.store(i64t, p, n, 8);
+        let cref = b.func_ref(sum9);
+        let args: Vec<_> = (1..=9i64).map(|v| b.const_i64(i64t, v)).collect();
+        let r = b.call(cref, &args, i64t).unwrap();
+        let loaded = b.load(i64t, p, 8);
+        let s = b.add(r, loaded, Flags::NONE);
+        b.ret(Some(s));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_dyn_call() {
+    let (m, syms) = build_dyn_call();
+    let c = r#"
+        long long lfdc(long long);
+        int main(void) {
+            long long ns[] = {8, 16, 64, 100};
+            for (int k = 0; k < 4; k++) {
+                if (lfdc(ns[k]) != 45 + ns[k]) return k + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "dyncall", c) {
+        Some(code) => assert_eq!(code, 0, "lfdc dyn-alloca+call mismatch (exit {code})"),
+        None => eprintln!("skipping run_dyn_call: no C compiler"),
+    }
+}
+
+/// `lfloop(n)`: a loop that on each iteration `dyn_alloca`s 16 bytes, stores the
+/// index, calls `lfid`, reloads, and accumulates `index + call_result` (= 2*i).
+/// Proves rsp is managed correctly across a call inside a loop and that the
+/// per-iteration allocations do not corrupt one another (C `alloca` accumulates
+/// until return).
+fn build_dyn_loop() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig1 = m.types_mut().func(vec![i64t], i64t, false);
+    let lfid = m.declare_function(syms.intern("lfid"), sig1);
+    {
+        let mut b = m.build(lfid);
+        let e = b.create_entry_block();
+        let x = b.param(e, 0);
+        b.ret(Some(x));
+    }
+    let f = m.declare_function(syms.intern("lfloop"), sig1);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let lp = b.create_block(&[i64t, i64t]); // i, acc
+        let body = b.create_block(&[i64t, i64t]);
+        let done = b.create_block(&[i64t]);
+        let z = b.const_i64(i64t, 0);
+        b.br(lp, &[z, z]);
+        b.switch_to(lp);
+        let i = b.param(lp, 0);
+        let acc = b.param(lp, 1);
+        let c = b.icmp(IntPred::Ult, i, n);
+        b.cond_br(c, body, &[i, acc], done, &[acc]);
+        b.switch_to(body);
+        let bi = b.param(body, 0);
+        let bacc = b.param(body, 1);
+        let sz = b.const_i64(i64t, 16);
+        let p = b.dyn_alloca(sz, 16);
+        b.store(i64t, p, bi, 8);
+        let cref = b.func_ref(lfid);
+        let r = b.call(cref, &[bi], i64t).unwrap();
+        let v = b.load(i64t, p, 8);
+        let t1 = b.add(bacc, v, Flags::NONE);
+        let t2 = b.add(t1, r, Flags::NONE);
+        let one = b.const_i64(i64t, 1);
+        let bi2 = b.add(bi, one, Flags::NONE);
+        b.br(lp, &[bi2, t2]);
+        b.switch_to(done);
+        let racc = b.param(done, 0);
+        b.ret(Some(racc));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_dyn_loop() {
+    let (m, syms) = build_dyn_loop();
+    let c = r#"
+        long long lfloop(long long);
+        int main(void) {
+            long long ns[] = {0, 1, 50, 100};
+            for (int k = 0; k < 4; k++) {
+                long long n = ns[k];
+                if (lfloop(n) != n * (n - 1)) return k + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "dynloop", c) {
+        Some(code) => assert_eq!(code, 0, "lfloop dyn-alloca-in-loop mismatch (exit {code})"),
+        None => eprintln!("skipping run_dyn_loop: no C compiler"),
+    }
+}
+
+/// `lfrec(n)`: recursive, each frame `dyn_alloca`s `8*n` bytes, stores `n`, then
+/// returns `n + lfrec(n-1)` (= sum 1..n). Proves each activation gets its own
+/// dynamic region and that the epilogue reclaims it on return.
+fn build_dyn_recursion() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("lfrec"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let base = b.create_block(&[]);
+        let rec = b.create_block(&[]);
+        let z = b.const_i64(i64t, 0);
+        let is0 = b.icmp(IntPred::Eq, n, z);
+        b.cond_br(is0, base, &[], rec, &[]);
+        b.switch_to(base);
+        let z2 = b.const_i64(i64t, 0);
+        b.ret(Some(z2));
+        b.switch_to(rec);
+        let eight = b.const_i64(i64t, 8);
+        let sz = b.mul(n, eight, Flags::NONE);
+        let p = b.dyn_alloca(sz, 16);
+        b.store(i64t, p, n, 8);
+        let one = b.const_i64(i64t, 1);
+        let nm1 = b.sub(n, one, Flags::NONE);
+        let cref = b.func_ref(f);
+        let r = b.call(cref, &[nm1], i64t).unwrap();
+        let v = b.load(i64t, p, 8);
+        let s = b.add(v, r, Flags::NONE);
+        b.ret(Some(s));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_dyn_recursion() {
+    let (m, syms) = build_dyn_recursion();
+    let c = r#"
+        long long lfrec(long long);
+        int main(void) {
+            long long ns[] = {0, 1, 10, 20};
+            for (int k = 0; k < 4; k++) {
+                long long n = ns[k];
+                if (lfrec(n) != n * (n + 1) / 2) return k + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "dynrec", c) {
+        Some(code) => assert_eq!(code, 0, "lfrec recursive dyn-alloca mismatch (exit {code})"),
+        None => eprintln!("skipping run_dyn_recursion: no C compiler"),
+    }
+}
+
+/// `lfalign<A>(n)`: `dyn_alloca` `n` bytes with a large alignment `A`, and return
+/// `(ptr & (A-1))` — zero iff the returned pointer is `A`-aligned.
+fn build_dyn_align(name: &str, align: u32) -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern(name), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let p = b.dyn_alloca(n, align);
+        let pi = b.cast(CastOp::PtrToInt, p, i64t);
+        let mask = b.const_i64(i64t, i64::from(align) - 1);
+        let r = b.bin(BinOp::And, pi, mask, Flags::NONE);
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_dyn_align() {
+    let (m, syms) = build_dyn_align("lfalign64", 64);
+    let c = r#"
+        long long lfalign64(long long);
+        int main(void) {
+            long long ns[] = {1, 7, 100, 999};
+            for (int k = 0; k < 4; k++) {
+                if (lfalign64(ns[k]) != 0) return k + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "dynalign64", c) {
+        Some(code) => assert_eq!(code, 0, "lfalign64 not 64-aligned (exit {code})"),
+        None => eprintln!("skipping run_dyn_align (64): no C compiler"),
+    }
+
+    let (m, syms) = build_dyn_align("lfalign256", 256);
+    let c = r#"
+        long long lfalign256(long long);
+        int main(void) {
+            long long ns[] = {1, 7, 100, 999};
+            for (int k = 0; k < 4; k++) {
+                if (lfalign256(ns[k]) != 0) return k + 1;
+            }
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "dynalign256", c) {
+        Some(code) => assert_eq!(code, 0, "lfalign256 not 256-aligned (exit {code})"),
+        None => eprintln!("skipping run_dyn_align (256): no C compiler"),
+    }
+}

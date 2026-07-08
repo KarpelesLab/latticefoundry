@@ -738,6 +738,7 @@ impl Enc<'_> {
             InstKind::FCmp(_) => return Err(unsupported("float comparison (fcmp)")),
             InstKind::PtrAdd { .. } => return Err(unsupported("pointer arithmetic (ptr_add)")),
             InstKind::Alloca { .. }
+            | InstKind::DynAlloca { .. }
             | InstKind::Load { .. }
             | InstKind::Store { .. }
             | InstKind::Call => return Err(unsupported("memory / call op")),

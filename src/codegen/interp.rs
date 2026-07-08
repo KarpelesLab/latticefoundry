@@ -211,6 +211,18 @@ impl Interp<'_> {
                 let v = fr.slot_val.get(&slot).cloned().unwrap_or(Int::ZERO);
                 fr.regs.insert(d, v);
             }
+            VOp::DynAlloca => {
+                let d = def(ops, 0)?;
+                let n = self.rd(fr, use_reg(ops, 1)?);
+                let align = (imm_u32(ops, 2)? as u64).max(1);
+                let size = n.to_u64().unwrap_or(0);
+                // Bump-allocate a fresh, aligned region from the flat memory (C
+                // `alloca` lifetime: it lives until the activation ends, so we
+                // never reclaim it here — matching accumulation across a loop).
+                let base = (fr.mem.len() as u64).div_ceil(align) * align;
+                fr.mem.resize((base + size.max(1) + 16) as usize, 0);
+                fr.regs.insert(d, Int::from_u64(base));
+            }
             VOp::Call => return self.exec_call(fr, inst),
             VOp::Ret => {
                 let v = match ops.first() {

@@ -120,7 +120,10 @@ impl AbstractDomain for ConstLattice {
         // Stateful / opaque opcodes produce a value the domain cannot know.
         if matches!(
             inst.kind,
-            InstKind::Alloca { .. } | InstKind::Load { .. } | InstKind::Call
+            InstKind::Alloca { .. }
+                | InstKind::DynAlloca { .. }
+                | InstKind::Load { .. }
+                | InstKind::Call
         ) {
             return ConstLattice::Top;
         }

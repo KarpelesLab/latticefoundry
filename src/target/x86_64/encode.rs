@@ -360,6 +360,17 @@ fn and_ri8(e: &mut Emitter, reg: u8, imm8: i8, w: bool) {
     e.u8(imm8 as u8);
 }
 
+/// Emit an ALU `op r/m, imm32` (`81 /ext id`, the immediate sign-extended);
+/// `ext` selects add(0)/or(1)/and(4)/sub(5)/cmp(7).
+fn alu_ri32(e: &mut Emitter, ext: u8, reg: u8, imm32: i32, w: bool) {
+    if w || reg >= 8 {
+        e.u8(rex(w, false, false, reg >= 8));
+    }
+    e.u8(0x81);
+    e.u8(modrm(3, ext, reg));
+    e.u32(imm32 as u32);
+}
+
 /// Emit the unsigned `u64 → f64`/`f32` conversion (`uitofp` from a 64-bit
 /// source). x86 has no unsigned int→float, so: if the source's sign bit is clear
 /// a direct `cvtsi2sd` is exact; otherwise convert `(s>>1)|(s&1)` — a halving
@@ -467,6 +478,11 @@ pub struct FrameLayout {
     cs_bytes: i32,
     /// The `sub rsp` amount that follows the callee-saved pushes.
     sub_size: i32,
+    /// The reserved outgoing-argument area size (bytes, a multiple of 16). The
+    /// area sits at `[rsp, rsp + outgoing)`; a `DynAlloca` relocates it below the
+    /// carved block so `[rsp + k]` stack-argument addressing survives a moving
+    /// `rsp`.
+    outgoing: i64,
 }
 
 /// Round `value` up to a multiple of `align` (a power of two ≥ 1).
@@ -511,7 +527,7 @@ pub fn layout_frame(mf: &MachineFunction, target: &X86_64Target) -> FrameLayout 
     let padded = align_up(total, 16);
     let sub_size = (padded - cs_bytes as i64) as i32;
 
-    FrameLayout { slot_off, cs_regs, cs_bytes, sub_size }
+    FrameLayout { slot_off, cs_regs, cs_bytes, sub_size, outgoing }
 }
 
 fn phys(r: u16) -> MachineOperand {
@@ -912,6 +928,45 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let d = rnum(&ops[0]);
             let off = iimm(&ops[1]) as i32;
             mem(e, &[0x8D], d, RSP as u8, off, true, false); // lea d, [rsp + off]
+        }
+        X86Op::DynAlloca => {
+            // Dynamic (runtime-sized) stack allocation. `d` doubles as the size
+            // scratch and then receives the result pointer; `n` is the byte count.
+            //
+            // The moving `rsp` must coexist with the fixed rsp-relative
+            // outgoing-argument area, which the framework reserves at the bottom
+            // of the frame and addresses as `[rsp + k]`. We keep that area at the
+            // bottom of the *current* rsp by relocating it below the carved block:
+            // we subtract `outgoing` extra bytes and hand back `rsp + outgoing`, so
+            // after the allocation `[rsp, rsp + outgoing)` is again free outgoing
+            // space and every prior allocation sits above it, untouched. The
+            // rbp-relative epilogue (`lea rsp, [rbp - cs]`) reclaims the whole
+            // dynamic region on return.
+            let d = rnum(&ops[0]);
+            let n = rnum(&ops[1]);
+            let align = uimm(&ops[2]);
+            let outgoing = ctx.layout.outgoing;
+            // Slack so the pointer can be rounded *up* to a large alignment while
+            // staying inside the carved region. For align ≤ 16 no slack and no
+            // rounding are needed: rsp stays 16-aligned (we subtract a multiple of
+            // 16) and `outgoing` is itself a multiple of 16.
+            let extra = if align > 16 { align as i64 } else { 0 };
+            let c = outgoing + extra; // a multiple of 16
+            if d != n {
+                mov_rr(e, d, n, true); // d = n
+            }
+            // d = ((n + 15 + C) & ~15): round the size up to 16 and add the
+            // relocated outgoing area + alignment slack (both multiples of 16, so
+            // the mask rounds only the `n + 15` part).
+            alu_ri32(e, 0, d, (15 + c) as i32, true); // add d, 15 + C
+            and_ri8(e, d, -16, true); // and d, ~15
+            alu_rr(e, 0x29, RSP as u8, d, true); // sub rsp, d
+            // result = rsp + outgoing (its own alignment), rounded up to `align`.
+            mem(e, &[0x8D], d, RSP as u8, outgoing as i32, true, false); // lea d,[rsp+outgoing]
+            if align > 16 {
+                alu_ri32(e, 0, d, (align - 1) as i32, true); // add d, align-1
+                alu_ri32(e, 4, d, -(align as i64) as i32, true); // and d, -align
+            }
         }
 
         // --- SSE scalar floating-point ------------------------------------

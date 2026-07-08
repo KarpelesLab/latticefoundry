@@ -306,6 +306,32 @@ impl<'a> Ctx<'a> {
                     ));
                 }
             }
+            InstKind::DynAlloca { align } => {
+                if *align == 0 || !align.is_power_of_two() {
+                    self.err(format!(
+                        "instruction #{}: dyn_alloca alignment {align} must be a nonzero power of two",
+                        inst.index()
+                    ));
+                }
+                if !self.arity(inst, ops, 1) {
+                    return;
+                }
+                let n = func.value_type(ops[0]);
+                if !is_int(module, n) {
+                    self.err(format!(
+                        "instruction #{}: dyn_alloca size operand must be an integer, found {}",
+                        inst.index(),
+                        render_type(module, n),
+                    ));
+                }
+                if !is_ptr(module, ty) {
+                    self.err(format!(
+                        "instruction #{}: dyn_alloca result must be a pointer, found {}",
+                        inst.index(),
+                        render_type(module, ty),
+                    ));
+                }
+            }
             InstKind::Load { ty: acc, align } => {
                 self.check_align(inst, "load", *align);
                 if !self.arity(inst, ops, 1) {
@@ -1216,6 +1242,84 @@ mod struct_by_value_tests {
         assert!(
             diags.iter().any(|d| d.message.contains("call argument #0")),
             "expected a call-argument type mismatch, got: {:?}",
+            diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the dynamic (runtime-sized) stack allocation op `dyn_alloca`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod dyn_alloca_tests {
+    use crate::ir::Module;
+    use crate::support::StrInterner;
+    use crate::verify::verify_module;
+
+    #[test]
+    fn valid_dyn_alloca_verifies() {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let i64t = m.types_mut().int(64);
+        let ptr = m.types_mut().ptr();
+        let sig = m.types_mut().func(vec![i64t], ptr, false);
+        let f = m.declare_function(syms.intern("d"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let n = b.param(e, 0);
+            let p = b.dyn_alloca(n, 16);
+            b.ret(Some(p));
+        }
+        assert!(
+            verify_module(&m).is_ok(),
+            "valid dyn_alloca must verify: {:?}",
+            verify_module(&m).err()
+        );
+    }
+
+    #[test]
+    fn non_integer_size_rejected() {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let i8t = m.types_mut().int(8);
+        let ptr = m.types_mut().ptr();
+        let sig = m.types_mut().func(vec![], ptr, false);
+        let f = m.declare_function(syms.intern("bad"), sig);
+        {
+            let mut b = m.build(f);
+            b.create_entry_block();
+            let a = b.alloca(i8t); // a pointer value
+            let p = b.dyn_alloca(a, 16); // size operand is a pointer -> invalid
+            b.ret(Some(p));
+        }
+        let diags = verify_module(&m).expect_err("non-integer size must be rejected");
+        assert!(
+            diags.iter().any(|d| d.message.contains("dyn_alloca size operand must be an integer")),
+            "expected a size-type diagnostic, got: {:?}",
+            diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn non_power_of_two_align_rejected() {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let i64t = m.types_mut().int(64);
+        let ptr = m.types_mut().ptr();
+        let sig = m.types_mut().func(vec![i64t], ptr, false);
+        let f = m.declare_function(syms.intern("a3"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let n = b.param(e, 0);
+            let p = b.dyn_alloca(n, 3); // align 3 is not a power of two
+            b.ret(Some(p));
+        }
+        let diags = verify_module(&m).expect_err("non-power-of-two align must be rejected");
+        assert!(
+            diags.iter().any(|d| d.message.contains("must be a nonzero power of two")),
+            "expected an alignment diagnostic, got: {:?}",
             diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
         );
     }

@@ -217,7 +217,13 @@ impl AbstractDomain for Range {
 
     fn transfer(ctx: DomainCtx<'_>, inst: &InstData, operands: &[Self]) -> Self {
         // Stateful / opaque opcodes: the produced value is unknown.
-        if matches!(inst.kind, InstKind::Alloca { .. } | InstKind::Load { .. } | InstKind::Call) {
+        if matches!(
+            inst.kind,
+            InstKind::Alloca { .. }
+                | InstKind::DynAlloca { .. }
+                | InstKind::Load { .. }
+                | InstKind::Call
+        ) {
             return Range::Top;
         }
         // SCCP optimism: an undetermined operand keeps the result undetermined.

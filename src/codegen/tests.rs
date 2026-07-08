@@ -156,6 +156,31 @@ fn build_mem() -> (Module, FuncId) {
     (m, f)
 }
 
+/// `dynroundtrip(x)`: `dyn_alloca` 8 bytes, store `x`, then a *second*
+/// `dyn_alloca` with a sentinel store, and finally reload the first slot. A
+/// correct implementation returns `x` (the two dynamic regions are distinct).
+fn build_dyn_mem() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("dynroundtrip"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let eight = b.const_i64(i64t, 8);
+        let p = b.dyn_alloca(eight, 16);
+        b.store(i64t, p, x, 8);
+        let q = b.dyn_alloca(eight, 16);
+        let sentinel = b.const_i64(i64t, -1);
+        b.store(i64t, q, sentinel, 8);
+        let loaded = b.load(i64t, p, 8); // must still be x, not the sentinel
+        b.ret(Some(loaded));
+    }
+    (m, f)
+}
+
 // --- MIR well-formedness ---------------------------------------------------
 
 /// Assert the structural invariants a well-formed [`MachineFunction`] must hold.
@@ -257,6 +282,19 @@ fn lower_loop_runs() {
         let expected: i64 = (0..n).sum();
         let got = interp::run(&target, &funcs, 0, &[Int::from_i64(n)]).unwrap().unwrap();
         assert_eq!(got, Int::from_i64(expected), "sum({n})");
+    }
+}
+
+#[test]
+fn lower_dyn_alloca_runs() {
+    let target = VirtualTarget::new();
+    let (m, f) = build_dyn_mem();
+    let mf = target.select(&m, f);
+    assert_well_formed(&mf, &target);
+    let funcs = vec![mf];
+    for x in [0i64, 42, 1234567] {
+        let got = interp::run(&target, &funcs, 0, &[Int::from_i64(x)]).unwrap().unwrap();
+        assert_eq!(got, Int::from_i64(x), "dynroundtrip({x})");
     }
 }
 

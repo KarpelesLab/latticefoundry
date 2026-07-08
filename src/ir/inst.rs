@@ -346,6 +346,21 @@ pub enum InstKind {
         /// The type whose storage is allocated.
         elem_ty: TypeId,
     },
+    /// Dynamically allocate `n` bytes of stack storage; operand `[n]` is an
+    /// integer byte count. The result is a fresh, `align`-aligned, non-null
+    /// pointer (of pointer type) to `n` bytes of freshly allocated stack, valid
+    /// for the lifetime of the enclosing function activation — the C `alloca`
+    /// lifetime: the storage is reclaimed when the function returns, **not** at
+    /// scope exit (so `dyn_alloca` inside a loop accumulates until return).
+    /// Reading the newly allocated memory before it is written yields poison.
+    /// A negative or unrepresentably-large `n` is treated as `Alloca` treats an
+    /// out-of-model size (the resulting pointer is poison). `align` is the
+    /// required alignment, a power of two.
+    DynAlloca {
+        /// The required alignment of the returned pointer, in bytes (a power of
+        /// two).
+        align: u32,
+    },
     /// Load a value of the accessed type from memory; operand `[ptr]`. Result
     /// type = the accessed type. The accessed type and alignment live on the op
     /// (this is where opaque pointers put the type back). Loading through a

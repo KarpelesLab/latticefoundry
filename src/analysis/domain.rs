@@ -175,6 +175,7 @@ pub(crate) fn concrete_eval(
         // Stateful opcodes have no pure denotation; the soundness harness skips
         // them (their transfer must return `top`).
         crate::ir::InstKind::Alloca { .. }
+        | crate::ir::InstKind::DynAlloca { .. }
         | crate::ir::InstKind::Load { .. }
         | crate::ir::InstKind::Store { .. }
         | crate::ir::InstKind::Call => None,

@@ -797,6 +797,10 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
             w.u8(5);
             w.uvarint(t.ty(*elem_ty));
         }
+        InstKind::DynAlloca { align } => {
+            w.u8(17);
+            w.uvarint(u64::from(*align));
+        }
         InstKind::Load { ty, align } => {
             w.u8(6);
             w.uvarint(t.ty(*ty));
@@ -1167,6 +1171,7 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
             InstKind::Switch(Box::new(SwitchData { default, default_args, cases }))
         }
         16 => InstKind::Unreachable,
+        17 => InstKind::DynAlloca { align: r.u32()? },
         t => return Err(DecodeError::InvalidTag { what: "opcode", tag: u32::from(t) }),
     })
 }
@@ -1374,6 +1379,35 @@ mod tests {
         let main = m2.functions().nth(1).unwrap();
         assert_eq!(main.block_count(), 7);
         assert!(main.entry().is_some());
+    }
+
+    #[test]
+    fn dyn_alloca_round_trips() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("dyn");
+        let i64t = m.types_mut().int(64);
+        let sig = m.types_mut().func(vec![i64t], i64t, false);
+        let f = m.declare_function(interner.intern("d"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let n = b.param(e, 0);
+            let p = b.dyn_alloca(n, 64);
+            let v = b.load(i64t, p, 8);
+            b.ret(Some(v));
+        }
+        let bytes = encode(&m, &interner);
+        let mut back = StrInterner::new();
+        let m2 = decode(&bytes, &mut back).expect("decode should succeed");
+        assert_eq!(encode(&m2, &back), bytes, "binary form must be stable");
+        let func = m2.function(crate::ir::FuncId::from_index(0));
+        let has = (0..func.inst_count()).any(|i| {
+            matches!(
+                func.inst(crate::ir::InstId::from_index(i)).kind,
+                crate::ir::InstKind::DynAlloca { align: 64 }
+            )
+        });
+        assert!(has, "decoded module must contain dyn_alloca align 64");
     }
 
     #[test]

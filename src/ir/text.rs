@@ -44,6 +44,7 @@
 //!               | "fcmp" fpred fm operand "," operand ":" type
 //!               | castop operand ":" type
 //!               | "alloca" type ":" type
+//!               | "dyn_alloca" operand "align" INT ":" type
 //!               | "load" operand "align" INT ":" type
 //!               | "store" operand "," operand "align" INT ":" type
 //!               | "ptr_add" [ "inbounds" ] operand "," operand ":" type
@@ -300,6 +301,12 @@ fn write_inst<W: fmt::Write>(
             write!(f, "alloca ")?;
             write_type(f, module, *elem_ty)?;
             write!(f, " : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::DynAlloca { align } => {
+            write!(f, "dyn_alloca ")?;
+            op(f, ops[0])?;
+            write!(f, " align {align} : ")?;
             write_type(f, module, data.ty)
         }
         InstKind::Load { ty, align } => {
@@ -940,6 +947,7 @@ enum OpAst {
     FCmp(FloatPred, Flags, Operand, Operand),
     Cast(CastOp, Operand, TypeId),
     Alloca(TypeId),
+    DynAlloca(u32, Operand),
     Load(TypeId, u32, Operand),
     Store(TypeId, u32, Operand, Operand),
     PtrAdd(bool, Operand, Operand),
@@ -1354,6 +1362,14 @@ impl Parser {
                 self.expect(&TokKind::Colon, "`:`")?;
                 let _ptr = self.parse_type(module)?;
                 Ok(OpAst::Alloca(elem))
+            }
+            "dyn_alloca" => {
+                let n = self.parse_operand(module)?;
+                self.expect_ident("align")?;
+                let align = self.parse_u32()?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let _ptr = self.parse_type(module)?;
+                Ok(OpAst::DynAlloca(align, n))
             }
             "load" => {
                 let ptr = self.parse_operand(module)?;
@@ -1822,6 +1838,10 @@ fn emit_inst(
             Some(b.cast(*op, v, *ty))
         }
         OpAst::Alloca(elem) => Some(b.alloca(*elem)),
+        OpAst::DynAlloca(align, n) => {
+            let nv = resolve_operand(b, n, names, func_names, global_names)?;
+            Some(b.dyn_alloca(nv, *align))
+        }
         OpAst::Load(ty, align, ptr) => {
             let p = resolve_operand(b, ptr, names, func_names, global_names)?;
             Some(b.load(*ty, p, *align))
@@ -2051,6 +2071,32 @@ mod tests {
         let text2 = print_module(&parsed, syms);
         assert_eq!(text1, text2, "round-trip not idempotent\n--- first ---\n{text1}\n--- second ---\n{text2}");
         parsed
+    }
+
+    #[test]
+    fn dyn_alloca_round_trips() {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("dyn");
+        let i64_ = m.types_mut().int(64);
+        let sig = m.types_mut().func(vec![i64_], i64_, false);
+        let f = m.declare_function(syms.intern("d"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let n = b.param(e, 0);
+            let p = b.dyn_alloca(n, 32);
+            let v = b.load(i64_, p, 8);
+            b.ret(Some(v));
+        }
+        let parsed = round_trip(&m, &mut syms);
+        let func = parsed.function(FuncId::from_index(0));
+        let has = (0..func.inst_count()).any(|i| {
+            matches!(
+                func.inst(crate::ir::InstId::from_index(i)).kind,
+                crate::ir::InstKind::DynAlloca { align: 32 }
+            )
+        });
+        assert!(has, "round-tripped module must contain dyn_alloca align 32");
     }
 
     #[test]

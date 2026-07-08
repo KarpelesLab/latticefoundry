@@ -40,7 +40,13 @@ impl FunctionTransform for Dce {
 
 /// Whether an opcode has a side effect that keeps it live regardless of use.
 fn has_side_effect(kind: &InstKind) -> bool {
-    matches!(kind, InstKind::Alloca { .. } | InstKind::Store { .. } | InstKind::Call)
+    matches!(
+        kind,
+        InstKind::Alloca { .. }
+            | InstKind::DynAlloca { .. }
+            | InstKind::Store { .. }
+            | InstKind::Call
+    )
 }
 
 /// Mark instruction `i` live and enqueue it, if it was not already.

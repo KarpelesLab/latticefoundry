@@ -226,6 +226,16 @@ pub enum X86Op {
     /// address in the reserved outgoing-argument area at the bottom of the frame
     /// (`rsp` is constant after the prologue), for stack-passed call arguments.
     LeaRspOff = 53,
+    /// `[Def d, Use n, Imm align]` — dynamic (runtime-sized) stack allocation
+    /// (`dyn_alloca`). Carves `n` bytes off the stack by moving `rsp` and returns
+    /// an `align`-aligned pointer into the fresh region in `d`. The moving `rsp`
+    /// coexists with the fixed rsp-relative outgoing-argument area: the encoder
+    /// keeps the outgoing area travelling at the bottom of the frame
+    /// (`[rsp, rsp + outgoing)`) by relocating it below the carved block, so
+    /// stack-argument `[rsp + k]` addressing stays valid; the rbp-relative
+    /// epilogue reclaims the whole dynamic region on return. See [`encode_inst`]
+    /// (`super::encode`) for the exact expansion.
+    DynAlloca = 54,
 }
 
 impl X86Op {
@@ -238,12 +248,12 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 54] = [
+        const TABLE: [X86Op; 55] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
             StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
-            Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff,
+            Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
         ];
         TABLE[op.0 as usize]
     }
@@ -1326,6 +1336,19 @@ impl TargetIsel for X86_64Target {
                 let align = lo.types().align_of(*elem_ty);
                 let slot = lo.new_slot(size, align);
                 lo.emit(self.frame_addr(d, slot));
+            }
+            InstKind::DynAlloca { align } => {
+                // Runtime-sized stack allocation: move `rsp` down by the (rounded)
+                // byte count and hand back a pointer into the fresh region. The
+                // encoder does the rsp arithmetic and the outgoing-area relocation
+                // (see [`X86Op::DynAlloca`]); here we just wire the count operand
+                // and the required alignment.
+                let d = lo.result_reg(inst);
+                let n = self.oper(lo, inst.operands()[0]);
+                lo.emit(MachineInst::new(
+                    X86Op::DynAlloca.opcode(),
+                    vec![def_v(d), use_v(n), imm(u64::from(*align))],
+                ));
             }
             InstKind::Load { ty, .. } => {
                 let d = lo.result_reg(inst);

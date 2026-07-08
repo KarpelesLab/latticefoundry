@@ -496,6 +496,12 @@ impl TargetIsel for RiscvTarget {
                 let slot = lo.new_slot(size, align);
                 lo.emit(self.frame_addr(d, slot));
             }
+            // Dynamic (runtime-sized) stack allocation is implemented and
+            // execution-tested only on x86-64 so far; the riscv sp-adjust
+            // lowering is deferred (like other target-specific gaps here).
+            InstKind::DynAlloca { .. } => {
+                panic!("riscv backend: dynamic `dyn_alloca` is not yet supported")
+            }
             InstKind::Load { ty, .. } => {
                 let d = lo.result_reg(inst);
                 let ptr = lo.reg(inst.operands()[0]);
