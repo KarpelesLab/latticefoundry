@@ -373,6 +373,10 @@ impl Parser {
                     self.declare_ordinary(n, Some(p.ty.clone()));
                 }
             }
+            // A trailing declarator attribute — `f(void) __attribute__((noreturn));`
+            // (GNU) or `[[noreturn]]` — sits between the parameter list and the
+            // `;`/`{`. bzip2's NORETURN and glibc prototypes rely on this position.
+            self.skip_attributes()?;
             if self.is_punct(Punct::LBrace) {
                 let body = self.parse_block_stmts()?;
                 self.pop_scope();

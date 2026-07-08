@@ -1522,6 +1522,11 @@ impl Pp {
             }
             "restrict" if self.std.inline_restrict() => Some(TokenKind::Keyword(Keyword::Restrict)),
             "inline" if self.std.inline_restrict() => Some(TokenKind::Keyword(Keyword::Inline)),
+            // GNU spellings live in the reserved `__` namespace and are available
+            // as extensions under every standard (not std-gated), so real C code
+            // (e.g. bzip2's `static __inline__ void ...`) parses in any mode.
+            "__inline__" | "__inline" => Some(TokenKind::Keyword(Keyword::Inline)),
+            "__restrict__" | "__restrict" => Some(TokenKind::Keyword(Keyword::Restrict)),
             "_Noreturn" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Noreturn, span),
             "_Alignof" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignof, span),
             "_Alignas" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignas, span),

@@ -16,6 +16,11 @@ use lf_cc::{CStd, PpOptions};
 /// The corpus: `(name, source)`. Each `main` returns a value in `0..256`.
 fn programs() -> Vec<(&'static str, &'static str)> {
     vec![
+        // GNU extensions exercised by real code (gzip/bzip2): __inline__ as an
+        // inline spelling, and a trailing __attribute__ on a prototype.
+        ("gnu_inline", "static __inline__ int sq(int x){ return x*x; } int main(){ return sq(6) + 6; }"),
+        ("gnu_attr_trailing", "int f(int) __attribute__((const)); int f(int x){ return x+1; } int main(){ return f(41); }"),
+        ("gnu_restrict", "int add(int *__restrict a, int *__restrict b){ return *a + *b; } int main(){ int x=40,y=2; return add(&x,&y); }"),
         // Arithmetic + precedence.
         ("precedence", "int main(){ return 2 + 3 * 4 - 10 / 2 + 7 % 4; }"),
         ("paren", "int main(){ return (2 + 3) * (4 - 1) + 1; }"),
