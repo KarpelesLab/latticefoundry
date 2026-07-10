@@ -8,7 +8,7 @@
 
 use latticefoundry::support::diagnostics::{Diagnostic, FileId, Span};
 
-use crate::ast::{CType, IntTy};
+use crate::ast::{CType, IntTy, StrKind};
 
 /// A lexical token: its [`TokenKind`] and the source [`Span`] it covers.
 #[derive(Clone, Debug)]
@@ -29,9 +29,10 @@ pub enum TokenKind {
     /// A floating-point constant (its exact value, already rounded to the target
     /// precision) with the C type its suffix implies (`float`/`double`).
     FloatLit(f64, CType),
-    /// A string literal, carrying its already-decoded C byte sequence (produced
-    /// by the preprocessor; octal/hex escapes and high bytes are byte-exact).
-    Str(Vec<u8>),
+    /// A string literal, carrying its already-decoded element bytes (produced by
+    /// the preprocessor; encoded little-endian at the element width, octal/hex
+    /// escapes byte-exact) and its encoding (narrow/wide/`u`/`U`).
+    Str(Vec<u8>, StrKind),
     /// A language keyword.
     Keyword(Keyword),
     /// A punctuator or operator.

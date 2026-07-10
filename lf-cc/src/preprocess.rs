@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use latticefoundry::support::diagnostics::{Diagnostic, FileId, Span};
 
-use crate::ast::CType;
+use crate::ast::{CType, StrKind};
 use crate::cstd::CStd;
 use crate::headers::builtin_header;
 use crate::lex::{self, Keyword, Punct, Token, TokenKind};
@@ -1545,7 +1545,10 @@ impl Pp {
                     }
                 },
                 PpKind::Char(raw) => TokenKind::IntLit(eval_char(raw), CType::int()),
-                PpKind::Str(raw) => TokenKind::Str(decode_string_bytes(raw)),
+                PpKind::Str(raw) => {
+                    let kind = str_kind_of(raw);
+                    TokenKind::Str(decode_string_elements(raw, kind), kind)
+                }
                 PpKind::Punct(p) => TokenKind::Punct(*p),
                 PpKind::Hash | PpKind::HashHash => {
                     self.diags.push(Diagnostic::error("stray '#' in program").with_span(span));
@@ -1933,13 +1936,113 @@ fn decode_string(raw: &str) -> String {
     unescape(inner)
 }
 
-/// Decode a string literal spelling to its exact C byte sequence (strip quotes,
-/// interpret escapes). Unlike [`decode_string`], the result is byte-exact for
-/// high-byte octal/hex escapes (a C string literal is a byte array).
-fn decode_string_bytes(raw: &str) -> Vec<u8> {
+/// Classify a string-literal spelling by its encoding prefix.
+fn str_kind_of(raw: &str) -> StrKind {
+    if raw.starts_with("u8") {
+        StrKind::Narrow
+    } else if raw.starts_with('L') {
+        StrKind::Wide
+    } else if raw.starts_with('u') {
+        StrKind::Char16
+    } else if raw.starts_with('U') {
+        StrKind::Char32
+    } else {
+        StrKind::Narrow
+    }
+}
+
+/// Decode a string-literal spelling to its element bytes, encoded little-endian
+/// at the element width for its `kind`. For a narrow string this is exactly the
+/// byte sequence [`decode_string_bytes`] produces; for a wide/`u`/`U` string
+/// each element occupies `kind.elem_width()` bytes.
+fn decode_string_elements(raw: &str, kind: StrKind) -> Vec<u8> {
     let raw = strip_encoding_prefix(raw);
     let inner = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
-    unescape_bytes(inner)
+    let width = kind.elem_width();
+    if width == 1 {
+        return unescape_bytes(inner);
+    }
+    let mut out = Vec::new();
+    for elem in unescape_elements(inner, width) {
+        out.extend_from_slice(&elem.to_le_bytes()[..width as usize]);
+    }
+    out
+}
+
+/// Decode a wide string-literal body to its sequence of element values (masked
+/// to `width` bytes). A source character contributes its Unicode scalar value as
+/// one element; escapes are interpreted at the element width.
+fn unescape_elements(inner: &str, width: u64) -> Vec<u32> {
+    let mask: u64 = if width >= 4 { 0xffff_ffff } else { (1u64 << (width * 8)) - 1 };
+    let m = |v: u64| (v & mask) as u32;
+    let mut out: Vec<u32> = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(m(u64::from(c)));
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(m(u64::from(b'\n'))),
+            Some('t') => out.push(m(u64::from(b'\t'))),
+            Some('r') => out.push(m(u64::from(b'\r'))),
+            Some('a') => out.push(m(7)),
+            Some('b') => out.push(m(8)),
+            Some('f') => out.push(m(12)),
+            Some('v') => out.push(m(11)),
+            Some('\\') => out.push(m(u64::from(b'\\'))),
+            Some('\'') => out.push(m(u64::from(b'\''))),
+            Some('"') => out.push(m(u64::from(b'"'))),
+            Some('?') => out.push(m(u64::from(b'?'))),
+            // `\xhh…`: a hexadecimal escape, masked to the element width.
+            Some('x') => {
+                let mut v: u64 = 0;
+                let mut any = false;
+                while let Some(h) = chars.peek().and_then(|c| c.to_digit(16)) {
+                    v = v.wrapping_mul(16).wrapping_add(u64::from(h));
+                    any = true;
+                    chars.next();
+                }
+                out.push(if any { m(v) } else { m(u64::from(b'x')) });
+            }
+            // `\uNNNN` / `\UNNNNNNNN`: a universal character name.
+            Some(u @ ('u' | 'U')) => {
+                let ndigits = if u == 'u' { 4 } else { 8 };
+                let mut v: u64 = 0;
+                let mut n = 0;
+                while n < ndigits {
+                    match chars.peek().and_then(|c| c.to_digit(16)) {
+                        Some(h) => {
+                            v = v.wrapping_mul(16).wrapping_add(u64::from(h));
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                out.push(m(v));
+            }
+            // `\ooo`: an octal escape of one to three octal digits.
+            Some(d @ '0'..='7') => {
+                let mut v = u64::from(d.to_digit(8).unwrap());
+                let mut n = 1;
+                while n < 3 {
+                    match chars.peek().and_then(|c| c.to_digit(8)) {
+                        Some(o) => {
+                            v = v * 8 + u64::from(o);
+                            chars.next();
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                out.push(m(v));
+            }
+            Some(other) => out.push(m(u64::from(other))),
+            None => out.push(m(u64::from(b'\\'))),
+        }
+    }
+    out
 }
 
 /// Decode a string-literal body to its exact C byte sequence, interpreting the

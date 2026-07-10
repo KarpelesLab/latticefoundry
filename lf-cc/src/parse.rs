@@ -14,7 +14,7 @@ use latticefoundry::support::diagnostics::{Diagnostic, Span};
 use crate::ast::{
     BinaryOp, CType, Designator, Expr, ExprKind, Field, FloatTy, FuncDef, FuncProto, FuncType,
     GenericAssoc, Init, InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt,
-    StmtKind, Storage, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    StmtKind, Storage, StrKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
 use crate::layout;
@@ -271,7 +271,7 @@ impl Parser {
         let mut message: Option<String> = None;
         if self.eat_punct(Punct::Comma) {
             match self.peek().clone() {
-                TokenKind::Str(s) => {
+                TokenKind::Str(s, _) => {
                     self.bump();
                     message = Some(String::from_utf8_lossy(&s).into_owned());
                 }
@@ -1067,8 +1067,10 @@ impl Parser {
                     None
                 }
             }
-            ExprKind::StrLit(bytes) => {
-                Some(CType::Array(Box::new(CType::Int(IntTy::new(8, true))), bytes.len() as u64 + 1))
+            ExprKind::StrLit(bytes, kind) => {
+                let width = kind.elem_width();
+                let n = bytes.len() as u64 / width + 1;
+                Some(CType::Array(Box::new(kind.elem_type()), n))
             }
             ExprKind::Cast(ty, _) => Some(ty.clone()),
             ExprKind::CompoundLiteral(ty, _) => Some(ty.clone()),
@@ -1479,7 +1481,7 @@ impl Parser {
                     max
                 }
                 Init::Expr(e) => match &e.kind {
-                    ExprKind::StrLit(bytes) => bytes.len() as u64 + 1,
+                    ExprKind::StrLit(bytes, kind) => bytes.len() as u64 / kind.elem_width() + 1,
                     _ => 0,
                 },
             };
@@ -2152,15 +2154,37 @@ impl Parser {
                 self.expect_punct(Punct::RParen, "')' to close parenthesized expression")?;
                 Ok(inner)
             }
-            TokenKind::Str(_) => {
-                // Adjacent string literals concatenate into one literal.
-                let mut bytes = Vec::new();
+            TokenKind::Str(..) => {
+                // Adjacent string literals concatenate into one literal. Element
+                // values (not raw bytes) are concatenated so a narrow literal
+                // adjacent to a wide one is re-encoded at the wider element width.
                 let mut span = self.peek_span();
-                while let TokenKind::Str(s) = self.peek().clone() {
-                    bytes.extend_from_slice(&s);
+                let mut kind = StrKind::Narrow;
+                let mut pieces: Vec<(Vec<u8>, StrKind)> = Vec::new();
+                let mut first = true;
+                while let TokenKind::Str(s, k) = self.peek().clone() {
+                    kind = if first { k } else { kind.concat(k) };
+                    first = false;
+                    pieces.push((s, k));
                     span = span.merge(self.bump().span);
                 }
-                Ok(Expr { kind: ExprKind::StrLit(bytes), span })
+                let out_width = kind.elem_width();
+                let mut bytes = Vec::new();
+                for (piece, pk) in pieces {
+                    let pw = pk.elem_width() as usize;
+                    if pw == out_width as usize {
+                        bytes.extend_from_slice(&piece);
+                    } else {
+                        // Widen a narrower piece element-by-element (zero-extend).
+                        for chunk in piece.chunks(pw) {
+                            let mut v = [0u8; 8];
+                            v[..chunk.len()].copy_from_slice(chunk);
+                            let elem = u64::from_le_bytes(v);
+                            bytes.extend_from_slice(&elem.to_le_bytes()[..out_width as usize]);
+                        }
+                    }
+                }
+                Ok(Expr { kind: ExprKind::StrLit(bytes, kind), span })
             }
             TokenKind::Keyword(Keyword::Generic) => self.parse_generic(),
             _ => self.err("expected an expression"),

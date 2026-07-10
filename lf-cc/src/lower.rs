@@ -1049,6 +1049,10 @@ impl FnLower<'_> {
             TExprKind::Call(callee, args) => {
                 self.lower_call(callee, args, e).expect("non-void call has a result")
             }
+            TExprKind::DynAlloca(n) => {
+                let n_val = self.lower_rvalue(n);
+                self.b.dyn_alloca(n_val, 16)
+            }
             TExprKind::Cond(c, t, f) => self.lower_ternary(c, t, f, &e.ty),
             TExprKind::Comma(a, b) => {
                 self.lower_effect(a);

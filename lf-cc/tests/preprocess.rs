@@ -36,7 +36,7 @@ fn render(toks: &[Token]) -> String {
             TokenKind::Keyword(_) => s.push_str("<kw>"),
             TokenKind::IntLit(v, _) => s.push_str(&v.to_string()),
             TokenKind::FloatLit(v, _) => s.push_str(&v.to_string()),
-            TokenKind::Str(v) => {
+            TokenKind::Str(v, _) => {
                 s.push('"');
                 s.push_str(&String::from_utf8_lossy(v));
                 s.push('"');

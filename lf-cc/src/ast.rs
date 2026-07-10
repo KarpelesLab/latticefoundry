@@ -90,6 +90,52 @@ impl IntTy {
     }
 }
 
+/// The encoding of a string literal: its prefix determines the element type
+/// and width. Wide char *constants* (`L'c'`) are handled separately; this only
+/// governs string literals.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StrKind {
+    /// `"..."` or `u8"..."` — `char` elements (1 byte, signed 8-bit).
+    Narrow,
+    /// `L"..."` — `wchar_t` = `int` elements (4 bytes, signed 32-bit; gcc LP64).
+    Wide,
+    /// `u"..."` — `char16_t` elements (2 bytes, unsigned 16-bit).
+    Char16,
+    /// `U"..."` — `char32_t` elements (4 bytes, unsigned 32-bit).
+    Char32,
+}
+
+impl StrKind {
+    /// The width in bytes of a single element.
+    pub fn elem_width(self) -> u64 {
+        match self {
+            StrKind::Narrow => 1,
+            StrKind::Char16 => 2,
+            StrKind::Wide | StrKind::Char32 => 4,
+        }
+    }
+
+    /// The C type of a single element.
+    pub fn elem_type(self) -> CType {
+        match self {
+            StrKind::Narrow => CType::Int(IntTy::new(8, true)),
+            StrKind::Wide => CType::Int(IntTy::new(32, true)),
+            StrKind::Char16 => CType::Int(IntTy::new(16, false)),
+            StrKind::Char32 => CType::Int(IntTy::new(32, false)),
+        }
+    }
+
+    /// Combine two adjacent-literal kinds (C string-literal concatenation): a
+    /// wide kind wins over a narrow one; two identical kinds stay; two distinct
+    /// wide kinds are ill-formed in ISO C — pick the left as a best effort.
+    pub fn concat(self, other: StrKind) -> StrKind {
+        match (self, other) {
+            (StrKind::Narrow, k) | (k, StrKind::Narrow) => k,
+            (a, _) => a,
+        }
+    }
+}
+
 /// The smallest standard integer storage width (in bits) that holds an
 /// `N`-value-bit `_BitInt`: 8, 16, 32, or 64.
 pub fn bitint_storage_width(n: u16) -> u16 {
@@ -480,9 +526,10 @@ pub enum ExprKind {
     SizeofExpr(Box<Expr>),
     /// `sizeof(T)`.
     SizeofType(CType),
-    /// A string literal's decoded bytes (already NUL-terminated is *not*
-    /// assumed; sema appends the terminator).
-    StrLit(Vec<u8>),
+    /// A string literal's decoded element bytes (encoded little-endian at the
+    /// element width for wide/`u`/`U` kinds), with its encoding. The terminating
+    /// NUL element is *not* included; sema appends it.
+    StrLit(Vec<u8>, StrKind),
     /// Array subscript `base[index]`.
     Index(Box<Expr>, Box<Expr>),
     /// Member access: `base.name` (`arrow == false`) or `base->name`

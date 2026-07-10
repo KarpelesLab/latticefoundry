@@ -13,7 +13,7 @@ use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
     BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records, Stmt,
-    StmtKind, Storage, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    StmtKind, Storage, StrKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
 use crate::layout;
@@ -268,6 +268,9 @@ pub enum TExprKind {
     Compound { lvalue: Box<TExpr>, rhs: Box<TExpr>, op: BinaryOp, compute_ty: CType },
     /// A call: callee then already-converted arguments.
     Call(Box<TExpr>, Vec<TExpr>),
+    /// `alloca(n)` / `__builtin_alloca(n)`: allocate `n` bytes on the stack
+    /// (native `dyn_alloca`), yielding a `void *`. `n` is a byte count.
+    DynAlloca(Box<TExpr>),
     /// Conditional; `then`/`els` already converted to the node type.
     Cond(Box<TExpr>, Box<TExpr>, Box<TExpr>),
     /// Comma; result is the right operand.
@@ -469,8 +472,10 @@ struct Checker {
     /// C23 `constexpr` objects: name → (reduced value, declared type). Resolved
     /// as a typed compile-time constant in expressions.
     constexprs: HashMap<String, (i128, CType)>,
-    /// Deduplicated string-literal objects: bytes → global index.
-    string_pool: HashMap<Vec<u8>, usize>,
+    /// Deduplicated string-literal objects: (element bytes, encoding) → global
+    /// index. The encoding is part of the key so two literals with identical
+    /// bytes but distinct element types (`L"…"` vs `U"…"`) are not merged.
+    string_pool: HashMap<(Vec<u8>, StrKind), usize>,
     /// The active language dialect (gates implicit function declarations, etc.).
     std: CStd,
 }
@@ -487,15 +492,18 @@ impl Checker {
 
     /// Intern a string literal as an anonymous read-only global, returning its
     /// index in [`Program::globals`]. Identical literals are deduplicated.
-    fn intern_string(&mut self, mut bytes: Vec<u8>) -> usize {
-        bytes.push(0); // NUL terminator
-        if let Some(&idx) = self.string_pool.get(&bytes) {
+    fn intern_string(&mut self, mut bytes: Vec<u8>, kind: StrKind) -> usize {
+        let width = kind.elem_width();
+        // Append the terminating NUL *element* (`width` zero bytes).
+        bytes.extend(std::iter::repeat_n(0u8, width as usize));
+        let key = (bytes.clone(), kind);
+        if let Some(&idx) = self.string_pool.get(&key) {
             return idx;
         }
         let idx = self.globals.len();
         let name = format!(".Lstr.{idx}");
-        let ty = CType::Array(Box::new(char_ty()), bytes.len() as u64);
-        self.string_pool.insert(bytes.clone(), idx);
+        let ty = CType::Array(Box::new(kind.elem_type()), bytes.len() as u64 / width);
+        self.string_pool.insert(key, idx);
         self.globals.push(TGlobal {
             name,
             ty,
@@ -675,12 +683,16 @@ impl Checker {
     ) {
         match ty {
             CType::Array(elem, n) => {
-                // `char[] = "..."` writes the literal bytes directly.
+                // `char[] = "..."` (or a wide array from `L"…"`/`u"…"`/`U"…"`)
+                // writes the literal element bytes directly, when the array's
+                // element type matches the literal's element width.
                 if let Init::Expr(e) = init
-                    && let ExprKind::StrLit(s) = &e.kind
-                    && matches!(**elem, CType::Int(IntTy { width: 8, bitint: None, .. }))
+                    && let ExprKind::StrLit(s, kind) = &e.kind
+                    && matches!(**elem, CType::Int(IntTy { bitint: None, .. }))
+                    && layout::size_of(&self.records, elem) == kind.elem_width()
                 {
-                    write_string_bytes(bytes, off, s, *n);
+                    let limit = (*n).saturating_mul(kind.elem_width());
+                    write_string_bytes(bytes, off, s, limit);
                     return;
                 }
                 let stride = layout::stride_of(&self.records, elem);
@@ -809,8 +821,8 @@ impl Checker {
             // An integer that is not otherwise a constant-expression (rare here):
             // treat as a pure numeric address with no symbol.
             ExprKind::IntLit(v, _) => Some((None, *v as i64)),
-            ExprKind::StrLit(bytes) => {
-                let idx = self.intern_string(bytes.clone());
+            ExprKind::StrLit(bytes, kind) => {
+                let idx = self.intern_string(bytes.clone(), *kind);
                 Some((Some(self.globals[idx].name.clone()), 0))
             }
             // A cast does not change the represented address.
@@ -875,7 +887,7 @@ impl Checker {
         if let CType::Array(elem, 0) = ty {
             let n = match init {
                 Init::Expr(e) => match &e.kind {
-                    ExprKind::StrLit(s) => s.len() as u64 + 1,
+                    ExprKind::StrLit(s, kind) => s.len() as u64 / kind.elem_width() + 1,
                     _ => 1,
                 },
                 Init::List(items) => {
@@ -1385,16 +1397,23 @@ impl Checker {
     ) -> Option<()> {
         match ty {
             CType::Array(elem, n) => {
-                // `char[]` initialized from a string literal.
+                // `char[]` (or a wide `wchar_t[]`/`char16_t[]`/`char32_t[]`)
+                // initialized from a matching string literal: one store per
+                // element, decoded from the literal's little-endian element bytes.
                 if let Init::Expr(e) = init
-                    && let ExprKind::StrLit(s) = &e.kind
-                    && matches!(**elem, CType::Int(IntTy { width: 8, bitint: None, .. }))
+                    && let ExprKind::StrLit(s, kind) = &e.kind
+                    && matches!(**elem, CType::Int(IntTy { bitint: None, .. }))
+                    && layout::size_of(&self.records, elem) == kind.elem_width()
                 {
-                    for (i, &b) in s.iter().enumerate() {
+                    let w = kind.elem_width() as usize;
+                    for (i, chunk) in s.chunks(w).enumerate() {
                         if (i as u64) < *n {
+                            let mut buf = [0u8; 8];
+                            buf[..chunk.len()].copy_from_slice(chunk);
+                            let value = i128::from(u64::from_le_bytes(buf));
                             out.push(AggStore {
-                                offset: base + i as u64,
-                                value: self.char_const(i128::from(b), elem, span),
+                                offset: base + (i * w) as u64,
+                                value: self.char_const(value, elem, span),
                                 bits: None,
                             });
                         }
@@ -1537,8 +1556,8 @@ impl Checker {
                 let sz = self.size_of(ty) as i128;
                 Some(TExpr::new(TExprKind::Const(sz), size_t(), span))
             }
-            ExprKind::StrLit(bytes) => {
-                let idx = self.intern_string(bytes.clone());
+            ExprKind::StrLit(bytes, kind) => {
+                let idx = self.intern_string(bytes.clone(), *kind);
                 let ty = self.globals[idx].ty.clone();
                 // A string literal is an lvalue array object (it decays elsewhere).
                 Some(TExpr::new(TExprKind::Global(idx), ty, span))
@@ -2205,6 +2224,21 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> Option<TExpr> {
+        // `alloca(n)` / `__builtin_alloca(n)`: lowered to the native `dyn_alloca`
+        // (a stack allocation freed at function return), not an external call.
+        // GNU treats `alloca` as a builtin even when a prototype is in scope.
+        if let ExprKind::Ident(name) = &callee.kind
+            && (name == "alloca" || name == "__builtin_alloca")
+            && args.len() == 1
+        {
+            let n = self.check_rvalue(ctx, &args[0])?;
+            let n = self.convert(n, &size_t());
+            return Some(TExpr::new(
+                TExprKind::DynAlloca(Box::new(n)),
+                CType::ptr_to(CType::Void),
+                span,
+            ));
+        }
         // GNU `__builtin_<name>` calls that are not one of the specially-parsed
         // forms (the `va_*` family become dedicated AST nodes in the parser) and
         // that are not explicitly declared are treated as aliases for the
@@ -2626,8 +2660,9 @@ fn const_eval_with(
 fn ast_static_type(e: &Expr, gtypes: &HashMap<&str, &CType>) -> Option<CType> {
     match &e.kind {
         ExprKind::IntLit(_, ty) | ExprKind::FloatLit(_, ty) => Some(ty.clone()),
-        ExprKind::StrLit(bytes) => {
-            Some(CType::Array(Box::new(CType::Int(IntTy::new(8, true))), bytes.len() as u64 + 1))
+        ExprKind::StrLit(bytes, kind) => {
+            let n = bytes.len() as u64 / kind.elem_width() + 1;
+            Some(CType::Array(Box::new(kind.elem_type()), n))
         }
         ExprKind::Cast(ty, _) | ExprKind::CompoundLiteral(ty, _) | ExprKind::VaArg(_, ty) => {
             Some(ty.clone())
@@ -2754,9 +2789,9 @@ fn write_int_bytes(bytes: &mut [u8], off: u64, v: i128, size: u64) {
 
 /// Write string bytes into `bytes` at `off`, truncated to `n` (the NUL and any
 /// remaining bytes are already zero from the caller's zero-fill).
-fn write_string_bytes(bytes: &mut [u8], off: u64, s: &[u8], n: u64) {
+fn write_string_bytes(bytes: &mut [u8], off: u64, s: &[u8], limit: u64) {
     for (i, &b) in s.iter().enumerate() {
-        if (i as u64) < n
+        if (i as u64) < limit
             && let Some(dst) = bytes.get_mut(off as usize + i)
         {
             *dst = b;

@@ -503,6 +503,73 @@ fn programs() -> Vec<(&'static str, &'static str)> {
         ),
         // `$` is a valid identifier character under the GNU dialect (gcc default).
         ("dollar_in_ident", "int a$b = 42; int main(){ return a$b; }"),
+        // --- Wide/prefixed string literals: element type/width and sizeof -------
+        // `wchar_t` (== `int`) is 4 bytes: `L"ab"` is 3 elements × 4 = 12.
+        ("wstr_sizeof_L", "int main(){ return sizeof(L\"ab\"); }"),
+        // `char32_t` is 4 bytes: `U"abc"` is 4 elements × 4 = 16.
+        ("wstr_sizeof_U", "int main(){ return sizeof(U\"abc\"); }"),
+        // `char16_t` is 2 bytes: `u"ab"` is 3 elements × 2 = 6.
+        ("wstr_sizeof_u", "int main(){ return sizeof(u\"ab\"); }"),
+        // Indexing a wide literal yields the element value (`'B'` == 66).
+        ("wstr_index", "int main(){ return (int)L\"ABC\"[1]; }"),
+        // A wide literal with an escape: `L\"a\\tb\"[1]` is the tab (9).
+        ("wstr_escape", "int main(){ return (int)L\"a\\tb\"[1]; }"),
+        // A `\\xNN` hex escape wider than a byte in a `char32_t` element.
+        ("wstr_hex_escape", "int main(){ return (int)(U\"\\x102A\"[0] - 0x1000); }"),
+        // Adjacent-literal concatenation stays wide: `L\"a\" \"b\"` is 3 × 4 = 12.
+        ("wstr_concat", "int main(){ return sizeof(L\"a\" \"b\"); }"),
+        // Mixed adjacent narrow+wide promotes to wide, and elements are correct.
+        (
+            "wstr_concat_mixed",
+            "int main(){ return sizeof(\"a\" L\"bc\") + (int)(L\"a\" \"Z\")[1]; }",
+        ),
+        // A narrow string is unchanged: `sizeof(\"ab\")` stays 3 (regression).
+        ("nstr_sizeof", "int main(){ return sizeof(\"ab\"); }"),
+        // `u8\"...\"` stays a `char` array (1 byte/element): sizeof(\"abc\") == 4.
+        ("u8str_sizeof", "int main(){ return sizeof(u8\"abc\"); }"),
+        // A wide string used via a pointer: sum the first two elements.
+        (
+            "wstr_ptr",
+            "int main(){ const int *p = L\"AB\"; return (int)p[0] + (int)p[1]; }",
+        ),
+        // A `wchar_t[]` array initialized from a wide string literal.
+        (
+            "wstr_array_init",
+            "int main(){ int w[] = L\"AB\"; return (int)(sizeof(w)/sizeof(w[0]))*10 + w[1]; }",
+        ),
+        // --- alloca / __builtin_alloca lowered to native dyn_alloca ------------
+        // Write/read a dynamically allocated region. (The `alloca` prototype lets
+        // gcc compile cleanly; both compilers still use the builtin/native op.)
+        (
+            "alloca_basic",
+            "void *alloca(unsigned long); \
+             int main(){ int n=64; char*p=(char*)alloca(n); int i; \
+             for(i=0;i<n;i++)p[i]=(char)i; return p[63]&0xff; }",
+        ),
+        // Pass the alloca'd region to a function that fills it.
+        (
+            "alloca_pass",
+            "void *alloca(unsigned long); \
+             static void fill(char*p,int n){ int i; for(i=0;i<n;i++)p[i]=(char)(i+1); } \
+             int main(){ int n=42; char*p=(char*)alloca(n); fill(p,n); return p[41]&0xff; }",
+        ),
+        // alloca inside a loop (each iteration a fresh region).
+        (
+            "alloca_loop",
+            "void *alloca(unsigned long); \
+             int main(){ int s=0,k; for(k=1;k<=8;k++){ char*p=(char*)alloca(k); \
+             p[k-1]=(char)k; s+=p[k-1]; } return s; }",
+        ),
+        // The `__builtin_alloca` spelling.
+        (
+            "builtin_alloca",
+            "int main(){ char*p=(char*)__builtin_alloca(16); int i; \
+             for(i=0;i<16;i++)p[i]=(char)(i*i); return p[7]&0xff; }",
+        ),
+        // NOTE: runtime-sized VLAs (`int a[n];`) are deferred: the `CType::Array`
+        // length is a `u64`, so a VLA would need a new type variant threaded
+        // through layout/sema/lower/decay/sizeof. Gap 2's required part is the
+        // `alloca`/`__builtin_alloca` -> `dyn_alloca` hookup above.
     ]
 }
 
@@ -818,4 +885,44 @@ fn differential_against_gcc() {
     );
     assert!(failures.is_empty(), "differential mismatches:\n{}", failures.join("\n"));
     assert_eq!(ran, total + std_total, "every program should compile and run");
+}
+
+/// `alloca`/`__builtin_alloca` must lower to the native `dyn_alloca` op, not an
+/// external `call alloca`.
+#[test]
+fn alloca_lowers_to_dyn_alloca() {
+    use latticefoundry::ir::text::print_module;
+
+    for src in [
+        "void *alloca(unsigned long); int main(){ char*p=(char*)alloca(64); return p[0]; }",
+        "int main(){ char*p=(char*)__builtin_alloca(64); return p[0]; }",
+    ] {
+        let (module, syms) = lf_cc::compile_to_ir(src, "alloca_ir", false).expect("compiles");
+        let ir = print_module(&module, &syms);
+        assert!(ir.contains("dyn_alloca"), "expected a dyn_alloca op in IR:\n{ir}");
+        assert!(
+            !ir.contains("call") || !ir.contains("alloca\""),
+            "alloca must not be lowered as an external call:\n{ir}"
+        );
+    }
+}
+
+/// A wide string literal's read-only global stores its elements at the correct
+/// width (little-endian), e.g. `L"AB"` -> the 4-byte words 0x41, 0x42, 0x00.
+#[test]
+fn wide_string_global_uses_element_width() {
+    // sizeof at compile time already asserts widths via the differential run;
+    // this checks the emitted global storage has the right byte length.
+    use lf_cc::check_source;
+    let prog = check_source("const int *p = L\"AB\";").expect("checks");
+    // The wide literal object is a `.Lstr` global of 3 elements × 4 bytes = 12.
+    let wide = prog
+        .globals
+        .iter()
+        .find(|g| g.name.starts_with(".Lstr"))
+        .expect("a string-literal global");
+    assert_eq!(wide.bytes.len(), 12, "L\"AB\" is 3 wchar_t elements × 4 bytes");
+    assert_eq!(&wide.bytes[0..4], &[0x41, 0, 0, 0], "first element is 'A' little-endian");
+    assert_eq!(&wide.bytes[4..8], &[0x42, 0, 0, 0], "second element is 'B' little-endian");
+    assert_eq!(&wide.bytes[8..12], &[0, 0, 0, 0], "terminating wide NUL");
 }
