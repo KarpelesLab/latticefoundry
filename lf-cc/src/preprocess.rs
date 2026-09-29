@@ -84,7 +84,8 @@ pub struct PpOptions {
     /// `<stdint.h>` layer over the C library's own (via `#include_next`), and a
     /// `stdc-predef.h` found on the system search chain is pre-included.
     pub hosted: bool,
-    /// Optimization is enabled (`-O1` and up): predefines `__OPTIMIZE__`.
+    /// Optimization is enabled (`-O1` and up): predefines `__OPTIMIZE__` once the
+    /// parser accepts the statement expressions C library headers then use.
     pub optimize: bool,
 }
 
@@ -772,7 +773,11 @@ impl Pp {
         let base = escape_string(&opts.main_file_name);
         self.define_object("__BASE_FILE__", &format!("\"{base}\""));
 
-        if opts.optimize {
+        // `__OPTIMIZE__` makes C library headers swap functions for
+        // optimized macro forms — glibc's <ctype.h> `tolower`/`toupper` become
+        // GNU statement expressions `({ … })` — so it is only claimed once the
+        // parser accepts those (see `STATEMENT_EXPRESSIONS`).
+        if opts.optimize && STATEMENT_EXPRESSIONS {
             self.define_object("__OPTIMIZE__", "1");
         }
         // `__NO_INLINE__` is gcc's "no function is inlined" signal. C libraries
@@ -1643,8 +1648,17 @@ impl Pp {
             && matches!(first.kind, PpKind::Punct(Punct::LParen))
             && !first.space_before
         {
-            if let Some((params, variadic, body_start)) = self.parse_params(rest) {
-                let body = clean_body(&rest[body_start..]);
+            if let Some((params, variadic, va_name, body_start)) = self.parse_params(rest) {
+                let mut body = clean_body(&rest[body_start..]);
+                // GNU named variadic parameter (`args...`): its uses in the body
+                // denote the variable arguments, exactly like `__VA_ARGS__`.
+                if let Some(va) = va_name {
+                    for t in &mut body {
+                        if matches!(&t.kind, PpKind::Ident(n) if *n == va) {
+                            t.kind = PpKind::Ident("__VA_ARGS__".to_owned());
+                        }
+                    }
+                }
                 self.macros.insert(name, Macro { params: Some(params), variadic, body });
             }
             return;
@@ -1654,19 +1668,30 @@ impl Pp {
     }
 
     /// Parse a function-like parameter list starting at `rest[0] == '('`.
-    /// Returns the parameters, whether variadic, and the body start index.
-    fn parse_params(&mut self, rest: &[PpTok]) -> Option<(Vec<String>, bool, usize)> {
+    /// Returns the parameters, whether variadic, the name of a GNU named
+    /// variadic parameter (`args...`), and the body start index.
+    #[allow(clippy::type_complexity)]
+    fn parse_params(&mut self, rest: &[PpTok]) -> Option<(Vec<String>, bool, Option<String>, usize)> {
         let mut params = Vec::new();
         let mut variadic = false;
+        let mut va_name = None;
         let mut i = 1usize; // skip '('
         if matches!(rest.get(i).map(|t| &t.kind), Some(PpKind::Punct(Punct::RParen))) {
-            return Some((params, variadic, i + 1));
+            return Some((params, variadic, va_name, i + 1));
         }
         loop {
             match rest.get(i).map(|t| &t.kind) {
                 Some(PpKind::Punct(Punct::Ellipsis)) => {
                     variadic = true;
                     i += 1;
+                    break;
+                }
+                Some(PpKind::Ident(n))
+                    if matches!(rest.get(i + 1).map(|t| &t.kind), Some(PpKind::Punct(Punct::Ellipsis))) =>
+                {
+                    variadic = true;
+                    va_name = Some(n.clone());
+                    i += 2;
                     break;
                 }
                 Some(PpKind::Ident(n)) => {
@@ -1694,7 +1719,7 @@ impl Pp {
             self.error("expected ')' to close macro parameter list", sp);
             return None;
         }
-        Some((params, variadic, i + 1))
+        Some((params, variadic, va_name, i + 1))
     }
 
     // --- macro expansion ----------------------------------------------------
@@ -2151,7 +2176,11 @@ impl Pp {
         for t in toks {
             let item = match &t.kind {
                 PpKind::Number(s) => match eval_number(s, self.std) {
-                    Ok(NumVal::Int(v, _)) => EItem::Num(v),
+                    // Out-of-range values were rejected by `eval_number`; the
+                    // constant's type decides signed vs unsigned arithmetic.
+                    Ok(NumVal::Int(v, ty)) => {
+                        EItem::Num(PpVal { bits: v as u64, unsigned: ty.is_integer() && !ty.is_signed() })
+                    }
                     Ok(NumVal::Float(..)) => {
                         return Err(Diagnostic::error(
                             "floating constant in a preprocessor `#if` expression",
@@ -2160,10 +2189,10 @@ impl Pp {
                     }
                     Err(m) => return Err(Diagnostic::error(m).with_span(t.span)),
                 },
-                PpKind::Char(raw) => EItem::Num(eval_char(raw)),
+                PpKind::Char(raw) => EItem::Num(PpVal::signed(eval_char(raw) as i64)),
                 PpKind::Ident(n) => {
                     // Remaining identifiers evaluate to 0 (C23 `true` is 1).
-                    EItem::Num(i128::from(self.std.is_c23() && n == "true"))
+                    EItem::Num(PpVal::truth(self.std.is_c23() && n == "true"))
                 }
                 PpKind::Punct(p) => EItem::Op(*p),
                 PpKind::Str(_) => {
@@ -2177,12 +2206,12 @@ impl Pp {
             };
             items.push(item);
         }
-        let mut ev = Ev { items: &items, pos: 0, at };
+        let mut ev = Ev { items: &items, pos: 0, at, skip: 0 };
         let v = ev.expr()?;
         if ev.pos != ev.items.len() {
             return Err(Diagnostic::error("trailing tokens in `#if` expression").with_span(ev.at));
         }
-        Ok(v)
+        Ok(v.value())
     }
 
     // --- finalize -----------------------------------------------------------
@@ -2306,10 +2335,38 @@ impl Pp {
 
 // --- free helpers -----------------------------------------------------------
 
+/// A value in a `#if` expression: per C (6.10.1), every integer is evaluated
+/// as `intmax_t` or `uintmax_t` — 64 bits on this target — so `bits` holds the
+/// two's-complement representation and `unsigned` selects the interpretation.
+#[derive(Clone, Copy, Debug)]
+struct PpVal {
+    bits: u64,
+    unsigned: bool,
+}
+
+impl PpVal {
+    fn signed(v: i64) -> PpVal {
+        PpVal { bits: v as u64, unsigned: false }
+    }
+
+    fn truth(b: bool) -> PpVal {
+        PpVal::signed(i64::from(b))
+    }
+
+    fn is_true(self) -> bool {
+        self.bits != 0
+    }
+
+    /// The mathematical value.
+    fn value(self) -> i128 {
+        if self.unsigned { i128::from(self.bits) } else { i128::from(self.bits as i64) }
+    }
+}
+
 /// The evaluator's simplified token.
 #[derive(Clone, Copy, Debug)]
 enum EItem {
-    Num(i128),
+    Num(PpVal),
     Op(Punct),
 }
 
@@ -2318,6 +2375,10 @@ struct Ev<'a> {
     items: &'a [EItem],
     pos: usize,
     at: Span,
+    /// Nesting depth of operands that are not evaluated (the untaken arm of
+    /// `?:`, the right side of a short-circuited `&&`/`||`): a division by
+    /// zero there is not an error.
+    skip: u32,
 }
 
 impl Ev<'_> {
@@ -2332,44 +2393,65 @@ impl Ev<'_> {
         Diagnostic::error(msg.to_owned()).with_span(self.at)
     }
 
-    fn expr(&mut self) -> Result<i128, Diagnostic> {
+    fn expr(&mut self) -> Result<PpVal, Diagnostic> {
         self.ternary()
     }
 
-    fn ternary(&mut self) -> Result<i128, Diagnostic> {
+    /// Parse an operand that is evaluated only when `live`.
+    fn operand<T>(&mut self, live: bool, f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>) -> Result<T, Diagnostic> {
+        if !live {
+            self.skip += 1;
+        }
+        let r = f(self);
+        if !live {
+            self.skip -= 1;
+        }
+        r
+    }
+
+    fn ternary(&mut self) -> Result<PpVal, Diagnostic> {
         let c = self.binary(0)?;
         if self.peek() == Some(Punct::Question) {
             self.pos += 1;
-            let t = self.expr()?;
+            let t = self.operand(c.is_true(), Self::expr)?;
             if self.peek() != Some(Punct::Colon) {
                 return Err(self.err("expected ':' in `#if` conditional"));
             }
             self.pos += 1;
-            let e = self.ternary()?;
-            Ok(if c != 0 { t } else { e })
+            let e = self.operand(!c.is_true(), Self::ternary)?;
+            // The result has the common type of the two arms.
+            let unsigned = t.unsigned || e.unsigned;
+            let v = if c.is_true() { t } else { e };
+            Ok(PpVal { bits: v.bits, unsigned })
         } else {
             Ok(c)
         }
     }
 
-    fn binary(&mut self, min_prec: u8) -> Result<i128, Diagnostic> {
+    fn binary(&mut self, min_prec: u8) -> Result<PpVal, Diagnostic> {
         let mut lhs = self.unary()?;
         while let Some((prec, op)) = self.peek().and_then(binop_prec) {
             if prec < min_prec {
                 break;
             }
             self.pos += 1;
-            let rhs = self.binary(prec + 1)?;
+            let live = match op {
+                Punct::AmpAmp => lhs.is_true(),
+                Punct::PipePipe => !lhs.is_true(),
+                _ => true,
+            };
+            let rhs = self.operand(live, |ev| ev.binary(prec + 1))?;
             lhs = apply_binop(op, lhs, rhs, self)?;
         }
         Ok(lhs)
     }
 
-    fn unary(&mut self) -> Result<i128, Diagnostic> {
+    fn unary(&mut self) -> Result<PpVal, Diagnostic> {
         match self.peek() {
             Some(Punct::Minus) => {
                 self.pos += 1;
-                Ok(self.unary()?.wrapping_neg())
+                let v = self.unary()?;
+                Ok(PpVal { bits: v.bits.wrapping_neg(), ..v })
             }
             Some(Punct::Plus) => {
                 self.pos += 1;
@@ -2377,17 +2459,18 @@ impl Ev<'_> {
             }
             Some(Punct::Bang) => {
                 self.pos += 1;
-                Ok(i128::from(self.unary()? == 0))
+                Ok(PpVal::truth(!self.unary()?.is_true()))
             }
             Some(Punct::Tilde) => {
                 self.pos += 1;
-                Ok(!self.unary()?)
+                let v = self.unary()?;
+                Ok(PpVal { bits: !v.bits, ..v })
             }
             _ => self.primary(),
         }
     }
 
-    fn primary(&mut self) -> Result<i128, Diagnostic> {
+    fn primary(&mut self) -> Result<PpVal, Diagnostic> {
         match self.items.get(self.pos) {
             Some(EItem::Num(v)) => {
                 self.pos += 1;
@@ -2424,35 +2507,55 @@ fn binop_prec(p: Punct) -> Option<(u8, Punct)> {
     Some((prec, p))
 }
 
-fn apply_binop(op: Punct, a: i128, b: i128, ev: &Ev<'_>) -> Result<i128, Diagnostic> {
+/// Apply a binary operator with the usual arithmetic conversions of
+/// `intmax_t`/`uintmax_t` (either operand unsigned makes both unsigned; a shift
+/// has its left operand's type; comparisons and logical operators yield a
+/// signed 0/1).
+fn apply_binop(op: Punct, a: PpVal, b: PpVal, ev: &Ev<'_>) -> Result<PpVal, Diagnostic> {
+    let unsigned = a.unsigned || b.unsigned;
+    let (x, y) = (a.bits, b.bits);
+    let (sx, sy) = (x as i64, y as i64);
+    let arith = |bits: u64| PpVal { bits, unsigned };
+    let (lt, eq) = if unsigned { (x < y, x == y) } else { (sx < sy, sx == sy) };
     Ok(match op {
-        Punct::PipePipe => i128::from(a != 0 || b != 0),
-        Punct::AmpAmp => i128::from(a != 0 && b != 0),
-        Punct::Pipe => a | b,
-        Punct::Caret => a ^ b,
-        Punct::Amp => a & b,
-        Punct::EqEq => i128::from(a == b),
-        Punct::Ne => i128::from(a != b),
-        Punct::Lt => i128::from(a < b),
-        Punct::Le => i128::from(a <= b),
-        Punct::Gt => i128::from(a > b),
-        Punct::Ge => i128::from(a >= b),
-        Punct::Shl => a.wrapping_shl(b as u32),
-        Punct::Shr => a.wrapping_shr(b as u32),
-        Punct::Plus => a.wrapping_add(b),
-        Punct::Minus => a.wrapping_sub(b),
-        Punct::Star => a.wrapping_mul(b),
-        Punct::Slash => {
-            if b == 0 {
-                return Err(ev.err("division by zero in `#if` expression"));
-            }
-            a.wrapping_div(b)
+        Punct::PipePipe => PpVal::truth(a.is_true() || b.is_true()),
+        Punct::AmpAmp => PpVal::truth(a.is_true() && b.is_true()),
+        Punct::Pipe => arith(x | y),
+        Punct::Caret => arith(x ^ y),
+        Punct::Amp => arith(x & y),
+        Punct::EqEq => PpVal::truth(eq),
+        Punct::Ne => PpVal::truth(!eq),
+        Punct::Lt => PpVal::truth(lt),
+        Punct::Le => PpVal::truth(lt || eq),
+        Punct::Gt => PpVal::truth(!lt && !eq),
+        Punct::Ge => PpVal::truth(!lt),
+        Punct::Shl | Punct::Shr => {
+            // An out-of-range count is undefined; take the limit of the shift.
+            let count = if b.unsigned || sy >= 0 { y.min(64) as u32 } else { 64 };
+            let bits = match (op, a.unsigned) {
+                (Punct::Shl, _) => x.checked_shl(count).unwrap_or(0),
+                (_, true) => x.checked_shr(count).unwrap_or(0),
+                _ => sx.checked_shr(count).unwrap_or(if sx < 0 { -1 } else { 0 }) as u64,
+            };
+            PpVal { bits, unsigned: a.unsigned }
         }
-        Punct::Percent => {
-            if b == 0 {
+        Punct::Plus => arith(x.wrapping_add(y)),
+        Punct::Minus => arith(x.wrapping_sub(y)),
+        Punct::Star => arith(x.wrapping_mul(y)),
+        Punct::Slash | Punct::Percent => {
+            if y == 0 {
+                if ev.skip > 0 {
+                    return Ok(arith(0));
+                }
                 return Err(ev.err("division by zero in `#if` expression"));
             }
-            a.wrapping_rem(b)
+            let bits = match (op, unsigned) {
+                (Punct::Slash, true) => x / y,
+                (Punct::Slash, false) => sx.wrapping_div(sy) as u64,
+                (_, true) => x % y,
+                _ => sx.wrapping_rem(sy) as u64,
+            };
+            arith(bits)
         }
         _ => return Err(ev.err("unsupported operator in `#if` expression")),
     })
@@ -3161,6 +3264,11 @@ fn has_builtin(name: &str) -> bool {
 /// builtin `<stdarg.h>` spells `__gnuc_va_list` with it when available and
 /// otherwise declares the psABI `struct __va_list_tag[1]` itself.
 const BUILTIN_VA_LIST_TYPE: bool = false;
+
+/// Whether the parser accepts GNU statement expressions `({ … })`, which C
+/// library headers use in their `__OPTIMIZE__` macro forms. Until it does,
+/// `-O1`+ does not predefine `__OPTIMIZE__`.
+const STATEMENT_EXPRESSIONS: bool = false;
 
 /// `__has_attribute(name)` (GNU `__attribute__` names, bare or `__x__`-
 /// decorated): true only for attributes whose meaning lf-cc provides — which,
