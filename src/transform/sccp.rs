@@ -284,6 +284,7 @@ fn has_side_effect(kind: &InstKind) -> bool {
             | InstKind::DynAlloca { .. }
             | InstKind::Store { .. }
             | InstKind::Call
+            | InstKind::Syscall
     )
 }
 

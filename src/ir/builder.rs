@@ -349,6 +349,19 @@ impl<'a> FunctionBuilder<'a> {
         self.emit(InstKind::Call, operands, Flags::NONE, result_ty)
     }
 
+    /// An operating-system call: syscall number `nr` with up to six `args`
+    /// (each `i64` or `ptr`; extend narrower integers first). Returns the raw
+    /// `i64` kernel result (`-errno` on failure, not interpreted). The verifier
+    /// rejects more than six arguments.
+    pub fn syscall(&mut self, nr: ValueId, args: &[ValueId]) -> ValueId {
+        let mut operands = Vec::with_capacity(1 + args.len());
+        operands.push(nr);
+        operands.extend_from_slice(args);
+        let i64t = self.types.int(64);
+        self.emit(InstKind::Syscall, operands, Flags::NONE, Some(i64t))
+            .expect("syscall has a result")
+    }
+
     // --- terminators -------------------------------------------------------
 
     /// Return an optional value.

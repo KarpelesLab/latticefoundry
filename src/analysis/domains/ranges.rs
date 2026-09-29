@@ -223,6 +223,7 @@ impl AbstractDomain for Range {
                 | InstKind::DynAlloca { .. }
                 | InstKind::Load { .. }
                 | InstKind::Call
+                | InstKind::Syscall
         ) {
             return Range::Top;
         }

@@ -305,6 +305,7 @@ impl AbstractDomain for KnownBits {
                 | InstKind::DynAlloca { .. }
                 | InstKind::Load { .. }
                 | InstKind::Call
+                | InstKind::Syscall
         ) {
             return KnownBits::Top;
         }

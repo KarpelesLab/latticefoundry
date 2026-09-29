@@ -51,6 +51,7 @@
 //!               | "select" operand "," operand "," operand ":" type
 //!               | "freeze" operand ":" type
 //!               | "call" operand "(" [ operand { "," operand } ] ")" ":" type
+//!               | "syscall" operand { "," operand } ":" type
 //!               | "ret" [ operand ]
 //!               | "br" target
 //!               | "cond_br" operand "," target "," target
@@ -363,6 +364,17 @@ fn write_inst<W: fmt::Write>(
                 op(f, a)?;
             }
             write!(f, ") : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::Syscall => {
+            write!(f, "syscall ")?;
+            for (i, &a) in ops.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                op(f, a)?;
+            }
+            write!(f, " : ")?;
             write_type(f, module, data.ty)
         }
         InstKind::Ret => {
@@ -948,6 +960,7 @@ enum OpAst {
     Cast(CastOp, Operand, TypeId),
     Alloca(TypeId),
     DynAlloca(u32, Operand),
+    Syscall(Vec<Operand>),
     Load(TypeId, u32, Operand),
     Store(TypeId, u32, Operand, Operand),
     PtrAdd(bool, Operand, Operand),
@@ -1432,6 +1445,20 @@ impl Parser {
                 let ret = self.parse_type(module)?;
                 Ok(OpAst::Call(callee, args, ret))
             }
+            "syscall" => {
+                // `syscall nr {, arg} : i64` — the result is always `i64`.
+                let mut ops = vec![self.parse_operand(module)?];
+                while self.eat(&TokKind::Comma) {
+                    ops.push(self.parse_operand(module)?);
+                }
+                self.expect(&TokKind::Colon, "`:`")?;
+                let span = self.span();
+                let ty = self.parse_type(module)?;
+                if ty != module.types_mut().int(64) {
+                    return self.err(span, "a syscall's result type must be `i64`");
+                }
+                Ok(OpAst::Syscall(ops))
+            }
             "ret" => {
                 if matches!(self.peek_kind(), TokKind::Caret | TokKind::RBrace | TokKind::Eof) {
                     Ok(OpAst::Ret(None))
@@ -1874,6 +1901,14 @@ fn emit_inst(
                 avs.push(resolve_operand(b, a, names, func_names, global_names)?);
             }
             b.call(cv, &avs, *ret)
+        }
+        OpAst::Syscall(ops) => {
+            let nr = resolve_operand(b, &ops[0], names, func_names, global_names)?;
+            let mut avs = Vec::with_capacity(ops.len() - 1);
+            for a in &ops[1..] {
+                avs.push(resolve_operand(b, a, names, func_names, global_names)?);
+            }
+            Some(b.syscall(nr, &avs))
         }
         OpAst::Ret(v) => {
             let rv = match v {
@@ -2380,5 +2415,58 @@ mod tests {
         // The bad type token `nonsense` starts at byte offset of its position.
         let at = &src[span.start as usize..span.end as usize];
         assert_eq!(at, "nonsense");
+    }
+
+    /// A module exercising `syscall` with 0, 3 and 6 arguments (constant,
+    /// parameter and pointer operands), including an unused result.
+    fn syscall_module(syms: &mut StrInterner) -> Module {
+        let mut m = Module::new("sys");
+        let i64_ = m.types_mut().int(64);
+        let ptr = m.types_mut().ptr();
+        let sig = m.types_mut().func(vec![i64_, ptr], i64_, false);
+        let f = m.declare_function(syms.intern("s"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let x = b.param(e, 0);
+            let p = b.param(e, 1);
+            let nr_pid = b.const_i64(i64_, 39);
+            let pid = b.syscall(nr_pid, &[]);
+            let one = b.const_i64(i64_, 1);
+            b.syscall(one, &[one, p, x]);
+            let nine = b.const_i64(i64_, 9);
+            let r = b.syscall(nine, &[x, pid, one, x, p, x]);
+            b.ret(Some(r));
+        }
+        m
+    }
+
+    #[test]
+    fn syscall_round_trips() {
+        let mut syms = StrInterner::new();
+        let m = syscall_module(&mut syms);
+        let text = print_module(&m, &syms);
+        assert!(text.contains("= syscall i64 39 : i64"), "{text}");
+        assert!(text.contains("syscall i64 1, i64 1, %"), "{text}");
+        let parsed = round_trip(&m, &mut syms);
+        let func = parsed.function(FuncId::from_index(0));
+        let arities: Vec<usize> = (0..func.inst_count())
+            .map(|i| func.inst(crate::ir::InstId::from_index(i)))
+            .filter(|d| matches!(d.kind, crate::ir::InstKind::Syscall))
+            .map(|d| d.operands().len())
+            .collect();
+        assert_eq!(arities, vec![1, 4, 7], "syscall operand counts survive the round trip");
+    }
+
+    #[test]
+    fn syscall_parses_from_source_and_rejects_non_i64_result() {
+        let ok = "module \"x\"\nfunc @f(i64) -> i64 {\nentry ^0(%a: i64):\n  %r = syscall i64 60, %a : i64\n  ret %r\n}\n";
+        let mut syms = StrInterner::new();
+        let m = parse_module(ok, file(), &mut syms).expect("parse");
+        assert!(crate::verify::verify_module(&m).is_ok());
+
+        let bad = "module \"x\"\nfunc @f(i64) -> i32 {\nentry ^0(%a: i64):\n  %r = syscall i64 60, %a : i32\n  ret %r\n}\n";
+        let mut syms = StrInterner::new();
+        assert!(parse_module(bad, file(), &mut syms).is_err(), "a syscall result must be i64");
     }
 }

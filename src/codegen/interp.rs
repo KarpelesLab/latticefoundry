@@ -255,6 +255,11 @@ impl Interp<'_> {
             VOp::GlobalAddr => return Err("global addressing is not modeled".into()),
             VOp::Unreachable => return Err("reached an unreachable point (UB)".into()),
             VOp::Unsupported => return Err("executed an unsupported (non-integer) opcode".into()),
+            // An opaque effect on the outside world: there is no kernel to ask,
+            // and inventing a result would be unsound, so refuse cleanly.
+            VOp::Syscall => {
+                return Err("unsupported side effect: syscall (the interpreter has no kernel)".into());
+            }
         }
         Ok(Flow::Next)
     }

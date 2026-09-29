@@ -209,3 +209,48 @@ fn generated_code_is_deterministic() {
         assert_eq!(sum_a(n), sum_b(n));
     }
 }
+
+/// Parse and verify a `.lf` module (the syscall fixtures).
+fn parse_lf(src: &str) -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(src, crate::support::diagnostics::FileId::new(0), &mut syms)
+        .expect("parse .lf");
+    crate::verify::verify_module(&m).expect("fixture verifies");
+    (m, syms)
+}
+
+#[test]
+fn jit_getpid_syscall_is_this_process() {
+    // A native `syscall` executed in-process: getpid (39) must be our own pid.
+    let (m, syms) = parse_lf(
+        "module \"t\"
+func @lfpid(i64) -> i64 {
+entry ^0(%x: i64):
+  %p = syscall i64 39 : i64
+  ret %p
+}
+",
+    );
+    let cm = Jit::new().compile(&m, &syms).unwrap();
+    let pid = cm.get_fn_i64_i64("lfpid").expect("lfpid is compiled");
+    assert_eq!(pid(0), i64::from(std::process::id()));
+}
+
+#[test]
+fn jit_syscall_returns_raw_negative_errno() {
+    // `fcntl(fd, F_GETFD)` on a bad fd: the op hands back the kernel's raw
+    // `-errno` (-EBADF = -9) uninterpreted.
+    let (m, syms) = parse_lf(
+        "module \"t\"
+func @lffcntl(i64) -> i64 {
+entry ^0(%fd: i64):
+  %r = syscall i64 72, %fd, i64 1 : i64
+  ret %r
+}
+",
+    );
+    let cm = Jit::new().compile(&m, &syms).unwrap();
+    let fcntl = cm.get_fn_i64_i64("lffcntl").expect("lffcntl is compiled");
+    assert_eq!(fcntl(-1), -9, "EBADF comes back as a raw -errno");
+    assert_eq!(fcntl(1_000_000), -9);
+}

@@ -100,7 +100,7 @@ struct LoopInfo {
 }
 
 /// Whether an opcode is a pure value producer that LICM may relocate. Excludes
-/// terminators, the memory/effect ops (`load`/`store`/`call`/`alloca`), and —
+/// terminators, the memory/effect ops (`load`/`store`/`call`/`syscall`/`alloca`), and —
 /// for speculation safety — integer division/remainder (the only pure ops that
 /// can trigger undefined behavior); see the module docs.
 fn is_hoistable_kind(kind: &InstKind) -> bool {

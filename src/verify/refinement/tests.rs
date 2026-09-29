@@ -370,6 +370,41 @@ fn float_constant_input_is_unknown() {
     assert!(matches!(h.check(), RefinementResult::Unknown(_)));
 }
 
+#[test]
+fn dropping_a_syscall_is_never_proved() {
+    // src performs an (unused-result) syscall; tgt silently drops it. The values
+    // agree, but the observable effect differs: the checker has no kernel model,
+    // so it must answer Unknown — never a false Refines.
+    let mut h = Harness::signature(|m| {
+        let i64t = m.types_mut().int(64);
+        (vec![i64t], i64t)
+    });
+    h.set_src(|b, p| {
+        b.syscall(p[0], &[p[0]]);
+        p[0]
+    });
+    h.set_tgt(|_, p| p[0]);
+    match h.check() {
+        RefinementResult::Unknown(reason) => {
+            assert!(reason.contains("syscall"), "reason was {reason:?}");
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+#[test]
+fn syscall_result_is_opaque_even_when_identical() {
+    // Two identical syscalls on both sides: still skipped (Unknown), since the
+    // result is an uninterpreted external value.
+    let mut h = Harness::signature(|m| {
+        let i64t = m.types_mut().int(64);
+        (vec![i64t], i64t)
+    });
+    h.set_src(|b, p| b.syscall(p[0], &[]));
+    h.set_tgt(|b, p| b.syscall(p[0], &[]));
+    assert!(matches!(h.check(), RefinementResult::Unknown(_)));
+}
+
 // ---------------------------------------------------------------------------
 // Cross-checks against the concrete reference evaluator.
 // ---------------------------------------------------------------------------

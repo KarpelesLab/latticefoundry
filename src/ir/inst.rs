@@ -406,6 +406,21 @@ pub enum InstKind {
     /// = the callee's return type (`void` for a procedure). Effects and poison
     /// propagation follow the callee's semantics.
     Call,
+    /// Operating-system call (Linux syscall ABI); operands `[nr, args...]` with
+    /// 0..=6 arguments. Every operand is `i64` or `ptr` — front ends extend
+    /// narrower integers themselves (no implicit extension rule), so the value
+    /// placed in each ABI register is exactly the operand's 64 bits. Result type
+    /// = `i64`: the raw kernel return, **uninterpreted** (Linux reports failure
+    /// as `-errno` in `[-4095, -1]`; the op does not decode it).
+    ///
+    /// Semantics: an opaque effect on the outside world, exactly as strong as a
+    /// call to an unknown external function — it may read or write any memory
+    /// reachable from an escaped pointer (operands included), so it is a full
+    /// memory clobber; it may not be removed (even with an unused result),
+    /// duplicated, reordered with other memory ops/calls/syscalls, hoisted, or
+    /// speculated. Its result is unknown to every analysis. A poison operand is
+    /// undefined behavior (the kernel would observe an arbitrary register).
+    Syscall,
 
     // --- terminators --------------------------------------------------------
     /// Return; operands `[value]` for a value-returning function, or `[]` for a

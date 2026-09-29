@@ -201,6 +201,10 @@ pub(crate) fn jalr(rd: u32, rs1: u32, imm: i32) -> u32 {
 pub(crate) fn ret() -> u32 {
     jalr(ZERO.into(), RA.into(), 0)
 }
+/// `ecall` (the environment call; a Linux syscall).
+pub(crate) fn ecall() -> u32 {
+    0x0000_0073
+}
 /// `ebreak` (a trap for `unreachable`).
 pub(crate) fn ebreak() -> u32 {
     0x0010_0073
@@ -722,6 +726,7 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             b.branch(jal(ZERO.into(), 0), default, FixupKind::JType);
         }
         RvOp::Unreachable => b.word(ebreak()),
+        RvOp::Ecall => b.word(ecall()),
     }
 }
 
