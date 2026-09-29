@@ -587,6 +587,28 @@ entry ^0:
     }
 }
 
+/// Values whose live ranges do not overlap share locals: a chain of 200
+/// values, each used twice (so none is recomputed in place), needs only a
+/// couple of locals, and a loop's parameters keep theirs apart.
+#[test]
+fn locals_are_reused() {
+    let mut body = String::from("  %v0 = add %a, i32 1 : i32\n");
+    for k in 1..200 {
+        body += &format!("  %v{k} = mul %v{}, %v{} : i32\n", k - 1, k - 1);
+    }
+    body += "  ret %v199\n";
+    let src = format!("module \"chain\"\nfunc @chain(i32) -> i32 {{\nentry ^0(%a: i32):\n{body}}}\n");
+    let (m, syms) = parse(&src);
+    let c = compile(&m, &syms, &CodegenOptions::default()).unwrap();
+    let locals = &c.object.funcs[0].body.as_ref().unwrap().locals;
+    assert!(locals.len() <= 2, "{} locals for a chain", locals.len());
+    if node::node().is_some() {
+        let wasm = c.object.to_linked(&Default::default()).unwrap();
+        let t = differential_module("chain", &m, &syms, &wasm, &[("chain", vec![3]), ("chain", vec![0xdead_beef])]);
+        assert_eq!(t.unwrap().compared, 2);
+    }
+}
+
 #[test]
 fn data_layout_is_ilp32_with_native_i64() {
     let dl = crate::target::wasm32::data_layout();

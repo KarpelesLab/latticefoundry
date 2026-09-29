@@ -111,6 +111,38 @@ fn json_str(s: &str) -> String {
     o
 }
 
+/// How long one node run may take before the test fails (a miscompiled loop
+/// would otherwise hang the suite).
+const NODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run `cmd` with its output captured in files under `dir`, killing it after
+/// [`NODE_TIMEOUT`].
+///
+/// # Panics
+///
+/// On a timeout.
+fn run_with_timeout(cmd: &mut Command, dir: &std::path::Path) -> std::process::Output {
+    let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
+    let mut child = cmd
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("run node");
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for node") {
+            break status;
+        }
+        if start.elapsed() > NODE_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("node did not finish in {NODE_TIMEOUT:?} (a miscompiled infinite loop?); files in {}", dir.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    std::process::Output { status, stdout: std::fs::read(&out_path).unwrap(), stderr: std::fs::read(&err_path).unwrap() }
+}
+
 /// Instantiate `wasm` under node and run `calls`. `None` without node.
 ///
 /// # Panics
@@ -135,7 +167,7 @@ pub(crate) fn run(tag: &str, wasm: &[u8], calls: &[Call]) -> Option<Vec<Outcome>
     }
     json.push(']');
     std::fs::write(&calls_path, json).unwrap();
-    let out = Command::new(node).arg(&runner).arg(&wasm_path).arg(&calls_path).output().expect("run node");
+    let out = run_with_timeout(Command::new(node).arg(&runner).arg(&wasm_path).arg(&calls_path), &dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "node failed ({}): {text}{}", out.status, String::from_utf8_lossy(&out.stderr));
     assert!(!text.starts_with("fatal"), "module rejected by node: {text} (saved in {})", wasm_path.display());
@@ -163,7 +195,7 @@ pub(crate) fn validate(tag: &str, wasm: &[u8]) -> Option<bool> {
     let runner = dir.join("run.js");
     std::fs::write(&wasm_path, wasm).unwrap();
     std::fs::write(&runner, RUNNER).unwrap();
-    let out = Command::new(node).arg(&runner).arg(&wasm_path).arg("-").arg("validate").output().expect("run node");
+    let out = run_with_timeout(Command::new(node).arg(&runner).arg(&wasm_path).arg("-").arg("validate"), &dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let _ = std::fs::remove_dir_all(&dir);
     Some(text.trim() == "valid")

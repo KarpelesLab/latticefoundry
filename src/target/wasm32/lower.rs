@@ -7,7 +7,10 @@
 //! each block parameter is a local assigned on the incoming edges, and each
 //! instruction is emitted as stack code that reads its operands from locals
 //! (or recomputes a single-use pure expression in place) and stores its result
-//! into its local. Control flow comes from the [structurizer](super::structure).
+//! into its local. Values whose live ranges do not overlap share a local (see
+//! the private `locals` module: SSA liveness and a greedy assignment in
+//! dominance order). Control flow comes from the
+//! [structurizer](super::structure).
 //!
 //! # Values
 //!
@@ -722,11 +725,12 @@ impl<'a, 'c> FnLower<'a, 'c> {
             }
         }
 
+        // The wasm types of every other value held in locals.
+        let mut wants: Vec<Vec<ValType>> = vec![Vec::new(); f.value_count()];
         for (b, block) in f.blocks() {
             if b != entry {
                 for &p in block.params() {
-                    let vts = self.repr(p)?.valtypes();
-                    self.loc[p.index()] = vts.into_iter().map(|t| self.new_local(t)).collect();
+                    wants[p.index()] = self.repr(p)?.valtypes();
                 }
             }
             for &i in block.insts() {
@@ -765,11 +769,15 @@ impl<'a, 'c> FnLower<'a, 'c> {
                 if pure && !matches!(repr, Repr::Wide(_)) && uses.len() == 1 && inst_block[uses[0].inst.index()] == b.index() {
                     self.inline[v.index()] = true;
                 } else {
-                    self.loc[v.index()] = repr.valtypes().into_iter().map(|t| self.new_local(t)).collect();
+                    wants[v.index()] = repr.valtypes();
                 }
             }
         }
         self.frame_size = self.frame_size.div_ceil(16) * 16;
+        // Values whose live ranges do not overlap share locals.
+        let assigned = super::locals::assign(f, self.nparams, &self.loc, &wants, &self.inline);
+        self.loc = assigned.loc;
+        self.locals = assigned.locals;
 
         for (_, block) in f.blocks() {
             let t = block.terminator().expect("verified: every block is terminated");

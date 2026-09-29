@@ -1043,6 +1043,11 @@ format:
   parameter a local assigned on the incoming edges (all arguments are pushed
   before any parameter is written: a parallel copy). A pure value with a single
   use in its own block is recomputed there as a stack expression instead.
+  Values whose live ranges do not overlap share a local: SSA interference is
+  "live at the other's definition", so a greedy pass in dominator-tree
+  preorder over liveness computed on the emitted code (block parameters live
+  from the incoming edges, inlined leaves read at their root's user) assigns
+  them without conflicts.
   Integers up to 32 bits live in an `i32`, up to 64 in an `i64`, always
   **zero-extended**: operations that can set bits above the width mask them,
   signed operations sign-extend their operands first, and parameters of

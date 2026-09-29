@@ -16,11 +16,12 @@
 //! 2. **Structuring** ([`structure`]). Each function's CFG becomes nested
 //!    `block` / `loop` / `if` / `br_table` constructs placed from the
 //!    dominator tree; an irreducible CFG falls back to a dispatch loop.
-//! 3. **Code** ([`lower`]). Every SSA value is a wasm local of its type,
-//!    block parameters are locals assigned on the incoming edges (a parallel
-//!    copy through the operand stack), single-use pure values are recomputed
-//!    in place as stack expressions, and narrow integers keep a
-//!    zero-extension invariant in `i32`/`i64` containers.
+//! 3. **Code** ([`lower`]). Every SSA value is a wasm local of its type
+//!    (values whose live ranges do not overlap share one, assigned greedily
+//!    in dominance order), block parameters are locals assigned on the
+//!    incoming edges (a parallel copy through the operand stack), single-use
+//!    pure values are recomputed in place as stack expressions, and narrow
+//!    integers keep a zero-extension invariant in `i32`/`i64` containers.
 //! 4. **Encoding** ([`binary`]). A [`WasmObject`] (functions with their code,
 //!    data segments, symbols) is written as a self-contained module
 //!    ([`WasmObject::to_linked`], what `lf build --target wasm32` produces) or
@@ -62,6 +63,7 @@
 
 pub mod binary;
 pub mod leb;
+mod locals;
 pub mod lower;
 pub mod structure;
 
