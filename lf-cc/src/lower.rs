@@ -229,6 +229,7 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             continue_targets: Vec::new(),
             switch_blocks: Vec::new(),
             label_blocks: vec![None; f.n_labels as usize],
+            indirect_dispatch: None,
             terminated: false,
             func_ids: &func_ids,
             global_ids: &global_ids,
@@ -329,6 +330,9 @@ struct FnLower<'a> {
     switch_blocks: Vec<Vec<BlockId>>,
     /// Blocks for named labels (label id → block), created lazily.
     label_blocks: Vec<Option<BlockId>>,
+    /// The shared `goto *` dispatch block (one `i64` parameter: the target
+    /// label's dispatch number), created by the first computed goto.
+    indirect_dispatch: Option<BlockId>,
     terminated: bool,
     func_ids: &'a [FuncId],
     global_ids: &'a [GlobalId],
@@ -608,21 +612,37 @@ impl FnLower<'_> {
                 self.terminated = true;
             }
             TStmt::GotoIndirect(target, labels) => {
-                // A multi-way branch on the label's dispatch number (`&&l` is
-                // `id + 1`); any other value is undefined behaviour.
+                // Every `goto *` of the function branches to one shared dispatch
+                // block — a multi-way branch on the label's dispatch number
+                // (`&&l` is `id + 1`; any other value is undefined behaviour) —
+                // so an interpreter with N computed gotos over N labels has N + N
+                // edges rather than N * N.
                 self.set_line(target.span);
                 let v = self.lower_rvalue(target);
-                let mut cases: Vec<(puremp::Int, BlockId, Vec<ValueId>)> = Vec::new();
-                let mut sorted = labels.clone();
-                sorted.sort_unstable();
-                for id in sorted {
-                    let bb = self.label_block(id);
-                    cases.push((puremp::Int::from_i64(i64::from(id) + 1), bb, Vec::new()));
-                }
-                let trap = self.b.create_block(&[]);
-                self.b.switch(v, trap, &[], cases);
-                self.switch(trap);
-                self.b.unreachable();
+                let dispatch = match self.indirect_dispatch {
+                    Some(d) => d,
+                    None => {
+                        let d = self.b.create_block(&[self.tys.i64]);
+                        self.indirect_dispatch = Some(d);
+                        self.b.br(d, &[v]);
+                        self.b.switch_to(d);
+                        let dv = self.b.block_params(d)[0];
+                        let mut cases: Vec<(puremp::Int, BlockId, Vec<ValueId>)> = Vec::new();
+                        let mut sorted = labels.clone();
+                        sorted.sort_unstable();
+                        for id in sorted {
+                            let bb = self.label_block(id);
+                            cases.push((puremp::Int::from_i64(i64::from(id) + 1), bb, Vec::new()));
+                        }
+                        let trap = self.b.create_block(&[]);
+                        self.b.switch(dv, trap, &[], cases);
+                        self.b.switch_to(trap);
+                        self.b.unreachable();
+                        self.terminated = true;
+                        return;
+                    }
+                };
+                self.b.br(dispatch, &[v]);
                 self.terminated = true;
             }
         }

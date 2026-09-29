@@ -308,7 +308,13 @@ fn apply_static_linkage(obj: &mut ObjectModule, sigs: &[FuncSig]) {
 fn verify_or(module: &Module, stage: &str) -> Result<(), BuildError> {
     verify::verify_module(module).map_err(|diags| {
         let n = diags.iter().filter(|d| d.is_error()).count();
-        BuildError::Backend(format!("{stage} IR verification failed ({n} error(s))"))
+        // Name the first problem: a failure here is a compiler bug, and the
+        // message is what a bug report starts from.
+        let first = diags.iter().find(|d| d.is_error()).map(|d| format!(": {}", d.message));
+        BuildError::Backend(format!(
+            "{stage} IR verification failed ({n} error(s)){}",
+            first.unwrap_or_default()
+        ))
     })
 }
 
