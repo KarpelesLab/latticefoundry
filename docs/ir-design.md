@@ -592,9 +592,9 @@ the same whichever OS it runs on. The choice is made once per compilation by a
   Every function in a module follows the same convention; there is no
   per-function `ms_abi`/`sysv_abi` attribute yet.
 - **Object format** (`Triple::object_format`): ELF on Linux and bare metal,
-  PE/COFF on Windows, Mach-O on Darwin. Each writer maps the generic
-  `RelocKind`s onto its format and rejects the ones it cannot express with an
-  error, never silently.
+  PE/COFF on Windows, Mach-O on Darwin; a wasm module for wasm32 (§6f). Each
+  writer maps the generic `RelocKind`s onto its format and rejects the ones it
+  cannot express with an error, never silently.
 - **Symbol names** stay the IR names everywhere; the Mach-O writer adds the
   platform's leading underscore itself.
 - **Rejected: a convention per call site.** It would let two ABIs meet inside
@@ -1019,6 +1019,66 @@ bitwise blend (`pand`/`pandn`/`por`, NEON `and`/`bic`/`orr`), scalarized
 selects are the targets' branchless selects, and none of the vector machine
 ops branches (each backend's `may_branch_on_data` audit lists them). Split
 loads and stores keep their `secret` flag.
+## 6f. wasm32: a stack-machine target  *(decided)*
+
+WebAssembly has typed locals instead of registers and structured control flow
+instead of jumps, so `target::wasm32` does **not** go through MIR, instruction
+selection and register allocation. It lowers the SSA IR directly, clean-room
+from the WebAssembly Core Specification and the tool-conventions linking
+format:
+
+- **Layout.** ILP32 with native `i32`/`i64` and a 16-byte stack
+  (`e-p:32:32-…-S128-n32:64`, `wasm32::data_layout`); linear memory is address
+  space 0, the only one. `lf build --target wasm32` gives a module without a
+  `datalayout` line this layout.
+- **Control flow.** A structurizer places each function's blocks from the
+  dominator tree and a reverse postorder: a backward edge targets a loop
+  header wrapped in `loop`; a node with several forward in-edges (a merge
+  node) follows a `block` its immediate dominator's code branches out of; any
+  other node is emitted inline at its one incoming edge. Two-way branches use
+  `if`/`else`, switches nested blocks with a `br_table` (dense cases) or a
+  `br_if` chain. An **irreducible** CFG becomes a dispatch loop (`loop` +
+  `br_table` over a label local).
+- **Values.** Every SSA value is a local of its wasm type and every block
+  parameter a local assigned on the incoming edges (all arguments are pushed
+  before any parameter is written: a parallel copy). A pure value with a single
+  use in its own block is recomputed there as a stack expression instead.
+  Integers up to 32 bits live in an `i32`, up to 64 in an `i64`, always
+  **zero-extended**: operations that can set bits above the width mask them,
+  signed operations sign-extend their operands first, and parameters of
+  non-`internal` functions and results of host or indirect calls are masked on
+  arrival. Wider integers are legalized into `i64` parts (§3b); what stays wide
+  at the ABI seam is a group of `i64` locals, several parameters, and a
+  multi-value result.
+- **Memory.** Loads and stores use the narrow `load8_u`… forms with alignment
+  hints; odd sizes (3, 5, 6, 7 bytes) are split. `alloca`/`dyn_alloca` live on a
+  **shadow stack** under the mutable global `__stack_pointer`, restored before
+  every return. Globals are data segments (`.rodata`, `.data`, `.bss` from the
+  shared emitter), their address a relocated `i32.const`.
+- **Calls.** Direct `call`; a function pointer is a slot of the function table
+  (slot 0 is empty so a null call traps) and an indirect call a
+  `call_indirect`. Undefined functions are imported from `"env"`; `frem` calls
+  `fmod`/`fmodf`.
+- **Other ops.** `fptosi`/`fptoui` use the saturating conversions (out of
+  range is poison, so they must not trap); volatile accesses are plain
+  accesses; atomics use the threads proposal, with `nand`/`max`/`min`/`umax`/
+  `umin` as compare-exchange loops and every fence an `atomic.fence`. `syscall`,
+  `f16`, other address spaces and variadic calls are errors.
+- **Output.** A self-contained module (memory, stack pointer, table, data;
+  exports `memory`, `__heap_base`, `main` and the default/protected-visibility
+  functions) whose shadow stack sits at the bottom of memory, so an overflow
+  wraps below 0 and traps; or a relocatable object (`linking` symbol table and
+  segment info, `reloc.CODE`/`reloc.DATA`, padded 5-byte LEBs at every
+  relocated field, memory/table/`__stack_pointer` imported) for `wasm-ld`.
+
+- **Rejected: a MIR-based wasm backend.** Register allocation has nothing to
+  allocate on wasm, and the MIR's flat blocks with jumps would have to be
+  re-structured anyway; lowering from the SSA IR keeps the dominator tree,
+  block arguments and value types that the structurizer and local assignment
+  need.
+- **Rejected: node splitting for irreducible control flow.** It can blow up
+  code size exponentially; a dispatch loop is linear, and irreducible CFGs are
+  rare in front-end output.
 
 ## 7. Instruction flags: one unified model  *(decided)*
 

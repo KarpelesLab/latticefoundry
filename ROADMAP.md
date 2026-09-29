@@ -446,6 +446,20 @@ by running every program three ways (reference evaluator, MIR interpreter, a
 Thumb-2 simulator over the encoded bytes). Deferred: FPv4-SP hard float,
 ARMv6-M, `ldrex`/`strex` atomics, `dyn_alloca`, DWARF, PIC.
 
+*wasm32* ✅ ([ir-design §6f](docs/ir-design.md)): a stack-machine backend
+outside the MIR/regalloc pipeline (`target::wasm32`). The SSA IR is lowered
+directly: a dominator-tree structurizer places `block`/`loop`/`if`/`br_table`
+(an irreducible CFG falls back to a dispatch loop), SSA values and block
+parameters become wasm locals, narrow integers keep a zero-extension invariant
+in `i32`/`i64`, `i128` is legalized into `i64` parts (multi-value at the ABI),
+`alloca` uses a shadow stack under `__stack_pointer`, and globals are data
+segments. Output: a self-contained module (`lf build --target wasm32`) or a
+relocatable object with `linking`/`reloc.*` sections that `wasm-ld` links
+(`-c`). Validated by differential execution under node against a reference
+interpreter (≈80 000 calls: every integer op at 12 widths, floats, casts,
+control flow, memory, calls, atomics, `i128`), `llvm-objdump` decoding, and
+`wasm-ld` links.
+
 ### **Phase 8 — Linker & first end-to-end**  ✅
 
 Produce a runnable program.

@@ -174,6 +174,7 @@ pub(crate) fn differential_module(
         }
         tally.compared += 1;
     }
+    eprintln!("differential {tag}: {} calls compared, {} skipped (UB in the IR)", tally.compared, tally.skipped);
     Some(tally)
 }
 
