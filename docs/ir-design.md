@@ -400,7 +400,10 @@ contains the lane (natural alignment guarantees the lane never straddles two
 words), inserting the new lane with shifts rather than a mask register. The
 loops use the encoder's never-allocated scratch registers `t0`/`t1`/`t2`/`t6`,
 plus the destination as the `sc` status, since the old value is recomputed
-from the loaded word after the loop.
+from the loaded word after the loop. Every loop is a *constrained* LR/SC loop
+(at most 16 base-ISA instructions from `lr` to the retry branch, no memory
+accesses or backward branches inside), which is what the ISA's
+forward-progress guarantee requires.
 
 ## 7. Instruction flags: one unified model  *(decided)*
 

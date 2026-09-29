@@ -1468,3 +1468,51 @@ fn atomic_sequences_match_llvm_mc() {
     }
     eprintln!("checked {checked} RISC-V atomic sequences against llvm-mc");
 }
+
+#[test]
+fn every_lr_sc_loop_is_a_constrained_loop() {
+    // The ISA guarantees forward progress only for a constrained LR/SC loop: at
+    // most 16 instructions from the `lr` through the retry branch, and no
+    // loads, stores or backward branches in between. Check every loop shape.
+    use super::isel::RvOp;
+    use super::regs::gpr;
+    use crate::codegen::mir::{MachineInst, MachineOperand, Reg};
+    use crate::ir::RmwOp;
+    let d = |n: u16| MachineOperand::Def(Reg::Physical(gpr(n)));
+    let u = |n: u16| MachineOperand::Use(Reg::Physical(gpr(n)));
+    let k = |v: u64| MachineOperand::Imm(Int::from_u64(v));
+    let mut insts = Vec::new();
+    for size in [1u64, 2, 4, 8] {
+        for op in RmwOp::ALL {
+            insts.push(MachineInst::new(
+                RvOp::AtomicRmw.opcode(),
+                vec![d(10), u(11), u(12), k(size), k(u64::from(op.code())), k(0b111)],
+            ));
+        }
+        insts.push(MachineInst::new(RvOp::CmpXchg.opcode(), vec![d(10), u(11), u(12), u(13), k(size), k(0b111)]));
+    }
+    let mut loops = 0;
+    for inst in &insts {
+        let words: Vec<u32> = encode_atomic_for_test(inst)
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let is_lr = |w: u32| w & 0x7F == 0x2F && (w >> 27) == 0b00010;
+        let Some(start) = words.iter().position(|&w| is_lr(w)) else { continue };
+        // The retry branch is the (only) backward branch.
+        let is_branch = |w: u32| w & 0x7F == 0x63;
+        let back = |w: u32| (w >> 31) == 1; // negative B-immediate
+        let end = words.iter().position(|&w| is_branch(w) && back(w)).expect("a retry branch");
+        let body = &words[start..=end];
+        assert!(body.len() <= 16, "{} instructions in {inst:?}", body.len());
+        for &w in &body[1..body.len() - 1] {
+            let opc = w & 0x7F;
+            assert!(opc != 0x03 && opc != 0x23, "no load/store inside the loop: {inst:?}");
+            assert!(!(is_branch(w) && back(w)), "no other backward branch: {inst:?}");
+            assert!(opc != 0x2F || (w >> 27) == 0b00011, "only the closing sc: {inst:?}");
+        }
+        loops += 1;
+    }
+    // nand at 4/8 bytes, every op at 1/2 bytes, cmpxchg at every size.
+    assert_eq!(loops, 2 + 2 * 11 + 4);
+}

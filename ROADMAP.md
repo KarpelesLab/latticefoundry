@@ -355,8 +355,14 @@ for the target's ABI; encodings match the architecture manual.
 *Progress:* x86-64 ✅ (integer, SSE, full System V ABI incl. struct-by-value
 and variadics; executes natively). AArch64 ✅ integer + scalar FP + AAPCS64
 aggregates (validated vs `llvm-mc` + an A64-MIR interpreter; no native
-execution on the x86-64 host). RISC-V 🔶 RV64IM integer only (validated vs
-`llvm-mc` + interpreter); F/D, C and relocations remain. Global data is
+execution on the x86-64 host). RISC-V 🔶 RV64IM integer, plus the A
+extension for atomics (validated vs `llvm-mc` + interpreter); F/D, C and
+relocations remain. Volatile accesses, atomics (`atomic_load`/`atomic_store`/
+`atomic_rmw`/`cmpxchg`) and fences lower on all three targets from each ISA's
+memory model (x86-64 TSO `mov`/`xchg`/`lock xadd`/`lock cmpxchg`/`mfence`;
+AArch64 `ldar`/`stlr`/exclusive loops/`dmb`; RISC-V AMOs, LR/SC loops and
+`fence`), with native two-thread execution tests on x86-64 (see
+[ir-design §6b](docs/ir-design.md)). Global data is
 first-class on x86-64: `compile_module` emits every defined global into
 `.rodata` (`constant`) / `.data` / `.bss` (all-zero) with its linkage as the
 symbol binding and `R_X86_64_64` relocations for address-valued initializers
