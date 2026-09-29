@@ -536,6 +536,10 @@ pub struct FrameLayout {
     slot_off: Vec<i32>,
     /// The callee-saved registers the allocation used, in push order.
     cs_regs: Vec<u8>,
+    /// The callee-saved `xmm` registers the function writes (Win64's
+    /// `xmm6..xmm15`), each with the rbp-relative offset of its 16-byte save
+    /// slot just below the pushed GPRs. Always empty under System V.
+    xmm_saves: Vec<(u8, i32)>,
     /// Bytes occupied by the pushed callee-saved registers (`8 * cs_regs.len()`).
     cs_bytes: i32,
     /// The `sub rsp` amount that follows the callee-saved pushes.
@@ -602,24 +606,48 @@ pub fn layout_frame_with(
     opts: &CodegenOptions,
 ) -> FrameLayout {
     use crate::codegen::target::MachineTarget;
-    let callee: Vec<u8> = target.callee_saved().iter().map(|p| p.num as u8).collect();
 
-    // Which callee-saved registers does the allocation actually define?
-    let mut used = [false; 16];
+    // Which registers does the function write? Every physical def after
+    // allocation, plus the temporaries an encoder expansion uses internally.
+    let mut used_gpr = [false; 16];
+    let mut used_xmm = [false; 16];
+    let mut mark = |p: crate::codegen::mir::PReg| match p.class {
+        RegClass::Gpr => used_gpr[p.num as usize] = true,
+        RegClass::Fp => used_xmm[p.num as usize] = true,
+    };
     for bid in mf.block_ids() {
         for inst in &mf.block(bid).insts {
             for d in inst.defs() {
                 if let Reg::Physical(p) = d {
-                    used[p.num as usize] = true;
+                    mark(p);
                 }
+            }
+            for p in hidden_clobbers(inst) {
+                mark(p);
             }
         }
     }
-    let cs_regs: Vec<u8> = callee.into_iter().filter(|&r| used[r as usize]).collect();
+    let callee = target.callee_saved();
+    let cs_regs: Vec<u8> = callee
+        .iter()
+        .filter(|p| p.class == RegClass::Gpr && used_gpr[p.num as usize])
+        .map(|p| p.num as u8)
+        .collect();
     let cs_bytes = (cs_regs.len() * 8) as i32;
+    let xmm_cs: Vec<u8> = callee
+        .iter()
+        .filter(|p| p.class == RegClass::Fp && used_xmm[p.num as usize])
+        .map(|p| p.num as u8)
+        .collect();
+    let xmm_saves: Vec<(u8, i32)> = xmm_cs
+        .iter()
+        .enumerate()
+        .map(|(k, &x)| (x, -(cs_bytes + 16 * (k as i32 + 1))))
+        .collect();
 
-    // Slot offsets grow downward from just below the callee-saved region.
-    let mut off = 0i64;
+    // Slot offsets grow downward from just below the callee-saved region (the
+    // pushed GPRs, then any xmm save slots).
+    let mut off = 16 * xmm_saves.len() as i64;
     let mut slot_off = vec![0i32; mf.frame().len()];
     for (i, off_slot) in slot_off.iter_mut().enumerate() {
         let info = mf.frame().slot(StackSlot::from_index(i));
@@ -636,7 +664,27 @@ pub fn layout_frame_with(
     let padded = align_up(total, 16);
     let sub_size = (padded - cs_bytes as i64) as i32;
 
-    FrameLayout { slot_off, cs_regs, cs_bytes, sub_size, outgoing, probes: opts.stack_probes }
+    FrameLayout { slot_off, cs_regs, xmm_saves, cs_bytes, sub_size, outgoing, probes: opts.stack_probes }
+}
+
+/// The registers an instruction's encoder expansion writes without naming
+/// them as operands (so the frame layout still sees a callee-saved one used):
+/// the unsigned 64-bit float conversions borrow `rbx`/`r10`/`r11` and
+/// `xmm13..xmm15` (see `u64tof`/`fptou64`).
+fn hidden_clobbers(inst: &MachineInst) -> Vec<crate::codegen::mir::PReg> {
+    let flag = |i: usize| inst.operands.get(i).map_or(0, uimm);
+    match X86Op::decode(inst.opcode) {
+        X86Op::CvtSi2f if flag(3) & 0b100 != 0 => {
+            vec![regs::gpr(regs::RBX), regs::gpr(regs::R10), regs::gpr(regs::R11)]
+        }
+        X86Op::CvtF2si if flag(3) & 0b10 != 0 => vec![
+            regs::gpr(regs::R11),
+            regs::xmm(13),
+            regs::xmm(14),
+            regs::xmm(15),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn phys(r: u16) -> MachineOperand {
@@ -668,6 +716,12 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
             vec![imm_op(layout.sub_size as u64), imm_op(u64::from(layout.probes))],
         ));
     }
+    for &(x, off) in &layout.xmm_saves {
+        prologue.push(MachineInst::new(
+            X86Op::SaveXmm.opcode(),
+            vec![MachineOperand::Use(Reg::Physical(regs::xmm(u16::from(x)))), MachineOperand::Imm(puremp::Int::from_i64(i64::from(off)))],
+        ));
+    }
     let old = std::mem::take(&mut mf.block_mut(entry).insts);
     prologue.extend(old);
     mf.block_mut(entry).insts = prologue;
@@ -679,6 +733,15 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
         let mut new_insts = Vec::with_capacity(old.len());
         for inst in old {
             if X86Op::decode(inst.opcode) == X86Op::Ret {
+                for &(x, off) in &layout.xmm_saves {
+                    new_insts.push(MachineInst::new(
+                        X86Op::RestoreXmm.opcode(),
+                        vec![
+                            MachineOperand::Def(Reg::Physical(regs::xmm(u16::from(x)))),
+                            MachineOperand::Imm(puremp::Int::from_i64(i64::from(off))),
+                        ],
+                    ));
+                }
                 new_insts.push(MachineInst::new(
                     X86Op::LeaRspRbp.opcode(),
                     vec![imm_op(layout.cs_bytes as u64)],
@@ -947,9 +1010,19 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::MovRR => {
             let d = rnum(&ops[0]);
             let s = rnum(&ops[1]);
-            if d == s {
+            let (dc, sc) = (rclass(&ops[0]), rclass(&ops[1]));
+            if dc != sc {
+                // A cross-class copy of the raw 64 bits: `movq gpr, xmm`
+                // (`66 REX.W 0F 7E /r`) or `movq xmm, gpr` (`66 REX.W 0F 6E /r`).
+                // Win64 variadic calls pass a float in both registers.
+                if dc == RegClass::Gpr {
+                    sse_rr(e, 0x66, true, 0x7E, s, d);
+                } else {
+                    sse_rr(e, 0x66, true, 0x6E, d, s);
+                }
+            } else if d == s {
                 // A self-move is a no-op regardless of class.
-            } else if rclass(&ops[0]) == RegClass::Fp {
+            } else if dc == RegClass::Fp {
                 // xmm↔xmm copy via `movsd` (copies the low 64 bits, which holds
                 // both f32 and f64 values exactly).
                 sse_rr(e, 0xF2, false, 0x10, d, s);
@@ -1099,6 +1172,8 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             other => panic!("Call expects a Func or register operand, found {other:?}"),
         },
         X86Op::Ret => e.u8(0xC3),
+        X86Op::SaveXmm => sse_mem(e, 0, 0x11, rnum(&ops[0]), RBP as u8, iimm(&ops[1]) as i32),
+        X86Op::RestoreXmm => sse_mem(e, 0, 0x10, rnum(&ops[0]), RBP as u8, iimm(&ops[1]) as i32),
         X86Op::Jmp => {
             let t = label_index(&ops[0]);
             e.u8(0xE9);
@@ -1498,7 +1573,7 @@ fn compile_function_full(
     opts: &CodegenOptions,
     lines: bool,
 ) -> FunctionOutput {
-    let target = X86_64Target::new();
+    let target = X86_64Target::for_os(opts.os);
     let mut mf = target.select_with_syms(module, func, syms);
     regalloc::allocate(&mut mf, &target);
     let layout = layout_frame_with(&mf, &target, opts);

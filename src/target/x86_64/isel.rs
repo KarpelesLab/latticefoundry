@@ -74,6 +74,17 @@
 //! `gp_offset < 48`, an SSE one from `reg_save_area + fp_offset`
 //! (then `fp_offset += 16`) while `fp_offset < 176`, and otherwise from
 //! `overflow_arg_area` (then `overflow_arg_area += 8`).
+//!
+//! ## Microsoft x64 (Win64)
+//!
+//! [`X86_64Target::with_call_conv`]`(`[`CallConvKind::Win64`]`)` — what
+//! [`CodegenOptions::os`](crate::codegen::CodegenOptions::os) =
+//! [`TargetOs::Windows`] selects — lowers calls, the prologue and `ret` with
+//! the Microsoft x64 convention instead: arguments in `rcx, rdx, r8, r9` /
+//! `xmm0..3` by position, 32 bytes of shadow space at every call, aggregates of
+//! 1/2/4/8 bytes by value and others by reference, `rsi`/`rdi`/`xmm6..15`
+//! callee-saved, and a pointer-walk `va_list`. The rules are in the `win64`
+//! submodule's documentation.
 
 use crate::codegen::isel::{Lower, TargetIsel};
 use crate::codegen::mir::{
@@ -89,6 +100,9 @@ use crate::support::StrInterner;
 use puremp::Int;
 
 use super::regs::{self, RegFile};
+use crate::target::{CallConvKind, TargetOs, Triple};
+
+mod win64;
 
 /// The x86-64 MIR opcode vocabulary. Operand layouts are documented per variant;
 /// `Def`/`Use` are register operands, the rest are immediates, frame slots,
@@ -267,6 +281,14 @@ pub enum X86Op {
     /// `mov rax, [ptr]; L: mov tmp, rax; tmp = op(tmp, val); lock cmpxchg [ptr],
     /// tmp; jne L`. The old value ends in `rax`; `tmp` is a clobbered scratch.
     RmwLoop = 60,
+
+    // --- Microsoft x64 frame support ------------------------------------------
+    /// `[Use xmm, Imm off]` — `movups [rbp + off], xmm` (signed `off`): save
+    /// all 128 bits of a callee-saved `xmm6..xmm15` in the prologue (Win64).
+    SaveXmm = 61,
+    /// `[Def xmm, Imm off]` — `movups xmm, [rbp + off]`: restore it in the
+    /// epilogue.
+    RestoreXmm = 62,
 }
 
 impl X86Op {
@@ -279,13 +301,13 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 61] = [
+        const TABLE: [X86Op; 63] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
             StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
-            Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop,
+            Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm,
         ];
         TABLE[op.0 as usize]
     }
@@ -503,6 +525,7 @@ impl VaIntrinsic {
 #[derive(Debug)]
 pub struct X86_64Target {
     rf: RegFile,
+    win64: bool,
 }
 
 impl Default for X86_64Target {
@@ -514,7 +537,29 @@ impl Default for X86_64Target {
 impl X86_64Target {
     /// Construct the x86-64 target with its fixed register file and SysV ABI.
     pub fn new() -> X86_64Target {
-        X86_64Target { rf: RegFile::new() }
+        X86_64Target { rf: RegFile::new(), win64: false }
+    }
+
+    /// Construct the x86-64 target for the calling convention `cc`:
+    /// [`CallConvKind::Win64`] selects the Microsoft x64 convention (see the
+    /// [`isel`](self) module docs); anything else is System V.
+    pub fn with_call_conv(cc: CallConvKind) -> X86_64Target {
+        if cc == CallConvKind::Win64 {
+            X86_64Target { rf: RegFile::win64(), win64: true }
+        } else {
+            X86_64Target::new()
+        }
+    }
+
+    /// Construct the x86-64 target for the calling convention of `os`
+    /// (Win64 on Windows, System V elsewhere).
+    pub fn for_os(os: TargetOs) -> X86_64Target {
+        X86_64Target::with_call_conv(Triple::new(crate::target::TargetArch::X86_64, os).call_conv())
+    }
+
+    /// The calling convention this target lowers calls with.
+    pub fn call_conv_kind(&self) -> CallConvKind {
+        if self.win64 { CallConvKind::Win64 } else { CallConvKind::SysV }
     }
 
     /// Lower function `func` of `module` to MIR over this target.
@@ -920,6 +965,9 @@ impl X86_64Target {
     /// `xmm0`/`xmm1` and is stored into a fresh result slot; a MEMORY-class result
     /// uses a hidden `sret` pointer (a caller-allocated slot passed in `rdi`).
     fn lower_call(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        if self.win64 {
+            return self.lower_call_win64(lo, inst);
+        }
         let cc = &self.rf.cc;
         let ops = inst.operands();
         let callee = ops[0];
@@ -1538,7 +1586,11 @@ impl TargetIsel for X86_64Target {
     }
 
     fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
-        self.lower_prologue_x86(lo);
+        if self.win64 {
+            self.lower_prologue_win64(lo);
+        } else {
+            self.lower_prologue_x86(lo);
+        }
     }
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
@@ -1669,6 +1721,7 @@ impl TargetIsel for X86_64Target {
 
     fn lower_term(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
+            InstKind::Ret if self.win64 => self.lower_ret_win64(lo, inst),
             InstKind::Ret => {
                 let cc = &self.rf.cc;
                 let ret_ty = match lo.types().get(lo.func().sig) {

@@ -9,6 +9,7 @@
 
 use crate::codegen::stack::StackReport;
 use crate::mc::object::ObjectModule;
+use crate::target::TargetOs;
 
 /// Target-independent code-generation options.
 ///
@@ -34,6 +35,15 @@ pub struct CodegenOptions {
     /// by another component at run time. See [`RelocModel`] and
     /// [`crate::codegen::linkage`].
     pub reloc_model: RelocModel,
+    /// The operating system the code runs on (default [`TargetOs::Linux`]).
+    /// With the backend's architecture it forms the [`Triple`] whose calling
+    /// convention ([`Triple::call_conv`]) every compiled function follows: on x86-64, [`TargetOs::Windows`] selects the Microsoft x64
+    /// convention and every other OS System V. It does not change the object
+    /// *format* — pick the writer with [`crate::mc::write_object`].
+    ///
+    /// [`Triple`]: crate::target::Triple
+    /// [`Triple::call_conv`]: crate::target::Triple::call_conv
+    pub os: TargetOs,
 }
 
 /// How position-dependent the generated code may be, and so how it addresses
@@ -69,7 +79,7 @@ impl RelocModel {
 
 impl Default for CodegenOptions {
     fn default() -> CodegenOptions {
-        CodegenOptions { stack_probes: true, reloc_model: RelocModel::Static }
+        CodegenOptions { stack_probes: true, reloc_model: RelocModel::Static, os: TargetOs::Linux }
     }
 }
 
@@ -90,6 +100,12 @@ impl CodegenOptions {
     /// ([`RelocModel::Pic`]) when `on`, else [`RelocModel::Static`].
     pub fn with_pic(self, on: bool) -> CodegenOptions {
         self.with_reloc_model(if on { RelocModel::Pic } else { RelocModel::Static })
+    }
+
+    /// Target the operating system `os` (see [`CodegenOptions::os`]).
+    pub fn with_os(mut self, os: TargetOs) -> CodegenOptions {
+        self.os = os;
+        self
     }
 }
 

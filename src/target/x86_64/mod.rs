@@ -18,6 +18,10 @@
 //! deferred (it is not an x86 scalar type); wider SIMD and AArch64 FP are
 //! follow-ups.
 //!
+//! Calls follow System V by default, or the Microsoft x64 convention for
+//! Windows targets (`CodegenOptions::with_os(TargetOs::Windows)`; see
+//! [`isel`]).
+//!
 //! Submodules:
 //!
 //! - `regs` — the 16 GPRs as physical registers, the allocatable/scratch split,
@@ -48,6 +52,8 @@ mod data_tests;
 mod atomic_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod runtime_tests;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod win64_tests;
 
 pub use encode::{
     DebugSource, compile_function, compile_module, compile_module_debug, compile_module_debug_with,

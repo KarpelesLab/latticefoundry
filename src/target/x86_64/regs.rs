@@ -25,8 +25,16 @@
 //! leading integer arguments in `rdi, rsi, rdx, rcx, r8, r9`, returns in `rax`,
 //! and requires `rbx, rbp, rsp, r12..r15` to be preserved by the callee.
 //!
-//! This is implemented from the published SysV AMD64 psABI (tenet T1), not from
-//! any toolchain's tables.
+//! [`RegFile::win64`] describes the **Microsoft x64** convention instead (used
+//! for Windows targets): the leading four arguments go in `rcx, rdx, r8, r9`
+//! (or `xmm0..xmm3` for floats — one shared positional counter), and the
+//! callee must preserve `rbx, rbp, rdi, rsi, rsp, r12..r15` and `xmm6..xmm15`.
+//! The register numbering, the allocatable/scratch split and the return
+//! registers are the same, so only the ABI sets differ.
+//!
+//! This is implemented from the published SysV AMD64 psABI and Microsoft's
+//! x64 calling-convention documentation (tenet T1), not from any toolchain's
+//! tables.
 
 use crate::codegen::mir::{PReg, RegClass};
 use crate::codegen::target::CallConv;
@@ -109,6 +117,48 @@ impl RegFile {
         let cc = CallConv {
             arg_regs: [RDI, RSI, RDX, RCX, R8, R9].into_iter().map(gpr).collect(),
             fp_arg_regs: (0u16..=7).map(xmm).collect(),
+            ret_reg: gpr(RAX),
+            fp_ret_reg: xmm(0),
+            stack_grows_down: true,
+        };
+        RegFile {
+            classes: vec![RegClass::Gpr, RegClass::Fp],
+            allocatable,
+            allocatable_fp,
+            scratch,
+            scratch_fp,
+            caller_saved,
+            callee_saved,
+            cc,
+        }
+    }
+
+    /// The Microsoft x64 ("Win64") register file and ABI sets.
+    ///
+    /// The volatile (caller-saved) registers are `rax, rcx, rdx, r8..r11` and
+    /// `xmm0..xmm5`; everything else is callee-saved, including `rsi`, `rdi`
+    /// and `xmm6..xmm15` (all 128 bits). The allocation order prefers the
+    /// volatile registers (no save cost). The scratch registers are the same
+    /// as System V's (`r10, r11, rbx` and `xmm13..xmm15`); the frame layout
+    /// saves `rbx` and `xmm13..15` whenever a function writes them.
+    pub(crate) fn win64() -> RegFile {
+        let allocatable = [RAX, RCX, RDX, R8, R9, RSI, RDI, R12, R13, R14, R15]
+            .into_iter()
+            .map(gpr)
+            .collect();
+        let scratch = [R10, R11, RBX].into_iter().map(gpr).collect();
+        let allocatable_fp = (0u16..=12).map(xmm).collect();
+        let scratch_fp = [13u16, 14, 15].into_iter().map(xmm).collect();
+
+        let mut caller_saved: Vec<PReg> =
+            [RAX, RCX, RDX, R8, R9, R10, R11].into_iter().map(gpr).collect();
+        caller_saved.extend((0u16..=5).map(xmm));
+        let mut callee_saved: Vec<PReg> =
+            [RBX, RSI, RDI, R12, R13, R14, R15].into_iter().map(gpr).collect();
+        callee_saved.extend((6u16..=15).map(xmm));
+        let cc = CallConv {
+            arg_regs: [RCX, RDX, R8, R9].into_iter().map(gpr).collect(),
+            fp_arg_regs: (0u16..=3).map(xmm).collect(),
             ret_reg: gpr(RAX),
             fp_ret_reg: xmm(0),
             stack_grows_down: true,
