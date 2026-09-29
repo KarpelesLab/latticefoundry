@@ -131,6 +131,21 @@ impl<'a> FunctionBuilder<'a> {
         self.func.value_type(v)
     }
 
+    /// The shared type context (with the module's data layout), for queries.
+    pub fn types(&self) -> &TypeContext {
+        self.types
+    }
+
+    /// The shared type context, mutably (to intern new types).
+    pub fn types_mut(&mut self) -> &mut TypeContext {
+        self.types
+    }
+
+    /// The shared constant pool, for reading constants.
+    pub fn consts(&self) -> &ConstPool {
+        self.consts
+    }
+
     // --- constants & references --------------------------------------------
 
     /// A constant of an integer type from an arbitrary-precision value.

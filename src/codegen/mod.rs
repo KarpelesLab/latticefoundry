@@ -21,6 +21,10 @@
 //! - [`data`] — the target-independent emission of global data (initializer
 //!   serialization, `.rodata`/`.data`/`.bss` placement, data relocations) that
 //!   each backend's `compile_module` calls with its absolute-pointer reloc kind;
+//! - [`legalize_int`] — wide-integer legalization: splits integer operations
+//!   wider than a target's native width into part-width operations (and
+//!   libcalls), the shared IR-to-IR step before isel on 32-, 16- and 8-bit
+//!   targets;
 //! - [`linkage`] — symbol binding decisions shared by the backends: which
 //!   symbols bind locally under a [`RelocModel`] (direct vs. GOT addressing),
 //!   and the IR linkage/visibility applied to the object's symbols;
@@ -37,6 +41,7 @@
 pub mod data;
 pub mod interp;
 pub mod isel;
+pub mod legalize_int;
 pub mod linkage;
 pub mod mir;
 pub mod options;
