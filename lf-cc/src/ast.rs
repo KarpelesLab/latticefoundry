@@ -699,6 +699,8 @@ pub enum StmtKind {
     Switch(Expr, Box<Stmt>),
     /// `case const-expr: stmt` — the constant is folded at parse time.
     Case(i128, Box<Stmt>),
+    /// GNU `case lo ... hi: stmt` (inclusive bounds, folded at parse time).
+    CaseRange(i128, i128, Box<Stmt>),
     /// `default: stmt`.
     Default(Box<Stmt>),
     /// `label: stmt` — a named label (function-scoped, in its own namespace).

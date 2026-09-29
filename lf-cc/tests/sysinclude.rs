@@ -289,7 +289,7 @@ fn has_queries() {
         "__has_include(<nonexistent/nope.h>)",
         "__has_builtin(__builtin_add_overflow)",
         "__has_builtin(__builtin_strlen)",
-        "__has_builtin(__builtin_clz)",
+        "__has_builtin(__builtin_clrsb)",
         "__has_attribute(__vector_size__)",
         "__has_attribute(section)",
         "__has_c_attribute(no_such_attribute)",

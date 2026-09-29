@@ -2588,10 +2588,30 @@ impl Parser {
             TokenKind::Keyword(Keyword::Case) => {
                 self.bump();
                 let value = self.parse_const_expr()?;
+                // GNU case range: `case lo ... hi:`.
+                let high = if self.eat_punct(Punct::Ellipsis) {
+                    let sp = self.peek_span();
+                    let hi = self.parse_const_expr()?;
+                    if hi < value {
+                        return Err(Diagnostic::error("empty case range").with_span(sp));
+                    }
+                    if hi - value >= 65536 {
+                        return Err(Diagnostic::error(
+                            "case ranges spanning more than 65536 values are not supported",
+                        )
+                        .with_span(sp));
+                    }
+                    Some(hi)
+                } else {
+                    None
+                };
                 self.expect_punct(Punct::Colon, "':' after case label")?;
                 let body = Box::new(self.parse_labeled_body()?);
                 let span = start.merge(body.span);
-                Ok(self.stmt(StmtKind::Case(value, body), span))
+                Ok(match high {
+                    Some(hi) => self.stmt(StmtKind::CaseRange(value, hi, body), span),
+                    None => self.stmt(StmtKind::Case(value, body), span),
+                })
             }
             TokenKind::Keyword(Keyword::Default) => {
                 self.bump();

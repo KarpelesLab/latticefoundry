@@ -123,6 +123,43 @@ int main(void) {
             1 + 2 + 4 + 16 + 32 + 64 + 1 + 1,
         ),
         (
+            "case_ranges",
+            r#"
+static int classify(int c) {
+    switch (c) {
+    case '0' ... '9': return 1;
+    case 'a' ... 'z':
+    case 'A' ... 'Z': return 2;
+    case -5 ... -1: return 3;
+    default: return 0;
+    }
+}
+int main(void) {
+    return classify('7') + classify('q') * 10 + classify('Q') * 10 + classify(-3) * 50 + classify('!');
+}
+"#,
+            1 + 20 + 20 + 150,
+        ),
+        (
+            "bit_count_builtins",
+            r#"
+int main(void) {
+    volatile unsigned x = 0xF0F0u;
+    int r = 0;
+    r += __builtin_popcount(x) == 8;
+    r += (__builtin_popcountll(0xFFFFFFFFFFFFFFFFull) == 64) * 2;
+    r += (__builtin_clz(1u) == 31 && __builtin_clz(x) == 16) * 4;
+    r += (__builtin_clzl(0x00F0000000000000ul) == 8) * 8;
+    r += (__builtin_ctz(0x80u) == 7 && __builtin_ctz(x) == 4) * 16;
+    r += (__builtin_ctzll(1ull << 40) == 40) * 32;
+    r += (__builtin_ffs(0) == 0 && __builtin_ffs(12) == 3 && __builtin_ffsl(-1L << 63) == 64) * 64;
+    r += __builtin_parity(7u) + __builtin_parityl(3ul);
+    return r;
+}
+"#,
+            1 + 2 + 4 + 8 + 16 + 32 + 64 + 1,
+        ),
+        (
             "float_classification",
             r#"
 int main(void) {

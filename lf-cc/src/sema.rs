@@ -1146,6 +1146,7 @@ impl Checker {
             | StmtKind::DoWhile(body, _)
             | StmtKind::Switch(_, body)
             | StmtKind::Case(_, body)
+            | StmtKind::CaseRange(_, _, body)
             | StmtKind::Default(body) => self.collect_labels(body, labels),
             StmtKind::For(init, _, _, body) => {
                 if let Some(i) = init {
@@ -1278,7 +1279,8 @@ impl Checker {
                 Some(TStmt::Continue)
             }
             StmtKind::Switch(expr, body) => self.check_switch(ctx, expr, body),
-            StmtKind::Case(value, body) => self.check_case(ctx, *value, body, stmt.span),
+            StmtKind::Case(value, body) => self.check_case(ctx, *value, *value, body, stmt.span),
+            StmtKind::CaseRange(lo, hi, body) => self.check_case(ctx, *lo, *hi, body, stmt.span),
             StmtKind::Default(body) => self.check_default(ctx, body, stmt.span),
             StmtKind::Label(name, body) => {
                 // The id was assigned during the function-wide label pre-scan.
@@ -1333,16 +1335,31 @@ impl Checker {
         })
     }
 
-    fn check_case(&mut self, ctx: &mut FnCtx, value: i128, body: &Stmt, span: Span) -> Option<TStmt> {
+    /// Check `case lo:` (`lo == hi`) or a GNU range `case lo ... hi:`, whose
+    /// every value branches to the same mark.
+    fn check_case(
+        &mut self,
+        ctx: &mut FnCtx,
+        lo: i128,
+        hi: i128,
+        body: &Stmt,
+        span: Span,
+    ) -> Option<TStmt> {
         let id = match ctx.switches.last_mut() {
             Some(coll) => {
-                let canon = convert_case(value, &coll.prom);
-                if coll.cases.iter().any(|(v, _)| *v == canon) {
-                    self.error(span, format!("duplicate case value '{value}'"));
-                }
                 let id = coll.nmarks;
                 coll.nmarks += 1;
-                coll.cases.push((canon, id));
+                let mut dup = None;
+                for value in lo..=hi {
+                    let canon = convert_case(value, &coll.prom);
+                    if dup.is_none() && coll.cases.iter().any(|(v, _)| *v == canon) {
+                        dup = Some(value);
+                    }
+                    coll.cases.push((canon, id));
+                }
+                if let Some(value) = dup {
+                    self.error(span, format!("duplicate case value '{value}'"));
+                }
                 id
             }
             None => {
@@ -2652,6 +2669,10 @@ impl Checker {
                 return Some(TExpr::new(TExprKind::Convert(Box::new(acc)), CType::Void, span));
             }
             "assume_aligned" => return self.check_rvalue(ctx, args.first()?),
+            "popcount" | "popcountl" | "popcountll" | "clz" | "clzl" | "clzll" | "ctz" | "ctzl"
+            | "ctzll" | "ffs" | "ffsl" | "ffsll" | "parity" | "parityl" | "parityll" => {
+                return self.builtin_bit_count(ctx, base, args, span);
+            }
             "bswap16" => return self.builtin_bswap(ctx, args, 16, span),
             "bswap32" => return self.builtin_bswap(ctx, args, 32, span),
             "bswap64" => return self.builtin_bswap(ctx, args, 64, span),
@@ -2784,6 +2805,111 @@ impl Checker {
         }
         let result = self.convert(acc?, &ret_ty);
         Some(TExpr::new(TExprKind::StmtExpr(vec![init], Some(Box::new(result))), ret_ty, span))
+    }
+
+    /// `__builtin_{popcount,clz,ctz,ffs,parity}{,l,ll}`, computed branch-free
+    /// in the operand's unsigned width: a SWAR population count, with `clz` as
+    /// the population count of the complement of the right-smeared value, `ctz`
+    /// as that of `(x & -x) - 1`, `ffs` as `ctz + 1` (0 for 0), and `parity` as
+    /// the count's low bit. (`clz`/`ctz` of 0 are undefined in C; this yields
+    /// the width.)
+    fn builtin_bit_count(
+        &mut self,
+        ctx: &mut FnCtx,
+        base: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<TExpr> {
+        let [arg] = args else {
+            self.error(span, format!("__builtin_{base} takes exactly one argument"));
+            return None;
+        };
+        let wide = base.ends_with('l');
+        let bits: u16 = if wide { 64 } else { 32 };
+        let family = base.trim_end_matches('l');
+        let u = CType::Int(IntTy::new(bits, false));
+        let v = self.check_rvalue(ctx, arg)?;
+        if !v.ty.is_integer() {
+            self.error(arg.span, format!("__builtin_{base} requires an integer argument"));
+            return None;
+        }
+        // `ffs` takes a signed operand; the bit pattern is what matters.
+        let v = self.convert(v, &CType::Int(IntTy::new(bits, family != "ffs")));
+        let v = self.convert(v, &u);
+        let mut stmts = Vec::new();
+        let c = |k: u128| TExpr::new(TExprKind::Const(k as i128), u.clone(), span);
+        let int_c = |k: i128| TExpr::new(TExprKind::Const(k), CType::int(), span);
+        let bin = |op: BinaryOp, a: TExpr, b: TExpr| {
+            TExpr::new(TExprKind::Arith(op, Box::new(a), Box::new(b)), u.clone(), span)
+        };
+        let shr = |a: TExpr, k: i128| {
+            TExpr::new(TExprKind::Shift(BinaryOp::Shr, Box::new(a), Box::new(int_c(k))), u.clone(), span)
+        };
+        let (init, x) = self.bind_temp(ctx, v);
+        stmts.push(init);
+        // The operand whose set bits are counted.
+        let counted = match family {
+            "clz" => {
+                let mut s = x.clone();
+                let mut k = 1;
+                while k < i128::from(bits) {
+                    let (init, t) = self.bind_temp(ctx, bin(BinaryOp::BitOr, s.clone(), shr(s, k)));
+                    stmts.push(init);
+                    s = t;
+                    k *= 2;
+                }
+                let ones = c(if wide { u128::from(u64::MAX) } else { u128::from(u32::MAX) });
+                bin(BinaryOp::BitXor, s, ones)
+            }
+            "ctz" | "ffs" => {
+                let neg = bin(BinaryOp::Sub, c(0), x.clone());
+                let low = bin(BinaryOp::BitAnd, x.clone(), neg);
+                bin(BinaryOp::Sub, low, c(1))
+            }
+            _ => x.clone(),
+        };
+        // SWAR population count.
+        let m1 = if wide { 0x5555_5555_5555_5555u128 } else { 0x5555_5555 };
+        let m2 = if wide { 0x3333_3333_3333_3333u128 } else { 0x3333_3333 };
+        let m4 = if wide { 0x0f0f_0f0f_0f0f_0f0fu128 } else { 0x0f0f_0f0f };
+        let h01 = if wide { 0x0101_0101_0101_0101u128 } else { 0x0101_0101 };
+        let (init, a) = self.bind_temp(ctx, counted);
+        stmts.push(init);
+        let a1 = bin(BinaryOp::Sub, a.clone(), bin(BinaryOp::BitAnd, shr(a, 1), c(m1)));
+        let (init, b) = self.bind_temp(ctx, a1);
+        stmts.push(init);
+        let b1 = bin(
+            BinaryOp::Add,
+            bin(BinaryOp::BitAnd, b.clone(), c(m2)),
+            bin(BinaryOp::BitAnd, shr(b, 2), c(m2)),
+        );
+        let (init, d) = self.bind_temp(ctx, b1);
+        stmts.push(init);
+        let d1 = bin(BinaryOp::BitAnd, bin(BinaryOp::Add, d.clone(), shr(d, 4)), c(m4));
+        let count = shr(bin(BinaryOp::Mul, d1, c(h01)), i128::from(bits) - 8);
+        let count = self.convert(count, &CType::int());
+        let result = match family {
+            "parity" => TExpr::new(
+                TExprKind::Arith(BinaryOp::BitAnd, Box::new(count), Box::new(int_c(1))),
+                CType::int(),
+                span,
+            ),
+            "ffs" => {
+                let is_zero = TExpr::new(
+                    TExprKind::Cmp(BinaryOp::Eq, Box::new(x), Box::new(c(0))),
+                    CType::int(),
+                    span,
+                );
+                let plus1 = TExpr::new(
+                    TExprKind::Arith(BinaryOp::Add, Box::new(count), Box::new(int_c(1))),
+                    CType::int(),
+                    span,
+                );
+                TExpr::new(TExprKind::Cond(Box::new(is_zero), Box::new(int_c(0)), Box::new(plus1)), CType::int(), span)
+            }
+            _ => count,
+        };
+        Some(TExpr::new(TExprKind::StmtExpr(stmts, Some(Box::new(result))), CType::int(), span))
     }
 
     /// The floating-point classification builtins behind `<math.h>`'s
@@ -3541,7 +3667,10 @@ fn idents_in_stmt(s: &Stmt, out: &mut HashSet<String>) {
             }
             idents_in_stmt(b, out);
         }
-        StmtKind::Case(_, b) | StmtKind::Default(b) | StmtKind::Label(_, b) => {
+        StmtKind::Case(_, b)
+        | StmtKind::CaseRange(_, _, b)
+        | StmtKind::Default(b)
+        | StmtKind::Label(_, b) => {
             idents_in_stmt(b, out);
         }
         StmtKind::Asm(asm) => {
