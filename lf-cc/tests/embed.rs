@@ -15,6 +15,8 @@
 //! `.c` file lives beside them so a `"…"` `#embed` resolves locally, exactly like
 //! an `#include`.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -71,7 +73,7 @@ impl Harness {
         let bin = self.dir.join(format!("{name}.gcc"));
         // `<…>` embeds search gcc's dedicated `--embed-dir` path (not `-I`).
         let status = Command::new(gcc)
-            .args(["-std=c23", "-O0", "-w"])
+            .args([&common::gcc_std_flag(gcc.as_ref(), "c23"), "-O0", "-w"])
             .arg(format!("--embed-dir={}", self.dir.display()))
             .arg("-o")
             .arg(&bin)
@@ -369,7 +371,7 @@ fn gcc_has_embed(gcc: &str, dir: &Path) -> bool {
     }
     let bin = dir.join("probe.bin.out");
     Command::new(gcc)
-        .args(["-std=c23", "-w", "-o"])
+        .args([&common::gcc_std_flag(gcc.as_ref(), "c23"), "-w", "-o"])
         .arg(&bin)
         .arg(&c)
         .status()

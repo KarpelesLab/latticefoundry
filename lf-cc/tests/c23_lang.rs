@@ -14,6 +14,8 @@
 //! a non-constant `constexpr` initializer, `constexpr`'s `const` implication
 //! (assignment rejected), and the `_BitInt` width constraints.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -131,7 +133,7 @@ impl Harness {
         std::fs::write(&c, src).expect("write source");
         let bin = self.dir.join(format!("{name}.gcc"));
         let status = Command::new(gcc)
-            .args(["-O0", "-w", "-std=c23", "-o"])
+            .args(["-O0", "-w", &common::gcc_std_flag(gcc.as_ref(), "c23"), "-o"])
             .arg(&bin)
             .arg(&c)
             .status()
@@ -150,7 +152,7 @@ fn gcc_supports_c23(gcc: &str, dir: &Path) -> bool {
     }
     let bin = dir.join("c23probe");
     Command::new(gcc)
-        .args(["-O0", "-w", "-std=c23", "-o"])
+        .args(["-O0", "-w", &common::gcc_std_flag(gcc.as_ref(), "c23"), "-o"])
         .arg(&bin)
         .arg(&c)
         .status()

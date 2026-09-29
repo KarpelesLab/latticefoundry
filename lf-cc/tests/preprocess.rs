@@ -2,6 +2,8 @@
 //! conditionals, includes, and command-line macros, plus standard-gating checks
 //! and an end-to-end differential-vs-gcc suite of preprocessor-heavy programs.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -460,8 +462,8 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-fn std_flag(std: CStd) -> String {
-    format!("-std={}", std.name())
+fn std_flag(gcc: &Path, std: CStd) -> String {
+    common::gcc_std_flag(gcc, std.name())
 }
 
 #[test]
@@ -501,7 +503,7 @@ fn preprocessor_differential_against_gcc() {
             std::fs::write(&cfile, c.src).unwrap();
             let bin = dir.join(format!("{}.gcc", c.name));
             let mut cmd = Command::new(gcc);
-            cmd.arg(std_flag(c.std)).arg("-O0").arg("-w").arg(format!("-I{}", inc.display()));
+            cmd.arg(std_flag(gcc, c.std)).arg("-O0").arg("-w").arg(format!("-I{}", inc.display()));
             for (n, v) in &c.defines {
                 cmd.arg(format!("-D{n}={v}"));
             }

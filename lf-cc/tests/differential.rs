@@ -6,6 +6,8 @@
 //! unambiguous observation. If `gcc` is not installed the gcc comparison is
 //! skipped, but the -O0-vs-O2 self-consistency check still runs.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -799,11 +801,18 @@ impl Harness {
         std::fs::write(&c, src).expect("write source");
         let bin = self.dir.join(format!("{name}.gcc"));
         let status = Command::new(gcc)
-            .args(["-O0", "-w", &format!("-std={std}"), "-o"])
+            .args(["-O0", "-w", &common::gcc_std_flag(gcc.as_ref(), std), "-o"])
             .arg(&bin)
             .arg(&c)
             .status()
             .expect("run gcc");
+        // gcc is only the oracle: an older gcc (< 14) lacks parts of C23, so a
+        // C23 program it cannot build skips the comparison. Any other failure
+        // is a broken test program.
+        if !status.success() && std.ends_with("23") {
+            eprintln!("skipping gcc comparison for '{name}': this gcc lacks C23 support for it");
+            return None;
+        }
         assert!(status.success(), "gcc failed to compile '{name}' (-std={std})");
         Some(run_exit(&bin))
     }

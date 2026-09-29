@@ -15,6 +15,8 @@
 //! header *values* are still exercised through equivalent working idioms (e.g.
 //! `(size_t)0 - 1` for the maximum `size_t`).
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -182,7 +184,7 @@ impl Harness {
         std::fs::write(&c, src).expect("write source");
         let bin = self.dir.join(format!("{name}.gcc"));
         let status = Command::new(gcc)
-            .args(["-O0", "-w", &format!("-std={std}"), "-o"])
+            .args(["-O0", "-w", &common::gcc_std_flag(gcc.as_ref(), std), "-o"])
             .arg(&bin)
             .arg(&c)
             .status()
