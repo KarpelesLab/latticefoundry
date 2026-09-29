@@ -287,7 +287,10 @@ fn real_glibc_redirect_macros() {
     let program = lf_cc::check_source_with(
         src,
         &PpOptions {
-            include_dirs: vec![PathBuf::from("/usr/include")],
+            // The host's system directories exactly as the driver searches them
+        // (Debian/Ubuntu keep `bits/*` in the multiarch directory).
+        stdinc_dirs: lf_cc::default_system_include_dirs(),
+        hosted: true,
             builtin_headers: false,
             ..PpOptions::default()
         },
@@ -323,7 +326,10 @@ fn real_glibc_string_h() {
         return;
     }
     let opts = PpOptions {
-        include_dirs: vec![PathBuf::from("/usr/include")],
+        // The host's system directories exactly as the driver searches them
+        // (Debian/Ubuntu keep `bits/*` in the multiarch directory).
+        stdinc_dirs: lf_cc::default_system_include_dirs(),
+        hosted: true,
         // The compiler-provided headers (`<stddef.h>`) come from lf-cc itself.
         main_file_name: "strlen.c".to_owned(),
         ..PpOptions::default()
