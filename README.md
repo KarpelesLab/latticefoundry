@@ -140,8 +140,15 @@ the whole pipeline. It covers C89 through C23 (`--std=`):
 - freestanding standard headers
 
 Its test suite is differential: each program's exit status is compared with
-`gcc`'s at `-O0` and `-O2`. `-c` emits relocatable objects, which can be linked
-against the system libc.
+`gcc`'s at `-O0` and `-O2`.
+
+`lf-cc` is a complete compiler driver on its own. It accepts any mix of `.c`,
+`.s`, `.o`, `.a` and `-l` inputs, and `-c` writes one object per source. By
+default it links a dynamic executable against the host libc using qld;
+`-nostdlib` gives a static, libc-free executable instead. It never runs gcc or
+the system `ld`. GNU `asm` labels, compiler barriers and file-scope `asm`
+blocks are supported; file-scope asm is assembled with rsasm. The real glibc
+`<string.h>` already compiles.
 
 Real packages built from source with `lf-cc`:
 
@@ -152,7 +159,8 @@ Real packages built from source with `lf-cc`:
 | make 3.82   | All 27 files; builds real projects identically |
 | bash 3.2    | All 130 core files; the feature battery matches the system bash |
 
-These builds currently use minimal stub hosted headers. The next milestone,
+gzip is now built and linked by `lf-cc` alone, with no gcc at any step. These
+builds still use minimal stub hosted headers. The next milestone,
 **M9**, is compiling against the real glibc `/usr/include`, which means covering
 the full GNU C dialect. The goal after that is a bootstrap-capable compiler.
 

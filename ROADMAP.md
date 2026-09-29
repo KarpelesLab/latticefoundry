@@ -460,6 +460,10 @@ gap to a genuine bootstrap compiler is **the headers**.
 | make 3.82   | ✅ all 27 files; builds real projects identically to system make |
 | bash 3.2    | ✅ all 130 core files; feature battery identical to system bash |
 
+`lf-cc` is now its own driver. It links through our `qld` against the host
+libc (or statically with `-nostdlib`), so gzip builds with **no gcc or system
+`ld` at any step**.
+
 Each package exposed a handful of real gaps: K&R functions, implicit int,
 GNU keyword aliases, wide literals and `alloca`, plus a few miscompiles. All of
 them were fixed at the source, and every fix also counts toward M9.
@@ -476,6 +480,13 @@ GNU/glibc constructs `lf-cc` does not yet accept. Making `lf-cc` a drop-in that
 consumes the actual `/usr/include` (rather than minimal hosted-header stubs)
 requires, roughly:
 
+- *Done so far:* asm labels (including glibc's `__REDIRECT`), GNU
+  extended-asm syntax (compiler barriers compile to nothing), file-scope `asm`
+  (assembled with rsasm), `__extension__`, `__USER_LABEL_PREFIX__`,
+  `__inline__`/`__restrict__`, and trailing `__attribute__`. The real
+  `<string.h>` compiles and runs; `<stdio.h>` stops at `__builtin_va_list`.
+  Still open: inline asm with instructions or operands, which needs an
+  inline-asm IR op.
 - **GNU C extensions** the headers use pervasively: `__attribute__((...))` (parse
   in every position, mostly ignore), `__extension__`, `__inline`/`__inline__`,
   `__restrict`, `__asm__`/`asm` (incl. asm *labels* on declarations and
