@@ -319,6 +319,253 @@ entry ^0:
         assert_eq!(build_and_run(&module, &syms, "narrow_icmp"), 0b111);
     }
 
+    /// Build `src`, run it, and return its exit code (bits = failing checks).
+    fn run_lf(src: &str, tag: &str) -> i32 {
+        let mut syms = StrInterner::new();
+        let module = crate::ir::text::parse_module(src, FileId::new(0), &mut syms)
+            .expect("parse .lf");
+        build_and_run(&module, &syms, tag)
+    }
+
+    #[test]
+    fn native_narrow_ops_ignore_upper_register_bits() {
+        // Every op whose result depends on bits above an i8's width must see the
+        // wrapped value: 200 + 100 is 44 as an i8 (300 in a 32-bit register), and
+        // 100 + 100 is -56 as an i8 (200 in the register). Each function returns
+        // 0 when correct; main ORs a distinct bit per failing check.
+        let src = "\
+module \"k\"
+func @lshr(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = lshr %s, i8 1 : i8
+  %c = icmp ne %r, i8 22 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @ashr(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = ashr %s, i8 1 : i8
+  %c = icmp ne %r, i8 -28 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @udiv(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = udiv %s, i8 2 : i8
+  %c = icmp ne %r, i8 22 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @urem(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = urem %s, i8 3 : i8
+  %c = icmp ne %r, i8 2 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @sdiv(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = sdiv %s, i8 2 : i8
+  %c = icmp ne %r, i8 -28 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @srem(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = srem %s, i8 3 : i8
+  %c = icmp ne %r, i8 -2 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @switch(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  switch %s, ^1 [44: ^2]
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @condbr(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i1
+  cond_br %t, ^1, ^2
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @sitofp(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %f = sitofp %s : f64
+  %i = fptosi %f : i64
+  %c = icmp ne %i, i64 -56 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @uitofp(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %f = uitofp %s : f64
+  %i = fptosi %f : i64
+  %c = icmp ne %i, i64 44 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @main() -> i64 {
+entry ^0:
+  %v0 = call @lshr(i8 -56, i8 100) : i64
+  %v1 = call @ashr(i8 100, i8 100) : i64
+  %v2 = call @udiv(i8 -56, i8 100) : i64
+  %v3 = call @urem(i8 -56, i8 100) : i64
+  %v4 = call @sdiv(i8 100, i8 100) : i64
+  %v5 = call @srem(i8 100, i8 100) : i64
+  %v6 = call @switch(i8 -56, i8 100) : i64
+  %v7 = call @condbr(i32 2) : i64
+  %v8 = call @sitofp(i8 100, i8 100) : i64
+  %v9 = call @uitofp(i8 -56, i8 100) : i64
+  %s1 = shl %v1, i64 1 : i64
+  %s2 = shl %v2, i64 2 : i64
+  %s3 = shl %v3, i64 3 : i64
+  %s4 = shl %v4, i64 4 : i64
+  %s5 = shl %v5, i64 5 : i64
+  %s6 = shl %v6, i64 6 : i64
+  %s7 = shl %v7, i64 7 : i64
+  %s8 = shl %v8, i64 8 : i64
+  %s9 = shl %v9, i64 9 : i64
+  %o1 = or %v0, %s1 : i64
+  %o2 = or %o1, %s2 : i64
+  %o3 = or %o2, %s3 : i64
+  %o4 = or %o3, %s4 : i64
+  %o5 = or %o4, %s5 : i64
+  %o6 = or %o5, %s6 : i64
+  %o7 = or %o6, %s7 : i64
+  %o8 = or %o7, %s8 : i64
+  %o9 = or %o8, %s9 : i64
+  %lo = and %o9, i64 255 : i64
+  %hi = lshr %o9, i64 8 : i64
+  ret %lo
+}
+";
+        // An exit status holds 8 bits: run once for the low bits, once for the rest.
+        let code = run_lf(src, "narrow_ops_lo")
+            | (run_lf(&src.replace("ret %lo", "ret %hi"), "narrow_ops_hi") << 8);
+        let names = ["lshr", "ashr", "udiv", "urem", "sdiv", "srem", "switch", "cond_br", "sitofp", "uitofp"];
+        let failing: Vec<_> =
+            names.iter().enumerate().filter(|(i, _)| code & (1 << i) != 0).map(|(_, n)| *n).collect();
+        assert!(failing.is_empty(), "narrow ops saw dirty upper bits: {failing:?} (exit {code})");
+    }
+
+    #[test]
+    fn native_narrow_values_dirty_above_width() {
+        // More shapes of the same invariant: `0 - 1` as an i8 is 255 unsigned
+        // but 0xFFFFFFFF in a 32-bit register; a `trunc` to i1 keeps the source's
+        // other bits; odd widths (i24) have no `cmp`/`movzx` form of their own; a
+        // switch compares 64-bit values, and case values may not fit an imm32.
+        let src = "\
+module \"k\"
+func @ushr(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = sub %a, %b : i8
+  %r = lshr %s, i8 1 : i8
+  %c = icmp ne %r, i8 127 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @udiv(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = sub %a, %b : i8
+  %r = udiv %s, i8 2 : i8
+  %c = icmp ne %r, i8 127 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @uitofp(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = sub %a, %b : i8
+  %f = uitofp %s : f64
+  %i = fptosi %f : i64
+  %c = icmp ne %i, i64 255 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @zext1(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i1
+  %z = zext %t : i64
+  ret %z
+}
+func @select1(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i1
+  %r = select %t, i64 1, i64 0 : i64
+  ret %r
+}
+func @cmp24(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i24
+  %c = icmp ne %t, i24 5 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @switch32(i32, i32) -> i64 {
+entry ^0(%a: i32, %b: i32):
+  %s = sub %a, %b : i32
+  switch %s, ^1 [-1: ^2]
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @switch64(i64) -> i64 {
+entry ^0(%a: i64):
+  switch %a, ^1 [4294967296: ^2]
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @main() -> i64 {
+entry ^0:
+  %v0 = call @ushr(i8 0, i8 1) : i64
+  %v1 = call @udiv(i8 0, i8 1) : i64
+  %v2 = call @uitofp(i8 0, i8 1) : i64
+  %v3 = call @zext1(i32 2) : i64
+  %v4 = call @select1(i32 2) : i64
+  %v5 = call @cmp24(i32 16777221) : i64
+  %v6 = call @switch32(i32 0, i32 1) : i64
+  %v7 = call @switch64(i64 4294967296) : i64
+  %s1 = shl %v1, i64 1 : i64
+  %s2 = shl %v2, i64 2 : i64
+  %s3 = shl %v3, i64 3 : i64
+  %s4 = shl %v4, i64 4 : i64
+  %s5 = shl %v5, i64 5 : i64
+  %s6 = shl %v6, i64 6 : i64
+  %s7 = shl %v7, i64 7 : i64
+  %o1 = or %v0, %s1 : i64
+  %o2 = or %o1, %s2 : i64
+  %o3 = or %o2, %s3 : i64
+  %o4 = or %o3, %s4 : i64
+  %o5 = or %o4, %s5 : i64
+  %o6 = or %o5, %s6 : i64
+  %o7 = or %o6, %s7 : i64
+  ret %o7
+}
+";
+        let code = run_lf(src, "narrow_dirty");
+        let names = ["lshr", "udiv", "uitofp", "zext i1", "select i1", "icmp i24", "switch i32", "switch imm64"];
+        let failing: Vec<_> =
+            names.iter().enumerate().filter(|(i, _)| code & (1 << i) != 0).map(|(_, n)| *n).collect();
+        assert!(failing.is_empty(), "narrow values mishandled: {failing:?} (exit {code})");
+    }
+
     #[test]
     fn lfo_file_link_runs() {
         // Exercise the same file-based path `lf-ld` uses: encode a real object

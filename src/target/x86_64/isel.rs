@@ -259,6 +259,17 @@ impl X86Op {
     }
 }
 
+/// A switch case value sign-extended from the scrutinee's `width` to 64 bits,
+/// matching the sign-extended scrutinee it is compared against.
+fn sext_case(value: &Int, width: u32) -> Int {
+    if width >= 64 {
+        return value.clone();
+    }
+    let raw = value.to_i64().map(|v| v as u64).or_else(|| value.to_u64()).unwrap_or(0);
+    let shift = 64 - width;
+    Int::from_i64(((raw << shift) as i64) >> shift)
+}
+
 /// Encode an [`IntPred`] as the x86 condition-code nibble used by `setcc`/`jcc`.
 pub(crate) fn cc_code(p: IntPred) -> u8 {
     match p {
@@ -573,10 +584,10 @@ impl X86_64Target {
             BinOp::Shl => self.lower_shift(lo, X86Op::ShlI, X86Op::ShlCl, d, inst, width),
             BinOp::LShr => self.lower_shift(lo, X86Op::ShrI, X86Op::ShrCl, d, inst, width),
             BinOp::AShr => self.lower_shift(lo, X86Op::SarI, X86Op::SarCl, d, inst, width),
-            BinOp::UDiv => self.lower_div(lo, X86Op::Div, false, false, d, inst, width),
-            BinOp::URem => self.lower_div(lo, X86Op::Div, false, true, d, inst, width),
-            BinOp::SDiv => self.lower_div(lo, X86Op::Idiv, true, false, d, inst, width),
-            BinOp::SRem => self.lower_div(lo, X86Op::Idiv, true, true, d, inst, width),
+            BinOp::UDiv => self.lower_div(lo, X86Op::Div, false, false, d, inst),
+            BinOp::URem => self.lower_div(lo, X86Op::Div, false, true, d, inst),
+            BinOp::SDiv => self.lower_div(lo, X86Op::Idiv, true, false, d, inst),
+            BinOp::SRem => self.lower_div(lo, X86Op::Idiv, true, true, d, inst),
             // `frem` has no scalar SSE form (it is the `fmod` libcall). Rather
             // than silently emit a wrong result, fail loudly: the frontend must
             // lower `frem` to a call, or this backend must grow the libcall. All
@@ -586,6 +597,37 @@ impl X86_64Target {
             }
             _ => unreachable!("binop already handled: {op:?}"),
         }
+    }
+
+    /// An integer operand ready for an operation whose result depends on the
+    /// bits above the value's width (right shifts, division, int→float, odd-
+    /// width compares). Narrow values live in wider registers whose upper bits
+    /// are not kept clean (an `i8` add of 200 + 100 leaves 300 in the register),
+    /// so anything but an `i32`/`i64` is sign- or zero-extended to 64 bits first.
+    /// Returns the register and the width to operate at (32 for a value that
+    /// fits, else 64).
+    fn extended(&self, lo: &mut Lower<'_, Self>, v: ValueId, signed: bool) -> (VReg, u32) {
+        let r = self.oper(lo, v);
+        let width = lo.int_width(v);
+        if width == 32 || width >= 64 {
+            return (r, width.min(64));
+        }
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        let op = if signed { X86Op::Movsx } else { X86Op::Movzx };
+        lo.emit(MachineInst::new(op.opcode(), vec![def_v(d), use_v(r), imm(u64::from(width)), imm(64)]));
+        (d, if width < 32 { 32 } else { 64 })
+    }
+
+    /// An `i1` branch/select condition as a register holding exactly 0 or 1. A
+    /// compare's result already is; anything else (e.g. a `trunc` to `i1`) may
+    /// carry garbage above bit 0 and is zero-extended.
+    fn clean_cond(&self, lo: &mut Lower<'_, Self>, v: ValueId) -> VReg {
+        let is_compare = matches!(lo.func().value(v).def, ValueDef::Inst(id)
+            if matches!(lo.func().inst(id).kind, InstKind::ICmp(_) | InstKind::FCmp(_)));
+        if is_compare || lo.int_width(v) >= 8 {
+            return self.oper(lo, v);
+        }
+        self.extended(lo, v, false).0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -598,7 +640,12 @@ impl X86_64Target {
         inst: &InstData,
         width: u32,
     ) {
-        let a = self.oper(lo, inst.operands()[0]);
+        // A right shift brings the bits above the width down into the result.
+        let (a, width) = match imm_op {
+            X86Op::ShrI => self.extended(lo, inst.operands()[0], false),
+            X86Op::SarI => self.extended(lo, inst.operands()[0], true),
+            _ => (self.oper(lo, inst.operands()[0]), width),
+        };
         if let Some(c) = Self::const_of(lo, inst.operands()[1]) {
             let count = c.to_i64().unwrap_or(0) as u64;
             lo.emit(MachineInst::new(
@@ -625,10 +672,11 @@ impl X86_64Target {
         want_rem: bool,
         d: VReg,
         inst: &InstData,
-        width: u32,
     ) {
-        let a = self.oper(lo, inst.operands()[0]);
-        let b = self.oper(lo, inst.operands()[1]);
+        // The dividend and divisor are extended to at least 32 bits (division
+        // sees every bit of both), and the division runs at that width.
+        let (a, _) = self.extended(lo, inst.operands()[0], signed);
+        let (b, width) = self.extended(lo, inst.operands()[1], signed);
         let rax = regs::gpr(regs::RAX);
         let rdx = regs::gpr(regs::RDX);
         // dividend low half -> rax
@@ -729,7 +777,9 @@ impl X86_64Target {
                 ));
             }
             CastOp::SiToFp => {
-                // bit0 = 64-bit gpr source.
+                // bit0 = 64-bit gpr source. A narrow source is sign-extended
+                // first (its register's upper bits are not kept clean).
+                let (s, src_w) = self.extended(lo, inst.operands()[0], true);
                 let flags = u64::from(src_w > 32);
                 lo.emit(MachineInst::new(
                     X86Op::CvtSi2f.opcode(),
@@ -743,7 +793,14 @@ impl X86_64Target {
                 // `cvtsi2sd` when the sign bit is clear, else the halve-and-round
                 // `(x>>1)|(x&1)` sequence followed by a doubling `addsd`, which
                 // reproduces round-to-nearest for values ≥ 2^63.
-                let flags: u64 = if src_w > 32 { 0b100 } else { 0b10 };
+                // A narrow source is zero-extended first; an odd width above 32
+                // then fits a plain signed 64-bit conversion (it is < 2^63).
+                let (s, flags) = if src_w >= 64 {
+                    (s, 0b100)
+                } else {
+                    let (x, w) = self.extended(lo, inst.operands()[0], false);
+                    (x, if w > 32 { 0b1 } else { 0b10 })
+                };
                 lo.emit(MachineInst::new(
                     X86Op::CvtSi2f.opcode(),
                     vec![def_v(d), use_v(s), imm(u64::from(dst_w)), imm(flags)],
@@ -1315,9 +1372,20 @@ impl TargetIsel for X86_64Target {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
             InstKind::ICmp(pred) => {
                 let d = lo.result_reg(inst);
-                let a = self.oper(lo, inst.operands()[0]);
-                let b = self.oper(lo, inst.operands()[1]);
                 let width = lo.int_width(inst.operands()[0]);
+                // 8/16/32/64-bit compares use the matching `cmp` form; any other
+                // width is extended (by the predicate's signedness) first.
+                let (a, b, width) = if matches!(width, 8 | 16 | 32 | 64) {
+                    (self.oper(lo, inst.operands()[0]), self.oper(lo, inst.operands()[1]), width)
+                } else {
+                    let signed = matches!(
+                        pred,
+                        IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge
+                    );
+                    let (a, _) = self.extended(lo, inst.operands()[0], signed);
+                    let (b, w) = self.extended(lo, inst.operands()[1], signed);
+                    (a, b, w)
+                };
                 lo.emit(MachineInst::new(
                     X86Op::SetccCmp.opcode(),
                     vec![
@@ -1379,7 +1447,7 @@ impl TargetIsel for X86_64Target {
             }
             InstKind::Select => {
                 let d = lo.result_reg(inst);
-                let c = self.oper(lo, inst.operands()[0]);
+                let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = self.oper(lo, inst.operands()[1]);
                 let f = self.oper(lo, inst.operands()[2]);
                 // d = f; test c,c; cmovne d, t   (cond != 0 -> t)
@@ -1476,7 +1544,7 @@ impl TargetIsel for X86_64Target {
                 lo.emit(self.jump(e));
             }
             InstKind::CondBr { if_true, if_false, true_args, false_args } => {
-                let cond = self.oper(lo, inst.operands()[0]);
+                let cond = self.clean_cond(lo, inst.operands()[0]);
                 let ops = inst.operands();
                 let tb = 1 + *true_args as usize;
                 let fb = tb + *false_args as usize;
@@ -1490,7 +1558,21 @@ impl TargetIsel for X86_64Target {
                 ));
             }
             InstKind::Switch(data) => {
-                let cond = self.oper(lo, inst.operands()[0]);
+                // Cases are compared as 64-bit values: sign-extend the scrutinee
+                // (a 32-bit result's upper half is zero, not its sign) and each
+                // case value from the scrutinee's width.
+                let width = lo.int_width(inst.operands()[0]);
+                let cond = if width >= 64 {
+                    self.oper(lo, inst.operands()[0])
+                } else {
+                    let r = self.oper(lo, inst.operands()[0]);
+                    let d = lo.fresh_vreg(RegClass::Gpr);
+                    lo.emit(MachineInst::new(
+                        X86Op::Movsx.opcode(),
+                        vec![def_v(d), use_v(r), imm(u64::from(width)), imm(64)],
+                    ));
+                    d
+                };
                 let ops = inst.operands();
                 let mut idx = 1usize;
                 let dcount = data.default_args as usize;
@@ -1504,7 +1586,7 @@ impl TargetIsel for X86_64Target {
                     let cvals: Vec<_> = ops[idx..idx + n].to_vec();
                     idx += n;
                     let ce = lo.edge_to(case.target, &cvals);
-                    operands.push(MachineOperand::Imm(case.value.clone()));
+                    operands.push(MachineOperand::Imm(sext_case(&case.value, width)));
                     operands.push(MachineOperand::Label(ce));
                 }
                 lo.emit(MachineInst::new(X86Op::Switch.opcode(), operands));

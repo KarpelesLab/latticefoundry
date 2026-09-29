@@ -198,18 +198,34 @@ pub(crate) fn movsx_rr(e: &mut Emitter, dst: u8, src: u8, src_w: u32, dst_w: u32
             e.u8(0xBF);
             e.u8(modrm(3, dst, src));
         }
-        _ => {
+        32 => {
             // 32 → 64: `movsxd r64, r/m32` = REX.W 63 /r.
             e.u8(rex(true, dst >= 8, false, src >= 8));
             e.u8(0x63);
             e.u8(modrm(3, dst, src));
         }
+        _ => extend_by_shifts(e, dst, src, src_w, 7),
+    }
+}
+
+/// Extend an odd-width (`i1`, `i24`, `i48`, …) source to 64 bits by moving it to
+/// the top of the register and shifting back down: `ext` 7 = `sar` (sign), 5 =
+/// `shr` (zero). A 64-bit (or wider) source is a plain copy.
+fn extend_by_shifts(e: &mut Emitter, dst: u8, src: u8, src_w: u32, ext: u8) {
+    if dst != src {
+        mov_rr(e, dst, src, true);
+    }
+    if src_w < 64 {
+        let n = (64 - src_w) as u8;
+        shift_imm(e, 4, dst, n, true); // shl dst, n
+        shift_imm(e, ext, dst, n, true); // sar/shr dst, n
     }
 }
 
 /// Emit `movzx dst, src`: **zero**-extend a `src_w`-bit source. `0F B6` (byte) /
 /// `0F B7` (word) zero-extend into the full register; a 32-bit source uses a
-/// plain 32-bit `mov`, which zero-extends bits 32..63 automatically.
+/// plain 32-bit `mov`, which zero-extends bits 32..63 automatically. Any other
+/// width goes through [`extend_by_shifts`].
 pub(crate) fn movzx_rr(e: &mut Emitter, dst: u8, src: u8, src_w: u32) {
     match src_w {
         8 => {
@@ -228,7 +244,8 @@ pub(crate) fn movzx_rr(e: &mut Emitter, dst: u8, src: u8, src_w: u32) {
             e.u8(0xB7);
             e.u8(modrm(3, dst, src));
         }
-        _ => mov_rr(e, dst, src, false),
+        32 => mov_rr(e, dst, src, false),
+        _ => extend_by_shifts(e, dst, src, src_w, 5),
     }
 }
 
@@ -914,9 +931,18 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let default = label_index(&ops[1]);
             let mut i = 2;
             while i + 1 < ops.len() {
-                let value = iimm(&ops[i]) as i32;
+                let value = iimm(&ops[i]);
                 let case = label_index(&ops[i + 1]);
-                cmp_ri(e, cond, value, true);
+                match i32::try_from(value) {
+                    Ok(v) => cmp_ri(e, cond, v, true),
+                    Err(_) => {
+                        // No `cmp r64, imm64`: materialize the case value in the
+                        // r11 scratch first.
+                        let tmp = regs::R11 as u8;
+                        mov_ri(e, tmp, value as u64);
+                        alu_rr(e, 0x39, cond, tmp, true); // cmp cond, r11
+                    }
+                }
                 e.u8(0x0F);
                 e.u8(0x84); // je case
                 e.pcrel32(Ref::Label(ctx.labels[case]), 0);
