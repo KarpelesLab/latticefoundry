@@ -941,6 +941,9 @@ mod tests {
             (RelocKind::Pc64, CoffMachine::Amd64),
             (RelocKind::Aarch64Call26, CoffMachine::Amd64),
             (RelocKind::Plt32, CoffMachine::Arm64),
+            (RelocKind::ThumbCall, CoffMachine::Arm64),
+            (RelocKind::ThumbMovwAbsNc, CoffMachine::Amd64),
+            (RelocKind::ThumbMovtAbs, CoffMachine::Arm64),
         ] {
             let mut m = ObjectModule::new("e");
             let t = m.add_section(Section::new(".text", SectionKind::Text, 1));

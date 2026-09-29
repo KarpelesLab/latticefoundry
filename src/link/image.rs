@@ -506,7 +506,10 @@ pub fn link_executable(
                 RelocKind::GotPcRel
                 | RelocKind::Aarch64Call26
                 | RelocKind::Aarch64AdrPrelPgHi21
-                | RelocKind::Aarch64AddAbsLo12Nc => {
+                | RelocKind::Aarch64AddAbsLo12Nc
+                | RelocKind::ThumbCall
+                | RelocKind::ThumbMovwAbsNc
+                | RelocKind::ThumbMovtAbs => {
                     return Err(LinkError::UnsupportedReloc(r.kind));
                 }
             }

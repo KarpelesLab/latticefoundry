@@ -261,9 +261,9 @@ impl Symbol {
 /// These are *generic* — a target-independent description of how a field is
 /// patched from a symbol's address. Each concrete object writer maps them onto
 /// its format's numeric codes (see [`crate::mc::elf`] for the x86-64 mapping).
-/// The set is deliberately extensible; it currently covers what x86-64 and
-/// AArch64 relocatable code need for calls, data references, and PC-relative
-/// addressing, plus the absolute data kinds of every pointer width a
+/// The set is deliberately extensible; it currently covers what x86-64,
+/// AArch64 and Thumb-2 relocatable code need for calls, data references, and
+/// PC-relative addressing, plus the absolute data kinds of every pointer width a
 /// [`DataLayout`](crate::ir::DataLayout) allows a whole-byte relocation for
 /// (`Abs64`, `Abs32`, `Abs16`; see [`RelocKind::abs_for_width`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -295,6 +295,17 @@ pub enum RelocKind {
     /// AArch64 `R_AARCH64_ADD_ABS_LO12_NC`: the low 12 bits of `S + A` for the
     /// `add` that completes an `adrp`+`add` address materialization.
     Aarch64AddAbsLo12Nc,
+    /// Arm `R_ARM_THM_CALL`: a Thumb-2 `bl` to `S + A`, field = `S + A - P`
+    /// (halfword-scaled, ±16 MiB) split across the two halfwords of the
+    /// instruction (see [`write_thumb_field`]). A `bl` at `P` lands at
+    /// `P + 4 + imm`, so a call to `S` carries the addend `-4`.
+    ThumbCall,
+    /// Arm `R_ARM_THM_MOVW_ABS_NC`: the low 16 bits of `S + A` (with the Thumb
+    /// bit of a Thumb function symbol) into a `movw`'s `imm16`.
+    ThumbMovwAbsNc,
+    /// Arm `R_ARM_THM_MOVT_ABS`: the high 16 bits of `S + A` into a `movt`'s
+    /// `imm16`.
+    ThumbMovtAbs,
 }
 
 impl RelocKind {
@@ -309,10 +320,14 @@ impl RelocKind {
             | RelocKind::Pc32
             | RelocKind::Plt32
             | RelocKind::GotPcRel
-            // The AArch64 kinds patch a bitfield inside a 4-byte instruction word.
+            // The AArch64 and Thumb kinds patch a bitfield inside a 4-byte
+            // instruction (one word, or two halfwords).
             | RelocKind::Aarch64Call26
             | RelocKind::Aarch64AdrPrelPgHi21
-            | RelocKind::Aarch64AddAbsLo12Nc => 4,
+            | RelocKind::Aarch64AddAbsLo12Nc
+            | RelocKind::ThumbCall
+            | RelocKind::ThumbMovwAbsNc
+            | RelocKind::ThumbMovtAbs => 4,
         }
     }
 
@@ -340,7 +355,30 @@ impl RelocKind {
                 | RelocKind::GotPcRel
                 | RelocKind::Aarch64Call26
                 | RelocKind::Aarch64AdrPrelPgHi21
+                | RelocKind::ThumbCall
         )
+    }
+
+    /// Whether the relocation patches a bitfield inside an instruction rather
+    /// than a whole data field (the AArch64 and Thumb instruction kinds).
+    #[inline]
+    pub fn is_instruction_field(self) -> bool {
+        matches!(
+            self,
+            RelocKind::Aarch64Call26
+                | RelocKind::Aarch64AdrPrelPgHi21
+                | RelocKind::Aarch64AddAbsLo12Nc
+                | RelocKind::ThumbCall
+                | RelocKind::ThumbMovwAbsNc
+                | RelocKind::ThumbMovtAbs
+        )
+    }
+
+    /// Whether this is one of the Thumb-2 instruction kinds, whose field is
+    /// read and written by [`write_thumb_field`].
+    #[inline]
+    pub fn is_thumb(self) -> bool {
+        matches!(self, RelocKind::ThumbCall | RelocKind::ThumbMovwAbsNc | RelocKind::ThumbMovtAbs)
     }
 }
 
@@ -368,6 +406,60 @@ pub fn write_field(buf: &mut [u8], at: usize, width: usize, value: i64, endian: 
             }
         }
     }
+    true
+}
+
+/// Patch the Thumb-2 instruction at `buf[at..at + 4]` (two little-endian
+/// halfwords) for a Thumb relocation `kind` (see [`RelocKind::is_thumb`]),
+/// following *ELF for the Arm Architecture*:
+///
+/// - [`ThumbCall`](RelocKind::ThumbCall): `value` is the byte displacement
+///   `S + A - P`; it must be even and within ±16 MiB, and goes into the `bl`'s
+///   `S:I1:I2:imm10:imm11` fields (`J1 = !I1 ^ S`, `J2 = !I2 ^ S`).
+/// - [`ThumbMovwAbsNc`](RelocKind::ThumbMovwAbsNc) /
+///   [`ThumbMovtAbs`](RelocKind::ThumbMovtAbs): `value` is the 16-bit
+///   immediate itself (the low or high half of `S + A`, which the caller
+///   selects), stored in the `imm4:i:imm3:imm8` fields of `movw`/`movt`.
+///
+/// The same routine stores a `REL`-format *implicit addend*: the addend of a
+/// call is its displacement field, and that of `movw`/`movt` the signed 16-bit
+/// immediate. Returns `false`, leaving `buf` untouched, for a value that does
+/// not fit or a non-Thumb kind.
+pub fn write_thumb_field(buf: &mut [u8], at: usize, kind: RelocKind, value: i64) -> bool {
+    if at + 4 > buf.len() {
+        return false;
+    }
+    let hw = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let (mut h1, mut h2) = (hw(buf, at), hw(buf, at + 2));
+    match kind {
+        RelocKind::ThumbCall => {
+            if value & 1 != 0 || !(-(1i64 << 24)..(1i64 << 24)).contains(&value) {
+                return false;
+            }
+            let v = value as u32;
+            let s = (v >> 24) & 1;
+            let i1 = (v >> 23) & 1;
+            let i2 = (v >> 22) & 1;
+            let imm10 = (v >> 12) & 0x3ff;
+            let imm11 = (v >> 1) & 0x7ff;
+            let j1 = (i1 ^ 1) ^ s;
+            let j2 = (i2 ^ 1) ^ s;
+            h1 = (h1 & 0xf800) | (s << 10) as u16 | imm10 as u16;
+            h2 = (h2 & 0xd000) | (j1 << 13) as u16 | (j2 << 11) as u16 | imm11 as u16;
+        }
+        RelocKind::ThumbMovwAbsNc | RelocKind::ThumbMovtAbs => {
+            if !(-0x8000..=0xffff).contains(&value) {
+                return false;
+            }
+            let v = (value as u32) & 0xffff;
+            let (imm4, i, imm3, imm8) = (v >> 12, (v >> 11) & 1, (v >> 8) & 7, v & 0xff);
+            h1 = (h1 & 0xfbf0) | (i << 10) as u16 | imm4 as u16;
+            h2 = (h2 & 0x8f00) | (imm3 << 12) as u16 | imm8 as u16;
+        }
+        _ => return false,
+    }
+    buf[at..at + 2].copy_from_slice(&h1.to_le_bytes());
+    buf[at + 2..at + 4].copy_from_slice(&h2.to_le_bytes());
     true
 }
 

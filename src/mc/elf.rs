@@ -118,12 +118,15 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         RelocKind::Pc64 => R_X86_64_PC64,
         RelocKind::Plt32 => R_X86_64_PLT32,
         RelocKind::GotPcRel => R_X86_64_GOTPCREL,
-        // AArch64 relocation kinds never appear in an x86-64 ELF object (the
-        // AArch64 backend does not emit through this writer).
+        // AArch64 and Thumb relocation kinds never appear in an x86-64 ELF
+        // object (those backends do not emit through this mapping).
         RelocKind::Aarch64Call26
         | RelocKind::Aarch64AdrPrelPgHi21
-        | RelocKind::Aarch64AddAbsLo12Nc => {
-            unreachable!("AArch64 relocation kind {kind:?} in an x86-64 ELF object")
+        | RelocKind::Aarch64AddAbsLo12Nc
+        | RelocKind::ThumbCall
+        | RelocKind::ThumbMovwAbsNc
+        | RelocKind::ThumbMovtAbs => {
+            unreachable!("relocation kind {kind:?} in an x86-64 ELF object")
         }
     }
 }
@@ -227,10 +230,11 @@ pub enum RelocFormat {
     Rela,
     /// `SHT_REL` (`.rel<name>`): the addend is stored in the patched field
     /// itself (the *implicit addend*). The writer stores it there for every
-    /// kind that patches a whole field (the absolute and PC-relative kinds); a
-    /// kind that patches a bitfield inside an instruction (the `Aarch64*`
-    /// kinds) must carry a zero addend, its target having encoded any addend in
-    /// the instruction already.
+    /// kind that patches a whole field (the absolute and PC-relative kinds) and
+    /// for the Thumb-2 instruction kinds (in the instruction's immediate
+    /// fields); any other kind that patches a bitfield inside an instruction
+    /// (the `Aarch64*` kinds) must carry a zero addend, its target having
+    /// encoded any addend in the instruction already.
     Rel,
 }
 
@@ -260,6 +264,20 @@ pub struct ElfTarget {
 }
 
 impl ElfTarget {
+    /// 32-bit Arm EABI version 5 (Cortex-M Thumb-2 code): ELF32,
+    /// little-endian, `EM_ARM`, `e_flags` = EABI v5 with the soft-float
+    /// procedure call standard, `REL` relocations with implicit addends (a
+    /// Thumb instruction relocation keeps its addend in the instruction, see
+    /// [`write_thumb_field`](crate::mc::object::write_thumb_field)).
+    pub const ARM: ElfTarget = ElfTarget {
+        class: ElfClass::Elf32,
+        endian: Endian::Little,
+        machine: EM_ARM,
+        flags: EF_ARM_EABI_VER5 | EF_ARM_ABI_FLOAT_SOFT,
+        reloc_format: RelocFormat::Rel,
+        reloc_type: arm_reloc_type,
+    };
+
     /// x86-64 System V: ELF64, little-endian, `EM_X86_64`, `RELA`.
     pub const X86_64: ElfTarget = ElfTarget {
         class: ElfClass::Elf64,
@@ -271,12 +289,45 @@ impl ElfTarget {
     };
 }
 
-/// [`x86_64_reloc`] as a total mapping (`None` for the AArch64 kinds).
+/// [`x86_64_reloc`] as a total mapping (`None` for the instruction kinds of
+/// other machines).
 fn x86_64_reloc_type(kind: RelocKind) -> Option<u32> {
-    match kind {
-        RelocKind::Aarch64Call26 | RelocKind::Aarch64AdrPrelPgHi21 | RelocKind::Aarch64AddAbsLo12Nc => None,
-        k => Some(x86_64_reloc(k)),
+    if kind.is_instruction_field() {
+        return None;
     }
+    Some(x86_64_reloc(kind))
+}
+
+/// The `e_machine` value for 32-bit Arm.
+pub const EM_ARM: u16 = 40;
+/// Arm `e_flags`: EABI version 5.
+pub const EF_ARM_EABI_VER5: u32 = 0x0500_0000;
+/// Arm `e_flags`: the base procedure call standard (floating-point arguments
+/// in core registers, the soft-float ABI).
+pub const EF_ARM_ABI_FLOAT_SOFT: u32 = 0x200;
+
+// Arm relocation type numbers (ELF for the Arm Architecture, "Relocation codes").
+const R_ARM_ABS32: u32 = 2;
+const R_ARM_REL32: u32 = 3;
+const R_ARM_ABS16: u32 = 5;
+const R_ARM_THM_CALL: u32 = 10;
+const R_ARM_THM_MOVW_ABS_NC: u32 = 47;
+const R_ARM_THM_MOVT_ABS: u32 = 48;
+
+/// The 32-bit Arm relocation number of a generic kind: `R_ARM_ABS32`/`ABS16`
+/// for data, `R_ARM_REL32` for a PC-relative word, and the Thumb-2
+/// instruction relocations `R_ARM_THM_CALL`, `R_ARM_THM_MOVW_ABS_NC` and
+/// `R_ARM_THM_MOVT_ABS`. `None` for anything else.
+fn arm_reloc_type(kind: RelocKind) -> Option<u32> {
+    Some(match kind {
+        RelocKind::Abs32 => R_ARM_ABS32,
+        RelocKind::Abs16 => R_ARM_ABS16,
+        RelocKind::Pc32 => R_ARM_REL32,
+        RelocKind::ThumbCall => R_ARM_THM_CALL,
+        RelocKind::ThumbMovwAbsNc => R_ARM_THM_MOVW_ABS_NC,
+        RelocKind::ThumbMovtAbs => R_ARM_THM_MOVT_ABS,
+        _ => return None,
+    })
 }
 
 /// Why an object could not be written for an [`ElfTarget`].
@@ -572,11 +623,11 @@ pub fn write_with(obj: &ObjectModule, target: &ElfTarget) -> Result<Vec<u8>, Elf
                 return Err(ElfError::FieldOverflow { what: "relocation addend", value: i128::from(r.addend) });
             }
         } else {
-            let bitfield = matches!(
-                r.kind,
-                RelocKind::Aarch64Call26 | RelocKind::Aarch64AdrPrelPgHi21 | RelocKind::Aarch64AddAbsLo12Nc
-            );
-            let stored = if bitfield {
+            let stored = if r.kind.is_thumb() {
+                // Thumb-2 instruction fields hold their implicit addend.
+                let bytes = patched[i].get_or_insert_with(|| sections[i].bytes.clone());
+                crate::mc::object::write_thumb_field(bytes, r.offset as usize, r.kind, r.addend)
+            } else if r.kind.is_instruction_field() {
                 r.addend == 0
             } else {
                 let bytes = patched[i].get_or_insert_with(|| sections[i].bytes.clone());
