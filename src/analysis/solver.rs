@@ -41,7 +41,7 @@
 
 use crate::analysis::cfg::{ControlFlowGraph, Dominators};
 use crate::analysis::domain::{AbstractDomain, DomainCtx, EdgeGuard};
-use crate::ir::inst::{InstData, InstKind};
+use crate::ir::inst::{InstData, InstId, InstKind};
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{ConstPool, ValueDef, ValueId};
 use crate::ir::{BlockId, Function};
@@ -77,12 +77,53 @@ impl<D: AbstractDomain> FixpointResult<D> {
     }
 }
 
+/// Context a domain's own transfer functions cannot see, supplied per run.
+///
+/// [`AbstractDomain::transfer`] is a pure function of one instruction and its
+/// operands' abstract values, which is exactly right for value domains. An
+/// analysis whose facts also depend on the *module* (a callee's attributes, a
+/// global's attributes, a summary of memory) plugs that knowledge in here
+/// instead of growing a bespoke dataflow pass (tenet T4): the one engine still
+/// computes the fixpoint. Both hooks default to "no override".
+pub trait SolveHooks<D: AbstractDomain> {
+    /// The initial abstract value of a value that has no incoming dataflow: a
+    /// constant, a global or function address, or an entry-block parameter.
+    /// `None` keeps the engine's default (α of the constant, ⊤ otherwise).
+    fn seed(&self, _v: ValueId, _def: &ValueDef) -> Option<D> {
+        None
+    }
+
+    /// The abstract result of instruction `inst`, overriding
+    /// [`AbstractDomain::transfer`]. Must be monotone in `operands`. `None`
+    /// keeps the domain's transfer.
+    fn transfer(&self, _inst: InstId, _data: &InstData, _operands: &[D]) -> Option<D> {
+        None
+    }
+}
+
+/// The hooks that override nothing (plain [`solve`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHooks;
+
+impl<D: AbstractDomain> SolveHooks<D> for NoHooks {}
+
 /// Run the fixpoint engine for domain `D` over `func`, resolving constants
 /// through `consts` and types through `types`.
 pub fn solve<D: AbstractDomain>(
     func: &Function,
     types: &TypeContext,
     consts: &ConstPool,
+) -> FixpointResult<D> {
+    solve_with(func, types, consts, &NoHooks)
+}
+
+/// [`solve`] with per-run [`SolveHooks`] supplying context the domain's own
+/// transfer functions cannot see.
+pub fn solve_with<D: AbstractDomain>(
+    func: &Function,
+    types: &TypeContext,
+    consts: &ConstPool,
+    hooks: &dyn SolveHooks<D>,
 ) -> FixpointResult<D> {
     let n_vals = func.value_count();
     let n_blocks = func.block_count();
@@ -95,7 +136,7 @@ pub fn solve<D: AbstractDomain>(
         };
     };
 
-    let mut engine = Engine::new(func, types, consts, entry);
+    let mut engine = Engine::new(func, types, consts, entry, hooks);
     engine.run(entry);
     FixpointResult { values: engine.vals, block_reachable: engine.block_exec }
 }
@@ -104,6 +145,7 @@ pub fn solve<D: AbstractDomain>(
 struct Engine<'a, D: AbstractDomain> {
     func: &'a Function,
     types: &'a TypeContext,
+    hooks: &'a dyn SolveHooks<D>,
     cfg: ControlFlowGraph,
     doms: Dominators,
     /// `inst_block[i]` is the block an instruction belongs to (`None` for
@@ -124,6 +166,7 @@ impl<'a, D: AbstractDomain> Engine<'a, D> {
         types: &'a TypeContext,
         consts: &'a ConstPool,
         entry: BlockId,
+        hooks: &'a dyn SolveHooks<D>,
     ) -> Self {
         let n_vals = func.value_count();
         let n_blocks = func.block_count();
@@ -146,7 +189,17 @@ impl<'a, D: AbstractDomain> Engine<'a, D> {
         let mut vals = Vec::with_capacity(n_vals);
         for i in 0..n_vals {
             let v = ValueId::from_index(i);
-            let init = match &func.value(v).def {
+            let def = &func.value(v).def;
+            let seeded = match def {
+                ValueDef::Inst(_) => None,
+                ValueDef::Param(block, _) if *block != entry => None,
+                _ => hooks.seed(v, def),
+            };
+            if let Some(s) = seeded {
+                vals.push(s);
+                continue;
+            }
+            let init = match def {
                 ValueDef::Const(cid) => D::abstract_const(ctx, consts.get(*cid)),
                 // A global or function address is an opaque pointer: unknown.
                 ValueDef::Global(_) | ValueDef::Func(_) => D::top(),
@@ -171,6 +224,7 @@ impl<'a, D: AbstractDomain> Engine<'a, D> {
         Engine {
             func,
             types,
+            hooks,
             cfg,
             doms,
             inst_block,
@@ -221,8 +275,10 @@ impl<'a, D: AbstractDomain> Engine<'a, D> {
         };
         let operands: Vec<D> =
             data.operands().iter().map(|&op| self.vals[op.index()].clone()).collect();
-        let ctx = DomainCtx::new(self.types);
-        let new = D::transfer(ctx, data, &operands);
+        let new = match self.hooks.transfer(inst, data, &operands) {
+            Some(d) => d,
+            None => D::transfer(DomainCtx::new(self.types), data, &operands),
+        };
         if new != self.vals[result.index()] {
             self.vals[result.index()] = new;
             self.ssa_wl.push(result);
@@ -329,9 +385,10 @@ impl<'a, D: AbstractDomain> Engine<'a, D> {
     }
 }
 
-/// The block-argument slice of edge `si` of terminator `term`, matching the
-/// target block's parameter list positionally.
-fn edge_args(term: &InstData, si: usize) -> &[ValueId] {
+/// The block-argument slice of edge `si` of terminator `term` (successor `si`
+/// in [`InstData::successors`] order), matching the target block's parameter
+/// list positionally.
+pub(crate) fn edge_args(term: &InstData, si: usize) -> &[ValueId] {
     let ops = term.operands();
     match &term.kind {
         InstKind::Br(_) => ops,

@@ -13,6 +13,8 @@
 //! Around them:
 //!
 //! - [`domains`] holds the concrete domains ([`ConstLattice`], the first);
+//! - [`secret`] is the secret-taint analysis behind constant-time preservation,
+//!   a domain plus [`SolveHooks`] for the module context it needs;
 //! - [`soundness`] is the harness that checks a domain's transfer is sound
 //!   against the reference semantics (the teeth of bet B8);
 //! - [`manager`] runs analyses, caches results, and invalidates them when a pass
@@ -26,6 +28,7 @@ pub mod domain;
 pub mod domfrontier;
 pub mod domains;
 pub mod manager;
+pub mod secret;
 pub mod soundness;
 pub mod solver;
 
@@ -33,7 +36,8 @@ pub use domain::{AbstractDomain, DomainCtx, EdgeGuard};
 pub use domfrontier::DominanceFrontiers;
 pub use domains::ConstLattice;
 pub use manager::{AnalysisCache, ConstantPropagation, FunctionAnalysis};
-pub use solver::{FixpointResult, solve};
+pub use secret::{SecretTaint, Taint};
+pub use solver::{FixpointResult, NoHooks, SolveHooks, solve, solve_with};
 
 #[cfg(test)]
 mod tests;

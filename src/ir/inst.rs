@@ -588,7 +588,7 @@ pub enum InstKind {
     /// secret (Lode's `secret[T]`): its result is secret-derived for the
     /// constant-time discipline (`docs/ir-design.md` §6d). The flag has no
     /// effect on the value semantics; it only feeds the secret-taint analysis
-    /// and the constant-time verifier.
+    /// ([`crate::analysis::secret`]) and the constant-time verifier.
     Load {
         /// The type read from memory (the result type).
         ty: TypeId,
