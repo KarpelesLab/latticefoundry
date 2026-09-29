@@ -8,6 +8,8 @@ pub mod aarch64;
 pub mod riscv;
 pub mod x86_64;
 
+pub(crate) mod rt_words;
+
 use crate::codegen::{CodegenOptions, CompiledModule, RelocModel};
 use crate::ir::Module;
 use crate::support::StrInterner;

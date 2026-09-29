@@ -23,11 +23,14 @@
 //! - `regs` — the 31 GPRs (`x0`–`x30`) plus `sp`/`xzr`, the allocatable/scratch
 //!   split, and the AAPCS64 calling convention;
 //! - [`isel`] — the [`A64Op`] opcode set and the lowering rules;
+//! - [`runtime`] — the green-thread context-switching runtime (save/restore/
+//!   switch/init), emitted as machine code for a front end to link in;
 //! - [`encode`] — the fixed-width bitfield encoder, frame layout +
 //!   prologue/epilogue, and the `compile_function`/`compile_module` drivers.
 
 pub mod encode;
 pub mod isel;
+pub mod runtime;
 pub(crate) mod regs;
 
 #[cfg(test)]
@@ -36,6 +39,8 @@ mod interp;
 mod tests;
 #[cfg(test)]
 mod stack_tests;
+#[cfg(test)]
+mod runtime_tests;
 
 pub use encode::{compile_function, compile_module, compile_module_with};
 pub use isel::{A64Op, AArch64Target};
