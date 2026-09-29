@@ -350,10 +350,10 @@ fn run_exit(bin: &Path) -> i32 {
                 std::thread::sleep(std::time::Duration::from_millis(20))
             }
             Ok(status) => {
-                use std::os::unix::process::ExitStatusExt;
+                // No exit code: killed by a signal (`Display` names it on Unix).
                 return status
                     .code()
-                    .unwrap_or_else(|| panic!("{} killed by {:?}", bin.display(), status.signal()));
+                    .unwrap_or_else(|| panic!("{} terminated abnormally: {status}", bin.display()));
             }
             Err(e) => panic!("run {}: {e}", bin.display()),
         }
