@@ -109,10 +109,41 @@ pub enum Linkage {
     Weak,
 }
 
+/// A symbol's **visibility**: which *linked components* (the executable and each
+/// shared object) can see and preempt it, independent of its [`Linkage`]
+/// (`docs/ir-design.md` §4b). Maps onto the ELF `st_other` visibility field.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, PartialOrd, Ord)]
+pub enum Visibility {
+    /// `STV_DEFAULT`: exported from the component and **preemptible** — another
+    /// component (e.g. the executable, or an `LD_PRELOAD`ed library) may
+    /// interpose its own definition, so position-independent code reaches it
+    /// through the GOT/PLT. The default.
+    #[default]
+    Default,
+    /// `STV_PROTECTED`: exported, but references from inside the defining
+    /// component always bind to its own definition (not preemptible).
+    Protected,
+    /// `STV_HIDDEN`: not exported from the linked component at all; binds
+    /// locally, so references need no GOT/PLT indirection.
+    Hidden,
+}
+
+impl Visibility {
+    /// The more constraining of two visibilities (the ELF gABI rule when several
+    /// references/definitions of one symbol meet: hidden beats protected beats
+    /// default).
+    pub fn most_constraining(self, other: Visibility) -> Visibility {
+        self.max(other)
+    }
+}
+
 /// Per-global attributes beyond name/type/initializer (`docs/ir-design.md` §4a).
 ///
 /// - `linkage` picks the object symbol binding of a definition. A global with no
 ///   initializer is always an external *reference* whatever its linkage.
+/// - `visibility` picks the symbol's ELF visibility (definitions *and*
+///   references; a hidden reference promises the definition is in the same
+///   linked component).
 /// - `constant` promises the program never stores to the global, so the backend
 ///   places it in read-only data (`.rodata`); a store to it faults at run time.
 /// - `detached` says the global's **storage is supplied outside the IR** (for
@@ -126,6 +157,8 @@ pub enum Linkage {
 pub struct GlobalAttrs {
     /// The symbol binding of a definition.
     pub linkage: Linkage,
+    /// The symbol visibility.
+    pub visibility: Visibility,
     /// Read-only storage (`.rodata`).
     pub constant: bool,
     /// Storage is provided outside the IR; the backend emits nothing for it.
@@ -135,13 +168,43 @@ pub struct GlobalAttrs {
 impl GlobalAttrs {
     /// External, mutable, backend-emitted: the attributes of a plain `.lf`
     /// `global @x : T = c` definition.
-    pub const DEFAULT: GlobalAttrs =
-        GlobalAttrs { linkage: Linkage::External, constant: false, detached: false };
+    pub const DEFAULT: GlobalAttrs = GlobalAttrs {
+        linkage: Linkage::External,
+        visibility: Visibility::Default,
+        constant: false,
+        detached: false,
+    };
 
     /// The attributes [`Module::add_global`] records: external, mutable, and
     /// [`detached`](GlobalAttrs::detached).
-    pub const DETACHED: GlobalAttrs =
-        GlobalAttrs { linkage: Linkage::External, constant: false, detached: true };
+    pub const DETACHED: GlobalAttrs = GlobalAttrs {
+        linkage: Linkage::External,
+        visibility: Visibility::Default,
+        constant: false,
+        detached: true,
+    };
+}
+
+/// Per-function attributes (`docs/ir-design.md` §4b), kept in
+/// [`Function::attrs`].
+///
+/// - `linkage` picks the symbol binding of a *definition* (external →
+///   `STB_GLOBAL`, internal → `STB_LOCAL`, weak → `STB_WEAK`); a body-less
+///   declaration is always an external reference.
+/// - `visibility` picks the ELF symbol visibility, for definitions and
+///   references alike.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct FuncAttrs {
+    /// The symbol binding of a definition.
+    pub linkage: Linkage,
+    /// The symbol visibility.
+    pub visibility: Visibility,
+}
+
+impl FuncAttrs {
+    /// External linkage, default visibility: a plain `func` definition.
+    pub const DEFAULT: FuncAttrs =
+        FuncAttrs { linkage: Linkage::External, visibility: Visibility::Default };
 }
 
 /// A translation unit: the top-level container of IR.
@@ -246,6 +309,11 @@ impl Module {
         &self.functions[id.index()]
     }
 
+    /// Replace a function's linkage/visibility attributes.
+    pub fn set_func_attrs(&mut self, id: FuncId, attrs: FuncAttrs) {
+        self.functions[id.index()].attrs = attrs;
+    }
+
     /// Iterate over every function in definition order.
     pub fn functions(&self) -> impl Iterator<Item = &Function> {
         self.functions.iter()
@@ -341,6 +409,8 @@ pub struct Function {
     pub name: Sym,
     /// The function's signature: a [`Type::Func`] type id.
     pub sig: TypeId,
+    /// The function's linkage and visibility (external / default unless set).
+    pub attrs: FuncAttrs,
     /// The 1-based source line the function is declared on, if known (debug
     /// info, tenet: optional so non-debug builds are unaffected). `None` when the
     /// function was not built from a source with line provenance.
@@ -367,6 +437,7 @@ impl Function {
         Self {
             name,
             sig,
+            attrs: FuncAttrs::DEFAULT,
             decl_line: None,
             values: Vec::new(),
             uses: Vec::new(),

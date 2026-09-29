@@ -138,6 +138,11 @@ impl Module {
                     if incoming > cur {
                         global_installs.push((existing, gi));
                     }
+                    // Visibility merges to the most constraining of the two
+                    // (ELF gABI); the install below keeps it.
+                    let vis = other.global_attrs[gi].visibility;
+                    let a = &mut self.global_attrs[i];
+                    a.visibility = a.visibility.most_constraining(vis);
                     existing
                 }
                 None => {
@@ -179,10 +184,18 @@ impl Module {
                         // Keep the existing definition / declaration.
                         (_, false) => {}
                     }
+                    // The definition's linkage wins; visibility merges to the
+                    // most constraining (ELF gABI).
+                    let cur = &mut self.functions[existing.index()].attrs;
+                    if incoming_def {
+                        cur.linkage = f.attrs.linkage;
+                    }
+                    cur.visibility = cur.visibility.most_constraining(f.attrs.visibility);
                     existing
                 }
                 None => {
                     let id = self.declare_function(f.name, sig);
+                    self.functions[id.index()].attrs = f.attrs;
                     self_funcs.insert(f.name, id);
                     if incoming_def {
                         to_install.push((i, id));
@@ -205,13 +218,18 @@ impl Module {
             let cur = &mut self.globals[target.index()];
             cur.ty = type_map[g.ty.index()];
             cur.init = g.init.map(|c| const_map[c.index()]);
-            self.global_attrs[target.index()] = other.global_attrs[gi];
+            let vis = self.global_attrs[target.index()].visibility;
+            let mut attrs = other.global_attrs[gi];
+            attrs.visibility = attrs.visibility.most_constraining(vis);
+            self.global_attrs[target.index()] = attrs;
         }
 
         // 4. Copy function bodies with every reference remapped.
         for (src_idx, target) in to_install {
             let src = &other.functions[src_idx];
-            let body = copy_body(src, &type_map, &const_map, &global_map, &func_map);
+            let mut body = copy_body(src, &type_map, &const_map, &global_map, &func_map);
+            // Keep the attributes resolved in step 2b.
+            body.attrs = self.functions[target.index()].attrs;
             self.functions[target.index()] = body;
         }
 
@@ -600,5 +618,28 @@ mod tests {
         let md = text::parse_module(a, file, &mut syms).unwrap();
         let mc = text::parse_module(c, file, &mut syms).unwrap();
         assert!(matches!(merge_modules([md, mc], "dc"), Err(MergeError::DuplicateGlobal(_))));
+    }
+
+    /// The definition's linkage wins and visibility merges to the most
+    /// constraining one, for functions and globals alike.
+    #[test]
+    fn merge_resolves_linkage_and_visibility() {
+        let a = "module \"a\"\n\
+                 global hidden @x : i64\n\
+                 func hidden @f() -> void\n\
+                 func protected @g() -> void\n";
+        let b = "module \"b\"\n\
+                 global @x : i64 = i64 1\n\
+                 func weak @f() -> void {\nentry ^0:\n  ret\n}\n\
+                 func internal @g() -> void {\nentry ^0:\n  ret\n}\n";
+        let file = crate::support::diagnostics::FileId::new(0);
+        let mut syms = StrInterner::new();
+        let ma = text::parse_module(a, file, &mut syms).unwrap();
+        let mb = text::parse_module(b, file, &mut syms).unwrap();
+        let merged = merge_modules([ma, mb], "ab").expect("merge");
+        let out = text::print_module(&merged, &syms);
+        assert!(out.contains("global hidden @x : i64 = i64 1\n"), "{out}");
+        assert!(out.contains("func weak hidden @f() -> void {"), "{out}");
+        assert!(out.contains("func internal protected @g() -> void {"), "{out}");
     }
 }

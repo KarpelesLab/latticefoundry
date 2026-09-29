@@ -31,9 +31,11 @@
 //! module      ::= "module" STRING { item }
 //! item        ::= global | func
 //!
-//! global      ::= "global" [ "internal" | "weak" ] [ "constant" ] [ "detached" ]
+//! global      ::= "global" [ linkage ] [ visibility ] [ "constant" ] [ "detached" ]
 //!                 "@" name ":" type [ "=" init ]
-//! func        ::= "func" "@" name fnsig [ body ]
+//! func        ::= "func" [ linkage ] [ visibility ] "@" name fnsig [ body ]
+//! linkage     ::= "internal" | "weak"
+//! visibility  ::= "hidden" | "protected"
 //! fnsig       ::= "(" [ type { "," type } [ "," "..." ] | "..." ] ")" "->" type
 //! body        ::= "{" { block } "}"
 //! block       ::= [ "entry" ] "^" INT [ "(" [ param { "," param } ] ")" ] ":" { inst }
@@ -89,7 +91,9 @@
 //! ```
 //!
 //! Global attributes (`docs/ir-design.md` §4a): the linkage keyword picks the
-//! symbol binding of a definition (external when omitted); `constant` places the
+//! symbol binding of a definition (external when omitted); the visibility
+//! keyword picks the ELF symbol visibility of globals and functions (default
+//! when omitted; §4b); `constant` places the
 //! global in read-only data; `detached` marks storage supplied outside the IR
 //! (the backend emits nothing for it). An `init` is a global initializer: it may
 //! be an aggregate (`(` … `)`), an **address constant** `ptr @sym + 8` (a global
@@ -117,7 +121,8 @@ use crate::ir::inst::{
 use crate::ir::types::{FloatKind, Type};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, ValueDef, ValueId};
 use crate::ir::{
-    BlockId, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module, TypeId,
+    BlockId, FuncAttrs, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module, TypeId,
+    Visibility,
 };
 use crate::support::StrInterner;
 use crate::support::diagnostics::{Diagnostic, FileId, Span};
@@ -181,11 +186,7 @@ fn write_global<W: fmt::Write>(
     attrs: GlobalAttrs,
 ) -> fmt::Result {
     write!(f, "global ")?;
-    match attrs.linkage {
-        Linkage::External => {}
-        Linkage::Internal => write!(f, "internal ")?,
-        Linkage::Weak => write!(f, "weak ")?,
-    }
+    write_linkage_visibility(f, attrs.linkage, attrs.visibility)?;
     if attrs.constant {
         write!(f, "constant ")?;
     }
@@ -202,6 +203,24 @@ fn write_global<W: fmt::Write>(
     writeln!(f)
 }
 
+/// Write the optional linkage and visibility keywords (each followed by a space).
+fn write_linkage_visibility<W: fmt::Write>(
+    f: &mut W,
+    linkage: Linkage,
+    visibility: Visibility,
+) -> fmt::Result {
+    match linkage {
+        Linkage::External => {}
+        Linkage::Internal => write!(f, "internal ")?,
+        Linkage::Weak => write!(f, "weak ")?,
+    }
+    match visibility {
+        Visibility::Default => Ok(()),
+        Visibility::Hidden => write!(f, "hidden "),
+        Visibility::Protected => write!(f, "protected "),
+    }
+}
+
 fn write_function<W: fmt::Write>(
     f: &mut W,
     module: &Module,
@@ -209,6 +228,7 @@ fn write_function<W: fmt::Write>(
     func: &Function,
 ) -> fmt::Result {
     write!(f, "func ")?;
+    write_linkage_visibility(f, func.attrs.linkage, func.attrs.visibility)?;
     write_name(f, syms.resolve(func.name))?;
     write_signature(f, module, func.sig)?;
 
@@ -1375,11 +1395,7 @@ impl Parser {
     ) -> PResult<(GlobalId, Option<InitAst>)> {
         self.expect_ident("global")?;
         let mut attrs = GlobalAttrs::DEFAULT;
-        if self.eat_ident("internal") {
-            attrs.linkage = Linkage::Internal;
-        } else if self.eat_ident("weak") {
-            attrs.linkage = Linkage::Weak;
-        }
+        (attrs.linkage, attrs.visibility) = self.parse_linkage_visibility();
         attrs.constant = self.eat_ident("constant");
         attrs.detached = self.eat_ident("detached");
         let name = self.parse_name()?;
@@ -1401,11 +1417,13 @@ impl Parser {
     ) -> PResult<(FuncId, Option<BodyAst>, u32)> {
         let func_kw = self.expect_ident("func")?;
         let decl_line = self.lines.line_of(func_kw.start);
+        let (linkage, visibility) = self.parse_linkage_visibility();
         let name = self.parse_name()?;
         let (params, ret, variadic) = self.parse_fn_sig(module)?;
         let sig = module.types_mut().func(params, ret, variadic);
         let sym = syms.intern(&name);
         let fid = module.declare_function(sym, sig);
+        module.set_func_attrs(fid, FuncAttrs { linkage, visibility });
         func_names.insert(name, fid);
 
         let body = if matches!(self.peek_kind(), TokKind::LBrace) {
@@ -1414,6 +1432,26 @@ impl Parser {
             None
         };
         Ok((fid, body, decl_line))
+    }
+
+    /// Parse the optional `internal`/`weak` linkage and `hidden`/`protected`
+    /// visibility keywords of a `global` or `func` header.
+    fn parse_linkage_visibility(&mut self) -> (Linkage, Visibility) {
+        let linkage = if self.eat_ident("internal") {
+            Linkage::Internal
+        } else if self.eat_ident("weak") {
+            Linkage::Weak
+        } else {
+            Linkage::External
+        };
+        let visibility = if self.eat_ident("hidden") {
+            Visibility::Hidden
+        } else if self.eat_ident("protected") {
+            Visibility::Protected
+        } else {
+            Visibility::Default
+        };
+        (linkage, visibility)
     }
 
     fn parse_fn_sig(&mut self, module: &mut Module) -> PResult<(Vec<TypeId>, TypeId, bool)> {
@@ -2806,6 +2844,28 @@ entry ^0:
 }
 "#;
 
+    /// Linkage and visibility keywords on globals and functions print in
+    /// canonical order and round-trip.
+    #[test]
+    fn visibility_and_function_linkage_round_trip() {
+        let src = "module \"v\"\n\n\
+                   global hidden @h : i32 = i32 1\n\n\
+                   global internal protected constant @p : i32 = i32 2\n\n\
+                   func weak hidden @w() -> void {\nentry ^0:\n  ret\n}\n\n\
+                   func internal @i() -> void {\nentry ^0:\n  ret\n}\n\n\
+                   func hidden @ext() -> void\n";
+        let mut syms = StrInterner::new();
+        let m = parse_module(src, file(), &mut syms).expect("parse");
+        assert_eq!(print_module(&m, &syms), src, "the source is in canonical form");
+        let parsed = round_trip(&m, &mut syms);
+        assert_eq!(parsed.global_attrs(GlobalId::from_index(0)).visibility, Visibility::Hidden);
+        assert_eq!(parsed.global_attrs(GlobalId::from_index(1)).visibility, Visibility::Protected);
+        let attrs: Vec<FuncAttrs> = parsed.functions().map(|f| f.attrs).collect();
+        assert_eq!(attrs[0], FuncAttrs { linkage: Linkage::Weak, visibility: Visibility::Hidden });
+        assert_eq!(attrs[1], FuncAttrs { linkage: Linkage::Internal, visibility: Visibility::Default });
+        assert_eq!(attrs[2], FuncAttrs { linkage: Linkage::External, visibility: Visibility::Hidden });
+    }
+
     #[test]
     fn global_attrs_and_address_constants_round_trip() {
         let mut syms = StrInterner::new();
@@ -2816,7 +2876,10 @@ entry ^0:
 
         let attrs: Vec<GlobalAttrs> =
             (0..parsed.global_count()).map(|i| parsed.global_attrs(GlobalId::from_index(i))).collect();
-        assert_eq!(attrs[0], GlobalAttrs { linkage: Linkage::Internal, constant: true, detached: false });
+        assert_eq!(
+            attrs[0],
+            GlobalAttrs { linkage: Linkage::Internal, constant: true, ..GlobalAttrs::DEFAULT }
+        );
         assert_eq!(attrs[1], GlobalAttrs { linkage: Linkage::Weak, ..GlobalAttrs::DEFAULT });
         assert_eq!(attrs[2], GlobalAttrs { constant: true, detached: true, ..GlobalAttrs::DEFAULT });
         assert_eq!(attrs[3], GlobalAttrs::DEFAULT);

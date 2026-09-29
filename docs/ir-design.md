@@ -85,7 +85,7 @@ address. With an initializer the module **defines** it; without one it is an
 external reference. Each global carries attributes:
 
 ```text
-global [internal | weak] [constant] [detached] @x : T [= init]
+global [internal | weak] [hidden | protected] [constant] [detached] @x : T [= init]
 ```
 
 - **Linkage** picks the object symbol binding of a definition: external
@@ -134,6 +134,45 @@ pointer-sized zero plus an absolute relocation `S + offset` (`R_X86_64_64` on
 x86-64). The static linker maps `.rodata` into an `R` segment and `.data`+`.bss`
 into one `RW` segment whose `memsz` exceeds its `filesz` by the zero-filled
 `.bss`.
+
+## 4b. Symbol linkage and visibility  *(decided)*
+
+Functions carry the same **linkage** as globals, plus every global and function
+carries a **visibility** — the ELF `st_other` field, which is orthogonal to
+the binding:
+
+```text
+func [internal | weak] [hidden | protected] @f(…) -> T [{ … }]
+```
+
+| visibility | ELF | exported from the `.so`/executable | preemptible |
+|---|---|---|---|
+| (default) | `STV_DEFAULT` | yes | yes — another component may interpose |
+| `protected` | `STV_PROTECTED` | yes | no — own references bind locally |
+| `hidden` | `STV_HIDDEN` | no | no |
+
+Linkage stays about the *object* (`internal` → `STB_LOCAL`, `weak` →
+`STB_WEAK`); visibility is about the *linked component*. A hidden symbol is
+global across the objects of one shared library but absent from its dynamic
+symbol table. Visibility applies to references too: a hidden declaration
+promises the definition lives in the same component, so code reaches it
+without the GOT. When IR linking meets several declarations/definitions of one
+symbol, the definition's linkage wins and the visibility becomes the most
+constraining of them (hidden > protected > default), as the gABI specifies for
+the static linker. Attributes live in `Function::attrs` (`FuncAttrs`) and in
+`GlobalAttrs::visibility`; the `.lfb` format carries them from version 3.
+
+**Position-independent code** (`CodegenOptions::reloc_model`, x86-64): a
+symbol is *locally bound* when it is `internal`, `hidden`, or — for PIE — any
+definition in the module. Direct calls always use `R_X86_64_PLT32` (the linker
+resolves a locally bound one directly). Taking the address of a locally bound
+global or function is a RIP-relative `lea` (`R_X86_64_PC32`); any other address
+(default or protected visibility, external declarations) is loaded from the
+GOT with `mov reg, [rip + sym@GOTPCREL]` — protected symbols included, because
+their canonical address may be the executable's. Address constants in data stay
+`R_X86_64_64` for the linker to turn into dynamic relocations, and `constant`
+globals holding an address move from `.rodata` to `.data.rel.ro` (made read-only
+after relocation), so a shared object never needs text relocations.
 
 ## 5. Value semantics: poison + freeze, **no `undef`**  *(decided)*
 

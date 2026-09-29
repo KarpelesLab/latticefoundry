@@ -52,7 +52,10 @@ use crate::ir::inst::{
 };
 use crate::ir::types::{FloatKind, FuncType, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, Value, ValueDef, ValueId};
-use crate::ir::{Block, BlockId, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module};
+use crate::ir::{
+    Block, BlockId, FuncAttrs, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module,
+    Visibility,
+};
 use crate::support::hash::{DetHashMap, DetHashSet};
 use crate::support::StrInterner;
 
@@ -70,7 +73,11 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 ///   address-constant tag ([`Const::Addr`]). Version-1 streams still decode:
 ///   their globals get [`GlobalAttrs::DEFAULT`] (external, mutable, emitted —
 ///   the meaning of a plain `.lf` `global` definition).
-pub const VERSION: u32 = 2;
+/// - **3** — adds symbol [`Visibility`] (bits 4–5 of the global attribute byte)
+///   and a per-function attribute byte ([`FuncAttrs`]: linkage in bits 0–1,
+///   visibility in bits 2–3) after each function's signature. Older streams
+///   decode with default visibility and [`FuncAttrs::DEFAULT`].
+pub const VERSION: u32 = 3;
 
 /// The oldest format version [`decode`] still reads.
 pub const MIN_VERSION: u32 = 1;
@@ -729,34 +736,80 @@ fn write_const(w: &mut Writer, c: &Const, t: &Tables) {
     }
 }
 
-/// Pack a global's attributes into one byte: linkage in bits 0–1
-/// (`0` external, `1` internal, `2` weak), `constant` in bit 2, `detached` in
-/// bit 3.
-fn attrs_bits(a: GlobalAttrs) -> u8 {
-    let linkage = match a.linkage {
+fn linkage_code(l: Linkage) -> u8 {
+    match l {
         Linkage::External => 0,
         Linkage::Internal => 1,
         Linkage::Weak => 2,
-    };
-    linkage | (u8::from(a.constant) << 2) | (u8::from(a.detached) << 3)
+    }
 }
 
-fn attrs_from_bits(b: u8) -> Result<GlobalAttrs, DecodeError> {
-    let linkage = match b & 3 {
+fn linkage_from(c: u8) -> Option<Linkage> {
+    Some(match c {
         0 => Linkage::External,
         1 => Linkage::Internal,
         2 => Linkage::Weak,
-        _ => return Err(DecodeError::InvalidTag { what: "global-attrs", tag: u32::from(b) }),
-    };
-    if b & !0b1111 != 0 {
-        return Err(DecodeError::InvalidTag { what: "global-attrs", tag: u32::from(b) });
+        _ => return None,
+    })
+}
+
+fn visibility_code(v: Visibility) -> u8 {
+    match v {
+        Visibility::Default => 0,
+        Visibility::Hidden => 1,
+        Visibility::Protected => 2,
     }
-    Ok(GlobalAttrs { linkage, constant: b & 4 != 0, detached: b & 8 != 0 })
+}
+
+fn visibility_from(c: u8) -> Option<Visibility> {
+    Some(match c {
+        0 => Visibility::Default,
+        1 => Visibility::Hidden,
+        2 => Visibility::Protected,
+        _ => return None,
+    })
+}
+
+/// Pack a global's attributes into one byte: linkage in bits 0–1
+/// (`0` external, `1` internal, `2` weak), `constant` in bit 2, `detached` in
+/// bit 3, visibility in bits 4–5 (`0` default, `1` hidden, `2` protected).
+fn attrs_bits(a: GlobalAttrs) -> u8 {
+    linkage_code(a.linkage)
+        | (u8::from(a.constant) << 2)
+        | (u8::from(a.detached) << 3)
+        | (visibility_code(a.visibility) << 4)
+}
+
+fn attrs_from_bits(b: u8) -> Result<GlobalAttrs, DecodeError> {
+    let bad = || DecodeError::InvalidTag { what: "global-attrs", tag: u32::from(b) };
+    let linkage = linkage_from(b & 3).ok_or_else(bad)?;
+    let visibility = visibility_from((b >> 4) & 3).ok_or_else(bad)?;
+    if b & !0b11_1111 != 0 {
+        return Err(bad());
+    }
+    Ok(GlobalAttrs { linkage, visibility, constant: b & 4 != 0, detached: b & 8 != 0 })
+}
+
+/// Pack a function's attributes into one byte: linkage in bits 0–1, visibility
+/// in bits 2–3 (same codes as [`attrs_bits`]).
+fn func_attrs_bits(a: FuncAttrs) -> u8 {
+    linkage_code(a.linkage) | (visibility_code(a.visibility) << 2)
+}
+
+fn func_attrs_from_bits(b: u8) -> Result<FuncAttrs, DecodeError> {
+    let bad = || DecodeError::InvalidTag { what: "func-attrs", tag: u32::from(b) };
+    let linkage = linkage_from(b & 3).ok_or_else(bad)?;
+    let visibility = visibility_from((b >> 2) & 3).ok_or_else(bad)?;
+    if b & !0b1111 != 0 {
+        return Err(bad());
+    }
+    Ok(FuncAttrs { linkage, visibility })
 }
 
 fn write_function(w: &mut Writer, f: &Function, names: &StrInterner, t: &Tables) {
     w.str(names.resolve(f.name));
     w.uvarint(t.ty(f.sig));
+    w.u8(func_attrs_bits(f.attrs));
 
     // Value table.
     w.uvarint(f.value_count() as u64);
@@ -1013,7 +1066,7 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
     // --- functions ---
     let nfuncs = r.uindex()?;
     for _ in 0..nfuncs {
-        let f = read_function(&mut r, names, &types, &consts, nglobals, nfuncs)?;
+        let f = read_function(&mut r, names, &types, &consts, nglobals, nfuncs, version)?;
         module.functions.push(f);
     }
 
@@ -1141,11 +1194,15 @@ fn read_function(
     consts: &[ConstId],
     nglobals: usize,
     nfuncs: usize,
+    version: u64,
 ) -> Result<Function, DecodeError> {
     let name = names.intern(r.str()?);
     let sig = types[checked(r.uindex()?, types.len(), "type")?];
 
     let mut f = Function::new(name, sig);
+    if version >= 3 {
+        f.attrs = func_attrs_from_bits(r.u8()?)?;
+    }
 
     // Value table.
     let nvals = r.uindex()?;
@@ -1368,12 +1425,15 @@ fn rebuild_value_cache(values: &[Value]) -> HashMap<ValueDef, ValueId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, MAGIC, Tables, VERSION, Writer, decode, encode, write_inst_kind};
+    use super::{
+        DecodeError, MAGIC, Tables, VERSION, Writer, attrs_from_bits, decode, encode,
+        func_attrs_from_bits, write_inst_kind,
+    };
     use crate::support::hash::DetHashMap;
     use crate::ir::inst::{BinOp, CastOp, FastMath, Flags, FloatPred, IntPred};
     use crate::ir::types::FloatKind;
     use crate::ir::value::{AddrTarget, Const, FloatBits};
-    use crate::ir::{Global, GlobalAttrs, GlobalId, Linkage, Module};
+    use crate::ir::{FuncAttrs, FuncId, Global, GlobalAttrs, GlobalId, Linkage, Module, Visibility};
     use crate::support::StrInterner;
     use puremp::Int;
 
@@ -1655,7 +1715,6 @@ mod tests {
         assert_eq!(w.buf[0], 19, "volatile load uses tag 19");
         let bytes = encode(&m, &interner);
         assert_eq!(bytes[4], VERSION as u8);
-        assert_eq!(VERSION, 2, "volatile/atomics need no format-version bump");
         let m2 = decode(&bytes, &mut interner).expect("decode");
         let func = m2.function(crate::ir::FuncId::from_index(0));
         assert!((0..func.inst_count()).all(|i| !func.inst(crate::ir::InstId::from_index(i)).kind.is_volatile()));
@@ -1792,8 +1851,58 @@ mod tests {
         );
         assert_eq!(
             m2.global_attrs(GlobalId::from_index(0)),
-            GlobalAttrs { linkage: Linkage::Internal, constant: true, detached: false }
+            GlobalAttrs { linkage: Linkage::Internal, constant: true, ..GlobalAttrs::DEFAULT }
         );
+    }
+
+    /// Visibility (globals and functions) and function linkage survive encode →
+    /// decode, and a version-2 stream (no function attribute byte) still decodes
+    /// with default function attributes.
+    #[test]
+    fn visibility_and_function_attrs_round_trip() {
+        let src = "module \"v\"\n\
+                   global hidden constant @h : i32 = i32 1\n\
+                   global weak protected @p : i32 = i32 2\n\
+                   func internal @i() -> void {\nentry ^0:\n  ret\n}\n\
+                   func weak hidden @w() -> void {\nentry ^0:\n  ret\n}\n\
+                   func protected @x() -> void\n";
+        let mut interner = StrInterner::new();
+        let file = crate::support::diagnostics::FileId::new(0);
+        let m = crate::ir::text::parse_module(src, file, &mut interner).expect("parse");
+        let bytes = encode(&m, &interner);
+        let m2 = decode(&bytes, &mut interner).expect("decode");
+        assert_eq!(crate::ir::text::print_module(&m2, &interner), crate::ir::text::print_module(&m, &interner));
+        assert_eq!(m2.global_attrs(GlobalId::from_index(0)).visibility, Visibility::Hidden);
+        assert_eq!(
+            m2.global_attrs(GlobalId::from_index(1)),
+            GlobalAttrs { linkage: Linkage::Weak, visibility: Visibility::Protected, ..GlobalAttrs::DEFAULT }
+        );
+        let attrs: Vec<FuncAttrs> = m2.functions().map(|f| f.attrs).collect();
+        assert_eq!(
+            attrs,
+            [
+                FuncAttrs { linkage: Linkage::Internal, visibility: Visibility::Default },
+                FuncAttrs { linkage: Linkage::Weak, visibility: Visibility::Hidden },
+                FuncAttrs { linkage: Linkage::External, visibility: Visibility::Protected },
+            ]
+        );
+        // Bad visibility bits are rejected, not misread.
+        assert!(attrs_from_bits(3 << 4).is_err());
+        assert!(func_attrs_from_bits(3 << 2).is_err());
+
+        // A version-2 stream: one bodiless function, no attribute byte.
+        let mut m = Module::new("v2");
+        let void = m.types_mut().void();
+        let sig = m.types_mut().func(vec![], void, false);
+        m.declare_function(interner.intern("decl"), sig);
+        let mut bytes = encode(&m, &interner);
+        // The stream ends `<name> <sig> <attrs = 0> <0 values> <0 insts> <0 blocks> <no entry>`.
+        let n = bytes.len();
+        assert_eq!(&bytes[n - 5..], &[0, 0, 0, 0, 0]);
+        bytes.remove(n - 5);
+        bytes[4] = 2;
+        let m2 = decode(&bytes, &mut interner).expect("v2 decodes");
+        assert_eq!(m2.function(FuncId::from_index(0)).attrs, FuncAttrs::DEFAULT);
     }
 
     /// A version-1 stream (no per-global attribute byte) still decodes; its

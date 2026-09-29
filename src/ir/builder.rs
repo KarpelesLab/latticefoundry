@@ -59,6 +59,12 @@ impl<'a> FunctionBuilder<'a> {
         self.func.decl_line = Some(line);
     }
 
+    /// Set the function's linkage/visibility attributes (see
+    /// [`FuncAttrs`](crate::ir::FuncAttrs)).
+    pub fn set_attrs(&mut self, attrs: crate::ir::FuncAttrs) {
+        self.func.attrs = attrs;
+    }
+
     // --- blocks & insertion point ------------------------------------------
 
     /// Create a block with the given typed parameter list, returning its id.
