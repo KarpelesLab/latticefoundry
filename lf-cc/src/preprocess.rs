@@ -475,13 +475,15 @@ struct NewFile {
 
 impl Pp {
     fn new(opts: &PpOptions, main_source: &str) -> Pp {
-        // Assemble the search chain, dropping later duplicates of a directory
-        // (as a `-I` naming a system directory would otherwise shadow the
-        // system directory's position in the chain, a `-I` duplicate of an
-        // `-isystem` or standard directory is dropped in favour of the latter).
-        let system: Vec<&PathBuf> =
-            opts.system_dirs.iter().chain(&opts.stdinc_dirs).chain(&opts.after_dirs).collect();
-        let is_system = |d: &PathBuf| system.iter().any(|s| same_dir(s, d));
+        // Assemble the search chain, keeping only the first occurrence of a
+        // directory. A user directory (`-I`, `-isystem`) that names one of the
+        // standard system directories is dropped instead, so the C library's
+        // headers keep their place after the builtin compiler headers (their
+        // `#include_next` layering depends on it); likewise a `-I` naming an
+        // `-isystem` directory.
+        let standard: Vec<&PathBuf> = opts.stdinc_dirs.iter().chain(&opts.after_dirs).collect();
+        let is_standard = |d: &PathBuf| standard.iter().any(|s| same_dir(s, d));
+        let is_isystem = |d: &PathBuf| opts.system_dirs.iter().any(|s| same_dir(s, d));
         let mut search: Vec<SearchDir> =
             opts.quote_dirs.iter().cloned().map(SearchDir::Dir).collect();
         let angle_start = search.len();
@@ -494,10 +496,10 @@ impl Pp {
                 search.push(d);
             }
         };
-        for d in opts.include_dirs.iter().filter(|d| !is_system(d)) {
+        for d in opts.include_dirs.iter().filter(|d| !is_standard(d) && !is_isystem(d)) {
             push(&mut search, SearchDir::Dir(d.clone()));
         }
-        for d in &opts.system_dirs {
+        for d in opts.system_dirs.iter().filter(|d| !is_standard(d)) {
             push(&mut search, SearchDir::Dir(d.clone()));
         }
         if opts.builtin_headers {

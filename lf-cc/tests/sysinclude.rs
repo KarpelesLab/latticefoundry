@@ -166,6 +166,14 @@ fn hosted_limits_and_stdint_layer_over_the_c_library() {
     let hosted = PpOptions { stdinc_dirs: vec![std_dir.clone()], hosted: true, ..opts() };
     assert_eq!(values("#include <limits.h>\nINT_MAX LIBC_PATH_MAX", &hosted), vec![2147483647, 4096]);
     assert_eq!(values("#include <stdint.h>\nLIBC_STDINT\n#ifdef INT8_MAX\n9\n#endif", &hosted), vec![1]);
+    // A `-I` (or `-isystem`) naming a standard directory does not move it in
+    // front of the builtin headers.
+    for dup in [
+        PpOptions { include_dirs: vec![std_dir.clone()], ..hosted.clone() },
+        PpOptions { system_dirs: vec![std_dir.clone()], ..hosted.clone() },
+    ] {
+        assert_eq!(values("#include <limits.h>\nINT_MAX LIBC_PATH_MAX", &dup), vec![2147483647, 4096]);
+    }
     // Freestanding: the builtin headers stand alone.
     let free = PpOptions { stdinc_dirs: vec![std_dir], hosted: false, ..opts() };
     assert_eq!(
@@ -513,6 +521,11 @@ fn default_search_finds_system_headers() {
     if glibc {
         assert_eq!(posix, vec![1]);
     }
+    // Naming the standard directory with -I changes nothing (the case that
+    // used to stop at glibc's `#include_next <limits.h>`).
+    let dup = PpOptions { include_dirs: vec![PathBuf::from("/usr/include")], ..o.clone() };
+    check("#include <limits.h>\nint main(void){ return INT_MAX == 2147483647 ? 0 : 1; }\n", &dup)
+        .unwrap_or_else(|e| panic!("-I/usr/include <limits.h>:\n{e}"));
     // `-nostdinc`-equivalent options do not see them.
     let bare = PpOptions { builtin_headers: false, ..opts() };
     assert!(preprocess::preprocess("#include <stdio.h>\n", &bare).is_err());
