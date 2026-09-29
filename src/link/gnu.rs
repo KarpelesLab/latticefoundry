@@ -246,6 +246,21 @@ mod tests {
     use crate::mc::asm::{AsmOptions, AsmSource, assemble};
     use crate::target::TargetArch;
 
+    /// Run `exe`, retrying a transient ETXTBSY (errno 26): qld writes the
+    /// executable from inside this test process, so another test thread's
+    /// fork can briefly inherit a writable handle to it.
+    fn run(exe: &Path) -> std::process::ExitStatus {
+        for _ in 0..100 {
+            match std::process::Command::new(exe).status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other.expect("run the linked executable"),
+            }
+        }
+        panic!("{} stayed busy (ETXTBSY)", exe.display());
+    }
+
     /// A fresh scratch directory for one test.
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lf-gnu-{name}-{}", std::process::id()));
@@ -266,7 +281,7 @@ mod tests {
         std::fs::write(&o, obj).unwrap();
         link_gnu("test", &[OsString::from("-static"), "-o".into(), exe.clone().into(), o.into()])
             .unwrap();
-        let status = std::process::Command::new(&exe).status().unwrap();
+        let status = run(&exe);
         assert_eq!(status.code(), Some(7));
     }
 
@@ -314,7 +329,7 @@ mod tests {
         let (o, exe) = (dir.join("t.o"), dir.join("t"));
         std::fs::write(&o, crate::mc::elf::write(&obj)).unwrap();
         link_gnu("test", &host_c_link_args(&crt, &[&o], &[], &exe)).unwrap();
-        let status = std::process::Command::new(&exe).status().unwrap();
+        let status = run(&exe);
         assert_eq!(status.code(), Some(42));
     }
 }
