@@ -228,6 +228,29 @@ int main(void) { int x = 0; double d = 0; return __alignof__(x) + __alignof__ (d
             4 + 8 + 1 + 8,
         ),
         (
+            "computed_goto",
+            r#"
+static int run(const unsigned char *code) {
+    static const void *const ops[] = { &&op_halt, &&op_inc, &&op_dbl, &&op_add10 };
+    int acc = 0;
+    const void *entry = &&next;
+    goto *entry;
+next:
+    goto *ops[*code++];
+op_inc: acc += 1; goto next;
+op_dbl: acc *= 2; goto next;
+op_add10: acc += 10; goto *ops[*code++];
+op_halt:
+    return acc + (&&op_inc != &&op_dbl);
+}
+int main(void) {
+    const unsigned char prog[] = { 1, 1, 2, 3, 2, 1, 0 };
+    return run(prog);
+}
+"#,
+            ((1 + 1) * 2 + 10) * 2 + 1 + 1,
+        ),
+        (
             "builtin_va_list_in_program",
             r#"
 typedef __builtin_va_list my_va;

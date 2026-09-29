@@ -590,6 +590,9 @@ pub enum ExprKind {
     /// own scope and, when the last one is an expression statement, its value is
     /// the value of the whole expression (otherwise the type is `void`).
     StmtExpr(Vec<Stmt>),
+    /// GNU `&&label`: the "address" of a label in the enclosing function (a
+    /// `void *` usable only as the operand of `goto *`).
+    LabelAddr(String),
 }
 
 /// One association of a `_Generic` selection: a type (`None` for `default`) and
@@ -673,6 +676,8 @@ pub enum StmtKind {
     Label(String, Box<Stmt>),
     /// `goto label;`.
     Goto(String),
+    /// GNU computed goto `goto *expr;` (the target from `&&label`).
+    GotoIndirect(Expr),
     /// A GNU `asm` statement (basic or extended).
     Asm(AsmStmt),
 }

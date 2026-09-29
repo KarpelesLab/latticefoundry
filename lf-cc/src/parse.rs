@@ -1873,6 +1873,7 @@ impl Parser {
             // `va_arg` yields its type operand; the others are `void`.
             ExprKind::VaArg(_, ty) => Some(ty.clone()),
             ExprKind::VaStart(..) | ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => Some(CType::Void),
+            ExprKind::LabelAddr(_) => Some(CType::ptr_to(CType::Void)),
             ExprKind::StmtExpr(stmts) => match stmts.last() {
                 Some(Stmt { kind: StmtKind::Expr(Some(e)), .. }) => self.expr_type(e),
                 _ => Some(CType::Void),
@@ -2412,6 +2413,12 @@ impl Parser {
             }
             TokenKind::Keyword(Keyword::Goto) => {
                 self.bump();
+                // GNU computed goto: `goto *expr;`.
+                if self.eat_punct(Punct::Star) {
+                    let target = self.parse_expr()?;
+                    let end = self.expect_punct(Punct::Semi, "';' after goto")?;
+                    return Ok(self.stmt(StmtKind::GotoIndirect(target), start.merge(end)));
+                }
                 let (name, _) = self.expect_ident()?;
                 let end = self.expect_punct(Punct::Semi, "';' after goto")?;
                 Ok(self.stmt(StmtKind::Goto(name), start.merge(end)))
@@ -2757,6 +2764,14 @@ impl Parser {
 
     fn parse_unary(&mut self) -> PResult<Expr> {
         let start = self.peek_span();
+        // GNU labels as values: `&&label`.
+        if self.is_punct(Punct::AmpAmp)
+            && let TokenKind::Ident(name) = self.peek_at(1).clone()
+        {
+            self.bump();
+            let end = self.bump().span;
+            return Ok(Expr { kind: ExprKind::LabelAddr(name), span: start.merge(end) });
+        }
         if let TokenKind::Punct(p) = self.peek() {
             let unop = match p {
                 Punct::Minus => Some(UnaryOp::Neg),

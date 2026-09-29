@@ -607,6 +607,24 @@ impl FnLower<'_> {
                 self.b.br(bb, &[]);
                 self.terminated = true;
             }
+            TStmt::GotoIndirect(target, labels) => {
+                // A multi-way branch on the label's dispatch number (`&&l` is
+                // `id + 1`); any other value is undefined behaviour.
+                self.set_line(target.span);
+                let v = self.lower_rvalue(target);
+                let mut cases: Vec<(puremp::Int, BlockId, Vec<ValueId>)> = Vec::new();
+                let mut sorted = labels.clone();
+                sorted.sort_unstable();
+                for id in sorted {
+                    let bb = self.label_block(id);
+                    cases.push((puremp::Int::from_i64(i64::from(id) + 1), bb, Vec::new()));
+                }
+                let trap = self.b.create_block(&[]);
+                self.b.switch(v, trap, &[], cases);
+                self.switch(trap);
+                self.b.unreachable();
+                self.terminated = true;
+            }
         }
     }
 

@@ -213,6 +213,10 @@ pub enum TStmt {
     Labeled(u32, Box<TStmt>),
     /// `goto` to a named label (its function-wide label id).
     Goto(u32),
+    /// GNU computed `goto *target`: `target` (a `long`) holds some label's
+    /// dispatch number (see `label_value`); branch to whichever of the listed
+    /// label ids it names.
+    GotoIndirect(TExpr, Vec<u32>),
     /// Initialize a scalar local object with a value already converted to its type.
     InitLocal(ObjId, TExpr),
     /// Initialize a `struct`/`union` local object by copying `size` bytes from a
@@ -506,6 +510,19 @@ struct Checker {
     /// Nonzero while checking an unevaluated operand (`sizeof`), where naming a
     /// value of an unsupported type (`__int128`, `_Float128`) is harmless.
     unevaluated: u32,
+    /// The labels (name → id) of the function being checked, so `&&label` can
+    /// also appear in the constant initializer of a `static` local (a dispatch
+    /// table).
+    cur_labels: HashMap<String, u32>,
+}
+
+/// The value `&&label` takes for label `id`: a small nonzero dispatch number
+/// (not a machine address). `goto *p` branches on it through a multi-way
+/// branch over the function's labels, so it only needs to be distinct per
+/// label; like any other pointer value, it may be stored, copied, compared
+/// and indexed from a table.
+fn label_value(id: u32) -> i128 {
+    i128::from(id) + 1
 }
 
 impl Checker {
@@ -791,7 +808,7 @@ impl Checker {
         // may have changed).
         let gtypes: HashMap<&str, &CType> =
             self.global_index.iter().map(|(n, &i)| (n.as_str(), &self.globals[i].ty)).collect();
-        const_eval_with(e, &self.enum_consts, &self.records, &gtypes)
+        const_eval_with(e, &self.enum_consts, &self.records, &gtypes, &self.cur_labels)
     }
 
     /// Materialize an initializer to little-endian bytes at `off` within `bytes`
@@ -1061,6 +1078,7 @@ impl Checker {
             self.collect_labels(stmt, &mut labels);
         }
         let n_labels = labels.len() as u32;
+        self.cur_labels = labels.clone();
         let mut ctx = FnCtx {
             locals: Vec::new(),
             params: Vec::new(),
@@ -1273,6 +1291,15 @@ impl Checker {
                 Some(TStmt::Labeled(id, Box::new(b)))
             }
             StmtKind::Asm(asm) => self.check_asm(ctx, asm, stmt.span),
+            StmtKind::GotoIndirect(e) => {
+                let te = self.check_rvalue(ctx, e)?;
+                if !te.ty.is_pointer() {
+                    self.error(e.span, "the operand of 'goto *' must be a pointer ('&&label')");
+                    return None;
+                }
+                let targets = ctx.labels.values().copied().collect();
+                Some(TStmt::GotoIndirect(self.convert(te, &CType::long()), targets))
+            }
             StmtKind::Goto(name) => match ctx.labels.get(name) {
                 Some(&id) => Some(TStmt::Goto(id)),
                 None => {
@@ -1791,6 +1818,14 @@ impl Checker {
             ExprKind::VaEnd(ap) => self.check_va_end(ctx, ap, span),
             ExprKind::VaCopy(dst, src) => self.check_va_copy(ctx, dst, src, span),
             ExprKind::StmtExpr(stmts) => self.check_stmt_expr(ctx, stmts, span),
+            ExprKind::LabelAddr(name) => {
+                let Some(&id) = ctx.labels.get(name) else {
+                    self.error(span, format!("use of undeclared label '{name}'"));
+                    return None;
+                };
+                let v = TExpr::new(TExprKind::Const(label_value(id)), CType::long(), span);
+                Some(TExpr::new(TExprKind::Convert(Box::new(v)), CType::ptr_to(CType::Void), span))
+            }
         }
     }
 
@@ -3133,10 +3168,13 @@ fn const_eval_with(
     enums: &HashMap<String, i128>,
     recs: &Records,
     gtypes: &HashMap<&str, &CType>,
+    labels: &HashMap<String, u32>,
 ) -> Option<i128> {
-    let rec = |x: &Expr| const_eval_with(x, enums, recs, gtypes);
+    let rec = |x: &Expr| const_eval_with(x, enums, recs, gtypes, labels);
     match &e.kind {
         ExprKind::IntLit(v, _) => Some(*v),
+        // `&&label` (GNU labels as values) is the label's dispatch number.
+        ExprKind::LabelAddr(name) => labels.get(name).map(|&id| label_value(id)),
         ExprKind::Ident(name) => enums.get(name).copied(),
         ExprKind::Unary(op, inner) => {
             let v = rec(inner)?;
@@ -3499,6 +3537,7 @@ fn idents_in_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 idents_in_expr(&op.expr, out);
             }
         }
+        StmtKind::GotoIndirect(e) => idents_in_expr(e, out),
         StmtKind::Break | StmtKind::Continue | StmtKind::Goto(_) => {}
     }
 }
@@ -3525,7 +3564,8 @@ fn idents_in_expr(e: &Expr, out: &mut HashSet<String>) {
         | ExprKind::FloatLit(..)
         | ExprKind::StrLit(..)
         | ExprKind::SizeofType(_)
-        | ExprKind::AlignofType(_) => {}
+        | ExprKind::AlignofType(_)
+        | ExprKind::LabelAddr(_) => {}
         ExprKind::Unary(_, a)
         | ExprKind::Cast(_, a)
         | ExprKind::PreInc(a)
