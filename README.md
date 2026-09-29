@@ -32,28 +32,39 @@ this tree* where useful, but such wide tools are **not** taken as dependencies.
 
 ## Layout
 
-This is a single package (**not** a Cargo workspace): one library plus the
-binaries under `src/bin/`.
+The framework is a single package (**not** a Cargo workspace): one library plus
+the binaries under `src/bin/`. The C frontend `lf-cc/` is a separate nested
+crate (see below).
 
 ```
 latticefoundry/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs            the framework library
-│   ├── support/         interning, small ADTs, numeric core (puremp)
-│   ├── ir/              typed SSA IR + type system
-│   ├── verify/          well-formedness checks; SMT bridge to z3rs
+│   ├── lib.rs           the framework library
+│   ├── support/         arenas, deterministic hashing, diagnostics
+│   ├── ir/              typed SSA IR, type system, builder, reference
+│   │                    semantics, `.lf` text + `.lfb` binary formats, module merge
+│   ├── verify/          structural verifier; z3rs-backed refinement checker;
+│   │                    proof-carrying certificates
+│   ├── analysis/        one lattice fixpoint engine + abstract domains
+│   │                    (constants, ranges, known-bits, nullness)
 │   ├── pass/            pass & analysis manager
-│   ├── codegen/         IR → machine IR lowering
-│   ├── mc/              machine-code encoding + object formats
-│   ├── target/          per-architecture description tables
-│   ├── link/            linker core
+│   ├── transform/       mem2reg, DCE, simplify-cfg, SCCP, LICM, inlining,
+│   │                    e-graph equality saturation, superoptimizer, -O pipeline
+│   ├── codegen/         machine IR, instruction selection, register allocation,
+│   │                    MIR interpreter
+│   ├── mc/              encoding + fixups, ELF64 objects, `.lfo`, DWARF
+│   ├── target/          x86_64/, aarch64/, riscv/
+│   ├── link/            static linker core (ELF64 executables)
+│   ├── jit/             in-process JIT (the only `unsafe` in the tree)
 │   └── bin/
-│       ├── lf.rs        compiler driver (umbrella front end)
+│       ├── lf.rs        compiler driver (`lf build`)
 │       ├── lf-ld.rs     linker
 │       ├── lf-as.rs     assembler
 │       ├── lf-opt.rs    IR optimizer driver
 │       └── lf-dis.rs    disassembler
+├── lf-cc/               C frontend (separate crate, not a workspace member)
+├── docs/                design tenets and IR design
 └── ROADMAP.md
 ```
 
@@ -72,9 +83,65 @@ What makes LatticeFoundry more than a re-implementation is written down:
 
 ## Status
 
-Early scaffold. The container hierarchy, type system, and tool skeletons exist
-and build; the engines behind them are filled in phase by phase. See
-[`ROADMAP.md`](ROADMAP.md).
+Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
+[`ROADMAP.md`](ROADMAP.md) for the full plan.
+
+**Framework (`latticefoundry`)**
+
+- `lf build foo.lf -o foo` compiles IR to a **static ELF64 executable that runs
+  directly on Linux x86-64**. It needs no libc and no system linker; every step
+  is LatticeFoundry code. `-O0`..`-O3`, `-g` (DWARF, loadable by gdb) and
+  `--lto` (whole-program merge + cross-module inlining) are supported.
+- The verification bets from the design tenets are live: executable opcode
+  semantics (B1), refinement checking with z3rs over multi-block acyclic
+  functions (B2), proof-carrying certificates (B3), an equality-saturation
+  optimizer (B4), a z3rs superoptimizer (B5), one lattice engine for all
+  analyses (B8) and a cost model (B9).
+- An in-process JIT runs the same code without writing an executable.
+
+| Target  | Coverage | Validation |
+| ------- | -------- | ---------- |
+| x86-64  | Integer, SSE float, System V ABI (struct-by-value, variadics), dynamic `alloca` | Runs natively; golden bytes; linked with gcc |
+| AArch64 | Integer, scalar FP, AAPCS64 struct-by-value | Encodings checked against `llvm-mc`; A64-MIR interpreter |
+| RISC-V  | RV64IM integer | Encodings checked against `llvm-mc`; interpreter |
+
+Not done yet: dynamic (shared-object) linking, sanitizers, RISC-V FP and
+relocations, dynamic `alloca` on AArch64/RISC-V, and the deferred bets (B6
+region form, B7 full content-addressing, B10 provenance types, B11 verified
+lowering).
+
+**C frontend (`lf-cc`)**
+
+`lf-cc` is a clean-room C compiler that lowers to LatticeFoundry IR and reuses
+the whole pipeline. It covers C89 through C23 (`--std=`):
+
+- a full preprocessor, including `#embed`
+- aggregates, including bit-fields, floating point, and struct-by-value
+- variadic functions
+- C11/C23 features: `_Generic`, `constexpr`, `_BitInt(N≤64)`, `typeof`,
+  `[[attributes]]`, and more
+- K&R functions and common GNU extensions
+- freestanding standard headers
+
+Its test suite is differential: each program's exit status is compared with
+`gcc`'s at `-O0` and `-O2`. `-c` emits relocatable objects, which can be linked
+against the system libc.
+
+Real packages built from source with `lf-cc`:
+
+| Package     | Result |
+| ----------- | ------ |
+| gzip 1.2.4  | Compressed output byte-identical to GNU gzip (milestone **M8**) |
+| bzip2 1.0.8 | Output byte-identical; interoperates with the system bzip2 in both directions |
+| make 3.82   | All 27 files; builds real projects identically |
+| bash 3.2    | All 130 core files; the feature battery matches the system bash |
+
+These builds currently use minimal stub hosted headers. The next milestone,
+**M9**, is compiling against the real glibc `/usr/include`, which means covering
+the full GNU C dialect. The goal after that is a bootstrap-capable compiler.
+
+Build and test `lf-cc` from inside its own directory (`cd lf-cc && cargo test`).
+The root `cargo build` does not touch it.
 
 ## Building
 
