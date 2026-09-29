@@ -8,6 +8,7 @@ pub mod aarch64;
 pub mod riscv;
 pub mod thumb;
 pub mod triple;
+pub mod wasm32;
 pub mod x86_64;
 
 pub(crate) mod rt_words;
