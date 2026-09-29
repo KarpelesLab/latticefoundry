@@ -19,7 +19,25 @@
 //!    instruction word, which the generic emitter's whole-field patcher cannot
 //!    express, so branch resolution is done here);
 //! 4. assembles the functions of a module into an [`ObjectModule`]
-//!    ([`compile_module`]).
+//!    ([`compile_module`]); [`compile_module_with`] also takes
+//!    [`CodegenOptions`] and returns each function's [`StackUsage`], read off the
+//!    same [`FrameLayout`] the prologue is built from.
+//!
+//! **Stack probes.** With probes on (the default, see [`crate::codegen::stack`]),
+//! a frame of at least [`STACK_PROBE_INTERVAL`] bytes is allocated as
+//!
+//! ```text
+//! lui t1, 1                                   # t1 = 4096
+//! sub sp, sp, t1 ; sd zero, 0(sp)             # × pages, when pages <= 4
+//!
+//! li t0, pages                                # otherwise, a counted loop
+//! L: sub sp, sp, t1 ; sd zero, 0(sp) ; addi t0, t0, -1 ; bnez t0, L
+//! addi sp, sp, -remainder                     # < 4096, if nonzero
+//! ```
+//!
+//! using the encoder expansion scratch `t0`/`t1` (never allocated, dead at
+//! function entry). The prologue then saves `ra` at `0(sp)` in any function that
+//! calls, so the next frame starts right at a touched address.
 //!
 //! The encoding tables are implemented from the published RISC-V ISA (tenet T1),
 //! not copied from any assembler.
@@ -33,6 +51,8 @@
 //! Wiring the relocations is a documented follow-up (it needs new `RelocKind`s).
 
 use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, PReg, Reg, RegClass, StackSlot};
+use crate::codegen::options::{CodegenOptions, CompiledModule};
+use crate::codegen::stack::{STACK_PROBE_INTERVAL, StackReport, StackUsage, scan_calls};
 use crate::codegen::regalloc;
 use crate::ir::Module;
 use crate::mc::emit::Emitted;
@@ -354,6 +374,36 @@ pub struct FrameLayout {
     saved_off: Vec<u64>,
     /// The total frame size subtracted from `sp` (16-byte aligned).
     size: u64,
+    /// Whether the prologue's `sp` adjustment emits stack probes.
+    probes: bool,
+}
+
+impl FrameLayout {
+    /// The stack usage this layout gives `mf` (whose MIR supplies the call
+    /// information; `func_name` resolves a function index — the callees and `mf`
+    /// itself — to its symbol name): the single `addi sp, sp, -size`, which also
+    /// covers the saved `ra`/callee-saved registers. `jal` pushes nothing.
+    pub fn stack_usage(
+        &self,
+        mf: &MachineFunction,
+        func_name: &dyn Fn(u32) -> String,
+    ) -> StackUsage {
+        let scan = scan_calls(mf, RvOp::Call.opcode(), RvOp::Ecall.opcode(), None);
+        StackUsage {
+            name: func_name(mf.info().source),
+            frame_size: self.size,
+            return_address: 0,
+            saved_registers: 8 * self.saved.len() as u64,
+            sp_adjust: self.size,
+            // No stack-passed arguments on this target yet.
+            outgoing_args: 0,
+            dynamic_alloca: scan.dynamic_alloca,
+            direct_callees: scan.direct.iter().map(|&f| func_name(f)).collect(),
+            indirect_calls: scan.indirect,
+            syscalls: scan.syscalls,
+            probed: self.probes,
+        }
+    }
 }
 
 /// Round `value` up to a multiple of `align` (a power of two ≥ 1).
@@ -362,8 +412,18 @@ fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(a) * a
 }
 
-/// Compute the frame layout of an allocated machine function.
+/// Compute the frame layout of an allocated machine function, with the default
+/// [`CodegenOptions`] (stack probes on).
 pub fn layout_frame(mf: &MachineFunction, target: &RiscvTarget) -> FrameLayout {
+    layout_frame_with(mf, target, &CodegenOptions::default())
+}
+
+/// Compute the frame layout of an allocated machine function under `opts`.
+pub fn layout_frame_with(
+    mf: &MachineFunction,
+    target: &RiscvTarget,
+    opts: &CodegenOptions,
+) -> FrameLayout {
     use crate::codegen::target::MachineTarget;
     let callee: Vec<PReg> = target.callee_saved().to_vec();
 
@@ -407,7 +467,7 @@ pub fn layout_frame(mf: &MachineFunction, target: &RiscvTarget) -> FrameLayout {
     }
     let size = align_up(off, 16);
 
-    FrameLayout { slot_off, saved, saved_off, size }
+    FrameLayout { slot_off, saved, saved_off, size, probes: opts.stack_probes }
 }
 
 fn def_preg(r: PReg) -> MachineOperand {
@@ -427,7 +487,11 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
     // --- prologue: addi sp, sp, -size; sd ra/cs, off(sp) ---
     let mut prologue = Vec::new();
     if layout.size > 0 {
-        prologue.push(MachineInst::new(RvOp::AddiSp.opcode(), vec![imm_op(-(layout.size as i64))]));
+        // The second operand requests the probed form.
+        prologue.push(MachineInst::new(
+            RvOp::AddiSp.opcode(),
+            vec![imm_op(-(layout.size as i64)), imm_op(i64::from(layout.probes))],
+        ));
     }
     for (&r, &off) in layout.saved.iter().zip(&layout.saved_off) {
         prologue.push(MachineInst::new(RvOp::SaveReg.opcode(), vec![use_preg(r), imm_op(off as i64)]));
@@ -604,6 +668,39 @@ fn frame_mem(b: &mut RvBuf, is_load: bool, reg: u32, off: i64) {
     }
 }
 
+/// Pages up to which a probed frame allocation is unrolled rather than looped.
+const PROBE_UNROLL: u64 = 4;
+
+/// The prologue's `sp -= amount` with stack probes (see the module docs).
+fn probed_sp_sub(b: &mut RvBuf, amount: u64) {
+    let pages = amount / STACK_PROBE_INTERVAL;
+    let rem = amount % STACK_PROBE_INTERVAL;
+    b.word(lui(T1.into(), (STACK_PROBE_INTERVAL >> 12) as u32)); // t1 = 4096
+    let sub_page = sub(SP.into(), SP.into(), T1.into()); // sub sp, sp, t1
+    let probe = store(8, ZERO.into(), SP.into(), 0); // sd zero, 0(sp)
+    if pages <= PROBE_UNROLL {
+        for _ in 0..pages {
+            b.word(sub_page);
+            b.word(probe);
+        }
+    } else {
+        emit_li(b, T0.into(), pages as i64);
+        b.word(sub_page);
+        b.word(probe);
+        b.word(addi(T0.into(), T0.into(), -1)); // addi t0, t0, -1
+        b.word(bne(T0.into(), ZERO.into(), -12)); // bnez t0, (back to the sub)
+    }
+    if rem > 0 {
+        let delta = -(rem as i64);
+        if fits12(delta) {
+            b.word(addi(SP.into(), SP.into(), delta as i32));
+        } else {
+            emit_li(b, T6.into(), delta);
+            b.word(add(SP.into(), SP.into(), T6.into()));
+        }
+    }
+}
+
 /// Encode one machine instruction into `b`.
 fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
     let ops = &inst.operands;
@@ -676,7 +773,10 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         RvOp::RestoreReg => frame_mem(b, true, rnum(&ops[0]), simm(&ops[1])),
         RvOp::AddiSp => {
             let delta = simm(&ops[0]);
-            if fits12(delta) {
+            let probe = ops.get(1).is_some_and(|o| simm(o) != 0);
+            if probe && delta <= -(STACK_PROBE_INTERVAL as i64) {
+                probed_sp_sub(b, delta.unsigned_abs());
+            } else if fits12(delta) {
                 b.word(addi(SP.into(), SP.into(), delta as i32));
             } else {
                 emit_li(b, T6.into(), delta);
@@ -818,32 +918,62 @@ pub fn encode_function(mf: &MachineFunction, layout: &FrameLayout) -> Emitted {
     Emitted { bytes: b.bytes, relocations: Vec::new() }
 }
 
-/// Compile one function of `module` to its encoded bytes. Runs isel → register
-/// allocation → frame layout → prologue/epilogue → encoding.
-pub fn compile_function(module: &Module, func: crate::ir::FuncId) -> Emitted {
+/// Run isel → register allocation → frame layout → prologue/epilogue →
+/// encoding for one function under `opts`, returning the code and its stack
+/// usage (`func_name` names the callees).
+fn compile_function_full(
+    module: &Module,
+    func: crate::ir::FuncId,
+    opts: &CodegenOptions,
+    func_name: &dyn Fn(u32) -> String,
+) -> (Emitted, StackUsage) {
     let target = RiscvTarget::new();
     let mut mf = target.select(module, func);
     regalloc::allocate(&mut mf, &target);
-    let layout = layout_frame(&mf, &target);
+    let layout = layout_frame_with(&mf, &target, opts);
     insert_prologue_epilogue(&mut mf, &layout);
-    encode_function(&mf, &layout)
+    let stack = layout.stack_usage(&mf, func_name);
+    (encode_function(&mf, &layout), stack)
+}
+
+/// Compile one function of `module` to its encoded bytes. Runs isel → register
+/// allocation → frame layout → prologue/epilogue → encoding.
+pub fn compile_function(module: &Module, func: crate::ir::FuncId) -> Emitted {
+    let name = |idx: u32| format!("f{idx}");
+    compile_function_full(module, func, &CodegenOptions::default(), &name).0
 }
 
 /// Compile every defined function of `module` into a relocatable
 /// [`ObjectModule`]: a single `.text` section with one global function symbol per
 /// definition. Call/global relocations are deferred (see the module docs), so a
 /// module whose functions are not self-contained links only after that follow-up.
-/// `syms` resolves the interned function names.
+/// `syms` resolves the interned function names. Uses the default
+/// [`CodegenOptions`] (stack probes on); see [`compile_module_with`].
 pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
+    compile_module_with(module, syms, &CodegenOptions::default()).object
+}
+
+/// Like [`compile_module`], under `opts`, and also returning every defined
+/// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
+pub fn compile_module_with(
+    module: &Module,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+) -> CompiledModule {
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
+    let mut stack = StackReport::new();
+    let func_name = |idx: u32| -> String {
+        syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
+    };
 
     for (i, f) in module.functions().enumerate() {
         if f.is_declaration() {
             continue;
         }
         let fid = crate::ir::FuncId::from_index(i);
-        let emitted = compile_function(module, fid);
+        let (emitted, usage) = compile_function_full(module, fid, opts, &func_name);
+        stack.push(usage);
         // 4-align this function's start within .text (RV instructions are words).
         {
             let sec = obj.section_mut(text);
@@ -865,5 +995,5 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
             len,
         ));
     }
-    obj
+    CompiledModule { object: obj, stack }
 }
