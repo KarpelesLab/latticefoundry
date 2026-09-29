@@ -736,6 +736,8 @@ impl Enc<'_> {
             InstKind::ICmp(pred) => enc_icmp(*pred, &ops)?,
             InstKind::Select => enc_select(&ops)?,
             InstKind::Cast(op) => enc_cast(*op, &ops, rw)?,
+            // `declassify` is the identity on values (and on poison).
+            InstKind::Declassify => (ops[0].val.clone(), ops[0].poison.clone()),
             InstKind::Freeze => {
                 let a = &ops[0];
                 let fresh = self.fresh_bv(rw);

@@ -204,7 +204,7 @@ impl AbstractDomain for Nullness {
             // every case: if the operand is `NonNull`/`Null` its γ excludes
             // poison so `freeze` is the identity; if it is `MaybeNull` the frozen
             // value (some pointer, or null) is still in γ(⊤).
-            InstKind::Freeze => operands.first().copied().unwrap_or(Nullness::MaybeNull),
+            InstKind::Freeze | InstKind::Declassify => operands.first().copied().unwrap_or(Nullness::MaybeNull),
 
             // Everything else that yields a pointer we cannot pin down —
             // `inttoptr` (any address), a `load`ed pointer, a `call` result — as

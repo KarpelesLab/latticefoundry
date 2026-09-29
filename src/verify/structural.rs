@@ -663,6 +663,15 @@ impl<'a> Ctx<'a> {
                     self.type_mismatch(inst, "freeze operand vs. result", o, ty);
                 }
             }
+            InstKind::Declassify => {
+                if !self.arity(inst, ops, 1) {
+                    return;
+                }
+                let o = func.value_type(ops[0]);
+                if o != ty {
+                    self.type_mismatch(inst, "declassify operand vs. result", o, ty);
+                }
+            }
             InstKind::Call => self.check_call(inst, data),
             InstKind::Syscall => {
                 // `[nr, args...]`: the number plus 0..=6 arguments (the Linux

@@ -322,13 +322,13 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Load a value of `ty` from `ptr` with the given alignment.
     pub fn load(&mut self, ty: TypeId, ptr: ValueId, align: u32) -> ValueId {
-        self.emit(InstKind::Load { ty, align, volatile: false }, vec![ptr], Flags::NONE, Some(ty))
+        self.emit(InstKind::Load { ty, align, volatile: false, secret: false }, vec![ptr], Flags::NONE, Some(ty))
             .expect("load has a result")
     }
 
     /// Store `val` (of `ty`) to `ptr` with the given alignment.
     pub fn store(&mut self, ty: TypeId, ptr: ValueId, val: ValueId, align: u32) {
-        self.emit(InstKind::Store { ty, align, volatile: false }, vec![ptr, val], Flags::NONE, None);
+        self.emit(InstKind::Store { ty, align, volatile: false, secret: false }, vec![ptr, val], Flags::NONE, None);
     }
 
     /// A **volatile** load of `ty` from `ptr` (memory-mapped I/O): performed
@@ -336,14 +336,28 @@ impl<'a> FunctionBuilder<'a> {
     /// volatile access; never removed, merged, or forwarded (see
     /// [`InstKind::Load`]).
     pub fn load_volatile(&mut self, ty: TypeId, ptr: ValueId, align: u32) -> ValueId {
-        self.emit(InstKind::Load { ty, align, volatile: true }, vec![ptr], Flags::NONE, Some(ty))
+        self.emit(InstKind::Load { ty, align, volatile: true, secret: false }, vec![ptr], Flags::NONE, Some(ty))
             .expect("load has a result")
     }
 
     /// A **volatile** store of `val` (of `ty`) to `ptr`; see
     /// [`FunctionBuilder::load_volatile`].
     pub fn store_volatile(&mut self, ty: TypeId, ptr: ValueId, val: ValueId, align: u32) {
-        self.emit(InstKind::Store { ty, align, volatile: true }, vec![ptr, val], Flags::NONE, None);
+        self.emit(InstKind::Store { ty, align, volatile: true, secret: false }, vec![ptr, val], Flags::NONE, None);
+    }
+
+    /// A **secret** load of `ty` from `ptr`: the result is secret-derived for
+    /// the constant-time discipline (see [`InstKind::Load`]).
+    pub fn load_secret(&mut self, ty: TypeId, ptr: ValueId, align: u32) -> ValueId {
+        self.emit(InstKind::Load { ty, align, volatile: false, secret: true }, vec![ptr], Flags::NONE, Some(ty))
+            .expect("load has a result")
+    }
+
+    /// A **secret** store of `val` (of `ty`) to `ptr`: writes secret memory, as
+    /// the constant-time verifier requires for a secret-derived value stored
+    /// through a pointer that is not a local stack slot (see [`InstKind::Store`]).
+    pub fn store_secret(&mut self, ty: TypeId, ptr: ValueId, val: ValueId, align: u32) {
+        self.emit(InstKind::Store { ty, align, volatile: false, secret: true }, vec![ptr, val], Flags::NONE, None);
     }
 
     /// The natural alignment of an atomic access of `ty`: its size in bytes.
@@ -468,6 +482,15 @@ impl<'a> FunctionBuilder<'a> {
     pub fn freeze(&mut self, val: ValueId) -> ValueId {
         let ty = self.value_type(val);
         self.emit(InstKind::Freeze, vec![val], Flags::NONE, Some(ty)).expect("freeze has a result")
+    }
+
+    /// `declassify`: end the secrecy of `val` (the identity on values; the
+    /// result is public for the constant-time discipline, see
+    /// [`InstKind::Declassify`]).
+    pub fn declassify(&mut self, val: ValueId) -> ValueId {
+        let ty = self.value_type(val);
+        self.emit(InstKind::Declassify, vec![val], Flags::NONE, Some(ty))
+            .expect("declassify has a result")
     }
 
     /// A call to `callee` with `args`, returning a value of `ret_ty` (or `None`

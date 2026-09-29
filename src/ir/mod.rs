@@ -155,6 +155,10 @@ impl Visibility {
 ///   analyses and keeps the global well-typed. This is what
 ///   [`Module::add_global`] records, preserving the pre-data-emission meaning of
 ///   that API for existing builder clients.
+/// - `secret` says the global's contents are secret (Lode's `secret[T]`): every
+///   load whose address is based on it yields a secret-derived value for the
+///   constant-time discipline (`docs/ir-design.md` §6d). Its *address* is
+///   public. No effect on layout or emission.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct GlobalAttrs {
     /// The symbol binding of a definition.
@@ -165,6 +169,8 @@ pub struct GlobalAttrs {
     pub constant: bool,
     /// Storage is provided outside the IR; the backend emits nothing for it.
     pub detached: bool,
+    /// The contents are secret (constant-time discipline).
+    pub secret: bool,
 }
 
 impl GlobalAttrs {
@@ -175,6 +181,7 @@ impl GlobalAttrs {
         visibility: Visibility::Default,
         constant: false,
         detached: false,
+        secret: false,
     };
 
     /// The attributes [`Module::add_global`] records: external, mutable, and
@@ -184,10 +191,11 @@ impl GlobalAttrs {
         visibility: Visibility::Default,
         constant: false,
         detached: true,
+        secret: false,
     };
 }
 
-/// Per-function attributes (`docs/ir-design.md` §4b), kept in
+/// Per-function attributes (`docs/ir-design.md` §4b, §6d), kept in
 /// [`Function::attrs`].
 ///
 /// - `linkage` picks the symbol binding of a *definition* (external →
@@ -195,18 +203,72 @@ impl GlobalAttrs {
 ///   declaration is always an external reference.
 /// - `visibility` picks the ELF symbol visibility, for definitions and
 ///   references alike.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+/// - the **secrecy** of the parameters and of the return value (§6d): a
+///   `secret` parameter carries a secret-derived value into the function (the
+///   constant-time verifier then forbids it from reaching a branch, an address
+///   or a divisor); a `secret` return lets the function return a
+///   secret-derived value, and makes every direct call's result secret-derived
+///   in the caller. Secrecy is part of the function's *interface*: a caller
+///   may pass a secret-derived argument only to a secret parameter.
+///
+/// Every functional rebuild ([`Module::map_function`]) carries the attributes
+/// over to the fresh function.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct FuncAttrs {
     /// The symbol binding of a definition.
     pub linkage: Linkage,
     /// The symbol visibility.
     pub visibility: Visibility,
+    /// `secret_params[i]` marks parameter `i` secret; indices past the end are
+    /// public (so the default, empty vector means "no secret parameter"). The
+    /// vector never ends in `false`, so equal secrecy compares equal.
+    secret_params: Vec<bool>,
+    /// Whether the return value is secret.
+    pub secret_ret: bool,
 }
 
 impl FuncAttrs {
-    /// External linkage, default visibility: a plain `func` definition.
-    pub const DEFAULT: FuncAttrs =
-        FuncAttrs { linkage: Linkage::External, visibility: Visibility::Default };
+    /// External linkage, default visibility, nothing secret: a plain `func`.
+    pub const DEFAULT: FuncAttrs = FuncAttrs {
+        linkage: Linkage::External,
+        visibility: Visibility::Default,
+        secret_params: Vec::new(),
+        secret_ret: false,
+    };
+
+    /// The given linkage and visibility, nothing secret.
+    pub const fn new(linkage: Linkage, visibility: Visibility) -> FuncAttrs {
+        FuncAttrs { linkage, visibility, secret_params: Vec::new(), secret_ret: false }
+    }
+
+    /// Whether parameter `i` is secret.
+    pub fn is_param_secret(&self, i: usize) -> bool {
+        self.secret_params.get(i).copied().unwrap_or(false)
+    }
+
+    /// Mark parameter `i` secret (or public).
+    pub fn set_param_secret(&mut self, i: usize, secret: bool) {
+        if self.secret_params.len() <= i {
+            if !secret {
+                return;
+            }
+            self.secret_params.resize(i + 1, false);
+        }
+        self.secret_params[i] = secret;
+        while self.secret_params.last() == Some(&false) {
+            self.secret_params.pop();
+        }
+    }
+
+    /// The indices of the secret parameters, ascending.
+    pub fn secret_params(&self) -> impl Iterator<Item = usize> + '_ {
+        self.secret_params.iter().enumerate().filter(|(_, s)| **s).map(|(i, _)| i)
+    }
+
+    /// Whether any parameter or the return value is secret.
+    pub fn has_secrets(&self) -> bool {
+        self.secret_ret || self.secret_params.iter().any(|&s| s)
+    }
 }
 
 /// A translation unit: the top-level container of IR.
@@ -294,6 +356,38 @@ impl Module {
         id
     }
 
+    /// The attributes (linkage, visibility, parameter / return secrecy) of a
+    /// function: its [`Function::attrs`].
+    pub fn func_attrs(&self, id: FuncId) -> &FuncAttrs {
+        &self.functions[id.index()].attrs
+    }
+
+    /// Mark parameter `param` of function `id` secret (or public).
+    pub fn set_param_secret(&mut self, id: FuncId, param: usize, secret: bool) {
+        self.functions[id.index()].attrs.set_param_secret(param, secret);
+    }
+
+    /// Mark the return value of function `id` secret (or public).
+    pub fn set_ret_secret(&mut self, id: FuncId, secret: bool) {
+        self.functions[id.index()].attrs.secret_ret = secret;
+    }
+
+    /// Whether the module declares any secret at all: a secret parameter or
+    /// return, a secret global, or a `secret` load/store. A module without one
+    /// is trivially constant-time and the constant-time verifier skips it.
+    pub fn has_secrets(&self) -> bool {
+        self.functions.iter().any(|f| f.attrs.has_secrets())
+            || self.global_attrs.iter().any(|a| a.secret)
+            || self.functions.iter().any(|f| {
+                f.insts.iter().any(|i| {
+                    matches!(
+                        i.kind,
+                        InstKind::Load { secret: true, .. } | InstKind::Store { secret: true, .. }
+                    )
+                })
+            })
+    }
+
     /// Append a global whose storage is supplied **outside the IR**, returning
     /// its handle. The global gets [`GlobalAttrs::DETACHED`]: the backend emits
     /// no storage or symbol definition for it (its initializer, if any, only
@@ -373,7 +467,7 @@ impl Module {
         &self.functions[id.index()]
     }
 
-    /// Replace a function's linkage/visibility attributes.
+    /// Replace a function's attributes (linkage, visibility, secrecy).
     pub fn set_func_attrs(&mut self, id: FuncId, attrs: FuncAttrs) {
         self.functions[id.index()].attrs = attrs;
     }
@@ -419,6 +513,7 @@ impl Module {
         let Module { types, consts, functions, global_addr_space, .. } = self;
         let old = &functions[id.index()];
         let mut fresh = Function::new(old.name, old.sig);
+        fresh.attrs = old.attrs.clone();
         let r = {
             let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts)
                 .with_global_spaces(global_addr_space);
@@ -449,6 +544,7 @@ impl Module {
         let funcs: &[Function] = functions.as_slice();
         let caller = &funcs[id.index()];
         let mut fresh = Function::new(caller.name, caller.sig);
+        fresh.attrs = caller.attrs.clone();
         let r = {
             let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts)
                 .with_global_spaces(global_addr_space);
@@ -476,7 +572,8 @@ pub struct Function {
     pub name: Sym,
     /// The function's signature: a [`Type::Func`] type id.
     pub sig: TypeId,
-    /// The function's linkage and visibility (external / default unless set).
+    /// The function's linkage, visibility and secrecy (external, default, public
+    /// unless set).
     pub attrs: FuncAttrs,
     /// The 1-based source line the function is declared on, if known (debug
     /// info, tenet: optional so non-debug builds are unaffected). `None` when the

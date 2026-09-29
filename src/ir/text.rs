@@ -33,8 +33,10 @@
 //! item        ::= global | func
 //!
 //! global      ::= "global" [ linkage ] [ visibility ] [ "constant" ] [ "detached" ]
-//!                 [ "addrspace" "(" INT ")" ] "@" name ":" type [ "=" init ]
-//! func        ::= "func" [ linkage ] [ visibility ] "@" name fnsig [ body ]
+//!                 [ "secret" ] [ "addrspace" "(" INT ")" ] "@" name ":" type [ "=" init ]
+//! func        ::= "func" [ linkage ] [ visibility ] "@" name funcsig [ body ]
+//! funcsig     ::= "(" [ [ "secret" ] type { "," [ "secret" ] type } [ "," "..." ]
+//!                 | "..." ] ")" "->" [ "secret" ] type
 //! linkage     ::= "internal" | "weak"
 //! visibility  ::= "hidden" | "protected"
 //! fnsig       ::= "(" [ type { "," type } [ "," "..." ] | "..." ] ")" "->" type
@@ -49,8 +51,9 @@
 //!               | castop operand ":" type
 //!               | "alloca" type ":" type
 //!               | "dyn_alloca" operand "align" INT ":" type
-//!               | "load" [ "volatile" ] operand "align" INT ":" type
-//!               | "store" [ "volatile" ] operand "," operand "align" INT ":" type
+//!               | "load" [ "volatile" ] [ "secret" ] operand "align" INT ":" type
+//!               | "store" [ "volatile" ] [ "secret" ] operand "," operand "align" INT
+//!                 ":" type
 //!               | "atomic_load" ordering operand "align" INT ":" type
 //!               | "atomic_store" ordering operand "," operand "align" INT ":" type
 //!               | "atomic_rmw" rmwop ordering operand "," operand "align" INT ":" type
@@ -60,6 +63,7 @@
 //!               | "ptr_add" [ "inbounds" ] operand "," operand ":" type
 //!               | "select" operand "," operand "," operand ":" type
 //!               | "freeze" operand ":" type
+//!               | "declassify" operand ":" type
 //!               | "call" operand "(" [ operand { "," operand } ] ")" ":" type
 //!               | "syscall" operand { "," operand } ":" type
 //!               | "ret" [ operand ]
@@ -192,9 +196,9 @@ pub fn write_module<W: fmt::Write>(f: &mut W, module: &Module, syms: &StrInterne
         write_global(f, module, syms, gi, g, module.global_attrs(GlobalId::from_index(gi)))?;
     }
 
-    for func in module.functions() {
+    for fi in 0..module.function_count() {
         writeln!(f)?;
-        write_function(f, module, syms, func)?;
+        write_function(f, module, syms, FuncId::from_index(fi))?;
     }
     Ok(())
 }
@@ -214,6 +218,9 @@ fn write_global<W: fmt::Write>(
     }
     if attrs.detached {
         write!(f, "detached ")?;
+    }
+    if attrs.secret {
+        write!(f, "secret ")?;
     }
     let space = module.global_addr_space(GlobalId::from_index(gi));
     if space != 0 {
@@ -251,12 +258,13 @@ fn write_function<W: fmt::Write>(
     f: &mut W,
     module: &Module,
     syms: &StrInterner,
-    func: &Function,
+    fid: FuncId,
 ) -> fmt::Result {
+    let func = module.function(fid);
     write!(f, "func ")?;
     write_linkage_visibility(f, func.attrs.linkage, func.attrs.visibility)?;
     write_name(f, syms.resolve(func.name))?;
-    write_signature(f, module, func.sig)?;
+    write_signature_attrs(f, module, func.sig, Some(module.func_attrs(fid)))?;
 
     if func.is_declaration() {
         return writeln!(f);
@@ -398,20 +406,26 @@ fn write_inst<W: fmt::Write>(
             write!(f, " align {align} : ")?;
             write_type(f, module, data.ty)
         }
-        InstKind::Load { ty, align, volatile } => {
+        InstKind::Load { ty, align, volatile, secret } => {
             write!(f, "load ")?;
             if *volatile {
                 write!(f, "volatile ")?;
+            }
+            if *secret {
+                write!(f, "secret ")?;
             }
             op(f, ops[0])?;
             write!(f, " align {align} : ")?;
             write_type(f, module, *ty)
         }
-        InstKind::Store { ty, align, volatile } => {
+        InstKind::Store { ty, align, volatile, secret } => {
             // operands are [ptr, value]; print value first for readability.
             write!(f, "store ")?;
             if *volatile {
                 write!(f, "volatile ")?;
+            }
+            if *secret {
+                write!(f, "secret ")?;
             }
             op(f, ops[1])?;
             write!(f, ", ")?;
@@ -477,6 +491,12 @@ fn write_inst<W: fmt::Write>(
         }
         InstKind::Freeze => {
             write!(f, "freeze ")?;
+            op(f, ops[0])?;
+            write!(f, " : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::Declassify => {
+            write!(f, "declassify ")?;
             op(f, ops[0])?;
             write!(f, " : ")?;
             write_type(f, module, data.ty)
@@ -633,7 +653,14 @@ fn write_const<W: fmt::Write>(
     }
 }
 
-fn write_signature<W: fmt::Write>(f: &mut W, module: &Module, sig: TypeId) -> fmt::Result {
+/// Write a signature, marking `secret` parameters and return (a function
+/// header's [`FuncAttrs`]).
+fn write_signature_attrs<W: fmt::Write>(
+    f: &mut W,
+    module: &Module,
+    sig: TypeId,
+    attrs: Option<&FuncAttrs>,
+) -> fmt::Result {
     let Type::Func(ft) = module.types().get(sig) else {
         // A non-Func signature should not occur; print defensively.
         write!(f, "(<bad-sig>) -> ")?;
@@ -643,6 +670,9 @@ fn write_signature<W: fmt::Write>(f: &mut W, module: &Module, sig: TypeId) -> fm
     for (i, &p) in ft.params.iter().enumerate() {
         if i > 0 {
             write!(f, ", ")?;
+        }
+        if attrs.is_some_and(|a| a.is_param_secret(i)) {
+            write!(f, "secret ")?;
         }
         write_type(f, module, p)?;
     }
@@ -654,6 +684,9 @@ fn write_signature<W: fmt::Write>(f: &mut W, module: &Module, sig: TypeId) -> fm
         }
     }
     write!(f, ") -> ")?;
+    if attrs.is_some_and(|a| a.secret_ret) {
+        write!(f, "secret ")?;
+    }
     write_type(f, module, ft.ret)
 }
 
@@ -1141,8 +1174,10 @@ enum OpAst {
     Alloca(TypeId),
     DynAlloca(u32, Operand),
     Syscall(Vec<Operand>),
-    Load(TypeId, u32, bool, Operand),
-    Store(TypeId, u32, bool, Operand, Operand),
+    /// `(ty, align, volatile, secret, ptr)`.
+    Load(TypeId, u32, bool, bool, Operand),
+    /// `(ty, align, volatile, secret, value, ptr)`.
+    Store(TypeId, u32, bool, bool, Operand, Operand),
     AtomicLoad(TypeId, u32, AtomicOrdering, Operand),
     AtomicStore(TypeId, u32, AtomicOrdering, Operand, Operand),
     AtomicRmw(RmwOp, TypeId, u32, AtomicOrdering, Operand, Operand),
@@ -1151,6 +1186,7 @@ enum OpAst {
     PtrAdd(bool, Operand, Operand),
     Select(Operand, Operand, Operand),
     Freeze(Operand),
+    Declassify(Operand),
     Call(Operand, Vec<Operand>, TypeId),
     Ret(Option<Operand>),
     Br(u32, Vec<Operand>),
@@ -1450,6 +1486,7 @@ impl Parser {
         (attrs.linkage, attrs.visibility) = self.parse_linkage_visibility();
         attrs.constant = self.eat_ident("constant");
         attrs.detached = self.eat_ident("detached");
+        attrs.secret = self.eat_ident("secret");
         let space = if self.eat_ident("addrspace") {
             self.expect(&TokKind::LParen, "`(`")?;
             let space = self.parse_u32()?;
@@ -1480,11 +1517,12 @@ impl Parser {
         let decl_line = self.lines.line_of(func_kw.start);
         let (linkage, visibility) = self.parse_linkage_visibility();
         let name = self.parse_name()?;
-        let (params, ret, variadic) = self.parse_fn_sig(module)?;
+        let mut attrs = FuncAttrs::new(linkage, visibility);
+        let (params, ret, variadic) = self.parse_fn_sig_attrs(module, Some(&mut attrs))?;
         let sig = module.types_mut().func(params, ret, variadic);
         let sym = syms.intern(&name);
         let fid = module.declare_function(sym, sig);
-        module.set_func_attrs(fid, FuncAttrs { linkage, visibility });
+        module.set_func_attrs(fid, attrs);
         func_names.insert(name, fid);
 
         let body = if matches!(self.peek_kind(), TokKind::LBrace) {
@@ -1516,6 +1554,16 @@ impl Parser {
     }
 
     fn parse_fn_sig(&mut self, module: &mut Module) -> PResult<(Vec<TypeId>, TypeId, bool)> {
+        self.parse_fn_sig_attrs(module, None)
+    }
+
+    /// Parse a signature; with `attrs` (a function header), a `secret` keyword
+    /// may precede each parameter type and the return type.
+    fn parse_fn_sig_attrs(
+        &mut self,
+        module: &mut Module,
+        mut attrs: Option<&mut FuncAttrs>,
+    ) -> PResult<(Vec<TypeId>, TypeId, bool)> {
         self.expect(&TokKind::LParen, "`(`")?;
         let mut params = Vec::new();
         let mut variadic = false;
@@ -1526,6 +1574,11 @@ impl Parser {
                     variadic = true;
                     break;
                 }
+                if let Some(a) = attrs.as_deref_mut()
+                    && self.eat_ident("secret")
+                {
+                    a.set_param_secret(params.len(), true);
+                }
                 params.push(self.parse_type(module)?);
                 if self.eat(&TokKind::Comma) {
                     continue;
@@ -1535,6 +1588,11 @@ impl Parser {
         }
         self.expect(&TokKind::RParen, "`)`")?;
         self.expect(&TokKind::Arrow, "`->`")?;
+        if let Some(a) = attrs
+            && self.eat_ident("secret")
+        {
+            a.secret_ret = true;
+        }
         let ret = self.parse_type(module)?;
         Ok((params, ret, variadic))
     }
@@ -1660,17 +1718,19 @@ impl Parser {
             }
             "load" => {
                 let volatile = self.eat_ident("volatile");
+                let secret = self.eat_ident("secret");
                 let ptr = self.parse_operand(module)?;
                 let (align, ty) = self.parse_align_type(module)?;
-                Ok(OpAst::Load(ty, align, volatile, ptr))
+                Ok(OpAst::Load(ty, align, volatile, secret, ptr))
             }
             "store" => {
                 let volatile = self.eat_ident("volatile");
+                let secret = self.eat_ident("secret");
                 let val = self.parse_operand(module)?;
                 self.expect(&TokKind::Comma, "`,`")?;
                 let ptr = self.parse_operand(module)?;
                 let (align, ty) = self.parse_align_type(module)?;
-                Ok(OpAst::Store(ty, align, volatile, val, ptr))
+                Ok(OpAst::Store(ty, align, volatile, secret, val, ptr))
             }
             "atomic_load" => {
                 let ordering = self.parse_ordering()?;
@@ -1733,6 +1793,12 @@ impl Parser {
                 self.expect(&TokKind::Colon, "`:`")?;
                 let _ty = self.parse_type(module)?;
                 Ok(OpAst::Freeze(v))
+            }
+            "declassify" => {
+                let v = self.parse_operand(module)?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let _ty = self.parse_type(module)?;
+                Ok(OpAst::Declassify(v))
             }
             "call" => {
                 let callee = self.parse_operand(module)?;
@@ -2230,15 +2296,17 @@ fn emit_inst(
             let nv = resolve_operand(b, n, names, func_names, global_names)?;
             Some(b.dyn_alloca(nv, *align))
         }
-        OpAst::Load(ty, align, volatile, ptr) => {
+        OpAst::Load(ty, align, volatile, secret, ptr) => {
             let p = resolve_operand(b, ptr, names, func_names, global_names)?;
-            let kind = InstKind::Load { ty: *ty, align: *align, volatile: *volatile };
+            let kind =
+                InstKind::Load { ty: *ty, align: *align, volatile: *volatile, secret: *secret };
             b.append_inst(kind, vec![p], Flags::NONE, Some(*ty))
         }
-        OpAst::Store(ty, align, volatile, val, ptr) => {
+        OpAst::Store(ty, align, volatile, secret, val, ptr) => {
             let v = resolve_operand(b, val, names, func_names, global_names)?;
             let p = resolve_operand(b, ptr, names, func_names, global_names)?;
-            let kind = InstKind::Store { ty: *ty, align: *align, volatile: *volatile };
+            let kind =
+                InstKind::Store { ty: *ty, align: *align, volatile: *volatile, secret: *secret };
             b.append_inst(kind, vec![p, v], Flags::NONE, None)
         }
         // The atomics carry an explicit alignment in text, so they are built
@@ -2287,6 +2355,10 @@ fn emit_inst(
         OpAst::Freeze(v) => {
             let val = resolve_operand(b, v, names, func_names, global_names)?;
             Some(b.freeze(val))
+        }
+        OpAst::Declassify(v) => {
+            let val = resolve_operand(b, v, names, func_names, global_names)?;
+            Some(b.declassify(val))
         }
         OpAst::Call(callee, args, ret) => {
             let cv = resolve_operand(b, callee, names, func_names, global_names)?;
@@ -2930,10 +3002,10 @@ entry ^0:
         let parsed = round_trip(&m, &mut syms);
         assert_eq!(parsed.global_attrs(GlobalId::from_index(0)).visibility, Visibility::Hidden);
         assert_eq!(parsed.global_attrs(GlobalId::from_index(1)).visibility, Visibility::Protected);
-        let attrs: Vec<FuncAttrs> = parsed.functions().map(|f| f.attrs).collect();
-        assert_eq!(attrs[0], FuncAttrs { linkage: Linkage::Weak, visibility: Visibility::Hidden });
-        assert_eq!(attrs[1], FuncAttrs { linkage: Linkage::Internal, visibility: Visibility::Default });
-        assert_eq!(attrs[2], FuncAttrs { linkage: Linkage::External, visibility: Visibility::Hidden });
+        let attrs: Vec<FuncAttrs> = parsed.functions().map(|f| f.attrs.clone()).collect();
+        assert_eq!(attrs[0], FuncAttrs::new(Linkage::Weak, Visibility::Hidden));
+        assert_eq!(attrs[1], FuncAttrs::new(Linkage::Internal, Visibility::Default));
+        assert_eq!(attrs[2], FuncAttrs::new(Linkage::External, Visibility::Hidden));
     }
 
     #[test]

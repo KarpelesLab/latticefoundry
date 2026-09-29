@@ -510,7 +510,7 @@ impl TargetIsel for VirtualTarget {
                     ],
                 ));
             }
-            InstKind::Freeze => {
+            InstKind::Freeze | InstKind::Declassify => {
                 let d = lo.result_reg(inst);
                 let s = lo.reg(inst.operands()[0]);
                 lo.emit(self.emit_move(Reg::Virtual(d), Reg::Virtual(s)));

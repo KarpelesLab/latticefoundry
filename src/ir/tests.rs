@@ -323,6 +323,202 @@ pub(crate) fn atomics_module(syms: &mut StrInterner) -> Module {
         .unwrap_or_else(|e| panic!("parse ATOMICS_LF: {e:?}"))
 }
 
+/// A module exercising every secrecy spelling (`docs/ir-design.md` §6d):
+/// secret globals, secret parameters and returns on a definition and on a
+/// declaration, secret (and volatile secret) loads and stores, and
+/// `declassify`.
+pub(crate) const SECRET_LF: &str = r#"
+module "secret"
+
+global secret @key : [4 x i64] = [4 x i64] (i64 1, i64 2, i64 3, i64 4)
+
+global internal constant secret @k2 : i64 = i64 7
+
+func @ext(secret i64, ptr) -> secret i64
+
+func @f(secret i64, i64, ptr) -> secret i64 {
+entry ^0(%s: i64, %p: i64, %q: ptr):
+  %a = load secret %q align 8 : i64
+  %b = load volatile secret %q align 8 : i64
+  store secret %a, %q align 8 : i64
+  store volatile secret %b, %q align 8 : i64
+  %x = add %s, %a : i64
+  %c = icmp eq %p, i64 0 : i1
+  %y = select %c, %x, %b : i64
+  %d = declassify %y : i64
+  %e = add %d, i64 1 : i64
+  %z = call @ext(%y, %q) : i64
+  ret %z
+}
+"#;
+
+/// Parse [`SECRET_LF`] (panicking on a parse error).
+pub(crate) fn secret_module(syms: &mut StrInterner) -> Module {
+    crate::ir::text::parse_module(SECRET_LF, crate::support::diagnostics::FileId::new(0), syms)
+        .unwrap_or_else(|e| panic!("parse SECRET_LF: {e:?}"))
+}
+
+#[test]
+fn secrecy_attributes_parse_and_round_trip() {
+    use crate::ir::{FuncId, GlobalId};
+    let mut syms = StrInterner::new();
+    let m = secret_module(&mut syms);
+    crate::verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    assert!(m.has_secrets());
+    assert!(m.global_attrs(GlobalId::from_index(0)).secret);
+    let k2 = m.global_attrs(GlobalId::from_index(1));
+    assert!(k2.secret && k2.constant && k2.linkage == crate::ir::Linkage::Internal);
+    let ext = m.func_attrs(FuncId::from_index(0));
+    assert!(ext.is_param_secret(0) && !ext.is_param_secret(1) && ext.secret_ret);
+    let f = m.func_attrs(FuncId::from_index(1));
+    assert_eq!(f.secret_params().collect::<Vec<_>>(), [0]);
+    assert!(f.secret_ret);
+
+    // Text: canonical and idempotent.
+    let text = crate::ir::text::print_module(&m, &syms);
+    for needle in [
+        "global secret @key",
+        "global internal constant secret @k2",
+        "func @ext(secret i64, ptr) -> secret i64\n",
+        "func @f(secret i64, i64, ptr) -> secret i64 {",
+        "= load secret %2 align 8 : i64",
+        "= load volatile secret %2 align 8 : i64",
+        "store secret %3, %2 align 8 : i64",
+        "store volatile secret %4, %2 align 8 : i64",
+        "= declassify %7 : i64",
+    ] {
+        assert!(text.contains(needle), "missing `{needle}` in\n{text}");
+    }
+    let file = crate::support::diagnostics::FileId::new(0);
+    let again = crate::ir::text::parse_module(&text, file, &mut syms).expect("reparse");
+    assert_eq!(crate::ir::text::print_module(&again, &syms), text);
+
+    // Binary: stable bytes, and the decoded module is the original.
+    let bytes = crate::ir::binary::encode(&m, &syms);
+    let mut back = StrInterner::new();
+    let m2 = crate::ir::binary::decode(&bytes, &mut back).expect("decode");
+    assert_eq!(crate::ir::binary::encode(&m2, &back), bytes);
+    assert_eq!(crate::ir::text::print_module(&m2, &back), text);
+
+    // A module without secrets reports none.
+    let plain = atomics_module(&mut syms);
+    assert!(!plain.has_secrets());
+}
+
+#[test]
+fn secrecy_combines_with_linkage_visibility_and_address_spaces() {
+    use crate::ir::{FuncId, GlobalId, Linkage, Visibility};
+    let src = r#"module "combo"
+
+global internal hidden constant secret addrspace(1) @a : i64 = i64 1
+
+global weak protected secret @b : i64 = i64 2
+
+global secret addrspace(2) @c : i64
+
+global hidden detached secret @d : i64 = i64 4
+
+func weak protected @f(secret i64, ptr, secret i64) -> secret i64
+
+func internal hidden @g(i64) -> secret i64 {
+entry ^0(%x: i64):
+  ret %x
+}
+
+func protected @h(secret i64) -> i64
+
+func internal @k() -> void {
+entry ^0:
+  ret
+}
+"#;
+    let mut syms = StrInterner::new();
+    let file = crate::support::diagnostics::FileId::new(0);
+    let m = crate::ir::text::parse_module(src, file, &mut syms).expect("parse");
+    let a = m.global_attrs(GlobalId::from_index(0));
+    assert!(a.secret && a.constant && a.linkage == Linkage::Internal);
+    assert_eq!(a.visibility, Visibility::Hidden);
+    assert_eq!(m.global_addr_space(GlobalId::from_index(0)), 1);
+    assert!(m.global_attrs(GlobalId::from_index(1)).secret);
+    assert_eq!(m.global_addr_space(GlobalId::from_index(2)), 2);
+    assert!(m.global_attrs(GlobalId::from_index(3)).detached);
+    let f = m.func_attrs(FuncId::from_index(0));
+    assert_eq!((f.linkage, f.visibility), (Linkage::Weak, Visibility::Protected));
+    assert_eq!(f.secret_params().collect::<Vec<_>>(), [0, 2]);
+    assert!(f.secret_ret);
+    let g = m.func_attrs(FuncId::from_index(1));
+    assert_eq!((g.linkage, g.visibility, g.secret_ret), (Linkage::Internal, Visibility::Hidden, true));
+    assert!(!m.func_attrs(FuncId::from_index(3)).has_secrets());
+
+    // The printer writes every combination back in the canonical order.
+    let text = crate::ir::text::print_module(&m, &syms);
+    for needle in [
+        "global internal hidden constant secret addrspace(1) @a : i64 = i64 1",
+        "global weak protected secret @b",
+        "global secret addrspace(2) @c : i64\n",
+        "global hidden detached secret @d",
+        "func weak protected @f(secret i64, ptr, secret i64) -> secret i64\n",
+        "func internal hidden @g(i64) -> secret i64 {",
+        "func protected @h(secret i64) -> i64\n",
+    ] {
+        assert!(text.contains(needle), "missing `{needle}` in\n{text}");
+    }
+    let again = crate::ir::text::parse_module(&text, file, &mut syms).expect("reparse");
+    assert_eq!(crate::ir::text::print_module(&again, &syms), text);
+
+    // And through the binary form.
+    let bytes = crate::ir::binary::encode(&m, &syms);
+    let mut back = StrInterner::new();
+    let m2 = crate::ir::binary::decode(&bytes, &mut back).expect("decode");
+    assert_eq!(crate::ir::text::print_module(&m2, &back), text);
+
+    // A functional rebuild keeps every attribute (linkage and secrecy alike).
+    let mut m = m;
+    let (fresh, ()) = m.map_function(FuncId::from_index(1), |old, b| {
+        let e = b.create_entry_block();
+        let _ = old;
+        let x = b.param(e, 0);
+        b.ret(Some(x));
+    });
+    assert_eq!(fresh.attrs, *m.func_attrs(FuncId::from_index(1)));
+}
+
+#[test]
+fn func_attrs_normalize() {
+    let mut a = crate::ir::FuncAttrs::default();
+    assert!(!a.has_secrets());
+    a.set_param_secret(3, true);
+    assert!(a.is_param_secret(3) && !a.is_param_secret(2) && !a.is_param_secret(9));
+    a.set_param_secret(3, false);
+    // Clearing the last secret parameter restores the default value.
+    assert_eq!(a, crate::ir::FuncAttrs::default());
+    a.set_param_secret(7, false);
+    assert_eq!(a, crate::ir::FuncAttrs::default());
+}
+
+#[test]
+fn secret_merge_keeps_the_union_of_secrecy() {
+    use crate::ir::FuncId;
+    let mut syms = StrInterner::new();
+    let file = crate::support::diagnostics::FileId::new(0);
+    // A declares `g` with a secret parameter; B defines it with a secret return.
+    let a = crate::ir::text::parse_module(
+        "module \"a\"\nfunc @g(secret i64, i64) -> i64\n",
+        file,
+        &mut syms,
+    )
+    .expect("parse a");
+    let b = crate::ir::text::parse_module(
+        "module \"b\"\nfunc @g(i64, i64) -> secret i64 {\nentry ^0(%x: i64, %y: i64):\n  ret %x\n}\n",
+        file,
+        &mut syms,
+    )
+    .expect("parse b");
+    let m = crate::ir::merge_modules(vec![a, b], "ab").expect("merge");
+    let g = m.func_attrs(FuncId::from_index(0));
+    assert!(g.is_param_secret(0) && !g.is_param_secret(1) && g.secret_ret);
+}
+
 #[test]
 fn atomics_fixture_verifies_and_carries_every_form() {
     let mut syms = StrInterner::new();

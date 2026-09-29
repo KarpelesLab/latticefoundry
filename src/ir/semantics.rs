@@ -271,6 +271,11 @@ pub fn eval(
         // propagates poison from any operand.
         InstKind::Select => eval_select(operands),
         InstKind::Freeze => eval_freeze(types, result_ty, operands),
+        // `declassify` is the identity (poison included).
+        InstKind::Declassify => match operands.first() {
+            Some(v) => EvalOutcome::Value(v.clone()),
+            None => EvalOutcome::UndefinedBehavior,
+        },
 
         _ if operands.iter().any(SemValue::is_poison) => EvalOutcome::Value(SemValue::Poison),
 

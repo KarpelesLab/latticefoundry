@@ -112,6 +112,7 @@ fn is_hoistable_kind(kind: &InstKind) -> bool {
         | InstKind::Cast(_)
         | InstKind::Select
         | InstKind::Freeze
+        | InstKind::Declassify
         | InstKind::PtrAdd { .. } => true,
         _ => false,
     }

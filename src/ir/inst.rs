@@ -583,6 +583,12 @@ pub enum InstKind {
     /// unused), duplicated, merged, widened or narrowed, hoisted or sunk,
     /// promoted to a register, or forwarded from a store, and its result is
     /// unknown to every analysis.
+    ///
+    /// A **secret** load (`load secret`) reads memory the front end declared
+    /// secret (Lode's `secret[T]`): its result is secret-derived for the
+    /// constant-time discipline (`docs/ir-design.md` §6d). The flag has no
+    /// effect on the value semantics; it only feeds the secret-taint analysis
+    /// and the constant-time verifier.
     Load {
         /// The type read from memory (the result type).
         ty: TypeId,
@@ -590,12 +596,21 @@ pub enum InstKind {
         align: u32,
         /// Whether the access is volatile (see above).
         volatile: bool,
+        /// Whether the loaded value is secret (see above).
+        secret: bool,
     },
     /// Store a value to memory; operands `[ptr, value]`. No result. Storing
     /// through a poison/dangling pointer or under-aligned is undefined behavior.
     /// A **volatile** store (`store volatile`) obeys the same rules as a volatile
     /// load: performed exactly once, at exactly its width, in order, and never
     /// removed, not even when a later store overwrites it.
+    ///
+    /// A **secret** store (`store secret`) writes memory the front end declared
+    /// secret. It is how a secret-derived value may be written through a
+    /// pointer that is not a function-local stack slot (a parameter, a loaded
+    /// pointer, a non-secret global): the constant-time verifier rejects an
+    /// unflagged store of a secret-derived value there (§6d). No effect on the
+    /// value semantics.
     Store {
         /// The type written to memory (the type of the stored value).
         ty: TypeId,
@@ -603,6 +618,8 @@ pub enum InstKind {
         align: u32,
         /// Whether the access is volatile (see [`InstKind::Load`]).
         volatile: bool,
+        /// Whether the destination is secret memory (see above).
+        secret: bool,
     },
     /// Atomic load; operand `[ptr]`, result type = `ty` (`i8`/`i16`/`i32`/`i64`
     /// or `ptr`). Sequentially it reads `ty` from `ptr` exactly like `load`; the
@@ -697,6 +714,15 @@ pub enum InstKind {
     /// the operand unchanged. This is the only way to remove poison. Result type
     /// = instruction type. (There is no `undef`.)
     Freeze,
+    /// `declassify`; operand `[val]`. The identity on values (poison stays
+    /// poison): result = the operand, result type = instruction type = the
+    /// operand's type. It is the **explicit end of secrecy** (Lode's escape
+    /// hatch for `secret[T]`): its result is public for the constant-time
+    /// discipline (`docs/ir-design.md` §6d) even when its operand is
+    /// secret-derived, so it may then be branched on, used as an address or
+    /// divided. A pass must never replace a `declassify` result by its operand
+    /// (that would re-expose the secret); folding it to a *constant* is fine.
+    Declassify,
     /// Function call; operands `[callee, args...]`. `callee` is a function
     /// reference or a pointer; the rest are the arguments in order. Result type
     /// = the callee's return type (`void` for a procedure). Effects and poison

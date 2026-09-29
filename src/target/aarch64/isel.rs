@@ -1461,7 +1461,7 @@ impl TargetIsel for AArch64Target {
                     vec![def_v(d), use_v(c), use_v(t), use_v(f)],
                 ));
             }
-            InstKind::Freeze => {
+            InstKind::Freeze | InstKind::Declassify => {
                 let d = lo.result_reg(inst);
                 let s = lo.reg(inst.operands()[0]);
                 lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));

@@ -164,6 +164,8 @@ impl Module {
                     let vis = other.global_attrs[gi].visibility;
                     let a = &mut self.global_attrs[i];
                     a.visibility = a.visibility.most_constraining(vis);
+                    // So does secrecy: either side's `secret` sticks.
+                    a.secret |= other.global_attrs[gi].secret;
                     existing
                 }
                 None => {
@@ -213,11 +215,19 @@ impl Module {
                         cur.linkage = f.attrs.linkage;
                     }
                     cur.visibility = cur.visibility.most_constraining(f.attrs.visibility);
+                    // Secrecy is part of the interface: the merged function
+                    // keeps every parameter / return either side declared
+                    // secret (the conservative union; linking never drops a
+                    // secret).
+                    cur.secret_ret |= f.attrs.secret_ret;
+                    for p in f.attrs.secret_params() {
+                        cur.set_param_secret(p, true);
+                    }
                     existing
                 }
                 None => {
                     let id = self.declare_function(f.name, sig);
-                    self.functions[id.index()].attrs = f.attrs;
+                    self.functions[id.index()].attrs = f.attrs.clone();
                     self_funcs.insert(f.name, id);
                     if incoming_def {
                         to_install.push((i, id));
@@ -240,9 +250,11 @@ impl Module {
             let cur = &mut self.globals[target.index()];
             cur.ty = type_map[g.ty.index()];
             cur.init = g.init.map(|c| const_map[c.index()]);
-            let vis = self.global_attrs[target.index()].visibility;
+            let prev = self.global_attrs[target.index()];
             let mut attrs = other.global_attrs[gi];
-            attrs.visibility = attrs.visibility.most_constraining(vis);
+            attrs.visibility = attrs.visibility.most_constraining(prev.visibility);
+            // A global either side declares secret stays secret.
+            attrs.secret |= prev.secret;
             self.global_attrs[target.index()] = attrs;
             self.global_addr_space[target.index()] = other.global_addr_space[gi];
         }
@@ -252,7 +264,7 @@ impl Module {
             let src = &other.functions[src_idx];
             let mut body = copy_body(src, &type_map, &const_map, &global_map, &func_map);
             // Keep the attributes resolved in step 2b.
-            body.attrs = self.functions[target.index()].attrs;
+            body.attrs = self.functions[target.index()].attrs.clone();
             self.functions[target.index()] = body;
         }
 
@@ -393,11 +405,11 @@ fn remap_inst(inst: &InstData, type_map: &[TypeId]) -> InstData {
     let m = |ty: &TypeId| type_map[ty.index()];
     new.kind = match &inst.kind {
         InstKind::Alloca { elem_ty } => InstKind::Alloca { elem_ty: m(elem_ty) },
-        InstKind::Load { ty, align, volatile } => {
-            InstKind::Load { ty: m(ty), align: *align, volatile: *volatile }
+        InstKind::Load { ty, align, volatile, secret } => {
+            InstKind::Load { ty: m(ty), align: *align, volatile: *volatile, secret: *secret }
         }
-        InstKind::Store { ty, align, volatile } => {
-            InstKind::Store { ty: m(ty), align: *align, volatile: *volatile }
+        InstKind::Store { ty, align, volatile, secret } => {
+            InstKind::Store { ty: m(ty), align: *align, volatile: *volatile, secret: *secret }
         }
         InstKind::AtomicLoad { ty, align, ordering } => {
             InstKind::AtomicLoad { ty: m(ty), align: *align, ordering: *ordering }

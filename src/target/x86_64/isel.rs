@@ -1701,7 +1701,7 @@ impl TargetIsel for X86_64Target {
                     vec![def_v(d), use_v(d), use_v(t)],
                 ));
             }
-            InstKind::Freeze => {
+            InstKind::Freeze | InstKind::Declassify => {
                 let d = lo.result_reg(inst);
                 let s = self.oper(lo, inst.operands()[0]);
                 lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));

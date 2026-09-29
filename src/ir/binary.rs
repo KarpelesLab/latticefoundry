@@ -85,7 +85,30 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 ///   `ptr addrspace(N)` type (tag 7) needs no bump, as older streams never
 ///   contain it. Version-1/2/3 streams still decode, with no target, the LP64
 ///   layout and every global in space 0.
-pub const VERSION: u32 = 4;
+/// - **5** — secrecy (`docs/ir-design.md` §6d). Bit 7 of both the global and
+///   the function attribute byte now says an **extension varint** of further
+///   flags follows (after the address space, for a global), so attribute
+///   bytes never run out of bits again. Global extension bit 0 is `secret`;
+///   function extension bit 0 is a secret return and bit 1 says a secret
+///   parameter list follows (a count, then ascending parameter indices).
+///   Unknown extension bits are rejected. Secret loads/stores and
+///   `declassify` use new opcode tags 26/27/28. A module without secrets
+///   encodes exactly as in version 4 apart from the version number;
+///   version-1..4 streams still decode, with nothing secret.
+pub const VERSION: u32 = 5;
+
+/// Bit 7 of a (version ≥ 5) global or function attribute byte: an extension
+/// varint of further attribute flags follows.
+const ATTR_EXT_BIT: u8 = 0x80;
+
+/// Global extension flag: the global is `secret`.
+const GLOBAL_EXT_SECRET: u64 = 1;
+
+/// Function extension flag: the return value is `secret`.
+const FUNC_EXT_SECRET_RET: u64 = 1;
+
+/// Function extension flag: a secret-parameter list follows.
+const FUNC_EXT_SECRET_PARAMS: u64 = 2;
 
 /// The oldest format version [`decode`] still reads.
 pub const MIN_VERSION: u32 = 1;
@@ -653,9 +676,20 @@ pub fn encode(module: &Module, names: &StrInterner) -> Vec<u8> {
         }
         let gid = GlobalId::from_index(gi);
         let space = module.global_addr_space(gid);
-        w.u8(attrs_bits(module.global_attrs(gid)) | if space != 0 { ADDR_SPACE_BIT } else { 0 });
+        let gattrs = module.global_attrs(gid);
+        let mut byte = attrs_bits(gattrs);
+        if space != 0 {
+            byte |= ADDR_SPACE_BIT;
+        }
+        if gattrs.secret {
+            byte |= ATTR_EXT_BIT;
+        }
+        w.u8(byte);
         if space != 0 {
             w.uvarint(u64::from(space));
+        }
+        if gattrs.secret {
+            w.uvarint(GLOBAL_EXT_SECRET);
         }
     }
 
@@ -825,13 +859,68 @@ fn attrs_from_bits(b: u8) -> Result<GlobalAttrs, DecodeError> {
     if b & !0b11_1111 != 0 {
         return Err(bad());
     }
-    Ok(GlobalAttrs { linkage, visibility, constant: b & 4 != 0, detached: b & 8 != 0 })
+    Ok(GlobalAttrs { linkage, visibility, constant: b & 4 != 0, detached: b & 8 != 0, secret: false })
 }
 
 /// Pack a function's attributes into one byte: linkage in bits 0–1, visibility
-/// in bits 2–3 (same codes as [`attrs_bits`]).
-fn func_attrs_bits(a: FuncAttrs) -> u8 {
+/// in bits 2–3 (same codes as [`attrs_bits`]). (Bit 7, [`ATTR_EXT_BIT`], is
+/// added by the encoder from version 5 when the function has secrets.)
+fn func_attrs_bits(a: &FuncAttrs) -> u8 {
     linkage_code(a.linkage) | (visibility_code(a.visibility) << 2)
+}
+
+/// Write the version-5 function attributes: the attribute byte, and when
+/// anything is secret the extension varint (plus the secret-parameter list).
+fn write_func_attrs(w: &mut Writer, a: &FuncAttrs) {
+    if !a.has_secrets() {
+        w.u8(func_attrs_bits(a));
+        return;
+    }
+    w.u8(func_attrs_bits(a) | ATTR_EXT_BIT);
+    let params: Vec<usize> = a.secret_params().collect();
+    let mut ext = 0;
+    if a.secret_ret {
+        ext |= FUNC_EXT_SECRET_RET;
+    }
+    if !params.is_empty() {
+        ext |= FUNC_EXT_SECRET_PARAMS;
+    }
+    w.uvarint(ext);
+    if !params.is_empty() {
+        w.uvarint(params.len() as u64);
+        for p in params {
+            w.uvarint(p as u64);
+        }
+    }
+}
+
+/// Read a function's attributes as written for `version` (none before 3; the
+/// extension from 5). `arity` bounds the secret-parameter indices.
+fn read_func_attrs(r: &mut Reader<'_>, version: u64, arity: usize) -> Result<FuncAttrs, DecodeError> {
+    if version < 3 {
+        return Ok(FuncAttrs::DEFAULT);
+    }
+    let b = r.u8()?;
+    let has_ext = version >= 5 && b & ATTR_EXT_BIT != 0;
+    let mut attrs = func_attrs_from_bits(if version >= 5 { b & !ATTR_EXT_BIT } else { b })?;
+    if has_ext {
+        let ext = r.uvarint()?;
+        if ext & !(FUNC_EXT_SECRET_RET | FUNC_EXT_SECRET_PARAMS) != 0 {
+            return Err(DecodeError::InvalidTag {
+                what: "func-attrs extension",
+                tag: u32::try_from(ext).unwrap_or(u32::MAX),
+            });
+        }
+        attrs.secret_ret = ext & FUNC_EXT_SECRET_RET != 0;
+        if ext & FUNC_EXT_SECRET_PARAMS != 0 {
+            let n = r.uindex()?;
+            for _ in 0..n {
+                let p = checked(r.uindex()?, arity, "parameter")?;
+                attrs.set_param_secret(p, true);
+            }
+        }
+    }
+    Ok(attrs)
 }
 
 fn func_attrs_from_bits(b: u8) -> Result<FuncAttrs, DecodeError> {
@@ -841,13 +930,13 @@ fn func_attrs_from_bits(b: u8) -> Result<FuncAttrs, DecodeError> {
     if b & !0b1111 != 0 {
         return Err(bad());
     }
-    Ok(FuncAttrs { linkage, visibility })
+    Ok(FuncAttrs::new(linkage, visibility))
 }
 
 fn write_function(w: &mut Writer, f: &Function, names: &StrInterner, t: &Tables) {
     w.str(names.resolve(f.name));
     w.uvarint(t.ty(f.sig));
-    w.u8(func_attrs_bits(f.attrs));
+    write_func_attrs(w, &f.attrs);
 
     // Value table.
     w.uvarint(f.value_count() as u64);
@@ -968,16 +1057,31 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
         }
         // A volatile access has its own tag (19/20) with the same payload, so
         // streams without one keep the original bytes (no version bump).
-        InstKind::Load { ty, align, volatile } => {
+        InstKind::Load { ty, align, volatile, secret: false } => {
             w.u8(if *volatile { 19 } else { 6 });
             w.uvarint(t.ty(*ty));
             w.uvarint(u64::from(*align));
         }
-        InstKind::Store { ty, align, volatile } => {
+        InstKind::Store { ty, align, volatile, secret: false } => {
             w.u8(if *volatile { 20 } else { 7 });
             w.uvarint(t.ty(*ty));
             w.uvarint(u64::from(*align));
         }
+        // A secret access has its own tag (26/27) with a trailing volatile
+        // byte, so streams without secrets keep their bytes (no version bump).
+        InstKind::Load { ty, align, volatile, secret: true } => {
+            w.u8(26);
+            w.uvarint(t.ty(*ty));
+            w.uvarint(u64::from(*align));
+            w.u8(u8::from(*volatile));
+        }
+        InstKind::Store { ty, align, volatile, secret: true } => {
+            w.u8(27);
+            w.uvarint(t.ty(*ty));
+            w.uvarint(u64::from(*align));
+            w.u8(u8::from(*volatile));
+        }
+        InstKind::Declassify => w.u8(28),
         InstKind::AtomicLoad { ty, align, ordering } => {
             w.u8(21);
             w.uvarint(t.ty(*ty));
@@ -1110,7 +1214,20 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
         let (attrs, space) = if version >= 2 {
             let b = r.u8()?;
             let space = if version >= 4 && b & ADDR_SPACE_BIT != 0 { r.u32()? } else { 0 };
-            (attrs_from_bits(if version >= 4 { b & !ADDR_SPACE_BIT } else { b })?, space)
+            let has_ext = version >= 5 && b & ATTR_EXT_BIT != 0;
+            let low = if version >= 5 { b & !ATTR_EXT_BIT } else { b };
+            let mut attrs = attrs_from_bits(if version >= 4 { low & !ADDR_SPACE_BIT } else { low })?;
+            if has_ext {
+                let ext = r.uvarint()?;
+                if ext & !GLOBAL_EXT_SECRET != 0 {
+                    return Err(DecodeError::InvalidTag {
+                        what: "global-attrs extension",
+                        tag: u32::try_from(ext).unwrap_or(u32::MAX),
+                    });
+                }
+                attrs.secret = ext & GLOBAL_EXT_SECRET != 0;
+            }
+            (attrs, space)
         } else {
             (GlobalAttrs::DEFAULT, 0)
         };
@@ -1121,7 +1238,8 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
     // --- functions ---
     let nfuncs = r.uindex()?;
     for _ in 0..nfuncs {
-        let f = read_function(&mut r, names, &types, &consts, nglobals, nfuncs, version)?;
+        let f =
+            read_function(&mut r, names, module.types(), &types, &consts, nglobals, nfuncs, version)?;
         module.functions.push(f);
     }
 
@@ -1244,9 +1362,11 @@ fn to_arr<const N: usize>(slice: &[u8]) -> [u8; N] {
     arr
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_function(
     r: &mut Reader<'_>,
     names: &mut StrInterner,
+    tcx: &crate::ir::TypeContext,
     types: &[TypeId],
     consts: &[ConstId],
     nglobals: usize,
@@ -1257,9 +1377,12 @@ fn read_function(
     let sig = types[checked(r.uindex()?, types.len(), "type")?];
 
     let mut f = Function::new(name, sig);
-    if version >= 3 {
-        f.attrs = func_attrs_from_bits(r.u8()?)?;
-    }
+    // A secret parameter index is bounded by the signature's arity.
+    let arity = match tcx.get(sig) {
+        Type::Func(ft) => ft.params.len(),
+        _ => 0,
+    };
+    f.attrs = read_func_attrs(r, version, arity)?;
 
     // Value table.
     let nvals = r.uindex()?;
@@ -1388,13 +1511,28 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
         tag @ (6 | 19) => {
             let ty = ty(r)?;
             let align = r.u32()?;
-            InstKind::Load { ty, align, volatile: tag == 19 }
+            InstKind::Load { ty, align, volatile: tag == 19, secret: false }
         }
         tag @ (7 | 20) => {
             let ty = ty(r)?;
             let align = r.u32()?;
-            InstKind::Store { ty, align, volatile: tag == 20 }
+            InstKind::Store { ty, align, volatile: tag == 20, secret: false }
         }
+        tag @ (26 | 27) => {
+            let ty = ty(r)?;
+            let align = r.u32()?;
+            let volatile = match r.u8()? {
+                0 => false,
+                1 => true,
+                t => return Err(DecodeError::InvalidTag { what: "volatile", tag: u32::from(t) }),
+            };
+            if tag == 26 {
+                InstKind::Load { ty, align, volatile, secret: true }
+            } else {
+                InstKind::Store { ty, align, volatile, secret: true }
+            }
+        }
+        28 => InstKind::Declassify,
         8 => InstKind::PtrAdd { inbounds: r.u8()? != 0 },
         9 => InstKind::Select,
         10 => InstKind::Freeze,
@@ -1757,8 +1895,8 @@ mod tests {
             b.store(i32t, p, v, 4);
             b.ret(Some(v));
             (
-                crate::ir::InstKind::Load { ty: i32t, align: 4, volatile: false },
-                crate::ir::InstKind::Load { ty: i32t, align: 4, volatile: true },
+                crate::ir::InstKind::Load { ty: i32t, align: 4, volatile: false, secret: false },
+                crate::ir::InstKind::Load { ty: i32t, align: 4, volatile: true, secret: false },
             )
         };
         let mut type_index = DetHashMap::default();
@@ -1773,8 +1911,9 @@ mod tests {
         let bytes = encode(&m, &interner);
         assert_eq!(bytes[4], VERSION as u8);
         // Volatile/atomics needed no bump (version 2); version 4 is the
-        // target/data-layout header and per-global address spaces.
-        assert_eq!(VERSION, 4);
+        // target/data-layout header and per-global address spaces, version 5
+        // the attribute extensions (secrecy).
+        assert_eq!(VERSION, 5);
         let m2 = decode(&bytes, &mut interner).expect("decode");
         let func = m2.function(crate::ir::FuncId::from_index(0));
         assert!((0..func.inst_count()).all(|i| !func.inst(crate::ir::InstId::from_index(i)).kind.is_volatile()));
@@ -1937,13 +2076,13 @@ mod tests {
             m2.global_attrs(GlobalId::from_index(1)),
             GlobalAttrs { linkage: Linkage::Weak, visibility: Visibility::Protected, ..GlobalAttrs::DEFAULT }
         );
-        let attrs: Vec<FuncAttrs> = m2.functions().map(|f| f.attrs).collect();
+        let attrs: Vec<FuncAttrs> = m2.functions().map(|f| f.attrs.clone()).collect();
         assert_eq!(
             attrs,
             [
-                FuncAttrs { linkage: Linkage::Internal, visibility: Visibility::Default },
-                FuncAttrs { linkage: Linkage::Weak, visibility: Visibility::Hidden },
-                FuncAttrs { linkage: Linkage::External, visibility: Visibility::Protected },
+                FuncAttrs::new(Linkage::Internal, Visibility::Default),
+                FuncAttrs::new(Linkage::Weak, Visibility::Hidden),
+                FuncAttrs::new(Linkage::External, Visibility::Protected),
             ]
         );
         // Bad visibility bits are rejected, not misread.
@@ -2036,6 +2175,75 @@ mod tests {
         assert_eq!(encode(&m2, &interner), bytes, "re-encoding is byte-identical");
     }
 
+    /// Version 5: secrecy rides in the attribute-byte extensions (bit 7), next
+    /// to linkage, visibility and the address space; a secret-free module
+    /// encodes exactly as version 4 did (bar the version), and a v4 stream
+    /// still decodes; unknown extension bits and bit 7 in a v4 stream are
+    /// rejected.
+    #[test]
+    fn version_5_attribute_extensions() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("v5");
+        let i64t = m.types_mut().int(64);
+        let c = m.intern_const(Const::Int { ty: i64t, value: Int::from_i64(7) });
+        let gattrs = GlobalAttrs {
+            linkage: Linkage::Internal,
+            visibility: Visibility::Hidden,
+            constant: true,
+            secret: true,
+            ..GlobalAttrs::DEFAULT
+        };
+        let g = m.define_global(Global { name: interner.intern("k"), ty: i64t, init: Some(c) }, gattrs);
+        m.set_global_addr_space(g, 3);
+        let sig = m.types_mut().func(vec![i64t, i64t, i64t], i64t, false);
+        let f = m.declare_function(interner.intern("f"), sig);
+        let mut fattrs = FuncAttrs::new(Linkage::Weak, Visibility::Protected);
+        fattrs.set_param_secret(0, true);
+        fattrs.set_param_secret(2, true);
+        fattrs.secret_ret = true;
+        m.set_func_attrs(f, fattrs.clone());
+        let bytes = encode(&m, &interner);
+        let m2 = decode(&bytes, &mut interner).expect("decode");
+        assert_eq!(m2.global_attrs(GlobalId::from_index(0)), gattrs);
+        assert_eq!(m2.global_addr_space(GlobalId::from_index(0)), 3);
+        assert_eq!(m2.function(FuncId::from_index(0)).attrs, fattrs);
+        assert_eq!(encode(&m2, &interner), bytes);
+
+        // The function attribute byte carries bit 7, then the extension
+        // (secret return | parameter list), the count and the indices; the
+        // stream ends with the (empty) function's body header.
+        let fbyte = super::func_attrs_bits(&fattrs) | super::ATTR_EXT_BIT;
+        let tail = [fbyte, 3, 2, 0, 2];
+        let at = bytes.windows(tail.len()).rposition(|w| w == tail).expect("function attributes");
+        let mut bad = bytes.clone();
+        bad[at + 1] = 4; // an unknown function extension bit
+        assert!(decode(&bad, &mut interner).is_err());
+        let mut bad = bytes.clone();
+        bad[at + 4] = 3; // a secret parameter index past the arity
+        assert!(decode(&bad, &mut interner).is_err());
+        // The global: attribute byte with bits 6 and 7, space 3, extension 1.
+        let gbyte = super::attrs_bits(gattrs) | super::ADDR_SPACE_BIT | super::ATTR_EXT_BIT;
+        let at = bytes.windows(3).position(|w| w == [gbyte, 3, 1]).expect("global attributes");
+        let mut bad = bytes.clone();
+        bad[at + 2] = 2; // an unknown global extension bit
+        assert!(decode(&bad, &mut interner).is_err());
+
+        // Without secrets, v5 is v4 with a new version number; v4 still decodes.
+        m.set_func_attrs(f, FuncAttrs::new(Linkage::Weak, Visibility::Protected));
+        m.set_global_attrs(g, GlobalAttrs { secret: false, ..gattrs });
+        let mut v4 = encode(&m, &interner);
+        assert!(!v4.contains(&fbyte));
+        v4[4] = 4;
+        let m4 = decode(&v4, &mut interner).expect("v4 decodes");
+        assert!(!m4.has_secrets());
+        assert_eq!(m4.function(FuncId::from_index(0)).attrs.linkage, Linkage::Weak);
+        // In a v4 stream bit 7 is not an extension flag: it is rejected.
+        let mut bad = v4.clone();
+        let at = bad.iter().rposition(|&b| b == super::func_attrs_bits(&fattrs)).expect("byte");
+        bad[at] |= super::ATTR_EXT_BIT;
+        assert!(decode(&bad, &mut interner).is_err());
+    }
+
     /// Version-2 and version-3 streams (no target/layout header, no
     /// address-space bit) still decode, as LP64 modules with no target; a v3
     /// stream keeps its visibility and function attributes exactly.
@@ -2049,8 +2257,8 @@ mod tests {
         m.define_global(Global { name: interner.intern("g"), ty: i32t, init: Some(c) }, hidden);
         let sig = m.types_mut().func(vec![], i32t, false);
         let f = m.declare_function(interner.intern("f"), sig);
-        let fattrs = FuncAttrs { linkage: Linkage::Weak, visibility: Visibility::Protected };
-        m.set_func_attrs(f, fattrs);
+        let fattrs = FuncAttrs::new(Linkage::Weak, Visibility::Protected);
+        m.set_func_attrs(f, fattrs.clone());
         let v4 = encode(&m, &interner);
         // A master-v3 stream is the v4 stream without `<no target> <empty layout>`.
         assert_eq!(&v4[5..10], &[2, b'v', b'3', 0, 0]);
