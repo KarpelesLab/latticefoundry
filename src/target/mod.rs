@@ -8,6 +8,9 @@ pub mod aarch64;
 pub mod riscv;
 pub mod x86_64;
 
+#[cfg(test)]
+pub(crate) mod atomic_fixtures;
+
 /// A supported target architecture.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetArch {

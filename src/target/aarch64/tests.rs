@@ -1926,3 +1926,197 @@ entry ^0:
     let failing = failing_checks(code, &["shl i4 count", "ptr_add i32 offset"]);
     assert!(failing.is_empty(), "narrow shift count / offset mishandled: {failing:?} ({code:#b})");
 }
+
+// ===========================================================================
+// Atomics and volatile (ARMv8.0: ldar/stlr, ldxr/stxr loops, dmb)
+// ===========================================================================
+
+/// Every `llvm-mc` encoding in `asm` (multi-instruction, labels allowed),
+/// concatenated; `None` when `llvm-mc` is unavailable or rejects the input.
+fn llvm_mc_all(asm: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("llvm-mc")
+        .arg("--triple=aarch64")
+        .arg("--show-encoding")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(asm.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut bytes = Vec::new();
+    for line in text.lines() {
+        let Some(pos) = line.find("encoding: [") else { continue };
+        let start = pos + "encoding: [".len();
+        let end = line[start..].find(']')? + start;
+        for tok in line[start..end].split(',') {
+            // A fixup placeholder (`0bAAA...`) means an unresolved label.
+            bytes.push(u8::from_str_radix(tok.trim().trim_start_matches("0x"), 16).ok()?);
+        }
+    }
+    Some(bytes)
+}
+
+#[test]
+fn atomics_run_their_sequential_meaning_in_the_interpreter() {
+    use crate::target::atomic_fixtures::{CMPXCHG_SLOTS, rmw_cases, rmw_slot_program};
+    for bytes in [1, 2, 4, 8] {
+        let cases = rmw_cases(bytes);
+        let code = run_lf_main(&rmw_slot_program(&cases));
+        assert_eq!(code, 0, "i{}: case {:?}", 8 * bytes, cases.get((code as usize).wrapping_sub(1)));
+    }
+    assert_eq!(run_lf_main(CMPXCHG_SLOTS), 0, "cmpxchg failures: {:#b}", run_lf_main(CMPXCHG_SLOTS));
+}
+
+#[test]
+fn atomics_select_acquire_release_forms_and_barriers() {
+    use super::isel::A64Op;
+    use crate::codegen::mir::MachineOperand;
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(
+        crate::target::atomic_fixtures::ALL_FORMS,
+        crate::support::diagnostics::FileId::new(0),
+        &mut syms,
+    )
+    .expect("parse");
+    crate::verify::verify_module(&m).expect("verify");
+    let (_, funcs) = lower_all(&m);
+    let insts: Vec<_> = funcs[0].block_ids().flat_map(|b| funcs[0].block(b).insts.clone()).collect();
+    let of = |op: A64Op| insts.iter().filter(|i| A64Op::decode(i.opcode) == op).collect::<Vec<_>>();
+    let imm = |o: &MachineOperand| match o {
+        MachineOperand::Imm(v) => v.to_u64().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    // relaxed atomic_load + the volatile byte load; acquire + seq_cst loads.
+    assert_eq!(of(A64Op::Load).len(), 2);
+    assert_eq!(of(A64Op::LoadAcq).len(), 2);
+    // relaxed atomic_store + the volatile byte store; release + seq_cst stores.
+    assert_eq!(of(A64Op::Store).len(), 2);
+    assert_eq!(of(A64Op::StoreRel).len(), 2);
+    let dmbs: Vec<u64> = of(A64Op::Dmb).iter().map(|i| imm(&i.operands[0])).collect();
+    assert_eq!(dmbs, vec![0b1001, 0b1011, 0b1011, 0b1011], "ishld for acquire, ish otherwise");
+    // (size, acq|rel<<1) per rmw: relaxed, acquire, release, acq_rel, seq_cst, seq_cst i8.
+    let rmws: Vec<(u64, u64)> =
+        of(A64Op::AtomicRmw).iter().map(|i| (imm(&i.operands[3]), imm(&i.operands[5]))).collect();
+    assert_eq!(rmws, vec![(8, 0), (8, 1), (8, 2), (8, 3), (8, 3), (1, 3)]);
+    // cmpxchg: seq_cst/relaxed acquires and releases; acquire/acquire only acquires.
+    let cas: Vec<(u64, u64)> =
+        of(A64Op::CmpXchg).iter().map(|i| (imm(&i.operands[4]), imm(&i.operands[5]))).collect();
+    assert_eq!(cas, vec![(8, 3), (2, 1)]);
+    // The whole function allocates and encodes.
+    assert!(!compile_function(&m, FuncId::from_index(0), &syms).bytes.is_empty());
+}
+
+#[test]
+fn atomic_encodings_match_llvm_mc() {
+    let cases: Vec<(u32, &str)> = vec![
+        (ldxr(0, false, 0, 1), "ldxrb w0, [x1]"),
+        (ldxr(1, true, 2, 3), "ldaxrh w2, [x3]"),
+        (ldxr(2, false, 4, 5), "ldxr w4, [x5]"),
+        (ldxr(3, true, 6, 7), "ldaxr x6, [x7]"),
+        (stxr(0, false, 17, 16, 1), "stxrb w17, w16, [x1]"),
+        (stxr(2, true, 17, 16, 9), "stlxr w17, w16, [x9]"),
+        (stxr(3, true, 17, 3, 2), "stlxr w17, x3, [x2]"),
+        (ldar(0, 0, 1), "ldarb w0, [x1]"),
+        (ldar(3, 3, 4), "ldar x3, [x4]"),
+        (stlr(1, 5, 6), "stlrh w5, [x6]"),
+        (stlr(3, 7, 8), "stlr x7, [x8]"),
+        (dmb(0b1011), "dmb ish"),
+        (dmb(0b1001), "dmb ishld"),
+        (subs_ext(0, 31, 0, 1, 0), "cmp w0, w1, uxtb"),
+        (subs_ext(0, 31, 16, 2, 5), "cmp w16, w2, sxth"),
+        (orn_reg(1, 16, 31, 16), "mvn x16, x16"),
+    ];
+    let mut checked = 0;
+    for (word, asm) in cases {
+        match llvm_mc(asm) {
+            Some(bytes) => {
+                assert_eq!(word.to_le_bytes().to_vec(), bytes, "`{asm}`");
+                checked += 1;
+            }
+            None => eprintln!("skipping llvm-mc cross-check of `{asm}`"),
+        }
+    }
+    eprintln!("checked {checked} AArch64 atomic encodings against llvm-mc");
+}
+
+#[test]
+fn atomic_loops_match_llvm_mc() {
+    use super::isel::A64Op;
+    use super::regs::gpr;
+    use crate::codegen::mir::{MachineInst, MachineOperand, Reg};
+    use crate::ir::RmwOp;
+    let d = |n: u16| MachineOperand::Def(Reg::Physical(gpr(n)));
+    let u = |n: u16| MachineOperand::Use(Reg::Physical(gpr(n)));
+    let k = |v: u64| MachineOperand::Imm(Int::from_u64(v));
+    let rmw = |size: u64, op: RmwOp, acqrel: u64| {
+        MachineInst::new(
+            A64Op::AtomicRmw.opcode(),
+            vec![d(0), u(1), u(2), k(size), k(u64::from(op.code())), k(acqrel)],
+        )
+    };
+    let cases: Vec<(MachineInst, &str)> = vec![
+        (
+            rmw(8, RmwOp::Add, 3),
+            "1:\nldaxr x0, [x1]\nadd x16, x0, x2\nstlxr w17, x16, [x1]\ncbnz w17, 1b\n",
+        ),
+        (rmw(4, RmwOp::Xchg, 0), "1:\nldxr w0, [x1]\nstxr w17, w2, [x1]\ncbnz w17, 1b\n"),
+        (
+            rmw(2, RmwOp::Nand, 1),
+            "1:\nldaxrh w0, [x1]\nand w16, w0, w2\nmvn w16, w16\nstxrh w17, w16, [x1]\ncbnz w17, 1b\n",
+        ),
+        (
+            rmw(1, RmwOp::Max, 2),
+            "1:\nldxrb w0, [x1]\nsxtb w16, w0\ncmp w16, w2, sxtb\ncsel w16, w0, w2, gt\nstlxrb w17, w16, [x1]\ncbnz w17, 1b\n",
+        ),
+        (
+            rmw(2, RmwOp::UMin, 3),
+            "1:\nldaxrh w0, [x1]\ncmp w0, w2, uxth\ncsel w16, w0, w2, lo\nstlxrh w17, w16, [x1]\ncbnz w17, 1b\n",
+        ),
+        (
+            rmw(8, RmwOp::Min, 0),
+            "1:\nldxr x0, [x1]\ncmp x0, x2\ncsel x16, x0, x2, lt\nstxr w17, x16, [x1]\ncbnz w17, 1b\n",
+        ),
+        (
+            MachineInst::new(A64Op::CmpXchg.opcode(), vec![d(0), u(1), u(2), u(3), k(8), k(3)]),
+            "1:\nldaxr x0, [x1]\ncmp x0, x2\nb.ne 2f\nstlxr w17, x3, [x1]\ncbnz w17, 1b\n2:\n",
+        ),
+        (
+            MachineInst::new(A64Op::CmpXchg.opcode(), vec![d(4), u(5), u(6), u(7), k(1), k(1)]),
+            "1:\nldaxrb w4, [x5]\ncmp w4, w6, uxtb\nb.ne 2f\nstxrb w17, w7, [x5]\ncbnz w17, 1b\n2:\n",
+        ),
+    ];
+    // `llvm-mc --show-encoding` leaves label fixups unresolved, so rewrite the
+    // local labels as the equivalent immediate branch offsets: `1b` is the loop
+    // top, `2f` the word after the retry branch.
+    let resolve = |asm: &str| -> String {
+        let insns: Vec<&str> = asm.lines().filter(|l| !l.ends_with(':')).collect();
+        let n = insns.len() as i64;
+        insns
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let i = i as i64;
+                l.replace("1b", &format!("#{}", -4 * i)).replace("2f", &format!("#{}", 4 * (n - i)))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut checked = 0;
+    for (inst, asm) in cases {
+        let ours = encode_atomic_loop_for_test(&inst);
+        match llvm_mc_all(&resolve(asm)) {
+            Some(want) => {
+                assert_eq!(ours, want, "\n{asm}");
+                checked += 1;
+            }
+            None => eprintln!("skipping llvm-mc cross-check of\n{asm}"),
+        }
+    }
+    eprintln!("checked {checked} AArch64 atomic loops against llvm-mc");
+}

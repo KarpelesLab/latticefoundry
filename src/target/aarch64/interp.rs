@@ -494,6 +494,49 @@ impl Machine<'_> {
                 };
                 fr.regs.insert(d, fenc(x, dst_flt_w));
             }
+            // --- atomics: the machine is single-threaded, so each op runs its
+            // sequential meaning and a barrier does nothing ---------------------
+            A64Op::LoadAcq => {
+                let d = def(ops, 0)?;
+                let ptr = self.rd(fr, use_reg(ops, 1)?);
+                let size = imm_u32(ops, 2)? as usize;
+                let v = load_mem(&self.mem, addr(&ptr)?, size);
+                fr.regs.insert(d, v);
+            }
+            A64Op::StoreRel => {
+                let ptr = self.rd(fr, use_reg(ops, 0)?);
+                let val = self.rd(fr, use_reg(ops, 1)?);
+                let size = imm_u32(ops, 2)? as usize;
+                store_mem(&mut self.mem, addr(&ptr)?, size, &val);
+            }
+            A64Op::Dmb => {}
+            A64Op::AtomicRmw => {
+                let d = def(ops, 0)?;
+                let at = addr(&self.rd(fr, use_reg(ops, 1)?))?;
+                let val = self.rd(fr, use_reg(ops, 2)?);
+                let size = imm_u32(ops, 3)? as usize;
+                let rmw = crate::ir::RmwOp::from_code(u64::from(imm_u32(ops, 4)?))
+                    .ok_or("atomic rmw: bad operation code")?;
+                let w = (8 * size) as u32;
+                let old = load_mem(&self.mem, at, size);
+                let bits = |v: &Int| mask(v, w).to_u64().unwrap_or(0);
+                let new = rmw.apply(bits(&old), bits(&val), w);
+                store_mem(&mut self.mem, at, size, &Int::from_u64(new));
+                fr.regs.insert(d, old);
+            }
+            A64Op::CmpXchg => {
+                let d = def(ops, 0)?;
+                let at = addr(&self.rd(fr, use_reg(ops, 1)?))?;
+                let expected = self.rd(fr, use_reg(ops, 2)?);
+                let new = self.rd(fr, use_reg(ops, 3)?);
+                let size = imm_u32(ops, 4)? as usize;
+                let w = (8 * size) as u32;
+                let old = load_mem(&self.mem, at, size);
+                if old == mask(&expected, w) {
+                    store_mem(&mut self.mem, at, size, &new);
+                }
+                fr.regs.insert(d, old);
+            }
             // Prologue/epilogue pseudo-ops never appear in pre-regalloc MIR.
             A64Op::StpFpLr
             | A64Op::LdpFpLr

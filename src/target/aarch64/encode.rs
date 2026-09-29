@@ -209,6 +209,159 @@ pub(crate) fn ldst_uimm(load: bool, size: u32, rt: u32, rn: u32, imm12: u32) -> 
     base | (size << 30) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rt
 }
 
+// --- load/store exclusive, acquire/release, barriers (atomics) -----------
+
+/// `ldxr`/`ldaxr Rt, [Rn]` (`size` = log2 bytes; the `b`/`h` forms for 0/1,
+/// `W`/`X` for 2/3). `acquire` selects the load-acquire form.
+pub(crate) fn ldxr(size: u32, acquire: bool, rt: u32, rn: u32) -> u32 {
+    0x085F_7C00 | (size << 30) | (u32::from(acquire) << 15) | (rn << 5) | rt
+}
+/// `stxr`/`stlxr Ws, Rt, [Rn]`: store-exclusive, `Ws` = 0 on success.
+/// `release` selects the store-release form.
+pub(crate) fn stxr(size: u32, release: bool, rs: u32, rt: u32, rn: u32) -> u32 {
+    0x0800_7C00 | (size << 30) | (u32::from(release) << 15) | (rs << 16) | (rn << 5) | rt
+}
+/// `ldar Rt, [Rn]` (load-acquire).
+pub(crate) fn ldar(size: u32, rt: u32, rn: u32) -> u32 {
+    0x08DF_FC00 | (size << 30) | (rn << 5) | rt
+}
+/// `stlr Rt, [Rn]` (store-release).
+pub(crate) fn stlr(size: u32, rt: u32, rn: u32) -> u32 {
+    0x089F_FC00 | (size << 30) | (rn << 5) | rt
+}
+/// `dmb <option>` with the 4-bit `CRm` option (`0b1011` ish, `0b1001` ishld).
+pub(crate) fn dmb(crm: u32) -> u32 {
+    0xD503_30BF | ((crm & 0xF) << 8)
+}
+/// `subs Rd, Rn, Rm, <extend>` (extended-register form; `option` 0 `uxtb`,
+/// 1 `uxth`, 4 `sxtb`, 5 `sxth`): compares `Rn` with the extended low bits of
+/// `Rm`.
+pub(crate) fn subs_ext(sf: u32, rd: u32, rn: u32, rm: u32, option: u32) -> u32 {
+    0x6B20_0000 | (sf << 31) | (rm << 16) | (option << 13) | (rn << 5) | rd
+}
+/// `orn Rd, Rn, Rm` (`mvn Rd, Rm` when `Rn` is the zero register).
+pub(crate) fn orn_reg(sf: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    dp_reg(0x2A20_0000, sf, rd, rn, rm)
+}
+
+/// The intra-procedure scratch registers, never allocated: the atomic loops use
+/// `x16`/IP0 for the new value and `w17`/IP1 for the store-exclusive status, and
+/// large-offset addressing and the stack-probe loop use IP0. None of these
+/// sequences overlap, so nothing is live in them across another (the linker
+/// only uses them in call veneers).
+const IP0: u32 = 16;
+const IP1: u32 = 17;
+
+/// Expand [`A64Op::AtomicRmw`] into an exclusive-monitor retry loop (see the
+/// opcode docs). Arithmetic runs in the `W`/`X` form of the access width; the
+/// exclusive store writes only the low `size` bytes, so garbage above a narrow
+/// width is harmless, except for the signed/unsigned compares of `max`/`min`,
+/// which extend at the width (`sbfx`, or the `sxt`/`uxt` compare forms).
+fn encode_atomic_rmw(b: &mut A64Buf, ops: &[MachineOperand]) {
+    use crate::ir::inst::RmwOp;
+    let (d, ptr, val) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+    let bytes = uimm(&ops[3]);
+    let op = RmwOp::from_code(uimm(&ops[4])).expect("AtomicRmw carries a valid rmw code");
+    let acqrel = uimm(&ops[5]);
+    let (size, sf) = (ldst_size(bytes), u32::from(bytes == 8));
+    let zr = u32::from(XZR);
+    let top = b.offset();
+    b.word(ldxr(size, acqrel & 1 != 0, d, ptr));
+    let data = match op {
+        RmwOp::Xchg => val,
+        RmwOp::Add => {
+            b.word(add_reg(sf, IP0, d, val));
+            IP0
+        }
+        RmwOp::Sub => {
+            b.word(sub_reg(sf, IP0, d, val));
+            IP0
+        }
+        RmwOp::And => {
+            b.word(and_reg(sf, IP0, d, val));
+            IP0
+        }
+        RmwOp::Nand => {
+            b.word(and_reg(sf, IP0, d, val));
+            b.word(orn_reg(sf, IP0, zr, IP0));
+            IP0
+        }
+        RmwOp::Or => {
+            b.word(orr_reg(sf, IP0, d, val));
+            IP0
+        }
+        RmwOp::Xor => {
+            b.word(eor_reg(sf, IP0, d, val));
+            IP0
+        }
+        RmwOp::Max | RmwOp::Min | RmwOp::UMax | RmwOp::UMin => {
+            let signed = matches!(op, RmwOp::Max | RmwOp::Min);
+            // Compare old with val at the access width.
+            if bytes < 4 {
+                let (lhs, option) = if signed {
+                    // The exclusive load zero-extended `old`; sign-extend a copy.
+                    b.word(sbfx0(0, IP0, d, 8 * bytes as u32));
+                    (IP0, if bytes == 1 { 4 } else { 5 })
+                } else {
+                    (d, if bytes == 1 { 0 } else { 1 })
+                };
+                b.word(subs_ext(0, zr, lhs, val, option));
+            } else {
+                b.word(subs_reg(sf, zr, d, val));
+            }
+            // Keep `old` when it already wins, else take `val`.
+            let cond = match op {
+                RmwOp::Max => 0xC,  // GT
+                RmwOp::Min => 0xB,  // LT
+                RmwOp::UMax => 0x8, // HI
+                _ => 0x3,           // LO
+            };
+            b.word(csel(sf, IP0, d, val, cond));
+            IP0
+        }
+    };
+    b.word(stxr(size, acqrel & 2 != 0, IP1, data, ptr));
+    let back = (top as i64 - b.offset() as i64) / 4;
+    b.word(cbz(0, IP1, back as i32, true));
+}
+
+/// Expand [`A64Op::CmpXchg`] into a strong compare-and-exchange loop (see the
+/// opcode docs). The exclusive load zero-extends `old`, and the compare
+/// zero-extends `expected` at the access width (`uxtb`/`uxth`), so garbage
+/// above a narrow `expected` does not cause a spurious failure.
+fn encode_cmpxchg(b: &mut A64Buf, ops: &[MachineOperand]) {
+    let (d, ptr, expected, new) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), rnum(&ops[3]));
+    let bytes = uimm(&ops[4]);
+    let acqrel = uimm(&ops[5]);
+    let (size, sf) = (ldst_size(bytes), u32::from(bytes == 8));
+    let zr = u32::from(XZR);
+    let top = b.offset();
+    b.word(ldxr(size, acqrel & 1 != 0, d, ptr));
+    match bytes {
+        1 => b.word(subs_ext(0, zr, d, expected, 0)),
+        2 => b.word(subs_ext(0, zr, d, expected, 1)),
+        _ => b.word(subs_reg(sf, zr, d, expected)),
+    }
+    // b.ne done: skip this branch, the store and the retry (3 words).
+    b.word(b_cond(0x1, 3));
+    b.word(stxr(size, acqrel & 2 != 0, IP1, new, ptr));
+    let back = (top as i64 - b.offset() as i64) / 4;
+    b.word(cbz(0, IP1, back as i32, true));
+}
+
+/// Test hook: the encoding of one allocated [`A64Op::AtomicRmw`] or
+/// [`A64Op::CmpXchg`] (its whole loop).
+#[cfg(test)]
+pub(crate) fn encode_atomic_loop_for_test(inst: &MachineInst) -> Vec<u8> {
+    let mut b = A64Buf::new();
+    match A64Op::decode(inst.opcode) {
+        A64Op::AtomicRmw => encode_atomic_rmw(&mut b, &inst.operands),
+        A64Op::CmpXchg => encode_cmpxchg(&mut b, &inst.operands),
+        other => panic!("not an atomic loop: {other:?}"),
+    }
+    b.bytes
+}
+
 /// `csel Rd, Rn, Rm, cond`.
 pub(crate) fn csel(sf: u32, rd: u32, rn: u32, rm: u32, cond: u32) -> u32 {
     0x1A80_0000 | (sf << 31) | (rm << 16) | (cond << 12) | (rn << 5) | rd
@@ -813,6 +966,15 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             };
             b.word(word);
         }
+        A64Op::LoadAcq => {
+            b.word(ldar(ldst_size(uimm(&ops[2])), rnum(&ops[0]), rnum(&ops[1])));
+        }
+        A64Op::StoreRel => {
+            b.word(stlr(ldst_size(uimm(&ops[2])), rnum(&ops[1]), rnum(&ops[0])));
+        }
+        A64Op::Dmb => b.word(dmb(uimm(&ops[0]) as u32)),
+        A64Op::AtomicRmw => encode_atomic_rmw(b, ops),
+        A64Op::CmpXchg => encode_cmpxchg(b, ops),
         A64Op::FrameAddr => {
             let d = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
@@ -1017,9 +1179,6 @@ fn frame_ldst(class: RegClass, load: bool, rt: u32, off: u32) -> u32 {
     }
 }
 
-/// This module's large-offset / probe-loop scratch, `x16` (IP0): volatile, never
-/// allocated, and never live across our own instruction sequences.
-const IP0: u32 = 16;
 
 /// `rd = rn + amount` (or `- amount` when `sub`) for any `amount`; `rd`/`rn` may
 /// be `sp`. Up to 16 MiB this is `#hi, lsl #12` then `#lo` (one word when either

@@ -178,6 +178,30 @@ pub enum A64Op {
     /// `[Def d, Use s, Imm width]` — `ubfx Xd, Xs, #0, #width` (`ubfm`):
     /// zero-extend the low `width` bits (1..=63) of `s` to all 64 bits.
     Ubfx = 56,
+
+    // --- atomics (ARMv8.0: see `lower_atomic` for the mapping) --------------
+    /// `[Def d, Use ptr, Imm size]` — `ldar{b,h}` (load-acquire, `size`
+    /// bytes, zero-extended): an `acquire`/`seq_cst` atomic load.
+    LoadAcq = 57,
+    /// `[Use ptr, Use val, Imm size]` — `stlr{b,h}` (store-release): a
+    /// `release`/`seq_cst` atomic store.
+    StoreRel = 58,
+    /// `[Imm crm]` — `dmb <option>` (`0b1011` = `ish`, `0b1001` = `ishld`).
+    Dmb = 59,
+    /// `[Def d, Use ptr, Use val, Imm size, Imm op, Imm acqrel]` — an atomic
+    /// read-modify-write ([`RmwOp::code`](crate::ir::RmwOp::code) `op`),
+    /// expanded at encode time into an exclusive-monitor retry loop with an
+    /// internal label:
+    /// `L: ld{a}xr old, [ptr]; x16 = op(old, val); st{l}xr w17, x16, [ptr];
+    /// cbnz w17, L`. `acqrel` bit 0 selects the acquiring load, bit 1 the
+    /// releasing store. `x16`/`x17` (IP0/IP1, never allocated) are clobbered.
+    AtomicRmw = 60,
+    /// `[Def d, Use ptr, Use expected, Use new, Imm size, Imm acqrel]` — a
+    /// strong compare-and-exchange, expanded at encode time into
+    /// `L: ld{a}xr old, [ptr]; cmp old, expected; b.ne done;
+    /// st{l}xr w17, new, [ptr]; cbnz w17, L; done:` (the compare at the access
+    /// width). `acqrel` as for [`A64Op::AtomicRmw`]; `x17` is clobbered.
+    CmpXchg = 61,
 }
 
 impl A64Op {
@@ -190,12 +214,13 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 57] = [
+        const TABLE: [A64Op; 62] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
             AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
-            Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc, Sbfx, Ubfx,
+            Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc, Sbfx, Ubfx, LoadAcq, StoreRel,
+            Dmb, AtomicRmw, CmpXchg,
         ];
         TABLE[op.0 as usize]
     }
@@ -503,6 +528,86 @@ impl AArch64Target {
     /// else (e.g. a `trunc` to `i1`) may carry garbage above bit 0.
     fn clean_cond(&self, lo: &mut Lower<'_, Self>, v: ValueId) -> VReg {
         self.extend64(lo, v, false)
+    }
+
+    /// Lower an atomic memory operation or fence (ARMv8.0 memory model, Arm ARM
+    /// B2.3: `ldar`/`stlr` are RCsc acquire/release accesses, so together they
+    /// also give `seq_cst`; there is no single-instruction rmw before LSE):
+    ///
+    /// | IR | AArch64 |
+    /// |---|---|
+    /// | `atomic_load relaxed` | `ldr` |
+    /// | `atomic_load acquire`/`seq_cst` | `ldar` |
+    /// | `atomic_store relaxed` | `str` |
+    /// | `atomic_store release`/`seq_cst` | `stlr` |
+    /// | `atomic_rmw` | `ld{a}xr`/`st{l}xr` loop ([`A64Op::AtomicRmw`]) |
+    /// | `cmpxchg` | `ld{a}xr`/`cmp`/`st{l}xr` loop ([`A64Op::CmpXchg`]) |
+    /// | `fence acquire` | `dmb ishld` |
+    /// | `fence release`/`acq_rel`/`seq_cst` | `dmb ish` |
+    ///
+    /// The exclusive load acquires when the ordering (or, for `cmpxchg`, either
+    /// ordering) is acquiring, and the exclusive store releases when it is
+    /// releasing.
+    fn lower_atomic(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        use crate::ir::inst::AtomicOrdering;
+        let ops = inst.operands();
+        let acqrel = |acq: bool, rel: bool| imm(u64::from(acq) | (u64::from(rel) << 1));
+        match &inst.kind {
+            InstKind::AtomicLoad { ty, ordering, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(ops[0]);
+                let size = lo.byte_size(*ty);
+                let op = if ordering.is_acquire() { A64Op::LoadAcq } else { A64Op::Load };
+                lo.emit(MachineInst::new(op.opcode(), vec![def_v(d), use_v(ptr), imm(size)]));
+            }
+            InstKind::AtomicStore { ty, ordering, .. } => {
+                let ptr = lo.reg(ops[0]);
+                let val = lo.reg(ops[1]);
+                let size = lo.byte_size(*ty);
+                let op = if ordering.is_release() { A64Op::StoreRel } else { A64Op::Store };
+                lo.emit(MachineInst::new(op.opcode(), vec![use_v(ptr), use_v(val), imm(size)]));
+            }
+            InstKind::AtomicRmw { op, ty, ordering, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(ops[0]);
+                let val = lo.reg(ops[1]);
+                let size = lo.byte_size(*ty);
+                lo.emit(MachineInst::new(
+                    A64Op::AtomicRmw.opcode(),
+                    vec![
+                        def_v(d),
+                        use_v(ptr),
+                        use_v(val),
+                        imm(size),
+                        imm(u64::from(op.code())),
+                        acqrel(ordering.is_acquire(), ordering.is_release()),
+                    ],
+                ));
+            }
+            InstKind::CmpXchg { ty, success, failure, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(ops[0]);
+                let expected = lo.reg(ops[1]);
+                let new = lo.reg(ops[2]);
+                let size = lo.byte_size(*ty);
+                lo.emit(MachineInst::new(
+                    A64Op::CmpXchg.opcode(),
+                    vec![
+                        def_v(d),
+                        use_v(ptr),
+                        use_v(expected),
+                        use_v(new),
+                        imm(size),
+                        acqrel(success.is_acquire() || failure.is_acquire(), success.is_release()),
+                    ],
+                ));
+            }
+            InstKind::Fence(ordering) => {
+                let crm = if *ordering == AtomicOrdering::Acquire { 0b1001 } else { 0b1011 };
+                lo.emit(MachineInst::new(A64Op::Dmb.opcode(), vec![imm(crm)]));
+            }
+            other => unreachable!("lower_atomic on {other:?}"),
+        }
     }
 
     fn lower_bin(&self, lo: &mut Lower<'_, Self>, op: BinOp, inst: &InstData) {
@@ -1385,7 +1490,7 @@ impl TargetIsel for AArch64Target {
             }
             InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),
             InstKind::FCmp(pred) => self.lower_fcmp(lo, *pred, inst),
-            k if k.is_atomic() => panic!("AArch64 backend: atomics are not yet supported: {k:?}"),
+            k if k.is_atomic() => self.lower_atomic(lo, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),
         }
     }

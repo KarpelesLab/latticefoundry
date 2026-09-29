@@ -22,6 +22,7 @@ use crate::support::diagnostics::FileId;
 use crate::transform::pipeline::{OptLevel, optimize};
 
 use super::isel::{X86Op, X86_64Target};
+use crate::target::atomic_fixtures::{RmwCase, rmw_cases, ty_name};
 
 const LEVELS: [OptLevel; 4] = [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3];
 
@@ -121,22 +122,12 @@ fn atomic_counter_on_a_global() {
     }
 }
 
-/// The IR spelling of an `iN` or `ptr` type for a byte size.
-fn ty_name(bytes: u32) -> &'static str {
-    match bytes {
-        1 => "i8",
-        2 => "i16",
-        4 => "i32",
-        _ => "i64",
-    }
-}
-
 /// Build a program that runs every `(width, op, init, v)` case on its own
 /// global and checks the returned old value and the final memory against the
 /// expected pair, returning the (1-based) index of the last failing check, or
 /// 0. Optionally keeps `pressure` volatile loads live across every atomic so
 /// the allocator must spill around the fixed-register sequences.
-fn rmw_program(cases: &[(u32, &str, u64, u64, u64, u64)], pressure: usize) -> String {
+fn rmw_program(cases: &[RmwCase], pressure: usize) -> String {
     let mut s = String::from("module \"rmw\"\n");
     for (k, &(bytes, _, init, ..)) in cases.iter().enumerate() {
         s += &format!("global @g{k} : {t} = {t} {init}\n", t = ty_name(bytes));
@@ -172,51 +163,6 @@ fn rmw_program(cases: &[(u32, &str, u64, u64, u64, u64)], pressure: usize) -> St
     s
 }
 
-/// The rmw cases for one byte width, with the expected `(old, new)` computed by
-/// the standard library's atomics on the same bit patterns.
-fn rmw_cases(bytes: u32) -> Vec<(u32, &'static str, u64, u64, u64, u64)> {
-    use std::sync::atomic::Ordering::SeqCst;
-    use std::sync::atomic::{AtomicI64, AtomicU64};
-    let bits = 8 * bytes;
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-    let sext = |x: u64| -> i64 { ((x << (64 - bits)) as i64) >> (64 - bits) };
-    // (init, v) pairs chosen to straddle the sign bit and wrap.
-    let top = 1u64 << (bits - 1);
-    let pairs = [(top - 1, top + 1), (5 & mask, mask - 5), (mask, 3)];
-    let mut out = Vec::new();
-    for (init, v) in pairs {
-        // Unsigned ops: run on the zero-extended patterns, masked back.
-        let u = |f: &dyn Fn(&AtomicU64, u64) -> u64| {
-            let a = AtomicU64::new(init);
-            let old = f(&a, v);
-            (old & mask, a.load(SeqCst) & mask)
-        };
-        // Signed min/max: run on the sign-extended values.
-        let i = |f: &dyn Fn(&AtomicI64, i64) -> i64| {
-            let a = AtomicI64::new(sext(init));
-            let old = f(&a, sext(v));
-            (old as u64 & mask, a.load(SeqCst) as u64 & mask)
-        };
-        let table: [(&str, (u64, u64)); 11] = [
-            ("xchg", u(&|a, v| a.swap(v, SeqCst))),
-            ("add", u(&|a, v| a.fetch_add(v, SeqCst))),
-            ("sub", u(&|a, v| a.fetch_sub(v, SeqCst))),
-            ("and", u(&|a, v| a.fetch_and(v, SeqCst))),
-            ("nand", u(&|a, v| a.fetch_nand(v, SeqCst))),
-            ("or", u(&|a, v| a.fetch_or(v, SeqCst))),
-            ("xor", u(&|a, v| a.fetch_xor(v, SeqCst))),
-            ("max", i(&|a, v| a.fetch_max(v, SeqCst))),
-            ("min", i(&|a, v| a.fetch_min(v, SeqCst))),
-            ("umax", u(&|a, v| a.fetch_max(v, SeqCst))),
-            ("umin", u(&|a, v| a.fetch_min(v, SeqCst))),
-        ];
-        for (op, (old, new)) in table {
-            out.push((bytes, op, init, v, old, new));
-        }
-    }
-    out
-}
-
 #[test]
 fn every_rmw_op_returns_the_old_value_at_every_width() {
     for bytes in [1, 2, 4, 8] {
@@ -226,6 +172,20 @@ fn every_rmw_op_returns_the_old_value_at_every_width() {
             let code = exit_code(&src, level, "rmw");
             assert_eq!(code, 0, "i{} at {level:?}: case {:?} failed", 8 * bytes, cases.get((code as usize).wrapping_sub(1)));
         }
+    }
+}
+
+#[test]
+fn shared_slot_fixtures_run_natively() {
+    // The same stack-slot programs the AArch64/RISC-V interpreters run.
+    use crate::target::atomic_fixtures::{CMPXCHG_SLOTS, rmw_slot_program};
+    for level in [OptLevel::O0, OptLevel::O2] {
+        for bytes in [1, 2, 4, 8] {
+            let cases = rmw_cases(bytes);
+            let code = exit_code(&rmw_slot_program(&cases), level, "rmwslots");
+            assert_eq!(code, 0, "i{} at {level:?}: case {:?}", 8 * bytes, cases.get((code as usize).wrapping_sub(1)));
+        }
+        assert_eq!(exit_code(CMPXCHG_SLOTS, level, "casslots"), 0, "at {level:?}");
     }
 }
 

@@ -349,20 +349,23 @@ the same payload as tags 6/7, and the atomics use tags 21–25, so existing
 Clean-room from each ISA's memory model. Volatile accesses are one ordinary
 load/store of exactly the declared width on every target. Atomics:
 
-| IR | x86-64 (TSO) |
-|---|---|
-| `atomic_load` (any ordering) | `mov` |
-| `atomic_store relaxed`/`release` | `mov` |
-| `atomic_store seq_cst` | `xchg` |
-| `atomic_rmw xchg` | `xchg` |
-| `atomic_rmw add`/`sub` | `lock xadd` (`sub` negates first) |
-| other `atomic_rmw` | `lock cmpxchg` loop |
-| `cmpxchg` | `lock cmpxchg` (`rax`) |
-| `fence seq_cst` | `mfence` |
-| `fence` acquire/release/acq_rel | nothing |
+| IR | x86-64 (TSO) | AArch64 (ARMv8.0) |
+|---|---|---|
+| `atomic_load relaxed` | `mov` | `ldr` |
+| `atomic_load acquire`/`seq_cst` | `mov` | `ldar` |
+| `atomic_store relaxed` | `mov` | `str` |
+| `atomic_store release` | `mov` | `stlr` |
+| `atomic_store seq_cst` | `xchg` | `stlr` |
+| `atomic_rmw xchg` | `xchg` | `ld{a}xr`/`st{l}xr` loop |
+| `atomic_rmw add`/`sub` | `lock xadd` (`sub` negates first) | `ld{a}xr`/`st{l}xr` loop |
+| other `atomic_rmw` | `lock cmpxchg` loop | `ld{a}xr`/`st{l}xr` loop |
+| `cmpxchg` | `lock cmpxchg` (`rax`) | `ld{a}xr`/`cmp`/`b.ne`/`st{l}xr` loop |
+| `fence seq_cst` | `mfence` | `dmb ish` |
+| `fence acq_rel`/`release` | nothing | `dmb ish` |
+| `fence acquire` | nothing | `dmb ishld` |
 
-The AArch64 and RISC-V backends do not lower atomics yet (they stop with a
-clear "not yet supported" error).
+The RISC-V backend does not lower atomics yet (it stops with a clear "not yet
+supported" error).
 
 On x86-64 every `lock`ed instruction and `xchg` with memory is a full barrier,
 so the orderings of rmw/cmpxchg need nothing more; loads are never reordered with
@@ -374,6 +377,18 @@ contiguous window with every operand materialized before it. The `lock cmpxchg`
 retry loop is a single pseudo-instruction expanded at encode time with an
 internal label, so the allocator sees one instruction with `rax` and a scratch
 register as clobbered defs.
+
+On AArch64, `ldar`/`stlr` are RCsc (Arm ARM B2.3), so they implement both
+acquire/release and `seq_cst` loads and stores. Without LSE there is no
+single-instruction rmw, so each `atomic_rmw` and `cmpxchg` is one
+pseudo-instruction expanded at encode time into a load-exclusive /
+store-exclusive retry loop: the exclusive load acquires when the ordering (for
+`cmpxchg`, either ordering) acquires, and the exclusive store releases when it
+releases. Its result, address and operands are ordinary allocated registers
+(distinct, since all are live at the one instruction), and the new value and
+the store status use `x16`/`x17` (IP0/IP1), which are never allocated. A
+narrow compare (`cmpxchg`, `max`/`min`) extends at the access width, so
+garbage above a narrow value never causes a spurious mismatch.
 
 ## 7. Instruction flags: one unified model  *(decided)*
 
