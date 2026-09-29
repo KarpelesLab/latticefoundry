@@ -30,6 +30,7 @@ pub mod pipeline;
 pub mod sccp;
 pub mod simplify_cfg;
 pub mod superopt;
+pub mod yield_points;
 
 #[cfg(test)]
 mod tests;

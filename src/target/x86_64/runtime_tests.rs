@@ -705,3 +705,129 @@ fn timer_signal_preempts_busy_loop_and_resumes_it_intact() {
         assert_eq!(sum, checksum(&expected_gprs(), &xmm_patterns(), &[RAX]), "checksum at {level:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Yield points: a flag set by a timer signal makes a loop call the yield function
+// ---------------------------------------------------------------------------
+
+/// `@spin` has no provable trip bound (its limit is loaded from memory), so
+/// [`crate::transform::yield_points`] puts a check of `@preempt_flag` on its
+/// back edge. A `SIGALRM` handler sets the flag every millisecond; the yield
+/// function clears it and switches to green thread B, which counts its runs
+/// and switches back. `@spin` stops after three yields; without the inserted
+/// check it would run for billions of iterations and see none.
+const YIELD_EXEC: &str = r#"
+module "yieldexec"
+global @preempt_flag : i32 = i32 0
+global @yields : i64 = i64 0
+global @b_runs : i64 = i64 0
+global @current : i64 = i64 0
+global @limit : i64 = i64 4000000000
+global @ctx_main : [42 x i128] = [42 x i128] poison
+global @ctx_b : [42 x i128] = [42 x i128] poison
+
+func @rt_yield() -> void {
+entry ^0:
+  store volatile i32 0, @preempt_flag align 4 : i32
+  %cur = load volatile @current align 8 : i64
+  %main = icmp eq %cur, i64 0 : i1
+  cond_br %main, ^1, ^2
+^1:
+  store volatile i64 1, @current align 8 : i64
+  %y = load volatile @yields align 8 : i64
+  %y1 = add %y, i64 1 : i64
+  store volatile %y1, @yields align 8 : i64
+  call @lf_ctx_switch(@ctx_main, @ctx_b) : void
+  ret
+^2:
+  ret
+}
+
+func @thread_b(i64) -> i64 {
+entry ^0(%arg: i64):
+  br ^1
+^1:
+  %r = load volatile @b_runs align 8 : i64
+  %r1 = add %r, i64 1 : i64
+  store volatile %r1, @b_runs align 8 : i64
+  store volatile i64 0, @current align 8 : i64
+  call @lf_ctx_switch(@ctx_b, @ctx_main) : void
+  br ^1
+}
+
+func @on_alarm(i32, ptr, ptr) -> void {
+entry ^0(%sig: i32, %info: ptr, %uc: ptr):
+  store volatile i32 1, @preempt_flag align 4 : i32
+  ret
+}
+
+func @set_timer(i64) -> i64 {
+entry ^0(%usec: i64):
+  %tv = alloca [4 x i64] : ptr
+  store i64 0, %tv align 8 : i64
+  %p1 = ptr_add %tv, i64 8 : ptr
+  store %usec, %p1 align 8 : i64
+  %p2 = ptr_add %tv, i64 16 : ptr
+  store i64 0, %p2 align 8 : i64
+  %p3 = ptr_add %tv, i64 24 : ptr
+  store %usec, %p3 align 8 : i64
+  %r = syscall i64 38, i64 0, %tv, i64 0 : i64
+  ret %r
+}
+
+func @spin() -> i64 {
+entry ^0:
+  %n = load @limit align 8 : i64
+  br ^1(i64 0)
+^1(%i: i64):
+  %y = load volatile @yields align 8 : i64
+  %done = icmp uge %y, i64 3 : i1
+  cond_br %done, ^3, ^2
+^2:
+  %i1 = add %i, i64 1 : i64
+  %c = icmp slt %i1, %n : i1
+  cond_br %c, ^1(%i1), ^3
+^3:
+  ret %i
+}
+
+func @main() -> i64 {
+entry ^0:
+  %stk = syscall i64 9, i64 0, i64 65536, i64 3, i64 34, i64 -1, i64 0 : i64
+  %sp = inttoptr %stk : ptr
+  %top = ptr_add %sp, i64 65536 : ptr
+  call @lf_ctx_init(@ctx_b, %top, @thread_b, i64 0) : void
+  %i = call @lf_sig_install(i64 14, @on_alarm, i64 268435456) : i64
+  %t = call @set_timer(i64 1000) : i64
+  %n = call @spin() : i64
+  %t0 = call @set_timer(i64 0) : i64
+  %y = load volatile @yields align 8 : i64
+  %b = load volatile @b_runs align 8 : i64
+  %enough = icmp uge %y, i64 3 : i1
+  %same = icmp eq %y, %b : i1
+  %ok = and %enough, %same : i1
+  %rc = select %ok, i64 0, i64 1 : i64
+  ret %rc
+}
+"#;
+
+#[test]
+fn yield_points_let_a_timer_flag_switch_green_threads() {
+    use crate::transform::yield_points::{YieldConfig, analyze_loops, optimize_with_yield_points};
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let mut syms = StrInterner::new();
+        let src = format!("{YIELD_EXEC}\n{DECLS}");
+        let mut m = crate::ir::text::parse_module(&src, FileId::new(0), &mut syms).expect("parse");
+        crate::verify::verify_module(&m).expect("verify");
+        let cfg = YieldConfig::new(syms.intern("preempt_flag"), syms.intern("rt_yield"));
+        let spin = m.functions().position(|f| syms.resolve(f.name) == "spin").unwrap();
+        let spin = crate::ir::FuncId::from_index(spin);
+        assert!(analyze_loops(&m, spin, &cfg).iter().any(|r| r.needs_check), "spin's loop is unbounded");
+        optimize_with_yield_points(&mut m, level, cfg);
+        crate::verify::verify_module(&m).expect("verify after the yield pass");
+        let text = crate::ir::text::print_module(&m, &syms);
+        assert!(text.contains("call @rt_yield() : void"), "check inserted at {level:?}:\n{text}");
+        let (_, status) = link_and_run(vec![super::compile_module(&m, &syms)], "yield");
+        assert_eq!(status.code(), Some(0), "yields happened and B ran each time at {level:?}: {status:?}");
+    }
+}
