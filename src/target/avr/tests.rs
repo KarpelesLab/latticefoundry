@@ -1396,3 +1396,105 @@ entry ^0:
     let fw = super::link::build(vec![obj], &DEV, "main").unwrap();
     assert_eq!(run_main(&fw).0, 36);
 }
+
+// ===========================================================================
+// Vectors: scalarized, then soft float and integer legalization
+// ===========================================================================
+
+/// An `f32` vector program (the LF runtime has no `f64` helpers, so the
+/// shared float fixture, which uses `<2 x f64>`, cannot link on AVR).
+const F32_VECTORS: &str = r#"
+module "vf32"
+func @vf32(i64, i64, i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
+  %p0 = insertelement <2 x i64> poison, %a, 0 : <2 x i64>
+  %x0 = insertelement %p0, %b, 1 : <2 x i64>
+  %p1 = insertelement <2 x i64> poison, %c, 0 : <2 x i64>
+  %y0 = insertelement %p1, %d, 1 : <2 x i64>
+  %i = bitcast %x0 : <4 x i32>
+  %j = bitcast %y0 : <4 x i32>
+  %small = and %i, <4 x i32> (i32 65535, i32 65535, i32 65535, i32 65535) : <4 x i32>
+  %f = sitofp %small : <4 x f32>
+  %g = sitofp %j : <4 x f32>
+  %s = fadd %f, %g : <4 x f32>
+  %u = fmul %s, <4 x f32> (f32 0x3fc00000, f32 0xc0000000, f32 0x3f000000, f32 0x41200000) : <4 x f32>
+  %v = fdiv %u, <4 x f32> (f32 0x40400000, f32 0x3f800000, f32 0xc0800000, f32 0x3e800000) : <4 x f32>
+  %lt = fcmp olt %v, %f : <4 x i1>
+  %n = fneg %v : <4 x f32>
+  %w = select %lt, %n, %v : <4 x f32>
+  %back = fptosi %f : <4 x i32>
+  %wi = bitcast %w : <2 x i64>
+  %bi = bitcast %back : <2 x i64>
+  %o = xor %wi, %bi : <2 x i64>
+  %l = extractelement %o, 0 : i64
+  %h = extractelement %o, 1 : i64
+  %m = mul %h, i64 1000003 : i64
+  %r = xor %l, %m : i64
+  ret %r
+}
+"#;
+
+/// Run vector test functions `(i64, i64, i64, i64) -> i64` on the AVR
+/// interpreter (two of the four arguments travel on the stack) and compare
+/// with the reference executor on the original vector IR.
+fn check_vectors(what: &str, src: &str, cases: &[crate::target::vector_fixtures::Case]) -> usize {
+    // Scalarized vector code is large: each function gets its own image, on
+    // an AVR5 with 64 KiB of flash (the ATmega644 class).
+    let dev = Device { flash: 64 * 1024, ..DEV };
+    let want = crate::target::vector_fixtures::reference(src, cases);
+    let (m, syms) = parse(src);
+    let (pm, _, _) = super::prepare::prepare(&m, &syms, &dev).unwrap();
+    assert!(!crate::codegen::legalize::uses_vectors(&pm), "{what}: every vector is scalarized");
+    let head = &src[..src.find("func @").expect("a function")];
+    let mut n = 0;
+    let mut images: Vec<(String, Option<Firmware>)> = Vec::new();
+    for ((name, args), w) in cases.iter().zip(&want) {
+        let Some(w) = w else { continue };
+        if !images.iter().any(|(k, _)| k == name) {
+            let start = src.find(&format!("func @{name}(")).expect("the function");
+            let end = src[start + 1..].find("\nfunc @").map_or(src.len(), |e| start + 2 + e);
+            let body = &src[start..end];
+            // The LF runtime has no f64 helpers.
+            let fw = (!body.contains("f64")).then(|| firmware_for(&format!("{head}{body}"), &dev));
+            images.push((name.clone(), fw));
+        }
+        let Some(fw) = &images.iter().find(|(k, _)| k == name).expect("built").1 else { continue };
+        let (mut mach, stop) = boot(fw, &dev);
+        let a: Vec<(u64, u64)> = args.iter().map(|&x| (x as u64, 8)).collect();
+        let got = call_in(&mut mach, fw, &dev, stop, name, &a, 8);
+        assert_eq!(got, *w, "{what}: @{name}{args:?}");
+        n += 1;
+    }
+    n
+}
+
+#[test]
+fn vector_programs_are_scalarized_and_run() {
+    use crate::target::vector_fixtures as vf;
+    let mut n = 0;
+    for (what, src) in [
+        ("int arith", vf::int_arith_src()),
+        ("compares", vf::compare_src()),
+        ("lanes", vf::lanes_src()),
+        ("masks", vf::masks_src()),
+        ("f32", F32_VECTORS.to_owned()),
+    ] {
+        let names: Vec<&str> =
+            src.split("func @").skip(1).filter_map(|rest| rest.split_once('(').map(|(n, _)| n)).collect();
+        n += check_vectors(what, &src, &vf::cases(&names, &vf::INPUTS));
+    }
+    let mut rng = vf::Rng(0xa7e);
+    for p in 0..2u64 {
+        // Integer vectors only: float lanes may be f64, which has no LF runtime.
+        let (src, names) = vf::random_program(0xa000 + p, 3, 5, false);
+        let mut cs = Vec::new();
+        for name in &names {
+            for _ in 0..2 {
+                cs.push((name.clone(), vf::random_inputs(&mut rng)));
+            }
+        }
+        n += check_vectors(&format!("random{p}"), &src, &cs);
+    }
+    eprintln!("avr vector programs: {n} results compared");
+    assert!(n >= 100, "{n}");
+}

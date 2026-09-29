@@ -1,11 +1,10 @@
-//! Soft-float lowering: floating-point values as integers, floating-point
-//! operations as calls to the Arm run-time ABI helpers.
+//! Soft float: floating-point values as integers, floating-point operations
+//! as calls to run-time helpers, for targets without an FPU (Cortex-M3 Thumb,
+//! AVR).
 //!
-//! A Cortex-M3 has no floating-point unit, and the AAPCS base standard (the
-//! "soft-float" ABI) passes a `float` like a 32-bit integer and a `double`
-//! like a 64-bit one (an even-odd register pair or an 8-aligned stack slot).
-//! So this IR-to-IR pass, run before wide-integer legalization, rewrites a
-//! module so that no floating-point type remains:
+//! On such a target the ABI passes a float like an integer of its size, so
+//! this IR-to-IR pass, run after vector legalization and before wide-integer
+//! legalization, rewrites a module so that no floating-point type remains:
 //!
 //! - every `f16`/`f32`/`f64` value, parameter, result, block parameter,
 //!   load and store becomes an `i16`/`i32`/`i64` holding the IEEE-754 bits;
@@ -13,28 +12,31 @@
 //!   consistent), which is exactly the soft-float calling convention;
 //! - a float constant becomes the integer with its bit pattern, a `bitcast`
 //!   between a float and an integer disappears, `fneg` flips the sign bit;
-//! - arithmetic, comparisons and conversions become calls to the helpers of
-//!   the *Run-time ABI for the Arm Architecture* (RTABI, §4.1.2):
+//! - arithmetic, comparisons and conversions become calls to helpers whose
+//!   names a [`SoftFloatAbi`] chooses:
 //!
-//! | operation | `f32` | `f64` |
+//! | operation | [`SoftFloatAbi::Aeabi`] (Arm RTABI §4.1.2) | [`SoftFloatAbi::Libgcc`] |
 //! |---|---|---|
-//! | `fadd` `fsub` `fmul` `fdiv` | `__aeabi_fadd` `fsub` `fmul` `fdiv` | `__aeabi_dadd` `dsub` `dmul` `ddiv` |
-//! | `frem` | `fmodf` (C library) | `fmod` |
-//! | `fcmp` | `__aeabi_fcmpeq` `lt` `le` `ge` `gt` `un` | `__aeabi_dcmp…` |
-//! | `fptosi` / `fptoui` to ≤ 32 / ≤ 64 bits | `__aeabi_f2iz` `f2uiz` / `f2lz` `f2ulz` | `__aeabi_d2iz` `d2uiz` / `d2lz` `d2ulz` |
-//! | `sitofp` / `uitofp` from ≤ 32 / ≤ 64 bits | `__aeabi_i2f` `ui2f` / `l2f` `ul2f` | `__aeabi_i2d` `ui2d` / `l2d` `ul2d` |
-//! | `fpext` / `fptrunc` | `__aeabi_f2d` | `__aeabi_d2f` |
+//! | `fadd` `fsub` `fmul` `fdiv` | `__aeabi_fadd` … / `__aeabi_dadd` … | `__addsf3` … / `__adddf3` … |
+//! | `frem` | `fmodf` / `fmod` (C library) | `fmodf` / `fmod` |
+//! | `fcmp` | `__aeabi_fcmpeq` `lt` `le` `ge` `gt` `un` (nonzero when the relation holds) | `__eqsf2` `__nesf2` `__ltsf2` `__lesf2` `__gtsf2` `__gesf2` `__unordsf2` (an `int` compared against 0) |
+//! | `fptosi` / `fptoui` to ≤ 32 / ≤ 64 bits | `__aeabi_f2iz` `f2uiz` / `f2lz` `f2ulz` | `__fixsfsi` `__fixunssfsi` / `__fixsfdi` `__fixunssfdi` |
+//! | `sitofp` / `uitofp` from ≤ 32 / ≤ 64 bits | `__aeabi_i2f` `ui2f` / `l2f` `ul2f` | `__floatsisf` `__floatunsisf` / `__floatdisf` `__floatundisf` |
+//! | `fpext` / `fptrunc` | `__aeabi_f2d` / `__aeabi_d2f` | `__extendsfdf2` / `__truncdfsf2` |
+//! | `f16` ↔ `f32`, `f64` → `f16` | `__aeabi_h2f` `f2h` `d2h` | `__extendhfsf2` `__truncsfhf2` `__truncdfhf2` |
 //!
-//! The comparison helpers return a nonzero `int` when their relation holds
-//! and are false on unordered operands, so the ordered predicates call one
-//! helper, their unordered complements negate one (`ugt` is `!ole`), and
-//! `one`/`ueq` or two (`olt | ogt`, `uno | oeq`). `f16` values compute in
-//! `f32` (`__aeabi_h2f`, `__aeabi_f2h`, `__aeabi_d2h`): the sum, difference,
-//! product and quotient of two halves are exact in `f32` before the one
-//! rounding back, and an integer converts through `f64` (exact below 2^53)
-//! to round once. Narrow integer sources and destinations of a conversion go
-//! through the 32-bit helpers with an extension or truncation (an
-//! out-of-range conversion is poison in the IR, so the helper's saturation
+//! (the `f64` column of each is the `d`/`df` form). With the RTABI names an
+//! ordered predicate calls one helper, its unordered complement negates one
+//! (`ugt` is `!ole`), and `one`/`ueq` or two (`olt | ogt`, `uno | oeq`). With
+//! the libgcc names each predicate compares one helper's `int` against zero
+//! with the sign libgcc documents (`ult` is `__gesf2 < 0`), `one` is
+//! `__unordsf2 == 0 && __nesf2 != 0` and `ueq` `__unordsf2 != 0 || __eqsf2 ==
+//! 0`; `int` is the target's (16 bits on AVR). `f16` values compute in `f32`:
+//! the sum, difference, product and quotient of two halves are exact in `f32`
+//! before the one rounding back, and an integer converts through `f64` (exact
+//! below 2^53) to round once. Narrow integer sources and destinations of a
+//! conversion go through the 32-bit helpers with an extension or truncation
+//! (an out-of-range conversion is poison in the IR, so the helper's result
 //! refines it); integers wider than 64 bits are a [`SoftFloatError`].
 //!
 //! Every helper the module could need is declared up front (a declaration
@@ -91,66 +93,224 @@ fn int_bits_of(kind: FloatKind) -> u32 {
     }
 }
 
-/// The helper table: name, parameter widths, result width (all integers).
-const HELPERS: &[(&str, &[u32], u32)] = &[
-    ("__aeabi_fadd", &[32, 32], 32),
-    ("__aeabi_fsub", &[32, 32], 32),
-    ("__aeabi_fmul", &[32, 32], 32),
-    ("__aeabi_fdiv", &[32, 32], 32),
-    ("fmodf", &[32, 32], 32),
-    ("__aeabi_dadd", &[64, 64], 64),
-    ("__aeabi_dsub", &[64, 64], 64),
-    ("__aeabi_dmul", &[64, 64], 64),
-    ("__aeabi_ddiv", &[64, 64], 64),
-    ("fmod", &[64, 64], 64),
-    ("__aeabi_fcmpeq", &[32, 32], 32),
-    ("__aeabi_fcmplt", &[32, 32], 32),
-    ("__aeabi_fcmple", &[32, 32], 32),
-    ("__aeabi_fcmpge", &[32, 32], 32),
-    ("__aeabi_fcmpgt", &[32, 32], 32),
-    ("__aeabi_fcmpun", &[32, 32], 32),
-    ("__aeabi_dcmpeq", &[64, 64], 32),
-    ("__aeabi_dcmplt", &[64, 64], 32),
-    ("__aeabi_dcmple", &[64, 64], 32),
-    ("__aeabi_dcmpge", &[64, 64], 32),
-    ("__aeabi_dcmpgt", &[64, 64], 32),
-    ("__aeabi_dcmpun", &[64, 64], 32),
-    ("__aeabi_f2d", &[32], 64),
-    ("__aeabi_d2f", &[64], 32),
-    ("__aeabi_f2iz", &[32], 32),
-    ("__aeabi_f2uiz", &[32], 32),
-    ("__aeabi_f2lz", &[32], 64),
-    ("__aeabi_f2ulz", &[32], 64),
-    ("__aeabi_d2iz", &[64], 32),
-    ("__aeabi_d2uiz", &[64], 32),
-    ("__aeabi_d2lz", &[64], 64),
-    ("__aeabi_d2ulz", &[64], 64),
-    ("__aeabi_i2f", &[32], 32),
-    ("__aeabi_ui2f", &[32], 32),
-    ("__aeabi_l2f", &[64], 32),
-    ("__aeabi_ul2f", &[64], 32),
-    ("__aeabi_i2d", &[32], 64),
-    ("__aeabi_ui2d", &[32], 64),
-    ("__aeabi_l2d", &[64], 64),
-    ("__aeabi_ul2d", &[64], 64),
-    // Half precision: the value travels zero-extended in a word.
-    ("__aeabi_h2f", &[32], 32),
-    ("__aeabi_f2h", &[32], 32),
-    ("__aeabi_d2h", &[64], 32),
-];
+/// Which run-time helper names (and comparison conventions) the soft-float
+/// calls use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SoftFloatAbi {
+    /// The *Run-time ABI for the Arm Architecture* (`__aeabi_fadd`, ...),
+    /// comparison helpers returning a nonzero 32-bit `int` when the relation
+    /// holds.
+    Aeabi,
+    /// The libgcc names (`__addsf3`, `__ltsf2`, `__fixsfsi`, ...), comparison
+    /// helpers returning a C `int` of `int_bits` bits compared against zero.
+    Libgcc {
+        /// The width of the target's C `int` (32 on most targets, 16 on AVR).
+        int_bits: u32,
+    },
+}
+
+impl SoftFloatAbi {
+    /// Every helper this ABI may call: name, parameter widths, result width
+    /// (all integers).
+    pub fn helpers(self) -> Vec<(String, Vec<u32>, u32)> {
+        let mut out: Vec<(String, Vec<u32>, u32)> = Vec::new();
+        for dbl in [false, true] {
+            let w = if dbl { 64 } else { 32 };
+            for op in [BinOp::FAdd, BinOp::FSub, BinOp::FMul, BinOp::FDiv, BinOp::FRem] {
+                out.push((self.arith(op, dbl), vec![w, w], w));
+            }
+            for pred in [FloatPred::Oeq, FloatPred::One, FloatPred::Ogt, FloatPred::Oge, FloatPred::Olt, FloatPred::Ole, FloatPred::Uno] {
+                for (name, _) in self.compare(pred, dbl).expect("a non-constant predicate").0 {
+                    if !out.iter().any(|h| h.0 == name) {
+                        out.push((name, vec![w, w], self.cmp_bits()));
+                    }
+                }
+            }
+            for long in [false, true] {
+                let iw = if long { 64 } else { 32 };
+                for signed in [false, true] {
+                    out.push((self.fp_to_int(dbl, signed, long), vec![w], iw));
+                    out.push((self.int_to_fp(signed, long, dbl), vec![iw], w));
+                }
+            }
+        }
+        out.push((self.f2d().to_owned(), vec![32], 64));
+        out.push((self.d2f().to_owned(), vec![64], 32));
+        let (h2f, hw) = self.h2f();
+        out.push((h2f.to_owned(), vec![hw], 32));
+        let (f2h, rw) = self.f2h(false);
+        out.push((f2h.to_owned(), vec![32], rw));
+        let (d2h, rw) = self.f2h(true);
+        out.push((d2h.to_owned(), vec![64], rw));
+        out
+    }
+
+    /// The helper of a binary float operation (`dbl`: on `f64`).
+    pub fn arith(self, op: BinOp, dbl: bool) -> String {
+        if op == BinOp::FRem {
+            return (if dbl { "fmod" } else { "fmodf" }).to_owned();
+        }
+        let base = match op {
+            BinOp::FAdd => "add",
+            BinOp::FSub => "sub",
+            BinOp::FMul => "mul",
+            _ => "div",
+        };
+        match self {
+            SoftFloatAbi::Aeabi => format!("__aeabi_{}{base}", if dbl { 'd' } else { 'f' }),
+            SoftFloatAbi::Libgcc { .. } => format!("__{base}{}3", if dbl { "df" } else { "sf" }),
+        }
+    }
+
+    /// The result width of the comparison helpers.
+    pub fn cmp_bits(self) -> u32 {
+        match self {
+            SoftFloatAbi::Aeabi => 32,
+            SoftFloatAbi::Libgcc { int_bits } => int_bits,
+        }
+    }
+
+    /// How an `fcmp` predicate is computed: helper calls, each result compared
+    /// against zero with its predicate, combined with `or` (`true`) or `and`.
+    /// `None` for the constant predicates.
+    pub fn compare(self, pred: FloatPred, dbl: bool) -> Option<(Vec<(String, IntPred)>, bool)> {
+        use FloatPred::*;
+        if matches!(pred, False | True) {
+            return None;
+        }
+        Some(match self {
+            SoftFloatAbi::Aeabi => {
+                let h = |rel: &str| format!("__aeabi_{}cmp{rel}", if dbl { 'd' } else { 'f' });
+                let yes = |rel: &str| (h(rel), IntPred::Ne);
+                let no = |rel: &str| (h(rel), IntPred::Eq);
+                match pred {
+                    Oeq => (vec![yes("eq")], false),
+                    Olt => (vec![yes("lt")], false),
+                    Ole => (vec![yes("le")], false),
+                    Ogt => (vec![yes("gt")], false),
+                    Oge => (vec![yes("ge")], false),
+                    Uno => (vec![yes("un")], false),
+                    Ord => (vec![no("un")], false),
+                    Ugt => (vec![no("le")], false),
+                    Uge => (vec![no("lt")], false),
+                    Ult => (vec![no("ge")], false),
+                    Ule => (vec![no("gt")], false),
+                    Une => (vec![no("eq")], false),
+                    One => (vec![yes("lt"), yes("gt")], true),
+                    _ => (vec![yes("un"), yes("eq")], true),
+                }
+            }
+            SoftFloatAbi::Libgcc { .. } => {
+                let h = |n: &str, p: IntPred| (format!("__{n}{}2", if dbl { "df" } else { "sf" }), p);
+                match pred {
+                    Oeq => (vec![h("eq", IntPred::Eq)], false),
+                    One => (vec![h("unord", IntPred::Eq), h("ne", IntPred::Ne)], false),
+                    Ogt => (vec![h("gt", IntPred::Sgt)], false),
+                    Oge => (vec![h("ge", IntPred::Sge)], false),
+                    Olt => (vec![h("lt", IntPred::Slt)], false),
+                    Ole => (vec![h("le", IntPred::Sle)], false),
+                    Ord => (vec![h("unord", IntPred::Eq)], false),
+                    Uno => (vec![h("unord", IntPred::Ne)], false),
+                    Ueq => (vec![h("unord", IntPred::Ne), h("eq", IntPred::Eq)], true),
+                    Une => (vec![h("ne", IntPred::Ne)], false),
+                    Ugt => (vec![h("le", IntPred::Sgt)], false),
+                    Uge => (vec![h("lt", IntPred::Sge)], false),
+                    Ult => (vec![h("ge", IntPred::Slt)], false),
+                    _ => (vec![h("gt", IntPred::Sle)], false),
+                }
+            }
+        })
+    }
+
+    /// The float-to-integer helper (`long`: a 64-bit result).
+    pub fn fp_to_int(self, dbl: bool, signed: bool, long: bool) -> String {
+        match self {
+            SoftFloatAbi::Aeabi => format!(
+                "__aeabi_{}2{}{}z",
+                if dbl { 'd' } else { 'f' },
+                if signed { "" } else { "u" },
+                if long { 'l' } else { 'i' }
+            ),
+            SoftFloatAbi::Libgcc { .. } => format!(
+                "__fix{}{}{}",
+                if signed { "" } else { "uns" },
+                if dbl { "df" } else { "sf" },
+                if long { "di" } else { "si" }
+            ),
+        }
+    }
+
+    /// The integer-to-float helper (`long`: a 64-bit source).
+    pub fn int_to_fp(self, signed: bool, long: bool, dbl: bool) -> String {
+        match self {
+            SoftFloatAbi::Aeabi => format!(
+                "__aeabi_{}{}2{}",
+                if signed { "" } else { "u" },
+                if long { 'l' } else { 'i' },
+                if dbl { 'd' } else { 'f' }
+            ),
+            SoftFloatAbi::Libgcc { .. } => format!(
+                "__float{}{}{}",
+                if signed { "" } else { "un" },
+                if long { "di" } else { "si" },
+                if dbl { "df" } else { "sf" }
+            ),
+        }
+    }
+
+    /// `f32` → `f64`.
+    pub fn f2d(self) -> &'static str {
+        match self {
+            SoftFloatAbi::Aeabi => "__aeabi_f2d",
+            SoftFloatAbi::Libgcc { .. } => "__extendsfdf2",
+        }
+    }
+
+    /// `f64` → `f32`.
+    pub fn d2f(self) -> &'static str {
+        match self {
+            SoftFloatAbi::Aeabi => "__aeabi_d2f",
+            SoftFloatAbi::Libgcc { .. } => "__truncdfsf2",
+        }
+    }
+
+    /// `f16` → `f32`, with the width the half travels in (the RTABI passes
+    /// it zero-extended in a word).
+    pub fn h2f(self) -> (&'static str, u32) {
+        match self {
+            SoftFloatAbi::Aeabi => ("__aeabi_h2f", 32),
+            SoftFloatAbi::Libgcc { .. } => ("__extendhfsf2", 16),
+        }
+    }
+
+    /// `f32` (or `f64` with `from64`) → `f16`, with the result's width.
+    pub fn f2h(self, from64: bool) -> (&'static str, u32) {
+        match (self, from64) {
+            (SoftFloatAbi::Aeabi, false) => ("__aeabi_f2h", 32),
+            (SoftFloatAbi::Aeabi, true) => ("__aeabi_d2h", 32),
+            (SoftFloatAbi::Libgcc { .. }, false) => ("__truncsfhf2", 16),
+            (SoftFloatAbi::Libgcc { .. }, true) => ("__truncdfhf2", 16),
+        }
+    }
+}
 
 /// The name of the scratch declaration that carries a rewritten function's
 /// new signature while it is rebuilt.
 const SCRATCH: &str = "__lf_softfloat_scratch";
 
 /// Rewrite `module` so that no floating-point type remains (see the [module
-/// docs](self)). `syms` resolves and interns the helper names.
+/// docs](self)), calling `abi`'s helpers. `syms` resolves and interns the
+/// helper names.
 ///
 /// # Errors
 ///
 /// [`SoftFloatError::WideConversion`] for a conversion between a float and an
 /// integer wider than 64 bits.
-pub fn lower_soft_float(module: &mut Module, syms: &mut StrInterner) -> Result<SoftFloatReport, SoftFloatError> {
+pub fn lower_soft_float(
+    module: &mut Module,
+    syms: &mut StrInterner,
+    abi: SoftFloatAbi,
+) -> Result<SoftFloatReport, SoftFloatError> {
     // 1. Anything to do? Which functions, and are all conversions supported?
     let mut work = Vec::new();
     for fi in 0..module.function_count() {
@@ -195,8 +355,8 @@ pub fn lower_soft_float(module: &mut Module, syms: &mut StrInterner) -> Result<S
     }
 
     // 2. Declare the helpers (or find a function of that name).
-    let mut helpers: HashMap<&'static str, FuncId> = HashMap::new();
-    for &(name, params, ret) in HELPERS {
+    let mut helpers: HashMap<String, FuncId> = HashMap::new();
+    for (name, params, ret) in abi.helpers() {
         let existing = (0..module.function_count())
             .map(FuncId::from_index)
             .find(|&f| syms.resolve(module.function(f).name) == name);
@@ -206,7 +366,7 @@ pub fn lower_soft_float(module: &mut Module, syms: &mut StrInterner) -> Result<S
                 let ps: Vec<TypeId> = params.iter().map(|&w| module.types_mut().int(w)).collect();
                 let r = module.types_mut().int(ret);
                 let sig = module.types_mut().func(ps, r, false);
-                module.declare_function(syms.intern(name), sig)
+                module.declare_function(syms.intern(&name), sig)
             }
         };
         helpers.insert(name, fid);
@@ -232,7 +392,7 @@ pub fn lower_soft_float(module: &mut Module, syms: &mut StrInterner) -> Result<S
             module.replace_function(scratch, Function::new(name, new_sig));
             let (fresh, ()) = module.map_function_reading(scratch, |_, funcs, b| {
                 let old = &funcs[fid.index()];
-                let mut sf = Sf { b, old, vmap: vec![None; old.value_count()], helpers: &helpers };
+                let mut sf = Sf { b, old, vmap: vec![None; old.value_count()], helpers: &helpers, abi };
                 sf.run();
             });
             fresh
@@ -271,7 +431,8 @@ struct Sf<'x, 'b> {
     old: &'x Function,
     /// Old value → its image in the rebuilt function.
     vmap: Vec<Option<ValueId>>,
-    helpers: &'x HashMap<&'static str, FuncId>,
+    helpers: &'x HashMap<String, FuncId>,
+    abi: SoftFloatAbi,
 }
 
 impl Sf<'_, '_> {
@@ -347,14 +508,23 @@ impl Sf<'_, '_> {
 
     /// An `f16`'s bits (`i16`) as an `f32`'s (`i32`).
     fn h2f(&mut self, h: ValueId) -> ValueId {
-        let t = self.int(32);
-        let z = self.b.cast(CastOp::ZExt, h, t);
-        self.call("__aeabi_h2f", &[z], 32)
+        let (name, w) = self.abi.h2f();
+        let x = if w == 16 {
+            h
+        } else {
+            let t = self.int(w);
+            self.b.cast(CastOp::ZExt, h, t)
+        };
+        self.call(name, &[x], 32)
     }
 
     /// Round an `f32` (`i32`) or `f64` (`i64`) to an `f16` (`i16`).
     fn round_half(&mut self, v: ValueId, from64: bool) -> ValueId {
-        let r = if from64 { self.call("__aeabi_d2h", &[v], 32) } else { self.call("__aeabi_f2h", &[v], 32) };
+        let (name, w) = self.abi.f2h(from64);
+        let r = self.call(name, &[v], w);
+        if w == 16 {
+            return r;
+        }
         let t = self.int(16);
         self.b.cast(CastOp::Trunc, r, t)
     }
@@ -506,19 +676,19 @@ impl Sf<'_, '_> {
     }
 
     fn fbin(&mut self, op: BinOp, k: FloatKind, a: ValueId, b: ValueId) -> ValueId {
-        let (s, d) = match op {
-            BinOp::FAdd => ("__aeabi_fadd", "__aeabi_dadd"),
-            BinOp::FSub => ("__aeabi_fsub", "__aeabi_dsub"),
-            BinOp::FMul => ("__aeabi_fmul", "__aeabi_dmul"),
-            BinOp::FDiv => ("__aeabi_fdiv", "__aeabi_ddiv"),
-            _ => ("fmodf", "fmod"),
-        };
         match k {
-            FloatKind::F32 => self.call(s, &[a, b], 32),
-            FloatKind::F64 => self.call(d, &[a, b], 64),
+            FloatKind::F32 => {
+                let n = self.abi.arith(op, false);
+                self.call(&n, &[a, b], 32)
+            }
+            FloatKind::F64 => {
+                let n = self.abi.arith(op, true);
+                self.call(&n, &[a, b], 64)
+            }
             FloatKind::F16 => {
                 let (x, y) = (self.h2f(a), self.h2f(b));
-                let r = self.call(s, &[x, y], 32);
+                let n = self.abi.arith(op, false);
+                let r = self.call(&n, &[x, y], 32);
                 self.round_half(r, false)
             }
         }
@@ -530,41 +700,22 @@ impl Sf<'_, '_> {
             FloatKind::F32 => (a, b, false),
             FloatKind::F64 => (a, b, true),
         };
-        let name = |rel: &str| format!("__aeabi_{}cmp{rel}", if dbl { 'd' } else { 'f' });
-        // `rel(a, b)` as an i1, or its negation.
-        let rel = |s: &mut Self, r: &str, holds: bool| -> ValueId {
-            let n = name(r);
-            let c = s.call(&n, &[a, b], 32);
-            let t = s.int(32);
-            let zero = s.b.const_int(t, Int::ZERO);
-            s.b.icmp(if holds { IntPred::Ne } else { IntPred::Eq }, c, zero)
+        let Some((calls, any)) = self.abi.compare(pred, dbl) else {
+            return self.b.const_bool(pred == FloatPred::True);
         };
-        use FloatPred::*;
-        match pred {
-            False | True => self.b.const_bool(pred == True),
-            Oeq => rel(self, "eq", true),
-            Olt => rel(self, "lt", true),
-            Ole => rel(self, "le", true),
-            Ogt => rel(self, "gt", true),
-            Oge => rel(self, "ge", true),
-            Uno => rel(self, "un", true),
-            Ord => rel(self, "un", false),
-            Ugt => rel(self, "le", false),
-            Uge => rel(self, "lt", false),
-            Ult => rel(self, "ge", false),
-            Ule => rel(self, "gt", false),
-            Une => rel(self, "eq", false),
-            One => {
-                let x = rel(self, "lt", true);
-                let y = rel(self, "gt", true);
-                self.b.bin(BinOp::Or, x, y, Flags::NONE)
-            }
-            Ueq => {
-                let x = rel(self, "un", true);
-                let y = rel(self, "eq", true);
-                self.b.bin(BinOp::Or, x, y, Flags::NONE)
-            }
+        let bits = self.abi.cmp_bits();
+        let mut acc: Option<ValueId> = None;
+        for (name, p) in calls {
+            let c = self.call(&name, &[a, b], bits);
+            let t = self.int(bits);
+            let zero = self.b.const_int(t, Int::ZERO);
+            let bit = self.b.icmp(p, c, zero);
+            acc = Some(match acc {
+                None => bit,
+                Some(x) => self.b.bin(if any { BinOp::Or } else { BinOp::And }, x, bit, Flags::NONE),
+            });
         }
+        acc.expect("at least one helper")
     }
 
     /// Lower a conversion whose source (old value `src`, image `a`) or
@@ -584,10 +735,17 @@ impl Sf<'_, '_> {
                     (FloatKind::F16, FloatKind::F32) => self.h2f(a),
                     (FloatKind::F16, FloatKind::F64) => {
                         let x = self.h2f(a);
-                        self.call("__aeabi_f2d", &[x], 64)
+                        let n = self.abi.f2d();
+                        self.call(n, &[x], 64)
                     }
-                    (FloatKind::F32, FloatKind::F64) => self.call("__aeabi_f2d", &[a], 64),
-                    (FloatKind::F64, FloatKind::F32) => self.call("__aeabi_d2f", &[a], 32),
+                    (FloatKind::F32, FloatKind::F64) => {
+                        let n = self.abi.f2d();
+                        self.call(n, &[a], 64)
+                    }
+                    (FloatKind::F64, FloatKind::F32) => {
+                        let n = self.abi.d2f();
+                        self.call(n, &[a], 32)
+                    }
                     (FloatKind::F32, FloatKind::F16) => self.round_half(a, false),
                     (FloatKind::F64, FloatKind::F16) => self.round_half(a, true),
                     _ => a,
@@ -602,12 +760,7 @@ impl Sf<'_, '_> {
                     FloatKind::F64 => (a, true),
                 };
                 let long = w > 32;
-                let name = format!(
-                    "__aeabi_{}2{}{}z",
-                    if dbl { 'd' } else { 'f' },
-                    if signed { "" } else { "u" },
-                    if long { 'l' } else { 'i' }
-                );
+                let name = self.abi.fp_to_int(dbl, signed, long);
                 let r = self.call(&name, &[x], if long { 64 } else { 32 });
                 let full = if long { 64 } else { 32 };
                 if w < full { self.b.cast(CastOp::Trunc, r, to) } else { r }
@@ -626,16 +779,74 @@ impl Sf<'_, '_> {
                 let kind = to_kind.expect("a float result");
                 // An f16 result rounds once, from the exact f64.
                 let dbl = kind != FloatKind::F32;
-                let name = format!(
-                    "__aeabi_{}{}2{}",
-                    if signed { "" } else { "u" },
-                    if long { 'l' } else { 'i' },
-                    if dbl { 'd' } else { 'f' }
-                );
+                let name = self.abi.int_to_fp(signed, long, dbl);
                 let r = self.call(&name, &[x], if dbl { 64 } else { 32 });
                 if kind == FloatKind::F16 { self.round_half(r, true) } else { r }
             }
             _ => a,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::diagnostics::FileId;
+
+    const SRC: &str = r#"
+module "sf"
+func @f(f32, f32, f64, i16) -> i1 {
+entry ^0(%a: f32, %b: f32, %d: f64, %n: i16):
+  %s = fadd %a, %b : f32
+  %e = fpext %s : f64
+  %m = fmul %e, %d : f64
+  %i = sitofp %n : f32
+  %t = fptrunc %m : f32
+  %c = fcmp ult %t, %i : i1
+  ret %c
+}
+"#;
+
+    /// The helpers each ABI calls for the same program (checking that no
+    /// float type survives the rewrite).
+    fn called(abi: SoftFloatAbi) -> Vec<String> {
+        let mut syms = StrInterner::new();
+        let mut m = crate::ir::text::parse_module(SRC, FileId::new(0), &mut syms).unwrap();
+        lower_soft_float(&mut m, &mut syms, abi).unwrap();
+        crate::verify::verify_module(&m).unwrap_or_else(|e| panic!("{e:?}"));
+        let f = m.function(FuncId::from_index(0));
+        for v in 0..f.value_count() {
+            assert!(!m.types().get(f.value_type(ValueId::from_index(v))).is_float());
+        }
+        let mut out = Vec::new();
+        for (_, b) in f.blocks() {
+            for &i in b.insts() {
+                if let InstKind::Call = f.inst(i).kind
+                    && let ValueDef::Func(g) = f.value(f.inst(i).operands()[0]).def
+                {
+                    out.push(syms.resolve(m.function(g).name).to_owned());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn helper_names_per_abi() {
+        assert_eq!(
+            called(SoftFloatAbi::Aeabi),
+            ["__aeabi_fadd", "__aeabi_f2d", "__aeabi_dmul", "__aeabi_i2f", "__aeabi_d2f", "__aeabi_fcmpge"]
+        );
+        assert_eq!(
+            called(SoftFloatAbi::Libgcc { int_bits: 16 }),
+            ["__addsf3", "__extendsfdf2", "__muldf3", "__floatsisf", "__truncdfsf2", "__gesf2"]
+        );
+        for abi in [SoftFloatAbi::Aeabi, SoftFloatAbi::Libgcc { int_bits: 32 }] {
+            let names: Vec<String> = abi.helpers().into_iter().map(|h| h.0).collect();
+            let mut dedup = names.clone();
+            dedup.sort();
+            dedup.dedup();
+            assert_eq!(dedup.len(), names.len(), "every {abi:?} helper is distinct");
         }
     }
 }

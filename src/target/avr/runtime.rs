@@ -841,7 +841,23 @@ pub fn members(device: &super::Device) -> Vec<ObjectModule> {
 
 /// Like [`members`], with each member's stack-usage report (for a
 /// whole-program stack bound through the helpers).
+///
+/// The result depends only on the device's core (the multiplier), so it is
+/// compiled once per core and process and cloned afterwards.
 pub fn compiled(device: &super::Device) -> Vec<crate::codegen::CompiledModule> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<Vec<(bool, Vec<crate::codegen::CompiledModule>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Some((_, c)) = cache.lock().expect("the runtime cache").iter().find(|(m, _)| *m == device.has_mul) {
+        return c.clone();
+    }
+    let c = compile_members(device);
+    cache.lock().expect("the runtime cache").push((device.has_mul, c.clone()));
+    c
+}
+
+fn compile_members(device: &super::Device) -> Vec<crate::codegen::CompiledModule> {
     let mut syms = StrInterner::new();
     let m = module(device, &mut syms);
     let mut out = Vec::new();

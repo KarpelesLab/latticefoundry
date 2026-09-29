@@ -1,15 +1,19 @@
 //! Preparing a module for AVR instruction selection.
 //!
-//! The backend compiles a private copy of the module, rewritten in three
-//! target-independent-style steps:
+//! The backend compiles a private copy of the module, rewritten by the
+//! target-independent passes, in this order:
 //!
 //! 1. **Data layout.** A module that still has the default LP64 layout is given
 //!    the AVR layout with functions in space 0 ([`super::data_layout_p0`]: its
 //!    function references were typed that way); one with another layout must
 //!    already agree with AVR's on the pointer widths.
-//! 2. **Soft float** ([`super::softfloat`]): `f32`/`f64` become their bit
-//!    patterns and the operations runtime calls.
-//! 3. **Integer legalization** ([`legalize_ints`]) at a part width of 16:
+//! 2. **Vector legalization** ([`crate::codegen::legalize`] with no legal
+//!    vector type): every vector operation is scalarized.
+//! 3. **Soft float** ([`crate::codegen::softfloat`], libgcc helper names with a
+//!    16-bit `int`): `f32`/`f64` become their bit patterns — signatures
+//!    included, which is AVR's soft-float calling convention — and the
+//!    operations runtime calls.
+//! 4. **Integer legalization** ([`legalize_ints`]) at a part width of 16:
 //!    every integer wider than 16 bits becomes 16-bit parts, and a wide
 //!    `mul`/`udiv`/`sdiv`/`urem`/`srem` a call to `__mulsi3`, `__udivdi3`, ...
 //!
@@ -31,6 +35,11 @@ use super::isel::container;
 /// The helper functions isel calls for narrow operations, by `(op, container
 /// width)`, as function indices of the prepared module.
 pub(crate) type Helpers = DetHashMap<(BinOp, u32), u32>;
+
+/// The soft-float helper names: libgcc's, with AVR's 16-bit `int` as the
+/// comparison helpers' result.
+pub(crate) const SOFT_FLOAT: crate::codegen::softfloat::SoftFloatAbi =
+    crate::codegen::softfloat::SoftFloatAbi::Libgcc { int_bits: 16 };
 
 /// A deep copy of `module` (through the binary form) with a fresh interner.
 pub(crate) fn copy_module(module: &Module, syms: &StrInterner) -> Result<(Module, StrInterner), String> {
@@ -65,7 +74,11 @@ pub(crate) fn prepare(
             ));
         }
     }
-    super::softfloat::lower_floats(&mut m, &mut s)?;
+    // Vectors first (AVR has no vector registers: everything is scalarized),
+    // so the soft-float pass sees scalar float lanes and legalization scalar
+    // wide integers.
+    crate::codegen::legalize::legalize_vectors(&mut m, &crate::codegen::legalize::ScalarOnly);
+    crate::codegen::softfloat::lower_soft_float(&mut m, &mut s, SOFT_FLOAT).map_err(|e| e.to_string())?;
     legalize_ints(&mut m, &mut s, &LegalizeOptions::new(16)).map_err(|e| e.to_string())?;
     let helpers = declare_helpers(&mut m, &mut s, device.has_mul);
     Ok((m, s, helpers))

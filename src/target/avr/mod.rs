@@ -60,15 +60,24 @@
 //!
 //! # Floating point
 //!
-//! Soft float only ([`softfloat`]): `f32` and `f64` are
-//! their bit patterns and every operation is a libgcc-named call (`__addsf3`,
-//! `__ltsf2`, `__fixsfsi`, ...). [`runtime`] implements the `f32` helpers
+//! Soft float only, through the shared pass [`crate::codegen::softfloat`] with
+//! the libgcc names ([`SoftFloatAbi::Libgcc`], a 16-bit `int`): `f32` and
+//! `f64` are their bit patterns — in signatures too, which is how avr-gcc
+//! passes floats — and every operation is a call (`__addsf3`, `__ltsf2`,
+//! `__fixsfsi`, ...). [`runtime`] implements the `f32` helpers
 //! (round-to-nearest-even, IEEE 754 binary32 including subnormals, infinities
 //! and NaN). Note that **avr-gcc's `double` is 32 bits** by default: a C front
 //! end should map `double` to `f32` for avr-gcc compatibility. The IR's `f64`
 //! is always IEEE binary64; it is lowered to the `…df…` helpers, which the LF
-//! runtime does not provide (link a soft-float library that does). `f16` is not
-//! supported.
+//! runtime does not provide (link a soft-float library that does); so are
+//! `f16`'s (`__extendhfsf2`, `__truncsfhf2`).
+//!
+//! # Vectors
+//!
+//! AVR has no vector registers: the generic vector legalizer
+//! ([`crate::codegen::legalize`]) runs first with no legal vector type, so
+//! every vector operation is scalarized before soft float and integer
+//! legalization.
 //!
 //! # Calls and frames
 //!
@@ -107,6 +116,7 @@
 //! and [`startup`] supplies the vector table and reset code. `lf build
 //! --target avr-atmega328p --oformat ihex` produces an Intel HEX image.
 //!
+//! [`SoftFloatAbi::Libgcc`]: crate::codegen::softfloat::SoftFloatAbi::Libgcc
 //! [`RelocKind::AvrCall`]: crate::mc::object::RelocKind::AvrCall
 //! [`RelocKind::Avr13Pcrel`]: crate::mc::object::RelocKind::Avr13Pcrel
 //! [`RelocKind::Abs16`]: crate::mc::object::RelocKind::Abs16
@@ -125,7 +135,6 @@ pub mod startup;
 pub(crate) mod data;
 pub mod prepare;
 pub mod regs;
-pub mod softfloat;
 
 #[cfg(test)]
 mod interp;

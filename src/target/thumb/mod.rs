@@ -101,7 +101,8 @@ pub mod encode;
 pub mod firmware;
 pub mod isel;
 pub(crate) mod regs;
-pub mod softfloat;
+#[doc(no_inline)]
+pub use crate::codegen::softfloat;
 
 #[cfg(test)]
 mod interp;
@@ -197,7 +198,7 @@ pub fn prepare_module(
     // min/max and saturating ops expanded), so the soft-float pass sees the
     // scalarized float lanes and legalization the scalarized wide integers.
     crate::codegen::legalize::legalize_vectors(&mut m, &crate::codegen::legalize::ScalarOnly);
-    softfloat::lower_soft_float(&mut m, &mut s).map_err(PrepareError::SoftFloat)?;
+    softfloat::lower_soft_float(&mut m, &mut s, softfloat::SoftFloatAbi::Aeabi).map_err(PrepareError::SoftFloat)?;
     let opts = LegalizeOptions { part_bits: 32, libcall_name: aeabi_libcall };
     legalize_ints(&mut m, &mut s, &opts).map_err(PrepareError::Legalize)?;
 

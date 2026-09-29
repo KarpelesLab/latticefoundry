@@ -47,6 +47,7 @@ pub mod linkage;
 pub mod mir;
 pub mod options;
 pub mod regalloc;
+pub mod softfloat;
 pub(crate) mod simd128;
 pub mod stack;
 pub mod target;
