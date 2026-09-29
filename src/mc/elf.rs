@@ -118,14 +118,21 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         RelocKind::Pc64 => R_X86_64_PC64,
         RelocKind::Plt32 => R_X86_64_PLT32,
         RelocKind::GotPcRel => R_X86_64_GOTPCREL,
-        // AArch64 and Thumb relocation kinds never appear in an x86-64 ELF
+        // AArch64, Thumb and AVR relocation kinds never appear in an x86-64 ELF
         // object (those backends do not emit through this mapping).
         RelocKind::Aarch64Call26
         | RelocKind::Aarch64AdrPrelPgHi21
         | RelocKind::Aarch64AddAbsLo12Nc
         | RelocKind::ThumbCall
         | RelocKind::ThumbMovwAbsNc
-        | RelocKind::ThumbMovtAbs => {
+        | RelocKind::ThumbMovtAbs
+        | RelocKind::AvrCall
+        | RelocKind::Avr13Pcrel
+        | RelocKind::Avr16Pm
+        | RelocKind::AvrLo8Ldi
+        | RelocKind::AvrHi8Ldi
+        | RelocKind::AvrLo8LdiPm
+        | RelocKind::AvrHi8LdiPm => {
             unreachable!("relocation kind {kind:?} in an x86-64 ELF object")
         }
     }
@@ -292,7 +299,7 @@ impl ElfTarget {
 /// [`x86_64_reloc`] as a total mapping (`None` for the instruction kinds of
 /// other machines).
 fn x86_64_reloc_type(kind: RelocKind) -> Option<u32> {
-    if kind.is_instruction_field() {
+    if kind.is_instruction_field() || kind.is_avr() {
         return None;
     }
     Some(x86_64_reloc(kind))

@@ -57,6 +57,8 @@ fn rsasm_arch(arch: TargetArch) -> &'static str {
         // missing backend.
         TargetArch::Thumb => "thumb",
         TargetArch::Wasm32 => "wasm32",
+        // rsasm has no AVR backend: `assemble` reports that.
+        TargetArch::Avr => "avr",
     }
 }
 

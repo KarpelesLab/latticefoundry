@@ -306,6 +306,24 @@ pub enum RelocKind {
     /// Arm `R_ARM_THM_MOVT_ABS`: the high 16 bits of `S + A` into a `movt`'s
     /// `imm16`.
     ThumbMovtAbs,
+    /// AVR `R_AVR_CALL`: the 22-bit word address `(S + A) / 2` in a 2-word
+    /// `call`/`jmp` (the field is the whole 4-byte instruction).
+    AvrCall,
+    /// AVR `R_AVR_13_PCREL`: the 12-bit word displacement
+    /// `(S + A - (P + 2)) / 2` of an `rcall`/`rjmp`.
+    Avr13Pcrel,
+    /// AVR `R_AVR_16_PM`: a program-memory word address `(S + A) / 2` in a
+    /// 16-bit data field (a function pointer).
+    Avr16Pm,
+    /// AVR `R_AVR_LO8_LDI`: bits 0–7 of `S + A` in the `K` field of an
+    /// `ldi`-form instruction (`ldi`, `cpi`, `subi`, ...).
+    AvrLo8Ldi,
+    /// AVR `R_AVR_HI8_LDI`: bits 8–15 of `S + A` in an `ldi`-form `K` field.
+    AvrHi8Ldi,
+    /// AVR `R_AVR_LO8_LDI_PM`: bits 0–7 of the word address `(S + A) / 2`.
+    AvrLo8LdiPm,
+    /// AVR `R_AVR_HI8_LDI_PM`: bits 8–15 of the word address `(S + A) / 2`.
+    AvrHi8LdiPm,
 }
 
 impl RelocKind {
@@ -314,7 +332,14 @@ impl RelocKind {
     pub fn field_width(self) -> usize {
         match self {
             RelocKind::Abs64 | RelocKind::Pc64 => 8,
-            RelocKind::Abs16 => 2,
+            RelocKind::Abs16
+            | RelocKind::Avr13Pcrel
+            | RelocKind::Avr16Pm
+            | RelocKind::AvrLo8Ldi
+            | RelocKind::AvrHi8Ldi
+            | RelocKind::AvrLo8LdiPm
+            | RelocKind::AvrHi8LdiPm => 2,
+            RelocKind::AvrCall => 4,
             RelocKind::Abs32
             | RelocKind::Abs32S
             | RelocKind::Pc32
@@ -356,11 +381,28 @@ impl RelocKind {
                 | RelocKind::Aarch64Call26
                 | RelocKind::Aarch64AdrPrelPgHi21
                 | RelocKind::ThumbCall
+                | RelocKind::Avr13Pcrel
+        )
+    }
+
+    /// Whether this is one of the AVR-specific kinds (which only the AVR ELF
+    /// writer and firmware linker understand).
+    #[inline]
+    pub fn is_avr(self) -> bool {
+        matches!(
+            self,
+            RelocKind::AvrCall
+                | RelocKind::Avr13Pcrel
+                | RelocKind::Avr16Pm
+                | RelocKind::AvrLo8Ldi
+                | RelocKind::AvrHi8Ldi
+                | RelocKind::AvrLo8LdiPm
+                | RelocKind::AvrHi8LdiPm
         )
     }
 
     /// Whether the relocation patches a bitfield inside an instruction rather
-    /// than a whole data field (the AArch64 and Thumb instruction kinds).
+    /// than a whole data field (the AArch64, Thumb and AVR instruction kinds).
     #[inline]
     pub fn is_instruction_field(self) -> bool {
         matches!(
@@ -371,6 +413,12 @@ impl RelocKind {
                 | RelocKind::ThumbCall
                 | RelocKind::ThumbMovwAbsNc
                 | RelocKind::ThumbMovtAbs
+                | RelocKind::AvrCall
+                | RelocKind::Avr13Pcrel
+                | RelocKind::AvrLo8Ldi
+                | RelocKind::AvrHi8Ldi
+                | RelocKind::AvrLo8LdiPm
+                | RelocKind::AvrHi8LdiPm
         )
     }
 

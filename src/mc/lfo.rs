@@ -339,6 +339,13 @@ fn reloc_kind_code(k: RelocKind) -> u8 {
         RelocKind::ThumbCall => 11,
         RelocKind::ThumbMovwAbsNc => 12,
         RelocKind::ThumbMovtAbs => 13,
+        RelocKind::AvrCall => 14,
+        RelocKind::Avr13Pcrel => 15,
+        RelocKind::Avr16Pm => 16,
+        RelocKind::AvrLo8Ldi => 17,
+        RelocKind::AvrHi8Ldi => 18,
+        RelocKind::AvrLo8LdiPm => 19,
+        RelocKind::AvrHi8LdiPm => 20,
     }
 }
 
@@ -358,6 +365,13 @@ fn reloc_kind_from(c: u8) -> Result<RelocKind, DecodeError> {
         11 => RelocKind::ThumbCall,
         12 => RelocKind::ThumbMovwAbsNc,
         13 => RelocKind::ThumbMovtAbs,
+        14 => RelocKind::AvrCall,
+        15 => RelocKind::Avr13Pcrel,
+        16 => RelocKind::Avr16Pm,
+        17 => RelocKind::AvrLo8Ldi,
+        18 => RelocKind::AvrHi8Ldi,
+        19 => RelocKind::AvrLo8LdiPm,
+        20 => RelocKind::AvrHi8LdiPm,
         _ => return Err(DecodeError::InvalidTag { what: "reloc-kind", tag: u32::from(c) }),
     })
 }

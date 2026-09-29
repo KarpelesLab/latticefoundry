@@ -239,7 +239,14 @@ impl CompiledModule {
                     | RelocKind::Aarch64AddAbsLo12Nc
                     | RelocKind::ThumbCall
                     | RelocKind::ThumbMovwAbsNc
-                    | RelocKind::ThumbMovtAbs => {
+                    | RelocKind::ThumbMovtAbs
+                    | RelocKind::AvrCall
+                    | RelocKind::Avr13Pcrel
+                    | RelocKind::Avr16Pm
+                    | RelocKind::AvrLo8Ldi
+                    | RelocKind::AvrHi8Ldi
+                    | RelocKind::AvrLo8LdiPm
+                    | RelocKind::AvrHi8LdiPm => {
                         return Err(JitError::UnsupportedReloc(r.kind));
                     }
                 }

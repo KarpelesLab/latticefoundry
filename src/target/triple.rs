@@ -113,6 +113,8 @@ pub enum CallConvKind {
     /// WebAssembly's typed calls: every argument a wasm parameter (an `i128`
     /// two `i64`s), results as wasm results.
     Wasm32,
+    /// The avr-gcc calling convention (`r25`..`r8`, even-aligned).
+    AvrGcc,
 }
 
 /// An architecture plus an operating system.
@@ -150,6 +152,7 @@ impl Triple {
             // FPU extensions the backend does not use) share the backend.
             "thumbv7m" | "thumbv7em" | "thumb" | "thumbv7" => TargetArch::Thumb,
             "wasm32" => TargetArch::Wasm32,
+            "avr" => TargetArch::Avr,
             _ => return None,
         };
         let rest: Vec<&str> = parts.collect();
@@ -157,6 +160,11 @@ impl Triple {
             // `wasm32`, `wasm32-unknown-unknown`, `wasm32-none`: no OS.
             let bare = rest.iter().all(|p| matches!(*p, "unknown" | "none"));
             return bare.then_some(Triple::new(arch, TargetOs::None));
+        }
+        // AVR is always bare metal; the other components name the device
+        // (`avr-atmega328p`), which `avr::Device::from_triple` reads.
+        if arch == TargetArch::Avr {
+            return crate::target::avr::Device::from_triple(s).map(|_| Triple::new(arch, TargetOs::None));
         }
         let mut os = None;
         for part in &rest {
@@ -215,6 +223,7 @@ impl Triple {
             (TargetArch::Riscv64, _) => CallConvKind::RiscvLp64,
             (TargetArch::Thumb, _) => CallConvKind::Aapcs,
             (TargetArch::Wasm32, _) => CallConvKind::Wasm32,
+            (TargetArch::Avr, _) => CallConvKind::AvrGcc,
         }
     }
 
@@ -265,6 +274,8 @@ mod tests {
             ("thumbv7m-none-eabi", TargetArch::Thumb, TargetOs::None),
             ("thumbv7em-none-eabi", TargetArch::Thumb, TargetOs::None),
             ("thumbv7m", TargetArch::Thumb, TargetOs::None),
+            ("avr", TargetArch::Avr, TargetOs::None),
+            ("avr-atmega328p", TargetArch::Avr, TargetOs::None),
         ];
         for (s, arch, os) in cases {
             assert_eq!(Triple::parse(s), Some(Triple::new(arch, os)), "{s}");

@@ -5,6 +5,7 @@
 //! can select one by triple.
 
 pub mod aarch64;
+pub mod avr;
 pub mod riscv;
 pub mod thumb;
 pub mod triple;
@@ -43,6 +44,8 @@ pub enum TargetArch {
     /// module format, compiled without the register-machine pipeline (see
     /// [`wasm32`]).
     Wasm32,
+    /// 8-bit AVR (AVR5 baseline: ATmega328P).
+    Avr,
 }
 
 impl TargetArch {
@@ -54,6 +57,7 @@ impl TargetArch {
             TargetArch::Riscv64 => "riscv64",
             TargetArch::Thumb => "thumbv7m",
             TargetArch::Wasm32 => "wasm32",
+            TargetArch::Avr => "avr",
         }
     }
 }
@@ -142,5 +146,6 @@ pub fn compile_module_for(
         TargetArch::Thumb => thumb::compile_module_with(module, syms, opts),
         TargetArch::Wasm32 => wasm32::compile_module_with(module, syms, opts)
             .map_err(|e| CodegenError::Unsupported { arch, message: e.to_string() })?,
+        TargetArch::Avr => avr::compile_module_with(module, syms, opts),
     })
 }

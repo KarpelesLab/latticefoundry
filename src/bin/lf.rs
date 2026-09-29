@@ -16,6 +16,10 @@
 //! the result into a flashable image (`-L`/`-l` add the runtime library, e.g.
 //! `-lgcc`, for the soft-float and 64-bit division helpers).
 //!
+//! For AVR (`--target avr-atmega328p`), `--oformat ihex|binary` links a
+//! flashable firmware image (vector table, startup code, program, runtime)
+//! and `-c` writes an ELF32 `EM_AVR` object.
+//!
 //! For x86-64 Linux, `--shared` builds a **shared library** of position-
 //! independent code (linked by `qld`, optional `-soname`), `--pie` a
 //! position-independent executable against the host C library (its `main` is
@@ -85,7 +89,8 @@ fn print_usage() {
     println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
     println!("                 aarch64-windows, aarch64-apple-darwin, thumbv7m-none-eabi (Cortex-M),");
     println!("                 ... (ABI + object format), wasm32 (a WebAssembly module;");
-    println!("                 with -c, a wasm-ld object)");
+    println!("                 with -c, a wasm-ld object), avr-atmega328p (AVR firmware:");
+    println!("                 --oformat ihex|binary, or -c for an ELF object)");
     println!("  -c             emit a relocatable object instead of linking");
     println!("  --format F     object format for -c: elf, coff or macho (default: the target's)");
     println!("  --oformat F    executable format: elf (default), binary or ihex (firmware)");
@@ -113,6 +118,8 @@ struct BuildOptions {
     stack_usage: bool,
     stack_probes: bool,
     target: Triple,
+    /// The AVR device named by `--target` (for an AVR target).
+    device: Option<target::avr::Device>,
     format: Option<ObjectFormat>,
     oformat: Option<RawFormat>,
     base: Option<u64>,
@@ -186,6 +193,11 @@ fn build(args: &[String]) -> Result<(), String> {
     if opts.target.arch == TargetArch::Wasm32 && *module.data_layout() == latticefoundry::ir::DataLayout::lp64() {
         module.set_data_layout(target::wasm32::data_layout());
     }
+    // An AVR module that declares no layout gets AVR's (16-bit pointers, the
+    // program-memory address space 1) before it is checked.
+    if opts.target.arch == TargetArch::Avr && *module.data_layout() == latticefoundry::ir::DataLayout::lp64() {
+        module.set_data_layout(target::avr::data_layout());
+    }
 
     // Verify (Structural tier) unless suppressed.
     if opts.verify {
@@ -220,11 +232,24 @@ fn build(args: &[String]) -> Result<(), String> {
             target::x86_64::compile_module_debug_with(&module, &syms, &source, &cg)
         }
         _ if opts.debug => return Err(format!("-g is supported for x86-64 only, not {triple}")),
+        TargetArch::Avr => {
+            target::check_options(TargetArch::Avr, &cg).map_err(|e| e.to_string())?;
+            let device = opts.device.unwrap_or(target::avr::Device::ATMEGA328P);
+            target::avr::compile_module_for_device(&module, &syms, &cg, &device)
+        }
         arch => target::compile_module_for(arch, &module, &syms, &cg).map_err(|e| e.to_string())?,
     };
     let entry = opts.entry.clone().unwrap_or_else(|| ImageOptions::default().entry);
     if opts.stack_usage {
-        print_stack_usage(&compiled.stack, &entry);
+        let mut report = compiled.stack.clone();
+        if triple.arch == TargetArch::Avr {
+            // The runtime helpers the program may call are part of its stack.
+            let device = opts.device.unwrap_or(target::avr::Device::ATMEGA328P);
+            for member in target::avr::runtime::compiled(&device) {
+                report.extend(member.stack);
+            }
+        }
+        print_stack_usage(&report, &entry);
     }
     let obj = compiled.object;
     let stem = default_output(&opts.inputs[0]);
@@ -240,6 +265,20 @@ fn build(args: &[String]) -> Result<(), String> {
         let bytes = latticefoundry::mc::format::write_object_as(&obj, triple.arch, format)
             .map_err(|e| format!("cannot write a {} object for {triple}: {e}", format.name()))?;
         let output = output_or(if format == ObjectFormat::Coff { "obj" } else { "o" });
+        return std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"));
+    }
+
+    if triple.arch == TargetArch::Avr {
+        let device = opts.device.unwrap_or(target::avr::Device::ATMEGA328P);
+        let Some(format) = opts.oformat else {
+            return Err("an AVR executable is a firmware image: add --oformat ihex (or binary), or -c".to_owned());
+        };
+        let fw = target::avr::link::build(vec![obj], &device, &entry).map_err(|e| format!("link error: {e}"))?;
+        let (bytes, ext) = match format {
+            RawFormat::Binary => (fw.flash.clone(), "bin"),
+            RawFormat::Ihex => (fw.to_ihex().into_bytes(), "hex"),
+        };
+        let output = output_or(ext);
         return std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"));
     }
 
@@ -443,6 +482,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut stack_usage = false;
     let mut stack_probes = true;
     let mut target = Triple::default_target();
+    let mut device = None;
     let mut format = None;
     let mut oformat = None;
     let mut base = None;
@@ -465,6 +505,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "--target" => {
                 let t = it.next().ok_or("--target requires a triple")?;
                 target = Triple::parse(t).ok_or_else(|| format!("unknown target '{t}'"))?;
+                device = target::avr::Device::from_triple(t);
             }
             "-c" => output_kind = OutputKind::Object,
             "--shared" | "-shared" => output_kind = OutputKind::Shared,
@@ -543,6 +584,9 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     if target.arch == TargetArch::Wasm32 && (oformat.is_some() || base.is_some()) {
         return Err("--oformat/--base do not apply to wasm32".to_owned());
     }
+    if target.arch == TargetArch::Avr && base.is_some() {
+        return Err("--base does not apply to AVR firmware (flash starts at 0)".to_owned());
+    }
     if target.os == TargetOs::Darwin && output_kind == OutputKind::Executable {
         return Err(format!("cannot link a {target} executable yet: use -c"));
     }
@@ -558,6 +602,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         stack_usage,
         stack_probes,
         target,
+        device,
         format,
         oformat,
         base,
