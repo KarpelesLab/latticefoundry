@@ -58,9 +58,9 @@ parameters passed on the branch.
   exact and host-independent).
 - `Ptr` — **opaque** (no pointee type), in an **address space**: `ptr` is the
   default space 0, `ptr addrspace(N)` space `N` (§3a).
-- Aggregates: `Array(T, n)`, `Struct(fields)`; vectors (`Vector(T, n)`) added
-  with SIMD targets; scalable vectors deferred until a scalable-vector target
-  (SVE/RVV) is real.
+- Aggregates: `Array(T, n)`, `Struct(fields)`.
+- Vectors `Vector(T, n)` (`<n x T>`), first-class SIMD values (§6e); scalable
+  vectors deferred until a scalable-vector target (SVE/RVV) is real.
 - `Func(FuncType)`.
 
 Types are interned (structural identity, `Copy` handles) — hash-consing at the
@@ -825,6 +825,166 @@ arguments and `xmm` saves are added. The tests disassemble the whole
 - Floating point stays outside the constant-time subset, and so does a wide
   `mul`/`div`/`rem` on a target that legalizes it into a libcall.
 
+## 6e. SIMD vectors  *(decided)*
+
+A vector `<N x T>` is a first-class **value**: `N ≥ 1` lanes of `i1`, `i8`,
+`i16`, `i32`, `i64` or a float type. Unlike an array (an address, §6) it lives
+in registers where the target allows, crosses calls and block edges by value,
+and is loaded and stored whole. In memory its lanes are packed at the element
+size, lane 0 first (an `i1` lane takes one byte holding 0 or 1), each lane in
+the data layout's byte order (§3a); it is aligned to its size rounded up to a
+power of two, capped at 16 bytes and never below the element's alignment.
+
+### Operations
+
+The ordinary value ops apply **lane-wise** to vectors: the binops (`add` …
+`ashr`, `fadd` … `frem`, and the min/max and saturating ops below), `fneg`,
+the casts (with equal lane counts), and `freeze`. `icmp`/`fcmp` on `<N x T>`
+give `<N x i1>`; `select` takes an `i1` condition (choose a whole arm) or an
+`<N x i1>` one (choose per lane). Five ops are vector-only:
+
+```text
+%e = extractelement %v, 3 : i32                            ; lane 3
+%w = insertelement %v, %x, 0 : <4 x i32>                   ; lane 0 replaced
+%s = shufflevector %a, %b, [7, 0, 5, 2] : <4 x i32>        ; lanes of a ++ b
+%b = splat %x : <4 x i32>                                  ; broadcast
+%r = reduce add %v : i32      ; add mul and or xor smin smax umin umax fadd fmul
+```
+
+Lane indices and shuffle masks are **constants** (the verifier checks them in
+range), and a shuffle may change the lane count (`M = mask.len()`). The
+integer reductions are associative, so their order is unobservable; `reduce
+fadd`/`fmul` are **ordered** (`((l0 op l1) op l2) …`, each step rounded), and
+a `reassoc` flag licenses any other order. Vector constants are ordinary
+operands: `<4 x i32> (i32 1, i32 poison, i32 3, i32 4)`.
+
+Eight integer binops, valid on scalars and vectors, carry the common SIMD
+idioms: `smin`, `smax`, `umin`, `umax`, and the saturating `sadd_sat`,
+`uadd_sat`, `ssub_sat`, `usub_sat` (the exact result clamped to the type's
+range). They are never poison except from a poison operand.
+
+- **Rejected: dynamic lane indices.** SSE and NEON take lane numbers as
+  immediates; a dynamic index goes through memory anyway, which a front end
+  writes explicitly (`store` + `ptr_add` + `load`). Constant indices keep the
+  op's meaning total (no out-of-range case) and trivially checkable.
+- **Rejected: an "undef" shuffle-mask entry.** There is no `undef` (§5); a
+  front end that does not care about a lane picks any in-range index.
+- **Rejected: intrinsics for min/max/saturation.** An opaque call hides the
+  meaning from every pass and from the verifier; eight real opcodes with a
+  reference semantics cost little and lower directly on SSE2/NEON.
+
+### Semantics: poison per lane
+
+This resolves the §10 open question in favour of **per-lane poison**. The
+reference evaluator carries a vector as one value per lane, so:
+
+- lane-wise ops apply the scalar poison rules **per lane**: an over-wide shift
+  amount, a violated `nsw`/`nuw`/`exact`, an out-of-range `fptosi` poison only
+  that lane;
+- the scalar UB rules apply to the **whole instruction**: a zero divisor (or
+  `INT_MIN / -1`) in any lane makes the `udiv`/`sdiv`/`urem`/`srem` UB;
+- `select` with a vector condition poisons only the lanes whose condition lane
+  is poison; `freeze` fixes each poison lane (to zero in the evaluator);
+- `extractelement` is poison iff the lane is; `insertelement` defines the
+  written lane even in a poison vector; a shuffle lane is poison iff the lane
+  it picks is; `splat` of poison is all-poison; `reduce` is poison if any lane
+  is;
+- `bitcast` reinterprets the packed bits (lane 0 least significant, as in
+  memory on a little-endian machine), and a poison source lane poisons exactly
+  the result lanes (or the scalar) it overlaps.
+
+A whole-value `poison` of vector type means every lane is poison.
+Refinement (§5) is lane-wise: a target vector refines a source vector iff each
+lane refines. The refinement checker (B2) encodes scalars only, so it reports a
+function using vector ops as `Unknown`; the min/max/saturating ops have exact
+SMT encodings.
+
+### Verification, text and binary form
+
+The verifier checks vector well-formedness (lane count `1..=65536`, lane types
+above), lane-count agreement of lane-wise ops and compares, `<N x i1>` select
+conditions against `N`-lane arms, lane/mask ranges, `bitcast` total widths,
+and forbids `volatile` vector accesses (a vector access may be split into
+lanes, which "exactly once, at exactly the width" cannot allow) and vector
+atomics. In `.lfb`, the vector type is type tag 16 and the vector ops are
+opcode tags 40–44 (the min/max/saturating binops are binop codes 18–25).
+These are new tag values only, so the format stays at version 5: a stream
+without vectors is unchanged, and an older reader rejects a vector stream's
+tags as invalid rather than misreading them.
+
+### Legalization
+
+Each backend runs a target-independent IR→IR **legalizer**
+(`codegen::legalize`) before instruction selection, parameterized by the
+target's `VectorLegality`: which vector types it holds whole in a register and
+which ops on them it selects. Everything else is rewritten, so correctness
+never depends on the ISA having an instruction:
+
+1. min/max/saturating ops without a direct form are expanded into compares,
+   selects and wrapping arithmetic of the same type (a vector `smin` stays a
+   vector `icmp` + `select` where those are legal);
+2. illegal vector types are **split into lanes**: block parameters, edge
+   arguments, loads/stores (element accesses at `i × size`, alignment reduced
+   to what each offset guarantees), lane-wise ops, lane moves, reductions (an
+   in-order chain), and `bitcast` (rebuilt from lane bits with shifts,
+   truncations, extensions and ors — exact for `i1` lanes too);
+3. ops on legal types the target does not select are scalarized in place
+   through `extractelement`/`insertelement`.
+
+Illegal vector types in signatures follow one convention on every target: a
+parameter is passed as its `N` lanes, and a result is returned through a hidden
+leading `ptr` to caller-allocated storage. Both sides of every call obey it, so
+LatticeFoundry code agrees with itself; C interop for a vector type requires
+the target to make that type legal.
+
+### Lowering
+
+| target | legal vector types | lowering |
+|---|---|---|
+| x86-64 (SSE2, the baseline) | `<16 x i8>`, `<8 x i16>`, `<4 x i32>`, `<2 x i64>`, `<4 x f32>`, `<2 x f64>`, masks `<16/8/4/2 x i1>` | see below; System V passes them in `xmm0..7` and returns in `xmm0` (`__m128`); Win64 passes them by reference (a 16-byte-aligned caller copy) and returns in `xmm0` (§6c) |
+| AArch64 | none (NEON is a follow-up) | fully scalarized |
+| RISC-V | none (the V extension is out of scope) | fully scalarized |
+
+On x86-64 a mask `<N x i1>` lives in an xmm register as `N` lanes of
+`128 / N` bits, each all-ones or all-zeros — what `pcmpeq`/`pcmpgt`/`cmpps`
+produce and `pand`/`pandn`/`por` blend with. No instruction beyond SSE2 is
+used:
+
+| IR | SSE2 |
+|---|---|
+| `add`/`sub` | `padd{b,w,d,q}` / `psub{b,w,d,q}` |
+| `mul` i16 / i32 | `pmullw` / `pmuludq` ×2 + `pshufd` + `punpckldq` (no SSE4.1 `pmulld`) |
+| `and`/`or`/`xor` | `pand`/`por`/`pxor` |
+| `shl`/`lshr` i16–i64, `ashr` i16/i32, uniform constant amount | `psll`/`psrl`/`psra` `imm8` |
+| `umin`/`umax` i8, `smin`/`smax` i16 | `pminub`/`pmaxub`, `pminsw`/`pmaxsw` |
+| saturating add/sub i8/i16 | `padds`/`paddus`/`psubs`/`psubus` |
+| float `fadd`/`fsub`/`fmul`/`fdiv`, `fneg` | `addps`/`addpd`…, `xorps` with the sign bit |
+| `icmp` i8–i32 | `pcmpeq`/`pcmpgt` (operands swapped, results negated, sign-flipped for unsigned) |
+| `icmp eq`/`ne` i64 | `pcmpeqd` + `pshufd` + `pand` |
+| `fcmp` | `cmpps`/`cmppd` (`one`/`ueq` as two compares) |
+| `select` | `pand`/`pandn`/`por` (an `i1` condition broadcast with `movd` + `pshufd`) |
+| `sitofp`/`fptosi` i32↔f32 | `cvtdq2ps`/`cvttps2dq` |
+| mask ↔ int of the lane width | a copy (`sext`), `pand` (`zext`), `pand` + `pcmpeq` (`trunc`) |
+| `extractelement` / `insertelement` | `pshufd` + `movd`/`movq`, `pextrw` / `pinsrw`, `movsd`, `punpcklqdq`, `unpcklpd` |
+| `shufflevector` 32/64-bit lanes | `pshufd`, `shufps`, `shufpd` |
+| `splat` | `movd`/`movq` + `pshufd` |
+| `load`/`store` | `movdqa` (align ≥ 16) / `movdqu` |
+
+Everything else (division, `frem`, byte shifts, variable shifts, `mul` on
+bytes and quadwords, ordered i64 compares, other casts and shuffles,
+reductions, mask loads/stores) is scalarized. xmm spills are 16 bytes.
+
+### Constant time
+
+Vectors follow §6d lane by lane: the secret taint flows through lane-wise ops,
+lane moves and reductions like through their scalar forms, and the verifier
+rejects the same uses (a vector division, a float or multiply reduction, a
+branch on an extracted secret lane). A vector `select` on a secret mask is a
+bitwise blend (`pand`/`pandn`/`por`, NEON `and`/`bic`/`orr`), scalarized
+selects are the targets' branchless selects, and none of the vector machine
+ops branches (each backend's `may_branch_on_data` audit lists them). Split
+loads and stores keep their `secret` flag.
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than
@@ -882,9 +1042,7 @@ break structural sharing or parallel processing (tenets T5/T6).
   or NaN float→int casts, fast-math `nnan`/`ninf` violations — yields **poison**,
   not UB. This is enforced by the reference evaluator (`ir::semantics`) and
   matched by the opcode prose. Revisit only when memory/stateful ops are added.
-- **Vector poison granularity.** Per-lane poison vs. whole-value poison. Per-lane
-  is more precise but complicates the refinement relation; decide with the first
-  SIMD target.
+- **Vector poison granularity.** *(decided: per lane, §6e.)*
 - **Address-space semantics.** *(decided, §3a: per-space pointer widths, no
   `addrspacecast`.)*
 

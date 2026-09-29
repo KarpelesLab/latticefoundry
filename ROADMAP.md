@@ -47,6 +47,8 @@ the exit criteria are what "done" means for each phase.
 >   variable-time operation). Every pass and `-O` pipeline preserves it, and
 >   `select` is branchless on all three targets
 >   ([ir-design §6d](docs/ir-design.md)).
+> - **SIMD vectors** `<N x T>` (per-lane poison, a generic scalarizing
+>   legalizer, SSE2 lowering on x86-64; AArch64 and RISC-V scalarize)
 > - three targets:
 >   - **x86-64** executes, with the full System V ABI including
 >     struct-by-value and variadics.
@@ -419,6 +421,14 @@ target-independent wide-integer legalization pass (`codegen::legalize_int`) spli
 integers above the native width into parts, with libcalls for mul/div/rem,
 checked against the reference evaluator at 32-, 16- and 8-bit part widths. The
 three backends themselves remain to be written on top.
+
+**SIMD vectors** (`<N x T>`, [ir-design §6e](docs/ir-design.md)) lower on all
+three targets through the target-independent legalizer (`codegen::legalize`):
+x86-64 keeps the 128-bit types in xmm registers and selects SSE2 (the
+baseline; no SSE3+), passing `__m128`-class vectors in xmm registers under
+System V and by reference under Win64; AArch64 (NEON pending) and RISC-V (no V
+extension) scalarize. Execution tests on x86-64 and interpreter tests on
+AArch64/RISC-V check random vector programs against the reference evaluator.
 
 ### **Phase 8 — Linker & first end-to-end**  ✅
 
