@@ -7,7 +7,7 @@
 //! pointer-arithmetic nodes). Type errors are reported as spanned diagnostics.
 //! Lowering ([`crate::lower`]) then walks the typed tree mechanically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
@@ -331,6 +331,9 @@ pub enum TExprKind {
     /// `__builtin_va_copy(dst, src)`: copy the 24-byte `__va_list_tag` state from
     /// `src` to `dst` (both pointers to their tags).
     VaCopy(Box<TExpr>, Box<TExpr>),
+    /// A GNU statement expression `({ ... })`: run the statements, then yield
+    /// the value of the final expression statement (absent for a `void` one).
+    StmtExpr(Vec<TStmt>, Option<Box<TExpr>>),
 }
 
 impl TExpr {
@@ -495,6 +498,9 @@ struct Checker {
     string_pool: HashMap<(Vec<u8>, StrKind), usize>,
     /// The active language dialect (gates implicit function declarations, etc.).
     std: CStd,
+    /// Nonzero while checking an unevaluated operand (`sizeof`), where naming a
+    /// value of an unsupported type (`__int128`, `_Float128`) is harmless.
+    unevaluated: u32,
 }
 
 impl Checker {
@@ -535,9 +541,17 @@ impl Checker {
     }
 
     fn run(&mut self, unit: &TranslationUnit) {
+        // `static inline` definitions nothing refers to — the system-header
+        // idiom (`__bswap_32`, `__uint16_identity`, ...) — are dropped, as gcc
+        // drops them: they would contribute no code, and their bodies may use
+        // constructs this compiler does not implement.
+        let unused_inline = unused_static_inlines(unit);
         // Pass 1: register every signature and global so bodies can forward- and
         // mutually-reference them.
-        for item in &unit.items {
+        for (i, item) in unit.items.iter().enumerate() {
+            if unused_inline.contains(&i) {
+                continue;
+            }
             match item {
                 TopLevel::Proto(p) => {
                     let params = p.params.iter().map(|pp| pp.ty.clone()).collect();
@@ -570,8 +584,10 @@ impl Checker {
             }
         }
         // Pass 2: check each function body.
-        for item in &unit.items {
-            if let TopLevel::Func(f) = item {
+        for (i, item) in unit.items.iter().enumerate() {
+            if let TopLevel::Func(f) = item
+                && !unused_inline.contains(&i)
+            {
                 self.check_func(f);
             }
         }
@@ -1222,7 +1238,11 @@ impl Checker {
             StmtKind::Default(body) => self.check_default(ctx, body, stmt.span),
             StmtKind::Label(name, body) => {
                 // The id was assigned during the function-wide label pre-scan.
-                let id = ctx.labels[name];
+                // (A label inside a statement expression is not pre-scanned.)
+                let Some(&id) = ctx.labels.get(name) else {
+                    self.error(stmt.span, "a label inside a statement expression is not supported");
+                    return None;
+                };
                 let b = self.check_stmt(ctx, body)?;
                 Some(TStmt::Labeled(id, Box::new(b)))
             }
@@ -1660,7 +1680,25 @@ impl Checker {
 
     // --- expressions -------------------------------------------------------
 
+    /// Type-check an expression. Every subexpression passes through here, so it
+    /// is also where a value of a type lf-cc cannot compute with (`__int128`,
+    /// `_Float128`) is rejected: such types may be *named* by declarations (the
+    /// glibc headers declare many `_Float128` functions) but not evaluated.
     fn check_expr(&mut self, ctx: &mut FnCtx, e: &Expr) -> Option<TExpr> {
+        let te = self.check_expr_kind(ctx, e)?;
+        if self.unevaluated == 0
+            && let Some(name) = te.ty.unsupported_value()
+        {
+            self.error(
+                e.span,
+                format!("values of type '{name}' are not supported (it may only be declared)"),
+            );
+            return None;
+        }
+        Some(te)
+    }
+
+    fn check_expr_kind(&mut self, ctx: &mut FnCtx, e: &Expr) -> Option<TExpr> {
         let span = e.span;
         match &e.kind {
             ExprKind::IntLit(v, ty) => Some(TExpr::new(TExprKind::Const(*v), ty.clone(), span)),
@@ -1683,7 +1721,10 @@ impl Checker {
             ExprKind::PostInc(inner) => self.check_incdec(ctx, inner, true, true, span),
             ExprKind::PostDec(inner) => self.check_incdec(ctx, inner, false, true, span),
             ExprKind::SizeofExpr(inner) => {
-                let te = self.check_expr(ctx, inner)?;
+                self.unevaluated += 1;
+                let te = self.check_expr(ctx, inner);
+                self.unevaluated -= 1;
+                let te = te?;
                 let sz = self.size_of(&te.ty) as i128;
                 Some(TExpr::new(TExprKind::Const(sz), size_t(), span))
             }
@@ -1715,7 +1756,39 @@ impl Checker {
             ExprKind::VaArg(ap, ty) => self.check_va_arg(ctx, ap, ty, span),
             ExprKind::VaEnd(ap) => self.check_va_end(ctx, ap, span),
             ExprKind::VaCopy(dst, src) => self.check_va_copy(ctx, dst, src, span),
+            ExprKind::StmtExpr(stmts) => self.check_stmt_expr(ctx, stmts, span),
         }
+    }
+
+    /// Check a GNU statement expression: its statements in a fresh scope, with a
+    /// trailing expression statement supplying the value (decayed like any
+    /// rvalue, except that a struct/union value stays an lvalue to copy from).
+    fn check_stmt_expr(&mut self, ctx: &mut FnCtx, stmts: &[Stmt], span: Span) -> Option<TExpr> {
+        ctx.push_scope();
+        let mut out = Vec::new();
+        let mut value = None;
+        let mut ok = true;
+        for (i, s) in stmts.iter().enumerate() {
+            if i + 1 == stmts.len()
+                && let StmtKind::Expr(Some(e)) = &s.kind
+            {
+                match self.check_expr(ctx, e) {
+                    Some(te) if te.ty.is_record() => value = Some(te),
+                    Some(te) => value = Some(self.decay(te)),
+                    None => ok = false,
+                }
+                continue;
+            }
+            if let Some(ts) = self.check_stmt(ctx, s) {
+                out.push(ts);
+            }
+        }
+        ctx.pop_scope();
+        if !ok {
+            return None;
+        }
+        let ty = value.as_ref().map_or(CType::Void, |v| v.ty.clone());
+        Some(TExpr::new(TExprKind::StmtExpr(out, value.map(Box::new)), ty, span))
     }
 
     /// Type-check `__builtin_va_start(ap, last)`: `ap` decays to a pointer to its
@@ -2852,7 +2925,7 @@ fn const_eval_float(e: &Expr, enums: &HashMap<String, i128>) -> Option<f64> {
             let v = rec(inner)?;
             match ty.float_ty() {
                 Some(crate::ast::FloatTy::F32) => Some(f64::from(v as f32)),
-                Some(crate::ast::FloatTy::F64) => Some(v),
+                Some(crate::ast::FloatTy::F64 | crate::ast::FloatTy::F128) => Some(v),
                 None => Some(v.trunc()),
             }
         }
@@ -2872,7 +2945,7 @@ fn write_float_bytes(bytes: &mut [u8], off: u64, v: f64, fty: crate::ast::FloatT
                 }
             }
         }
-        crate::ast::FloatTy::F64 => {
+        crate::ast::FloatTy::F64 | crate::ast::FloatTy::F128 => {
             let le = v.to_le_bytes();
             for (i, &src) in le.iter().enumerate() {
                 if let Some(dst) = bytes.get_mut(off as usize + i) {
@@ -2930,6 +3003,182 @@ fn write_string_bytes(bytes: &mut [u8], off: u64, s: &[u8], limit: u64) {
             && let Some(dst) = bytes.get_mut(off as usize + i)
         {
             *dst = b;
+        }
+    }
+}
+
+/// The indices (in `unit.items`) of the `static inline` function definitions
+/// that nothing in the translation unit refers to. References are found by
+/// name from every other function body and global initializer, then
+/// transitively through the bodies of referenced inline functions.
+fn unused_static_inlines(unit: &TranslationUnit) -> HashSet<usize> {
+    let candidates: HashMap<&str, usize> = unit
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            TopLevel::Func(f) if f.is_static && f.is_inline => Some((f.name.as_str(), i)),
+            _ => None,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+    let mut names: HashSet<String> = HashSet::new();
+    for item in &unit.items {
+        match item {
+            TopLevel::Func(f) if !(f.is_static && f.is_inline) => {
+                for s in &f.body {
+                    idents_in_stmt(s, &mut names);
+                }
+            }
+            TopLevel::Global(g) => {
+                if let Some(init) = &g.init {
+                    idents_in_init(init, &mut names);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Close over the bodies of the referenced inline functions.
+    let mut used: HashSet<usize> = HashSet::new();
+    loop {
+        let newly: Vec<usize> = candidates
+            .iter()
+            .filter(|(n, i)| names.contains(**n) && !used.contains(*i))
+            .map(|(_, &i)| i)
+            .collect();
+        if newly.is_empty() {
+            break;
+        }
+        for i in newly {
+            used.insert(i);
+            if let TopLevel::Func(f) = &unit.items[i] {
+                for s in &f.body {
+                    idents_in_stmt(s, &mut names);
+                }
+            }
+        }
+    }
+    candidates.values().copied().filter(|i| !used.contains(i)).collect()
+}
+
+/// Collect every identifier named by expressions within `s`.
+fn idents_in_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Return(e) => {
+            if let Some(e) = e {
+                idents_in_expr(e, out);
+            }
+        }
+        StmtKind::Decl(decls) => {
+            for d in decls {
+                if let Some(init) = &d.init {
+                    idents_in_init(init, out);
+                }
+            }
+        }
+        StmtKind::Block(stmts) => {
+            for s in stmts {
+                idents_in_stmt(s, out);
+            }
+        }
+        StmtKind::If(c, t, e) => {
+            idents_in_expr(c, out);
+            idents_in_stmt(t, out);
+            if let Some(e) = e {
+                idents_in_stmt(e, out);
+            }
+        }
+        StmtKind::While(c, b) | StmtKind::DoWhile(b, c) | StmtKind::Switch(c, b) => {
+            idents_in_expr(c, out);
+            idents_in_stmt(b, out);
+        }
+        StmtKind::For(init, c, step, b) => {
+            if let Some(i) = init {
+                idents_in_stmt(i, out);
+            }
+            for e in [c, step].into_iter().flatten() {
+                idents_in_expr(e, out);
+            }
+            idents_in_stmt(b, out);
+        }
+        StmtKind::Case(_, b) | StmtKind::Default(b) | StmtKind::Label(_, b) => {
+            idents_in_stmt(b, out);
+        }
+        StmtKind::Asm(asm) => {
+            for op in asm.outputs.iter().chain(asm.inputs.iter()) {
+                idents_in_expr(&op.expr, out);
+            }
+        }
+        StmtKind::Break | StmtKind::Continue | StmtKind::Goto(_) => {}
+    }
+}
+
+/// Collect every identifier named within an initializer.
+fn idents_in_init(init: &Init, out: &mut HashSet<String>) {
+    match init {
+        Init::Expr(e) => idents_in_expr(e, out),
+        Init::List(items) => {
+            for it in items {
+                idents_in_init(&it.init, out);
+            }
+        }
+    }
+}
+
+/// Collect every identifier named within `e`.
+fn idents_in_expr(e: &Expr, out: &mut HashSet<String>) {
+    match &e.kind {
+        ExprKind::Ident(n) => {
+            out.insert(n.clone());
+        }
+        ExprKind::IntLit(..)
+        | ExprKind::FloatLit(..)
+        | ExprKind::StrLit(..)
+        | ExprKind::SizeofType(_)
+        | ExprKind::AlignofType(_) => {}
+        ExprKind::Unary(_, a)
+        | ExprKind::Cast(_, a)
+        | ExprKind::PreInc(a)
+        | ExprKind::PreDec(a)
+        | ExprKind::PostInc(a)
+        | ExprKind::PostDec(a)
+        | ExprKind::SizeofExpr(a)
+        | ExprKind::Member(a, _, _)
+        | ExprKind::VaArg(a, _)
+        | ExprKind::VaEnd(a) => idents_in_expr(a, out),
+        ExprKind::Binary(_, a, b)
+        | ExprKind::Assign(_, a, b)
+        | ExprKind::Comma(a, b)
+        | ExprKind::Index(a, b)
+        | ExprKind::VaStart(a, b)
+        | ExprKind::VaCopy(a, b) => {
+            idents_in_expr(a, out);
+            idents_in_expr(b, out);
+        }
+        ExprKind::Cond(a, b, c) => {
+            idents_in_expr(a, out);
+            idents_in_expr(b, out);
+            idents_in_expr(c, out);
+        }
+        ExprKind::Call(f, args) => {
+            idents_in_expr(f, out);
+            for a in args {
+                idents_in_expr(a, out);
+            }
+        }
+        ExprKind::Generic(c, assocs) => {
+            idents_in_expr(c, out);
+            for a in assocs {
+                idents_in_expr(&a.expr, out);
+            }
+        }
+        ExprKind::CompoundLiteral(_, init) => idents_in_init(init, out),
+        ExprKind::StmtExpr(stmts) => {
+            for s in stmts {
+                idents_in_stmt(s, out);
+            }
         }
     }
 }

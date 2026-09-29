@@ -38,6 +38,14 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         scopes: vec![HashMap::new()],
         last_alignas: None,
         last_constexpr: false,
+        spec_attrs: Attrs::default(),
+        decl_attrs: Attrs::default(),
+        pending_attrs: Attrs::default(),
+        spec_inline: false,
+        spec_thread: false,
+        va_list_record: None,
+        cur_func: None,
+        in_params: 0,
     };
     match parser.parse_unit() {
         Ok(items) => Ok(TranslationUnit {
@@ -88,6 +96,94 @@ struct Parser {
     last_alignas: Option<u64>,
     /// Whether the declaration specifiers just parsed included C23 `constexpr`.
     last_constexpr: bool,
+    /// The GNU attributes found among the declaration specifiers just parsed
+    /// (they apply to every declarator of the declaration).
+    spec_attrs: Attrs,
+    /// The GNU attributes trailing the declarator just parsed (after its
+    /// suffixes and around an asm label), applying to that declarator only.
+    decl_attrs: Attrs,
+    /// Attributes met among leading storage-class specifiers, not yet folded
+    /// into a declaration-specifier sequence.
+    pending_attrs: Attrs,
+    /// Whether the current declaration's specifiers included `inline`. Reset at
+    /// the start of each top-level/block declaration.
+    spec_inline: bool,
+    /// Whether the current declaration's specifiers included `_Thread_local` /
+    /// `__thread`. Reset like `spec_inline`.
+    spec_thread: bool,
+    /// The record modelling the System V `__va_list_tag` behind the builtin
+    /// `__builtin_va_list` type, created on first use.
+    va_list_record: Option<RecordId>,
+    /// The name of the function whose body is being parsed (for `__func__`).
+    cur_func: Option<String>,
+    /// Nesting depth of parameter lists being parsed (a parameter array bound
+    /// need not be constant).
+    in_params: u32,
+}
+
+/// The GNU `__attribute__((...))` properties lf-cc gives meaning to. Every other
+/// attribute (`nonnull`, `format`, `nothrow`, `leaf`, `pure`, `malloc`, ...) is
+/// parsed and ignored, which is always permitted.
+#[derive(Clone, Debug, Default)]
+struct Attrs {
+    /// `mode(QI|HI|SI|DI|TI|word|pointer|byte)`: the integer width in bits.
+    mode: Option<u16>,
+    /// `aligned` / `aligned(N)`: the requested minimum alignment.
+    aligned: Option<u64>,
+    /// `packed` on a record type.
+    packed: bool,
+    /// `gnu_inline` on a function (GNU89 `extern inline` semantics).
+    gnu_inline: bool,
+    /// `transparent_union` on a union type.
+    transparent_union: bool,
+    /// `vector_size(N)`: GCC vector types are not supported.
+    vector_size: bool,
+}
+
+/// The declaration-wide properties shared by every declarator of one
+/// file-scope declaration.
+struct DeclCtx {
+    /// The attributes among the declaration specifiers.
+    sattrs: Attrs,
+    /// An `_Alignas` among the declaration specifiers.
+    align: Option<u64>,
+    /// The linkage-affecting storage class.
+    storage: Storage,
+}
+
+/// A parsed function declarator at file scope: a definition, or a prototype.
+enum FnDecl {
+    Def(FuncDef),
+    Proto(FuncProto),
+    /// A GNU `extern inline` definition, reduced to its prototype (the body
+    /// has been consumed, so no `;` follows).
+    InlineOnly(FuncProto),
+}
+
+/// The stricter of two optional alignment requests.
+fn max_align(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+impl Attrs {
+    /// Fold the attributes of `other` into `self` (later wins; alignment keeps
+    /// the strictest request).
+    fn merge(&mut self, other: Attrs) {
+        if other.mode.is_some() {
+            self.mode = other.mode;
+        }
+        if let Some(a) = other.aligned {
+            self.aligned = Some(self.aligned.map_or(a, |b| b.max(a)));
+        }
+        self.packed |= other.packed;
+        self.gnu_inline |= other.gnu_inline;
+        self.transparent_union |= other.transparent_union;
+        self.vector_size |= other.vector_size;
+    }
 }
 
 impl Parser {
@@ -222,6 +318,9 @@ impl Parser {
             tag: Some(tag.to_owned()),
             fields: Vec::new(),
             complete: false,
+            packed: false,
+            align: None,
+            transparent: false,
         });
         self.tags.insert(tag.to_owned(), id);
         id
@@ -229,8 +328,49 @@ impl Parser {
 
     fn anon_record(&mut self, kind: RecordKind) -> RecordId {
         let id = self.records.defs.len();
-        self.records.defs.push(RecordDef { kind, tag: None, fields: Vec::new(), complete: false });
+        self.records.defs.push(RecordDef {
+            kind,
+            tag: None,
+            fields: Vec::new(),
+            complete: false,
+            packed: false,
+            align: None,
+            transparent: false,
+        });
         id
+    }
+
+    /// The builtin `__builtin_va_list` type: the System V AMD64 `va_list`,
+    /// `struct { unsigned gp_offset, fp_offset; void *overflow_arg_area,
+    /// *reg_save_area; }[1]`. It is layout-identical to the `va_list` of
+    /// lf-cc's own `<stdarg.h>` and to gcc's, so a `va_list` crosses into libc
+    /// (`vprintf`, `vsnprintf`, ...) unchanged; like any array parameter it is
+    /// passed as a pointer to its single element.
+    fn builtin_va_list(&mut self) -> CType {
+        let id = match self.va_list_record {
+            Some(id) => id,
+            None => {
+                let id = self.anon_record(RecordKind::Struct);
+                let field = |name: &str, ty: CType| Field {
+                    name: name.to_owned(),
+                    ty,
+                    anonymous: false,
+                    align: None,
+                    bit_width: None,
+                };
+                let vp = CType::ptr_to(CType::Void);
+                self.records.defs[id].fields = vec![
+                    field("gp_offset", CType::uint()),
+                    field("fp_offset", CType::uint()),
+                    field("overflow_arg_area", vp.clone()),
+                    field("reg_save_area", vp),
+                ];
+                self.records.defs[id].complete = true;
+                self.va_list_record = Some(id);
+                id
+            }
+        };
+        CType::Array(Box::new(CType::Record(id)), 1)
     }
 
     // --- top level ---------------------------------------------------------
@@ -306,19 +446,28 @@ impl Parser {
     }
 
     fn parse_top_level(&mut self) -> PResult<Vec<TopLevel>> {
+        // A stray `;` at file scope is an empty declaration (GNU accepts it).
+        if self.eat_punct(Punct::Semi) {
+            return Ok(Vec::new());
+        }
+        self.spec_inline = false;
+        self.spec_thread = false;
         if self.eat_kw(Keyword::Typedef) {
             return self.parse_typedef();
         }
         // Storage-class specifiers (extern/static) determine a file-scope object's
         // linkage; they may appear before and/or after the type specifiers.
-        let storage = self.consume_storage();
+        let storage = self.consume_storage()?;
         if self.eat_kw(Keyword::Typedef) {
             return self.parse_typedef();
         }
         let base = self.parse_decl_specs_impl(true)?;
+        // Capture the specifier attributes now: parsing a parameter list below
+        // re-enters the declaration-specifier parser.
+        let sattrs = self.spec_attrs.clone();
         let align = self.last_alignas.take();
         let is_constexpr = self.last_constexpr;
-        let storage = merge_storage(storage, self.consume_storage());
+        let storage = merge_storage(storage, self.consume_storage()?);
 
         // A C23 `constexpr` object is a named compile-time constant (no storage).
         if is_constexpr {
@@ -331,152 +480,209 @@ impl Parser {
             return Ok(Vec::new());
         }
 
+        let decl = DeclCtx { sattrs, align, storage };
+        let mut items = Vec::new();
         // First declarator: pointers, then a name.
-        let ty0 = self.parse_pointers(base.clone());
+        let ty0 = self.parse_pointers(base.clone())?;
 
-        // A grouped declarator (`ret (*name)(...)` or `ret (*name[N])(...)`) is
-        // always an object declaration — never a function definition — so parse
-        // it (and any comma-separated siblings) as globals.
         if self.is_punct(Punct::LParen) {
-            let mut items = Vec::new();
+            // A grouped declarator (`ret (*name)(...)`, `ret (*name[N])(...)`, or
+            // `ret (*f(args))(args)`) is never a function definition here.
             let (name, ty, span) = self.parse_named_declarator(ty0)?;
-            self.declare_ordinary(&name, Some(ty.clone()));
-            let asm_label = self.parse_declarator_extensions()?;
-            let init =
-                if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, asm_label, span }));
-            while self.eat_punct(Punct::Comma) {
-                let (name, ty, span) = self.parse_named_declarator(base.clone())?;
-                self.declare_ordinary(&name, Some(ty.clone()));
-                let asm_label = self.parse_declarator_extensions()?;
-                let init = if self.eat_punct(Punct::Assign) {
-                    Some(self.parse_initializer()?)
-                } else {
-                    None
-                };
-                items.push(TopLevel::Global(VarDecl {
-                    name,
-                    ty,
-                    init,
-                    align,
-                    storage,
-                    asm_label,
-                    span,
-                }));
-            }
-            self.expect_punct(Punct::Semi, "';' after global declaration")?;
-            return Ok(items);
-        }
-
-        let (name, name_span) = self.expect_ident()?;
-        self.declare_ordinary(&name, None);
-
-        if self.is_punct(Punct::LParen) {
-            self.push_scope();
-            // An old-style (K&R) function definition opens with an *identifier
-            // list*: `ret name(id, id, ...) decl-list { body }`. We recognize it
-            // by the first token after `(` being an identifier that does not name
-            // a type (a typedef-name would begin a prototype parameter instead).
-            // Empty `()`, `(void)`, and prototype parameter lists are handled by
-            // the normal path below.
-            if self.at_kr_identifier_list() {
-                let params = self.parse_kr_definition_params()?;
-                for p in &params {
-                    if let Some(n) = &p.name {
-                        self.declare_ordinary(n, Some(p.ty.clone()));
-                    }
+            items.push(self.file_scope_declarator(name, ty, span, &decl)?);
+        } else {
+            let (name, name_span) = self.expect_ident()?;
+            self.declare_ordinary(&name, None);
+            if self.is_punct(Punct::LParen) {
+                match self.parse_function_declarator(name, name_span, ty0, &decl)? {
+                    FnDecl::Def(f) => return Ok(vec![TopLevel::Func(f)]),
+                    FnDecl::InlineOnly(p) => return Ok(vec![TopLevel::Proto(p)]),
+                    FnDecl::Proto(p) => items.push(TopLevel::Proto(p)),
                 }
-                let body = self.parse_block_stmts()?;
-                self.pop_scope();
-                return Ok(vec![TopLevel::Func(FuncDef {
-                    name,
-                    ret: ty0,
-                    params,
-                    variadic: false,
-                    is_static: storage == Storage::Static,
-                    body,
-                    asm_label: None,
-                    span: name_span,
-                })]);
+            } else {
+                let ty = self.parse_array_suffix(ty0)?;
+                items.push(self.file_scope_declarator(name, ty, name_span, &decl)?);
             }
-            let (params, variadic) = self.parse_param_list()?;
+        }
+        while self.eat_punct(Punct::Comma) {
+            let (name, ty, span) = self.parse_named_declarator(base.clone())?;
+            items.push(self.file_scope_declarator(name, ty, span, &decl)?);
+        }
+        self.expect_punct(Punct::Semi, "';' after global declaration")?;
+        Ok(items)
+    }
+
+    /// Parse the parameter list (the `(` at the cursor) of a function declarator
+    /// named `name` returning `ret`, then its trailing extensions, and either a
+    /// body (a definition) or nothing (a prototype; the caller consumes `;`/`,`).
+    ///
+    /// An `extern inline` definition under GNU inline semantics (the
+    /// `gnu_inline` attribute, as glibc's `__extern_inline` spells it, or the
+    /// `gnu89` dialect) provides an inline body only: no out-of-line definition
+    /// is emitted, calls bind to the external symbol, so it is returned as a
+    /// prototype (exactly what gcc does when it does not inline).
+    fn parse_function_declarator(
+        &mut self,
+        name: String,
+        name_span: Span,
+        ret: CType,
+        decl: &DeclCtx,
+    ) -> PResult<FnDecl> {
+        let is_static = decl.storage == Storage::Static;
+        let is_inline = self.spec_inline;
+        self.cur_func = Some(name.clone());
+        self.push_scope();
+        // An old-style (K&R) function definition opens with an *identifier
+        // list*: `ret name(id, id, ...) decl-list { body }`. We recognize it
+        // by the first token after `(` being an identifier that does not name
+        // a type (a typedef-name would begin a prototype parameter instead).
+        // Empty `()`, `(void)`, and prototype parameter lists are handled by
+        // the normal path below.
+        if self.at_kr_identifier_list() {
+            let params = self.parse_kr_definition_params()?;
             for p in &params {
                 if let Some(n) = &p.name {
                     self.declare_ordinary(n, Some(p.ty.clone()));
                 }
             }
-            // A trailing declarator attribute — `f(void) __attribute__((noreturn));`
-            // (GNU) or `[[noreturn]]` — sits between the parameter list and the
-            // `;`/`{`. bzip2's NORETURN and glibc prototypes rely on this position.
-            // So does a GNU asm label (`f(int) __asm__("sym")`, glibc's
-            // `__REDIRECT`), mixed with attributes on either side of it.
-            let asm_label = self.parse_declarator_extensions()?;
-            if self.is_punct(Punct::LBrace) {
-                let body = self.parse_block_stmts()?;
-                self.pop_scope();
-                return Ok(vec![TopLevel::Func(FuncDef {
+            let body = self.parse_block_stmts()?;
+            self.pop_scope();
+            return Ok(FnDecl::Def(FuncDef {
+                name,
+                ret,
+                params,
+                variadic: false,
+                is_static,
+                is_inline,
+                body,
+                asm_label: None,
+                span: name_span,
+            }));
+        }
+        let (params, variadic) = self.parse_param_list()?;
+        for p in &params {
+            if let Some(n) = &p.name {
+                self.declare_ordinary(n, Some(p.ty.clone()));
+            }
+        }
+        // A trailing declarator attribute — `f(void) __attribute__((noreturn));`
+        // (GNU) or `[[noreturn]]` — sits between the parameter list and the
+        // `;`/`{`. bzip2's NORETURN and glibc prototypes rely on this position.
+        // So does a GNU asm label (`f(int) __asm__("sym")`, glibc's
+        // `__REDIRECT`), mixed with attributes on either side of it.
+        let (asm_label, ret, attrs) = self.finish_declarator(ret, name_span, &decl.sattrs)?;
+        let fty = CType::Func(Box::new(FuncType {
+            ret: ret.clone(),
+            params: params.iter().map(|p| p.ty.clone()).collect(),
+            variadic,
+        }));
+        if self.is_punct(Punct::LBrace) {
+            let body = self.parse_block_stmts()?;
+            self.pop_scope();
+            self.declare_ordinary(&name, Some(fty));
+            let gnu_inline = attrs.gnu_inline || !self.std.is_c99();
+            if is_inline && decl.storage == Storage::Extern && gnu_inline {
+                return Ok(FnDecl::InlineOnly(FuncProto {
                     name,
-                    ret: ty0,
+                    ret,
                     params,
                     variadic,
-                    is_static: storage == Storage::Static,
-                    body,
+                    is_static,
                     asm_label,
                     span: name_span,
-                })]);
+                }));
             }
-            self.pop_scope();
-            self.expect_punct(Punct::Semi, "';' or function body after prototype")?;
-            return Ok(vec![TopLevel::Proto(FuncProto {
+            return Ok(FnDecl::Def(FuncDef {
                 name,
-                ret: ty0,
+                ret,
                 params,
                 variadic,
-                is_static: storage == Storage::Static,
+                is_static,
+                is_inline,
+                body,
                 asm_label,
                 span: name_span,
-            })]);
+            }));
         }
+        self.pop_scope();
+        self.declare_ordinary(&name, Some(fty));
+        Ok(FnDecl::Proto(FuncProto {
+            name,
+            ret,
+            params,
+            variadic,
+            is_static,
+            asm_label,
+            span: name_span,
+        }))
+    }
 
-        // One or more global variables (each may have an initializer).
-        let mut items = Vec::new();
-        let ty = self.parse_array_suffix(ty0)?;
+    /// Complete one file-scope declarator `name` of type `ty`: its trailing
+    /// extensions and optional initializer. A declarator of function type (`int
+    /// a, f(int);`, or a grouped `void (*signal(int, h))(int);`) declares a
+    /// function prototype rather than an object.
+    fn file_scope_declarator(
+        &mut self,
+        name: String,
+        ty: CType,
+        span: Span,
+        decl: &DeclCtx,
+    ) -> PResult<TopLevel> {
+        let (asm_label, ty, attrs) = self.finish_declarator(ty, span, &decl.sattrs)?;
         self.declare_ordinary(&name, Some(ty.clone()));
-        let asm_label = self.parse_declarator_extensions()?;
+        if let CType::Func(ft) = &ty {
+            let params =
+                ft.params.iter().map(|t| Param { name: None, ty: t.clone(), span }).collect();
+            return Ok(TopLevel::Proto(FuncProto {
+                name,
+                ret: ft.ret.clone(),
+                params,
+                variadic: ft.variadic,
+                is_static: decl.storage == Storage::Static,
+                asm_label,
+                span,
+            }));
+        }
         let init = if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
         if let Some(i) = &init {
             self.declare_ordinary(&name, Some(self.deduce_array_symbol_type(&ty, i)));
         }
-        items.push(TopLevel::Global(VarDecl {
+        let align = max_align(decl.align, attrs.aligned);
+        Ok(TopLevel::Global(VarDecl {
             name,
             ty,
             init,
             align,
-            storage,
+            storage: decl.storage,
             asm_label,
-            span: name_span,
-        }));
-        while self.eat_punct(Punct::Comma) {
-            let (name, ty, span) = self.parse_named_declarator(base.clone())?;
-            self.declare_ordinary(&name, Some(ty.clone()));
-            let asm_label = self.parse_declarator_extensions()?;
-            let init =
-                if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            if let Some(i) = &init {
-                self.declare_ordinary(&name, Some(self.deduce_array_symbol_type(&ty, i)));
-            }
-            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, asm_label, span }));
-        }
-        self.expect_punct(Punct::Semi, "';' after global declaration")?;
-        Ok(items)
+            thread_local: self.spec_thread,
+            span,
+        }))
     }
 
     /// Parse the declarators of a `typedef` (the `typedef` keyword already
     /// consumed), registering each name as a typedef in the current scope.
     fn parse_typedef(&mut self) -> PResult<Vec<TopLevel>> {
         let base = self.parse_decl_specs()?;
+        let sattrs = self.spec_attrs.clone();
         loop {
-            let (name, ty, _span) = self.parse_named_declarator(base.clone())?;
+            let (name, ty, span) = self.parse_named_declarator(base.clone())?;
+            let (_label, ty, attrs) = self.finish_declarator(ty, span, &sattrs)?;
+            if let CType::Record(id) = &ty {
+                // glibc's `__SOCKADDR_ARG`: `typedef union { ... } name
+                // __attribute__ ((__transparent_union__));`.
+                if attrs.transparent_union {
+                    self.records.defs[*id].transparent = true;
+                }
+                // An alignment on the typedef of an untagged record is an
+                // alignment of that record (it has no other name).
+                if let Some(a) = attrs.aligned
+                    && self.records.defs[*id].tag.is_none()
+                {
+                    let def = &mut self.records.defs[*id];
+                    def.align = max_align(def.align, Some(a));
+                }
+            }
             self.declare_typedef(&name, ty);
             if !self.eat_punct(Punct::Comma) {
                 break;
@@ -493,14 +699,43 @@ impl Parser {
         let mut dims = Vec::new();
         while self.is_punct(Punct::LBracket) {
             self.bump();
+            // A parameter's array declarator may carry qualifiers and `static`
+            // (`char *argv[__restrict]`, `int a[static 4]`); they only matter to
+            // the parameter's pointer adjustment, which ignores them.
+            while self.is_kw(Keyword::Static)
+                || self.is_kw(Keyword::Const)
+                || self.is_kw(Keyword::Volatile)
+                || self.is_kw(Keyword::Restrict)
+            {
+                self.bump();
+            }
             if self.is_punct(Punct::RBracket) {
                 dims.push(0u64);
+            } else if self.in_params > 0
+                && dims.is_empty()
+                && (self.is_punct(Punct::Star)
+                    && matches!(self.peek_at(1), TokenKind::Punct(Punct::RBracket)))
+            {
+                // `[*]`: a VLA parameter of unspecified size.
+                self.bump();
+                dims.push(0u64);
             } else {
-                let n = self.parse_const_expr()?;
-                if n < 0 {
-                    return self.err("array size must be non-negative");
+                let sp = self.peek_span();
+                let e = self.parse_assign()?;
+                match self.eval_const_expr(&e) {
+                    Some(n) if n < 0 => return self.err("array size must be non-negative"),
+                    Some(n) => dims.push(n as u64),
+                    // The outermost bound of a parameter array may be any
+                    // expression (`regmatch_t m[__restrict n]`): the parameter is
+                    // adjusted to a pointer, so the bound is irrelevant.
+                    None if self.in_params > 0 && dims.is_empty() => dims.push(0u64),
+                    None => {
+                        return Err(Diagnostic::error(
+                            "expected a constant integer expression (variable-length arrays are unsupported)",
+                        )
+                        .with_span(sp));
+                    }
                 }
-                dims.push(n as u64);
             }
             self.expect_punct(Punct::RBracket, "']' after array size")?;
         }
@@ -512,10 +747,33 @@ impl Parser {
     }
 
     /// Parse and ignore any attribute specifier sequences at the cursor: C23
-    /// `[[ ... ]]` sequences and (under the GNU dialects) `__attribute__((...))`.
-    /// Standard attributes are accepted and ignored per C23 (an implementation
-    /// may ignore any attribute it does not recognize).
+    /// `[[ ... ]]` sequences and GNU `__attribute__((...))`. Standard attributes
+    /// are accepted and ignored per C23 (an implementation may ignore any
+    /// attribute it does not recognize).
     fn skip_attributes(&mut self) -> PResult<()> {
+        self.parse_attributes().map(|_| ())
+    }
+
+    /// Whether the cursor is at a GNU `__attribute__` (or `__attribute`).
+    fn at_gnu_attribute(&self) -> bool {
+        matches!(self.peek(), TokenKind::Ident(n) if n == "__attribute__" || n == "__attribute")
+            && matches!(self.peek_at(1), TokenKind::Punct(Punct::LParen))
+    }
+
+    /// Whether the cursor is at any attribute specifier (GNU, or a C23 `[[`).
+    fn at_attribute(&self) -> bool {
+        self.at_gnu_attribute()
+            || (self.is_punct(Punct::LBracket)
+                && matches!(self.peek_at(1), TokenKind::Punct(Punct::LBracket)))
+    }
+
+    /// Parse any attribute specifier sequences at the cursor — C23 `[[ ... ]]`
+    /// and GNU `__attribute__((...))` — returning the GNU attributes that carry
+    /// meaning for lf-cc (see [`Attrs`]). The GNU spelling lives in the reserved
+    /// namespace and system headers use it under every `-std`, so it is accepted
+    /// in all dialects.
+    fn parse_attributes(&mut self) -> PResult<Attrs> {
+        let mut attrs = Attrs::default();
         loop {
             // C23 `[[ attribute-list ]]`.
             if self.is_punct(Punct::LBracket)
@@ -543,29 +801,142 @@ impl Parser {
                 }
                 continue;
             }
-            // GNU `__attribute__((...))`.
-            if self.std.is_gnu()
-                && matches!(self.peek(), TokenKind::Ident(n) if n == "__attribute__")
-                && matches!(self.peek_at(1), TokenKind::Punct(Punct::LParen))
-            {
+            // GNU `__attribute__ (( attribute-list ))`.
+            if self.at_gnu_attribute() {
                 self.bump(); // __attribute__
-                let mut depth = 0u32;
+                self.expect_punct(Punct::LParen, "'(' after __attribute__")?;
+                self.expect_punct(Punct::LParen, "'((' after __attribute__")?;
                 loop {
-                    match self.peek() {
-                        TokenKind::Punct(Punct::LParen) => depth += 1,
-                        TokenKind::Punct(Punct::RParen) => depth -= 1,
-                        TokenKind::Eof => return self.err("unterminated __attribute__"),
-                        _ => {}
+                    if self.is_punct(Punct::RParen) {
+                        break;
                     }
-                    self.bump();
-                    if depth == 0 {
+                    if !self.is_punct(Punct::Comma) {
+                        self.parse_one_gnu_attribute(&mut attrs)?;
+                    }
+                    if !self.eat_punct(Punct::Comma) {
                         break;
                     }
                 }
+                self.expect_punct(Punct::RParen, "')' to close __attribute__")?;
+                self.expect_punct(Punct::RParen, "'))' to close __attribute__")?;
                 continue;
+            }
+            return Ok(attrs);
+        }
+    }
+
+    /// Parse one entry of a GNU attribute list — a name (an identifier, or a
+    /// keyword such as `const`) with an optional parenthesized argument list —
+    /// recording it in `attrs` when lf-cc gives it meaning.
+    fn parse_one_gnu_attribute(&mut self, attrs: &mut Attrs) -> PResult<()> {
+        let name = match self.peek().clone() {
+            TokenKind::Ident(n) => n,
+            TokenKind::Keyword(_) => String::new(),
+            _ => return self.err("expected an attribute name"),
+        };
+        self.bump();
+        // `__name__` and `name` spell the same attribute.
+        let bare = strip_dunder(&name).to_owned();
+        if !self.is_punct(Punct::LParen) {
+            match bare.as_str() {
+                // A bare `aligned` requests the target's largest useful alignment.
+                "aligned" => attrs.aligned = Some(attrs.aligned.map_or(16, |a| a.max(16))),
+                "packed" => attrs.packed = true,
+                "gnu_inline" => attrs.gnu_inline = true,
+                "transparent_union" => attrs.transparent_union = true,
+                _ => {}
             }
             return Ok(());
         }
+        match bare.as_str() {
+            "mode" => {
+                self.bump(); // (
+                let (m, sp) = self.expect_ident()?;
+                let width = match strip_dunder(&m) {
+                    "QI" | "byte" => 8,
+                    "HI" => 16,
+                    "SI" => 32,
+                    "DI" | "word" | "pointer" | "unwind_word" => 64,
+                    "TI" => 128,
+                    _ => {
+                        return Err(Diagnostic::error(format!(
+                            "unsupported machine mode '{m}' in a mode attribute"
+                        ))
+                        .with_span(sp));
+                    }
+                };
+                attrs.mode = Some(width);
+                self.expect_punct(Punct::RParen, "')' after the machine mode")?;
+            }
+            "aligned" | "vector_size" => {
+                self.bump(); // (
+                let sp = self.peek_span();
+                let n = self.parse_const_expr()?;
+                if bare == "aligned" {
+                    if n <= 0 || (n & (n - 1)) != 0 {
+                        return Err(Diagnostic::error(
+                            "requested alignment is not a positive power of 2",
+                        )
+                        .with_span(sp));
+                    }
+                    let n = n as u64;
+                    attrs.aligned = Some(attrs.aligned.map_or(n, |a| a.max(n)));
+                } else {
+                    attrs.vector_size = true;
+                }
+                self.expect_punct(Punct::RParen, "')' after the attribute argument")?;
+            }
+            _ => self.skip_balanced_parens()?,
+        }
+        Ok(())
+    }
+
+    /// Skip a balanced `( ... )` group starting at the `(` at the cursor.
+    fn skip_balanced_parens(&mut self) -> PResult<()> {
+        let mut depth = 0u32;
+        loop {
+            match self.peek() {
+                TokenKind::Punct(Punct::LParen) => depth += 1,
+                TokenKind::Punct(Punct::RParen) => depth -= 1,
+                TokenKind::Eof => return self.err("unterminated parenthesized group"),
+                _ => {}
+            }
+            self.bump();
+            if depth == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Apply the type-changing attributes of `attrs` to a declared type:
+    /// `mode(...)` resizes an integer type (keeping its signedness), and a GCC
+    /// vector type is rejected.
+    fn apply_type_attrs(&self, ty: CType, attrs: &Attrs, span: Span) -> PResult<CType> {
+        if attrs.vector_size {
+            return Err(Diagnostic::error("GCC vector types (vector_size) are not supported")
+                .with_span(span));
+        }
+        match (attrs.mode, ty) {
+            (Some(w), CType::Int(i)) => Ok(CType::Int(IntTy::new(w, i.signed))),
+            (Some(w), CType::Bool) => Ok(CType::Int(IntTy::new(w, false))),
+            (_, ty) => Ok(ty),
+        }
+    }
+
+    /// Finish a declarator: parse its trailing GNU extensions (attributes and an
+    /// optional asm label), then apply the declaration-specifier and declarator
+    /// attributes to its type. Returns `(asm label, adjusted type, attributes)`.
+    fn finish_declarator(
+        &mut self,
+        ty: CType,
+        span: Span,
+        sattrs: &Attrs,
+    ) -> PResult<(Option<String>, CType, Attrs)> {
+        let label = self.parse_declarator_extensions()?;
+        let mut attrs = sattrs.clone();
+        attrs.merge(std::mem::take(&mut self.decl_attrs));
+        let ty = self.apply_type_attrs(ty, &attrs, span)?;
+        Ok((label, ty, attrs))
     }
 
     /// Parse the GNU extensions that may trail a declarator: any mix of
@@ -574,7 +945,8 @@ impl Parser {
     fn parse_declarator_extensions(&mut self) -> PResult<Option<String>> {
         let mut label: Option<String> = None;
         loop {
-            self.skip_attributes()?;
+            let a = self.parse_attributes()?;
+            self.decl_attrs.merge(a);
             if !self.is_kw(Keyword::Asm) {
                 return Ok(label);
             }
@@ -705,26 +1077,42 @@ impl Parser {
     /// Consume any leading storage-class / function specifiers, returning the
     /// linkage-affecting one (`extern`/`static`) if present. `register`, `auto`,
     /// `inline`, and `_Noreturn` do not affect linkage and yield [`Storage::None`].
-    fn consume_storage(&mut self) -> Storage {
+    ///
+    /// `inline` and `_Thread_local`/`__thread` are recorded in `spec_inline` /
+    /// `spec_thread`, and interleaved GNU attributes (`extern __inline
+    /// __attribute__ ((__gnu_inline__)) int f ...`) are handed on to the
+    /// declaration-specifier parser through `pending_attrs`.
+    fn consume_storage(&mut self) -> PResult<Storage> {
         let mut storage = Storage::None;
         loop {
-            if self.is_kw(Keyword::Extern) {
-                storage = Storage::Extern;
-            } else if self.is_kw(Keyword::Static) {
-                storage = Storage::Static;
-            } else if !(self.is_kw(Keyword::Register)
-                || self.is_kw(Keyword::Auto)
-                || self.is_kw(Keyword::Inline)
-                || self.is_kw(Keyword::Noreturn))
-            {
-                break;
+            if self.at_attribute() {
+                let a = self.parse_attributes()?;
+                self.pending_attrs.merge(a);
+                continue;
+            }
+            match self.peek() {
+                TokenKind::Keyword(Keyword::Extern) => storage = Storage::Extern,
+                TokenKind::Keyword(Keyword::Static) => storage = Storage::Static,
+                TokenKind::Keyword(Keyword::Inline) => self.spec_inline = true,
+                TokenKind::Keyword(Keyword::Register | Keyword::Auto | Keyword::Noreturn) => {}
+                TokenKind::Ident(n) if n == "_Thread_local" || n == "__thread" => {
+                    self.spec_thread = true;
+                }
+                _ => break,
             }
             self.bump();
         }
-        storage
+        Ok(storage)
     }
 
     fn parse_param_list(&mut self) -> PResult<(Vec<Param>, bool)> {
+        self.in_params += 1;
+        let r = self.parse_param_list_inner();
+        self.in_params -= 1;
+        r
+    }
+
+    fn parse_param_list_inner(&mut self) -> PResult<(Vec<Param>, bool)> {
         self.expect_punct(Punct::LParen, "'('")?;
         let mut params = Vec::new();
         let mut variadic = false;
@@ -754,14 +1142,28 @@ impl Parser {
             // A prototype parameter may carry the `register` storage-class
             // specifier (the only one permitted on a parameter), e.g.
             // `int f(register int x)`. Consume and ignore it.
-            self.consume_storage();
+            self.consume_storage()?;
             let base = self.parse_decl_specs()?;
+            let sattrs = self.spec_attrs.clone();
             let (name, ty, span) = self.declarator(base)?;
             // A trailing attribute on the parameter declarator, e.g.
             // `int desc __attribute__((unused))` (GNU) or `int x [[maybe_unused]]`.
-            self.skip_attributes()?;
+            let (_label, ty, _attrs) = self.finish_declarator(ty, span, &sattrs)?;
             // A parameter of array or function type decays to a pointer.
             let ty = ty.decayed().unwrap_or(ty);
+            // A parameter of transparent-union type (GNU) is passed exactly like
+            // the union's first member, and accepts an argument of any member
+            // type; model it as that first member's type (glibc's
+            // `__SOCKADDR_ARG` and `__CONST_SOCKADDR_ARG` are pointer unions).
+            let ty = match &ty {
+                CType::Record(id)
+                    if self.records.get(*id).transparent
+                        && !self.records.get(*id).fields.is_empty() =>
+                {
+                    self.records.get(*id).fields[0].ty.clone()
+                }
+                _ => ty,
+            };
             params.push(Param { name, ty, span });
             if !self.eat_punct(Punct::Comma) {
                 break;
@@ -777,9 +1179,20 @@ impl Parser {
     /// identifier that does not name a type (a typedef-name would begin a
     /// prototype parameter). Empty `()` and `(void)` are not identifier lists.
     fn at_kr_identifier_list(&self) -> bool {
-        matches!(self.peek_at(1),
-            TokenKind::Ident(n)
-                if !self.is_typedef_name(n) && n != "_BitInt" && n != "constexpr")
+        matches!(self.peek_at(1), TokenKind::Ident(n) if !self.ident_starts_decl(n))
+    }
+
+    /// Whether the identifier `name` begins a declaration: a typedef-name, a
+    /// builtin type name that lexes as an identifier (`_BitInt`, `__int128`,
+    /// `_Float128`, `__builtin_va_list`, `__typeof__`, ...), C23 `constexpr`, a
+    /// thread-storage specifier, or a GNU `__attribute__`.
+    fn ident_starts_decl(&self, name: &str) -> bool {
+        is_builtin_type_ident(name)
+            || matches!(
+                name,
+                "constexpr" | "_Thread_local" | "__thread" | "__attribute__" | "__attribute"
+            )
+            || self.is_typedef_name(name)
     }
 
     /// Parse the parameters of an old-style (K&R) function definition: the
@@ -804,14 +1217,16 @@ impl Parser {
         // (`int a, b;`) and may carry a `register` storage-class specifier.
         let mut types: HashMap<String, (CType, Span)> = HashMap::new();
         while !self.is_punct(Punct::LBrace) && !self.at_eof() {
-            self.consume_storage();
+            self.consume_storage()?;
             let base = self.parse_decl_specs()?;
-            self.consume_storage();
+            let sattrs = self.spec_attrs.clone();
+            self.consume_storage()?;
             if self.eat_punct(Punct::Semi) {
                 continue;
             }
             loop {
                 let (pname, pty, psp) = self.parse_named_declarator(base.clone())?;
+                let (_label, pty, _attrs) = self.finish_declarator(pty, psp, &sattrs)?;
                 let pty = pty.decayed().unwrap_or(pty);
                 if !names.iter().any(|(n, _)| *n == pname) {
                     return Err(Diagnostic::error(format!(
@@ -881,7 +1296,7 @@ impl Parser {
             // declaration starts so a declaration using them is recognized (the
             // C23 gate is applied in `parse_decl_specs`).
             TokenKind::Ident(name) => {
-                name == "_BitInt" || name == "constexpr" || self.is_typedef_name(name)
+                self.ident_starts_decl(name)
             }
             _ => false,
         }
@@ -897,7 +1312,24 @@ impl Parser {
     /// a declarator plausibly follows. Only declaration contexts (file scope and
     /// K&R parameter declaration-lists) enable this, so parenthesised
     /// expressions are never misread as casts.
+    ///
+    /// GNU attributes may appear anywhere among the specifiers; they (and any
+    /// met among preceding storage-class specifiers) are left in `spec_attrs`,
+    /// and a `mode` attribute among them already resizes the returned type.
     fn parse_decl_specs_impl(&mut self, allow_implicit_int: bool) -> PResult<CType> {
+        let start = self.peek_span();
+        let mut attrs = std::mem::take(&mut self.pending_attrs);
+        let ty = self.parse_decl_specs_body(allow_implicit_int, &mut attrs)?;
+        let ty = self.apply_type_attrs(ty, &attrs, start)?;
+        self.spec_attrs = attrs;
+        Ok(ty)
+    }
+
+    fn parse_decl_specs_body(
+        &mut self,
+        allow_implicit_int: bool,
+        attrs: &mut Attrs,
+    ) -> PResult<CType> {
         let start = self.peek_span();
         self.last_alignas = None;
         self.last_constexpr = false;
@@ -915,11 +1347,88 @@ impl Parser {
         // A pending `_BitInt(N)` value-bit count (the signedness is applied at the
         // end, since `unsigned`/`signed` may appear on either side of `_BitInt`).
         let mut bitint_n: Option<u16> = None;
+        // GNU `__int128` (combines with `signed`/`unsigned`).
+        let mut has_int128 = false;
 
         loop {
+            if self.at_attribute() {
+                let a = self.parse_attributes()?;
+                attrs.merge(a);
+                continue;
+            }
+            let numeric_seen = has_void
+                || has_bool
+                || has_char
+                || has_short
+                || has_int
+                || has_float
+                || has_double
+                || has_int128
+                || longs > 0
+                || signed_spec.is_some();
             // C23 `constexpr` (a declaration specifier) and `_BitInt` (a type
             // specifier) are lexed as ordinary identifiers (they are not global
-            // keywords); recognize them here and gate them on C23.
+            // keywords); recognize them here and gate them on C23. So are the
+            // GNU/TS 18661 builtin type names and the thread-storage specifiers.
+            if let TokenKind::Ident(name) = self.peek().clone() {
+                let sp = self.peek_span();
+                match name.as_str() {
+                    "_Thread_local" | "__thread" => {
+                        self.bump();
+                        self.spec_thread = true;
+                        saw_any = true;
+                        continue;
+                    }
+                    "__int128" => {
+                        self.bump();
+                        has_int128 = true;
+                        saw_any = true;
+                        continue;
+                    }
+                    "_Complex" | "__complex__" => {
+                        return Err(Diagnostic::error("complex types (_Complex) are not supported")
+                            .with_span(sp));
+                    }
+                    _ => {}
+                }
+                if explicit.is_none() && !numeric_seen {
+                    let ty = match name.as_str() {
+                        "__int128_t" => Some(CType::Int(IntTy::new(128, true))),
+                        "__uint128_t" => Some(CType::Int(IntTy::new(128, false))),
+                        "_Float32" => Some(CType::float()),
+                        // `long double` is modelled as `double` in this subset, so
+                        // `_Float64x` (and the x87 `__float80`) follow it.
+                        "_Float64" | "_Float32x" | "_Float64x" | "__float80" => {
+                            Some(CType::double())
+                        }
+                        "_Float128" | "__float128" => Some(CType::Float(FloatTy::F128)),
+                        "_Float16" | "_Float128x" | "__ibm128" => {
+                            return Err(Diagnostic::error(format!(
+                                "the floating type '{name}' is not supported"
+                            ))
+                            .with_span(sp));
+                        }
+                        "__builtin_va_list" => {
+                            self.bump();
+                            explicit = Some(self.builtin_va_list());
+                            saw_any = true;
+                            continue;
+                        }
+                        "__typeof__" | "__typeof" => {
+                            explicit = Some(self.parse_typeof()?);
+                            saw_any = true;
+                            continue;
+                        }
+                        _ => None,
+                    };
+                    if let Some(ty) = ty {
+                        self.bump();
+                        explicit = Some(ty);
+                        saw_any = true;
+                        continue;
+                    }
+                }
+            }
             if let TokenKind::Ident(name) = self.peek() {
                 if name == "constexpr" {
                     if !self.std.is_c23() {
@@ -963,15 +1472,6 @@ impl Parser {
             }
             // A `struct`/`union`/`enum` specifier, or a typedef-name, supplies the
             // whole type; it may not combine with the numeric specifiers.
-            let numeric_seen = has_void
-                || has_bool
-                || has_char
-                || has_short
-                || has_int
-                || has_float
-                || has_double
-                || longs > 0
-                || signed_spec.is_some();
             match self.peek() {
                 TokenKind::Keyword(Keyword::Struct) if explicit.is_none() && !numeric_seen => {
                     explicit = Some(self.parse_record(RecordKind::Struct)?);
@@ -1010,12 +1510,12 @@ impl Parser {
             }
             match self.peek() {
                 TokenKind::Keyword(
-                    Keyword::Const
-                    | Keyword::Volatile
-                    | Keyword::Restrict
-                    | Keyword::Inline
-                    | Keyword::Noreturn,
+                    Keyword::Const | Keyword::Volatile | Keyword::Restrict | Keyword::Noreturn,
                 ) => {
+                    self.bump();
+                }
+                TokenKind::Keyword(Keyword::Inline) => {
+                    self.spec_inline = true;
                     self.bump();
                 }
                 TokenKind::Keyword(Keyword::Alignas) => {
@@ -1115,6 +1615,16 @@ impl Parser {
             }
             return Ok(CType::Int(IntTy::bit_int(n, signed)));
         }
+        // GNU `__int128` / `unsigned __int128`: only `signed`/`unsigned` (and a
+        // redundant `int`) may accompany it.
+        if has_int128 {
+            if has_void || has_bool || has_char || has_short || has_float || has_double || longs > 0
+            {
+                return Err(Diagnostic::error("invalid combination of type specifiers")
+                    .with_span(start));
+            }
+            return Ok(CType::Int(IntTy::new(128, signed_spec.unwrap_or(true))));
+        }
         if longs >= 2 && !self.std.has_long_long() {
             return Err(Diagnostic::error(
                 "`long long` is a C99 feature (use -std=c99 or later)",
@@ -1157,19 +1667,28 @@ impl Parser {
         Ok(CType::Int(IntTy::new(width, signed)))
     }
 
-    /// Consume leading `*` (with optional qualifiers) and wrap `base`.
-    fn parse_pointers(&mut self, mut base: CType) -> CType {
+    /// Consume leading `*` (with optional qualifiers and GNU attributes) and wrap
+    /// `base`. Attributes directly before the first `*` are accepted too.
+    fn parse_pointers(&mut self, mut base: CType) -> PResult<CType> {
+        self.skip_attributes()?;
         while self.eat_punct(Punct::Star) {
-            // Skip pointer qualifiers.
-            while self.is_kw(Keyword::Const)
-                || self.is_kw(Keyword::Volatile)
-                || self.is_kw(Keyword::Restrict)
-            {
-                self.bump();
+            // Skip pointer qualifiers and attributes (`char *__restrict p`,
+            // `void * __attribute__((aligned(8))) p`).
+            loop {
+                if self.is_kw(Keyword::Const)
+                    || self.is_kw(Keyword::Volatile)
+                    || self.is_kw(Keyword::Restrict)
+                {
+                    self.bump();
+                } else if self.at_attribute() {
+                    self.skip_attributes()?;
+                } else {
+                    break;
+                }
             }
             base = CType::ptr_to(base);
         }
-        base
+        Ok(base)
     }
 
     /// Parse a type-name (used in casts and `sizeof`): specifiers plus an
@@ -1308,6 +1827,10 @@ impl Parser {
             // `va_arg` yields its type operand; the others are `void`.
             ExprKind::VaArg(_, ty) => Some(ty.clone()),
             ExprKind::VaStart(..) | ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => Some(CType::Void),
+            ExprKind::StmtExpr(stmts) => match stmts.last() {
+                Some(Stmt { kind: StmtKind::Expr(Some(e)), .. }) => self.expr_type(e),
+                _ => Some(CType::Void),
+            },
         }
     }
 
@@ -1330,7 +1853,7 @@ impl Parser {
     /// declarator (a parameter or type-name with no identifier).
     fn declarator(&mut self, base: CType) -> PResult<(Option<String>, CType, Span)> {
         // Leading pointers wrap the type the inner declarator ultimately builds on.
-        let base = self.parse_pointers(base);
+        let base = self.parse_pointers(base)?;
         if self.is_punct(Punct::LParen) && self.grouped_declarator_ahead() {
             self.bump(); // '('
             let inner_start = self.pos;
@@ -1345,16 +1868,28 @@ impl Parser {
             self.pos = inner_start;
             let (name, ty, span) = self.declarator(outer)?;
             self.pos = resume;
+            // Attributes after the whole grouped declarator apply to it too.
+            let a = self.parse_attributes()?;
+            self.decl_attrs.merge(a);
             Ok((name, ty, span))
         } else {
             let (name, span) = match self.peek().clone() {
-                TokenKind::Ident(n) => {
+                TokenKind::Ident(n) if !self.at_gnu_attribute() => {
                     let sp = self.bump().span;
                     (Some(n), sp)
                 }
                 _ => (None, self.peek_span()),
             };
+            // Attributes between the name and its suffixes (`int x
+            // __attribute__((unused))[4]` is rare; `name attrs (params)` rarer).
+            let pre = self.parse_attributes()?;
             let ty = self.declarator_suffixes(base)?;
+            // The declarator's own trailing attributes (`int x
+            // __attribute__((aligned(8)))`, `typedef int T __attribute__((mode(DI)))`).
+            // They replace whatever a nested parameter declarator left behind.
+            let mut attrs = pre;
+            attrs.merge(self.parse_attributes()?);
+            self.decl_attrs = attrs;
             Ok((name, ty, span))
         }
     }
@@ -1376,7 +1911,9 @@ impl Parser {
     fn grouped_declarator_ahead(&self) -> bool {
         match self.peek_at(1) {
             TokenKind::Punct(Punct::Star | Punct::LParen) => true,
-            TokenKind::Ident(name) => !self.is_typedef_name(name),
+            TokenKind::Ident(name) => {
+                name == "__attribute__" || name == "__attribute" || !self.ident_starts_decl(name)
+            }
             _ => false,
         }
     }
@@ -1408,6 +1945,9 @@ impl Parser {
     /// the record type. A body `{ ... }` completes the record's definition.
     fn parse_record(&mut self, kind: RecordKind) -> PResult<CType> {
         self.bump(); // struct / union
+        // `struct __attribute__((packed)) tag { ... }`: attributes may precede
+        // the tag, and follow the closing brace; both apply to the record type.
+        let mut attrs = self.parse_attributes()?;
         let tag = match self.peek().clone() {
             TokenKind::Ident(name) => {
                 self.bump();
@@ -1415,6 +1955,7 @@ impl Parser {
             }
             _ => None,
         };
+        attrs.merge(self.parse_attributes()?);
         let has_body = self.is_punct(Punct::LBrace);
         if tag.is_none() && !has_body {
             return self.err("expected a tag name or '{' after struct/union");
@@ -1425,6 +1966,11 @@ impl Parser {
         };
         if has_body {
             self.parse_record_body(id)?;
+            attrs.merge(self.parse_attributes()?);
+            let def = &mut self.records.defs[id];
+            def.packed |= attrs.packed;
+            def.transparent |= attrs.transparent_union;
+            def.align = max_align(def.align, attrs.aligned);
         }
         Ok(CType::Record(id))
     }
@@ -1433,8 +1979,18 @@ impl Parser {
         self.expect_punct(Punct::LBrace, "'{' to open struct/union body")?;
         let mut fields = Vec::new();
         while !self.is_punct(Punct::RBrace) && !self.at_eof() {
+            // A stray `;` (GNU accepts an empty member declaration).
+            if self.eat_punct(Punct::Semi) {
+                continue;
+            }
+            // A `_Static_assert` member declaration (C11) declares nothing.
+            if self.is_kw(Keyword::StaticAssert) {
+                self.parse_static_assert()?;
+                continue;
+            }
             let base = self.parse_decl_specs()?;
-            let align = self.last_alignas.take();
+            let sattrs = self.spec_attrs.clone();
+            let align = max_align(self.last_alignas.take(), sattrs.aligned);
             // A member declaration with no declarator: an anonymous struct/union
             // member (an untagged `struct`/`union`, C11), or a nested tagged type
             // declaration (which declares no member).
@@ -1462,6 +2018,7 @@ impl Parser {
             // has no declarator, only a colon and a width.
             if self.is_punct(Punct::Colon) {
                 let bit_width = self.parse_bitfield_width(&base)?;
+                self.skip_attributes()?;
                 fields.push(Field {
                     name: String::new(),
                     ty: base.clone(),
@@ -1474,6 +2031,8 @@ impl Parser {
             }
             loop {
                 let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
+                // Attributes may sit before the bit-field width and after it.
+                let (_label, ty, mut attrs) = self.finish_declarator(ty, name_span, &sattrs)?;
                 let bit_width = if self.is_punct(Punct::Colon) {
                     let w = self.parse_bitfield_width(&ty)?;
                     // A named bit-field of width 0 is a constraint violation.
@@ -1483,10 +2042,12 @@ impl Parser {
                         )
                         .with_span(name_span));
                     }
+                    attrs.merge(self.parse_attributes()?);
                     Some(w)
                 } else {
                     None
                 };
+                let align = max_align(align, attrs.aligned);
                 fields.push(Field { name, ty, anonymous: false, align, bit_width });
                 if !self.eat_punct(Punct::Comma) {
                     break;
@@ -1533,16 +2094,20 @@ impl Parser {
     /// enumerator constants (auto-incrementing, or explicit `= const-expr`).
     fn parse_enum(&mut self) -> PResult<CType> {
         self.bump(); // enum
+        self.skip_attributes()?;
         let mut tag: Option<String> = None;
         if let TokenKind::Ident(name) = self.peek() {
             tag = Some(name.clone());
             self.bump(); // tag
         }
+        self.skip_attributes()?;
         if self.eat_punct(Punct::LBrace) {
             let mut next = 0i128;
             let mut any_negative = false;
             while !self.is_punct(Punct::RBrace) && !self.at_eof() {
                 let (name, _span) = self.expect_ident()?;
+                // An enumerator may carry attributes (`A __attribute__((deprecated))`).
+                self.skip_attributes()?;
                 if self.eat_punct(Punct::Assign) {
                     next = self.parse_const_expr()?;
                 }
@@ -1557,6 +2122,7 @@ impl Parser {
                 }
             }
             self.expect_punct(Punct::RBrace, "'}' to close enum body")?;
+            self.skip_attributes()?;
             // An enumerated type's underlying integer type, matching gcc: `int`
             // when any enumerator is negative, otherwise `unsigned int`. This is
             // observable in a `_Generic` selection and, crucially, in the sign of
@@ -1834,19 +2400,22 @@ impl Parser {
 
     fn parse_local_decl(&mut self) -> PResult<Stmt> {
         let start = self.peek_span();
+        self.spec_inline = false;
+        self.spec_thread = false;
         if self.eat_kw(Keyword::Typedef) {
             self.parse_typedef()?;
             return Ok(self.stmt(StmtKind::Expr(None), start));
         }
-        let storage = self.consume_storage();
+        let storage = self.consume_storage()?;
         if self.eat_kw(Keyword::Typedef) {
             self.parse_typedef()?;
             return Ok(self.stmt(StmtKind::Expr(None), start));
         }
         let base = self.parse_decl_specs()?;
+        let sattrs = self.spec_attrs.clone();
         let align = self.last_alignas.take();
         let is_constexpr = self.last_constexpr;
-        let storage = merge_storage(storage, self.consume_storage());
+        let storage = merge_storage(storage, self.consume_storage()?);
         // A C23 `constexpr` object is a named compile-time constant (no storage);
         // it contributes no executable statement.
         if is_constexpr {
@@ -1858,14 +2427,25 @@ impl Parser {
             let end = self.bump().span;
             return Ok(self.stmt(StmtKind::Expr(None), start.merge(end)));
         }
+        let thread_local = self.spec_thread;
         let mut decls = Vec::new();
         loop {
             let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
+            let (asm_label, ty, attrs) = self.finish_declarator(ty, name_span, &sattrs)?;
             self.declare_ordinary(&name, Some(ty.clone()));
-            let asm_label = self.parse_declarator_extensions()?;
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            decls.push(VarDecl { name, ty, init, align, storage, asm_label, span: name_span });
+            let align = max_align(align, attrs.aligned);
+            decls.push(VarDecl {
+                name,
+                ty,
+                init,
+                align,
+                storage,
+                asm_label,
+                thread_local,
+                span: name_span,
+            });
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
@@ -2124,7 +2704,7 @@ impl Parser {
                 | Keyword::Enum,
             ) => true,
             // `sizeof(_BitInt(N))` / a `(_BitInt(N))` cast (C23).
-            TokenKind::Ident(name) => name == "_BitInt" || self.is_typedef_name(name),
+            TokenKind::Ident(name) => is_builtin_type_ident(name) || self.is_typedef_name(name),
             _ => false,
         }
     }
@@ -2160,7 +2740,9 @@ impl Parser {
         if self.is_kw(Keyword::Sizeof) {
             return self.parse_sizeof();
         }
-        if self.is_kw(Keyword::Alignof) {
+        if self.is_kw(Keyword::Alignof)
+            || matches!(self.peek(), TokenKind::Ident(n) if n == "__alignof__" || n == "__alignof")
+        {
             return self.parse_alignof();
         }
         self.parse_postfix()
@@ -2184,7 +2766,17 @@ impl Parser {
     /// equal to the type's alignment.
     fn parse_alignof(&mut self) -> PResult<Expr> {
         let start = self.peek_span();
-        self.bump(); // _Alignof / alignof
+        self.bump(); // _Alignof / alignof / __alignof__
+        // GNU also takes an expression operand: `__alignof__ (x)`, `__alignof__ x`.
+        if !(self.is_punct(Punct::LParen) && self.type_name_follows_lparen()) {
+            let e = self.parse_unary()?;
+            let Some(ty) = self.expr_type(&e) else {
+                return Err(Diagnostic::error("cannot determine the type of this alignof operand")
+                    .with_span(e.span));
+            };
+            let span = start.merge(e.span);
+            return Ok(Expr { kind: ExprKind::AlignofType(ty), span });
+        }
         self.expect_punct(Punct::LParen, "'(' after _Alignof")?;
         let ty = self.parse_type_name()?;
         let end = self.expect_punct(Punct::RParen, "')' after _Alignof type")?;
@@ -2252,6 +2844,75 @@ impl Parser {
         };
         let end = self.expect_punct(Punct::RParen, "')' to close a va_* builtin")?;
         Ok(Expr { kind, span: start.merge(end) })
+    }
+
+    /// `__builtin_offsetof ( type-name , member-designator )` (the identifier at
+    /// the cursor): folded to its `size_t` byte offset. The designator is a
+    /// member name followed by any mix of `.member` and `[const-expr]`.
+    fn parse_builtin_offsetof(&mut self) -> PResult<Expr> {
+        let start = self.bump().span; // __builtin_offsetof
+        self.expect_punct(Punct::LParen, "'(' after __builtin_offsetof")?;
+        let mut ty = self.parse_type_name()?;
+        self.expect_punct(Punct::Comma, "',' in __builtin_offsetof")?;
+        let mut offset = 0u64;
+        let mut member = Some(self.expect_ident()?);
+        loop {
+            if let Some((name, sp)) = member.take() {
+                let CType::Record(id) = ty else {
+                    return Err(Diagnostic::error("__builtin_offsetof of a member of a non-record type")
+                        .with_span(sp));
+                };
+                let Some((off, fty)) = layout::resolve_member(&self.records, id, &name) else {
+                    return Err(Diagnostic::error(format!("no member named '{name}'")).with_span(sp));
+                };
+                offset += off;
+                ty = fty;
+            }
+            if self.eat_punct(Punct::Dot) {
+                member = Some(self.expect_ident()?);
+            } else if self.is_punct(Punct::LBracket) {
+                let sp = self.bump().span;
+                let idx = self.parse_const_expr()?;
+                self.expect_punct(Punct::RBracket, "']' in __builtin_offsetof")?;
+                let CType::Array(elem, _) = ty else {
+                    return Err(Diagnostic::error("subscript of a non-array in __builtin_offsetof")
+                        .with_span(sp));
+                };
+                offset = offset.wrapping_add((idx as u64).wrapping_mul(layout::stride_of(&self.records, &elem)));
+                ty = *elem;
+            } else {
+                break;
+            }
+        }
+        let end = self.expect_punct(Punct::RParen, "')' to close __builtin_offsetof")?;
+        Ok(Expr { kind: ExprKind::IntLit(i128::from(offset), size_t_ty()), span: start.merge(end) })
+    }
+
+    /// `__builtin_types_compatible_p ( type-name , type-name )`: the `int`
+    /// constant 1 when the two types are compatible (qualifiers are not
+    /// modelled, so this is type identity), else 0.
+    fn parse_builtin_types_compatible(&mut self) -> PResult<Expr> {
+        let start = self.bump().span;
+        self.expect_punct(Punct::LParen, "'(' after __builtin_types_compatible_p")?;
+        let a = self.parse_type_name()?;
+        self.expect_punct(Punct::Comma, "',' in __builtin_types_compatible_p")?;
+        let b = self.parse_type_name()?;
+        let end = self.expect_punct(Punct::RParen, "')' to close __builtin_types_compatible_p")?;
+        Ok(Expr { kind: ExprKind::IntLit(i128::from(a == b), CType::int()), span: start.merge(end) })
+    }
+
+    /// `__builtin_choose_expr ( const-expr , e1 , e2 )`: selects `e1` when the
+    /// constant is nonzero, else `e2`, at parse time (the other is discarded).
+    fn parse_builtin_choose_expr(&mut self) -> PResult<Expr> {
+        self.bump();
+        self.expect_punct(Punct::LParen, "'(' after __builtin_choose_expr")?;
+        let c = self.parse_const_expr()?;
+        self.expect_punct(Punct::Comma, "',' in __builtin_choose_expr")?;
+        let a = self.parse_assign()?;
+        self.expect_punct(Punct::Comma, "',' in __builtin_choose_expr")?;
+        let b = self.parse_assign()?;
+        self.expect_punct(Punct::RParen, "')' to close __builtin_choose_expr")?;
+        Ok(if c != 0 { a } else { b })
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
@@ -2325,8 +2986,36 @@ impl Parser {
                 {
                     return self.parse_va_builtin(&name);
                 }
+                if matches!(self.peek_at(1), TokenKind::Punct(Punct::LParen)) {
+                    match name.as_str() {
+                        "__builtin_offsetof" => return self.parse_builtin_offsetof(),
+                        "__builtin_types_compatible_p" => {
+                            return self.parse_builtin_types_compatible();
+                        }
+                        "__builtin_choose_expr" => return self.parse_builtin_choose_expr(),
+                        _ => {}
+                    }
+                }
+                // `__func__` (C99) and its GNU spellings name the enclosing
+                // function as a string literal (outside a function: "").
+                if matches!(name.as_str(), "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__")
+                    && self.var_type(&name).is_none()
+                {
+                    let span = self.bump().span;
+                    let bytes = self.cur_func.clone().unwrap_or_default().into_bytes();
+                    return Ok(Expr { kind: ExprKind::StrLit(bytes, StrKind::Narrow), span });
+                }
                 let span = self.bump().span;
                 Ok(Expr { kind: ExprKind::Ident(name), span })
+            }
+            // A GNU statement expression `({ ... })`.
+            TokenKind::Punct(Punct::LParen)
+                if matches!(self.peek_at(1), TokenKind::Punct(Punct::LBrace)) =>
+            {
+                let start = self.bump().span; // (
+                let stmts = self.parse_block_stmts()?;
+                let end = self.expect_punct(Punct::RParen, "')' to close a statement expression")?;
+                Ok(Expr { kind: ExprKind::StmtExpr(stmts), span: start.merge(end) })
             }
             TokenKind::Punct(Punct::LParen) => {
                 self.bump();
@@ -2523,6 +3212,39 @@ fn merge_storage(a: Storage, b: Storage) -> Storage {
         (s, Storage::None) => s,
         (_, s) => s,
     }
+}
+
+/// Whether `name` is a builtin type name that the lexer leaves as an identifier
+/// (so it can serve as a type specifier, or begin a type-name in a cast).
+fn is_builtin_type_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "_BitInt"
+            | "__int128"
+            | "__int128_t"
+            | "__uint128_t"
+            | "_Float16"
+            | "_Float32"
+            | "_Float64"
+            | "_Float128"
+            | "_Float32x"
+            | "_Float64x"
+            | "_Float128x"
+            | "__float128"
+            | "__float80"
+            | "__ibm128"
+            | "_Complex"
+            | "__complex__"
+            | "__builtin_va_list"
+            | "__typeof__"
+            | "__typeof"
+    )
+}
+
+/// `name` without a GNU `__...__` wrapping (`__aligned__` → `aligned`), the
+/// reserved-namespace spelling of attribute names and machine modes.
+fn strip_dunder(name: &str) -> &str {
+    name.strip_prefix("__").and_then(|n| n.strip_suffix("__")).unwrap_or(name)
 }
 
 /// Whether `name` is one of the variadic compiler builtins the frontend expands

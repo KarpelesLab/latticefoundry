@@ -155,6 +155,10 @@ pub enum FloatTy {
     F32,
     /// Double precision (`double`, 8 bytes).
     F64,
+    /// IEEE binary128 (`_Float128` / `__float128`, 16 bytes). Accepted in
+    /// declarations (glibc prototypes name it); computing with a value of this
+    /// type is rejected by sema, since no backend implements it.
+    F128,
 }
 
 impl FloatTy {
@@ -163,6 +167,7 @@ impl FloatTy {
         match self {
             FloatTy::F32 => 32,
             FloatTy::F64 => 64,
+            FloatTy::F128 => 128,
         }
     }
 }
@@ -214,6 +219,17 @@ pub struct RecordDef {
     pub fields: Vec<Field>,
     /// Whether a full definition (a member list) has been seen.
     pub complete: bool,
+    /// GNU `__attribute__((packed))`: members are laid out without padding
+    /// (each member's alignment drops to 1 unless it carries its own
+    /// `aligned`/`_Alignas`).
+    pub packed: bool,
+    /// GNU `__attribute__((aligned(N)))` on the record type: raises the record's
+    /// alignment (and so pads its size) to at least `N`.
+    pub align: Option<u64>,
+    /// GNU `__attribute__((transparent_union))`: a function parameter of this
+    /// union type accepts an argument of any member type and is passed as the
+    /// first member (the parser rewrites such parameters accordingly).
+    pub transparent: bool,
 }
 
 /// The registry of every `struct`/`union` definition in a translation unit,
@@ -363,6 +379,18 @@ impl CType {
         matches!(self, CType::Int(i) if i.signed)
     }
 
+    /// If values of this type cannot be computed with (only declared), the name
+    /// of the unsupported type: `__int128` (a 128-bit integer) or `_Float128`.
+    /// Prototypes, typedefs, pointers and `extern` declarations may still name
+    /// these types; sema rejects any expression that would produce such a value.
+    pub fn unsupported_value(&self) -> Option<&'static str> {
+        match self {
+            CType::Int(i) if i.width > 64 => Some("__int128"),
+            CType::Float(FloatTy::F128) => Some("_Float128"),
+            _ => None,
+        }
+    }
+
     /// The integer conversion rank used by the usual arithmetic conversions.
     /// For this subset the rank is simply the width, with `_Bool` lowest.
     pub fn rank(&self) -> u16 {
@@ -396,12 +424,15 @@ impl fmt::Display for CType {
                     (32, false) => "unsigned int",
                     (64, true) => "long",
                     (64, false) => "unsigned long",
+                    (128, true) => "__int128",
+                    (128, false) => "unsigned __int128",
                     _ => "int",
                 };
                 write!(f, "{base}")
             }
             CType::Float(FloatTy::F32) => write!(f, "float"),
             CType::Float(FloatTy::F64) => write!(f, "double"),
+            CType::Float(FloatTy::F128) => write!(f, "_Float128"),
             CType::Pointer(inner) => write!(f, "{inner} *"),
             CType::Array(elem, n) => write!(f, "{elem}[{n}]"),
             CType::Record(_) => write!(f, "struct/union"),
@@ -555,6 +586,10 @@ pub enum ExprKind {
     VaEnd(Box<Expr>),
     /// `__builtin_va_copy(dst, src)` — copy the traversal state of `src` to `dst`.
     VaCopy(Box<Expr>, Box<Expr>),
+    /// A GNU statement expression `({ stmt... })`: the statements run in their
+    /// own scope and, when the last one is an expression statement, its value is
+    /// the value of the whole expression (otherwise the type is `void`).
+    StmtExpr(Vec<Stmt>),
 }
 
 /// One association of a `_Generic` selection: a type (`None` for `default`) and
@@ -710,6 +745,8 @@ pub struct VarDecl {
     /// A GNU asm label (`T x asm("sym");`): the assembler symbol that replaces
     /// the C name at link level. The C name still governs lookup.
     pub asm_label: Option<String>,
+    /// Whether the object is thread-local (`_Thread_local` / GNU `__thread`).
+    pub thread_local: bool,
     /// The source span of the declarator.
     pub span: Span,
 }
@@ -738,6 +775,10 @@ pub struct FuncDef {
     pub variadic: bool,
     /// Whether the function has internal linkage (`static`).
     pub is_static: bool,
+    /// Whether the definition carries the `inline` function specifier. An
+    /// unreferenced `static inline` definition (the header idiom) is not
+    /// compiled at all, as gcc does not emit one either.
+    pub is_inline: bool,
     /// The function body (a list of statements).
     pub body: Vec<Stmt>,
     /// A GNU asm label (`T f(...) asm("sym") { ... }`) naming the emitted symbol.

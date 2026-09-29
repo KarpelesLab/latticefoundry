@@ -21,8 +21,10 @@ fn round_up(value: u64, align: u64) -> u64 {
 
 /// The effective alignment of a record member: its natural alignment raised to
 /// any explicit `_Alignas`/`alignas` request (alignment may only increase).
-fn field_align(recs: &Records, f: &Field) -> u64 {
-    let natural = align_of(recs, &f.ty);
+fn field_align(recs: &Records, f: &Field, packed: bool) -> u64 {
+    // A packed record drops every member's natural alignment to 1; an explicit
+    // `aligned`/`_Alignas` on the member still applies.
+    let natural = if packed { 1 } else { align_of(recs, &f.ty) };
     match f.align {
         Some(a) => natural.max(a),
         None => natural,
@@ -49,7 +51,7 @@ pub fn size_of(recs: &Records, ty: &CType) -> u64 {
 pub fn align_of(recs: &Records, ty: &CType) -> u64 {
     match ty {
         CType::Void | CType::Bool => 1,
-        CType::Int(i) => (u64::from(i.width) / 8).clamp(1, 8),
+        CType::Int(i) => (u64::from(i.width) / 8).clamp(1, 16),
         CType::Float(f) => u64::from(f.bits()) / 8,
         CType::Pointer(_) => 8,
         CType::Array(elem, _) => align_of(recs, elem),
@@ -133,8 +135,9 @@ fn record_layout(recs: &Records, id: RecordId) -> RecordLayout {
                         let w = u64::from(w);
                         let unit = u64::from(bitfield_unit_bits(&f.ty));
                         // A bit-field starts a new unit rather than straddle an
-                        // aligned container of its declared type.
-                        if offset_bits % unit + w > unit {
+                        // aligned container of its declared type (a packed record
+                        // packs bit-fields back to back instead).
+                        if !def.packed && offset_bits % unit + w > unit {
                             offset_bits = round_up(offset_bits, unit);
                         }
                         let unit_index = offset_bits / unit;
@@ -146,17 +149,22 @@ fn record_layout(recs: &Records, id: RecordId) -> RecordLayout {
                             width: w as u32,
                             signed: f.ty.is_signed(),
                         });
-                        align = align.max(align_of(recs, &f.ty));
+                        if !def.packed {
+                            align = align.max(align_of(recs, &f.ty));
+                        }
                         offset_bits += w;
                     }
                     None => {
-                        let a = field_align(recs, f);
+                        let a = field_align(recs, f, def.packed);
                         align = align.max(a);
                         offset_bits = round_up(offset_bits, a * 8);
                         offsets[i] = offset_bits / 8;
                         offset_bits += size_of(recs, &f.ty) * 8;
                     }
                 }
+            }
+            if let Some(a) = def.align {
+                align = align.max(a);
             }
             let size = round_up(offset_bits, align.max(1) * 8) / 8;
             RecordLayout { offsets, bits, size: size.max(1), align: align.max(1) }
@@ -173,12 +181,17 @@ fn record_layout(recs: &Records, id: RecordId) -> RecordLayout {
                             width: w,
                             signed: f.ty.is_signed(),
                         });
-                        align = align.max(align_of(recs, &f.ty));
+                        if !def.packed {
+                            align = align.max(align_of(recs, &f.ty));
+                        }
                     }
                 } else {
-                    align = align.max(field_align(recs, f));
+                    align = align.max(field_align(recs, f, def.packed));
                 }
                 size = size.max(size_of(recs, &f.ty));
+            }
+            if let Some(a) = def.align {
+                align = align.max(a);
             }
             let align = align.max(1);
             RecordLayout { offsets, bits, size: round_up(size, align).max(1), align }
@@ -257,6 +270,8 @@ pub fn ir_type(cx: &mut TypeContext, recs: &Records, ty: &CType) -> TypeId {
         CType::Int(i) => cx.int(u32::from(i.width)),
         CType::Float(FloatTy::F32) => cx.float(FloatKind::F32),
         CType::Float(FloatTy::F64) => cx.float(FloatKind::F64),
+        // Storage only: sema never lets a `_Float128` value be computed.
+        CType::Float(FloatTy::F128) => cx.int(128),
         CType::Pointer(_) => cx.ptr(),
         CType::Array(elem, n) => {
             let e = ir_type(cx, recs, elem);
@@ -277,7 +292,14 @@ fn ir_record(cx: &mut TypeContext, recs: &Records, id: RecordId) -> TypeId {
             // natural struct of the field types mis-sized; model such a struct by a
             // byte blob of the right size/alignment (as for unions) so the storage
             // reserved by an `alloca` stays adequate.
-            if def.fields.iter().any(|f| f.align.is_some() || f.bit_width.is_some()) {
+            // So can a packed or explicitly aligned record, or an over-aligned
+            // (16-byte) member.
+            if def.packed
+                || def.align.is_some()
+                || def.fields.iter().any(|f| {
+                    f.align.is_some() || f.bit_width.is_some() || align_of(recs, &f.ty) > 8
+                })
+            {
                 let size = record_size(recs, id);
                 let align = record_align(recs, id).min(8);
                 let head = cx.int((align * 8) as u32);
@@ -295,7 +317,7 @@ fn ir_record(cx: &mut TypeContext, recs: &Records, id: RecordId) -> TypeId {
         }
         RecordKind::Union => {
             let size = record_size(recs, id);
-            let align = record_align(recs, id);
+            let align = record_align(recs, id).min(8);
             let head = cx.int((align * 8) as u32);
             if size > align {
                 let i8t = cx.int(8);

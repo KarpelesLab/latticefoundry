@@ -59,7 +59,8 @@ impl Tys {
             CType::Bool => self.i8,
             CType::Int(i) => self.for_int(i.width),
             CType::Float(FloatTy::F32) => self.f32,
-            CType::Float(FloatTy::F64) => self.f64,
+            // `_Float128` only appears in unused prototypes (sema rejects values).
+            CType::Float(FloatTy::F64 | FloatTy::F128) => self.f64,
             CType::Pointer(_) => self.ptr,
             CType::Array(..) | CType::Record(_) => self.ptr,
             CType::Func(_) => self.ptr,
@@ -270,7 +271,8 @@ fn decode_float_le(fty: FloatTy, bytes: &[u8]) -> FloatBits {
             }
             FloatBits::F32(u32::from_le_bytes(buf))
         }
-        FloatTy::F64 => {
+        // `_Float128` values never reach lowering (sema rejects them).
+        FloatTy::F64 | FloatTy::F128 => {
             let mut buf = [0u8; 8];
             for (i, b) in bytes.iter().take(8).enumerate() {
                 buf[i] = *b;
@@ -784,6 +786,13 @@ impl FnLower<'_> {
                 self.lower_effect(a);
                 self.lower_effect(b);
             }
+            TExprKind::StmtExpr(stmts, value) => {
+                self.lower_block(stmts);
+                self.ensure_live();
+                if let Some(v) = value {
+                    self.lower_effect(v);
+                }
+            }
             // A conditional whose result is discarded — commonly a void-typed
             // ternary such as `cond ? (void)0 : abort()` (the `assert` macro).
             // Lower each arm for effect so a void-returning arm is not forced
@@ -1094,6 +1103,14 @@ impl FnLower<'_> {
                 let s = self.lower_rvalue(src);
                 self.copy_bytes(d, s, VA_LIST_SIZE);
                 self.void_value()
+            }
+            TExprKind::StmtExpr(stmts, value) => {
+                self.lower_block(stmts);
+                self.ensure_live();
+                match value {
+                    Some(v) => self.lower_rvalue(v),
+                    None => self.void_value(),
+                }
             }
         }
     }
@@ -1489,6 +1506,11 @@ impl FnLower<'_> {
             TExprKind::Comma(a, b) => {
                 self.lower_effect(a);
                 self.lower_struct_addr(b)
+            }
+            TExprKind::StmtExpr(stmts, Some(value)) => {
+                self.lower_block(stmts);
+                self.ensure_live();
+                self.lower_struct_addr(value)
             }
             _ => unreachable!("not a struct-addressable expression: {:?}", e.kind),
         }
