@@ -240,6 +240,9 @@ impl VirtualTarget {
             BinOp::LShr => VOp::LShr,
             BinOp::AShr => VOp::AShr,
             BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FRem => return None,
+            // Min/max and saturating ops: expanded by the vector legalizer
+            // before the real targets; the virtual target has no form.
+            _ => return None,
         })
     }
 

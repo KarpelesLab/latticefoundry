@@ -578,6 +578,25 @@ fn eval_bin(op: BinOp, flags: &Flags, operands: &[SemValue]) -> EvalOutcome {
         BinOp::Or => ok(SemValue::int(w, a.bitor(b))),
         BinOp::Xor => ok(SemValue::int(w, a.bitxor(b))),
         BinOp::Shl | BinOp::LShr | BinOp::AShr => eval_shift(op, flags, w, a, b),
+        BinOp::SMin => ok(SemValue::int(w, pick(signed(a, w) <= signed(b, w), a, b))),
+        BinOp::SMax => ok(SemValue::int(w, pick(signed(a, w) >= signed(b, w), a, b))),
+        BinOp::UMin => ok(SemValue::int(w, pick(a <= b, a, b))),
+        BinOp::UMax => ok(SemValue::int(w, pick(a >= b, a, b))),
+        BinOp::SAddSat | BinOp::SSubSat => {
+            let (sa, sb) = (signed(a, w), signed(b, w));
+            let exact = if op == BinOp::SAddSat { sa.add(&sb) } else { sa.sub(&sb) };
+            let (lo, hi) = (int_min(w), two_pow(w - 1).sub(&Int::ONE));
+            ok(SemValue::int(w, if exact < lo { lo } else if exact > hi { hi } else { exact }))
+        }
+        BinOp::UAddSat => {
+            let max = two_pow(w).sub(&Int::ONE);
+            let exact = a.add(b);
+            ok(SemValue::int(w, if exact > max { max } else { exact }))
+        }
+        BinOp::USubSat => {
+            let exact = a.sub(b);
+            ok(SemValue::int(w, if exact.is_negative() { Int::ZERO } else { exact }))
+        }
         // Float variants handled above.
         BinOp::FAdd
         | BinOp::FSub

@@ -1724,6 +1724,14 @@ fn bin_name(op: BinOp) -> &'static str {
         BinOp::FMul => "fmul",
         BinOp::FDiv => "fdiv",
         BinOp::FRem => "frem",
+        BinOp::SMin => "smin",
+        BinOp::SMax => "smax",
+        BinOp::UMin => "umin",
+        BinOp::UMax => "umax",
+        BinOp::SAddSat => "sadd_sat",
+        BinOp::UAddSat => "uadd_sat",
+        BinOp::SSubSat => "ssub_sat",
+        BinOp::USubSat => "usub_sat",
     }
 }
 

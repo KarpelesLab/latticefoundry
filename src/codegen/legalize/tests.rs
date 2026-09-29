@@ -246,6 +246,70 @@ entry ^0(%x: i32):
     assert_eq!(run_named(&m, &syms, "p", &[int(32, 1)]).unwrap(), Some(SemValue::Poison));
 }
 
+const MINMAX_SAT: &str = r#"
+module "ms"
+func @s(i64, i64) -> i64 {
+entry ^0(%x: i64, %y: i64):
+  %a = trunc %x : i8
+  %b = trunc %y : i8
+  %r1 = sadd_sat %a, %b : i8
+  %r2 = ssub_sat %a, %b : i8
+  %r3 = uadd_sat %a, %b : i8
+  %r4 = usub_sat %a, %b : i8
+  %r5 = smin %r1, %r2 : i8
+  %r6 = umax %r3, %r4 : i8
+  %r7 = smax %r5, %r6 : i8
+  %r8 = umin %r7, %a : i8
+  %w1 = zext %r5 : i64
+  %w2 = zext %r6 : i64
+  %w3 = zext %r8 : i64
+  %s1 = shl %w2, i64 8 : i64
+  %s2 = shl %w3, i64 16 : i64
+  %o1 = or %w1, %s1 : i64
+  %o2 = or %o1, %s2 : i64
+  ret %o2
+}
+func @v(i64, i64) -> i64 {
+entry ^0(%x: i64, %y: i64):
+  %p = insertelement <2 x i64> poison, %x, 0 : <2 x i64>
+  %q = insertelement %p, %y, 1 : <2 x i64>
+  %p2 = insertelement <2 x i64> poison, %y, 0 : <2 x i64>
+  %q2 = insertelement %p2, %x, 1 : <2 x i64>
+  %a = bitcast %q : <4 x i32>
+  %b = bitcast %q2 : <4 x i32>
+  %r1 = sadd_sat %a, %b : <4 x i32>
+  %r2 = usub_sat %a, %r1 : <4 x i32>
+  %r3 = smax %r1, %r2 : <4 x i32>
+  %r4 = umin %r3, %b : <4 x i32>
+  %c = bitcast %q : <8 x i16>
+  %d = bitcast %q2 : <8 x i16>
+  %h1 = ssub_sat %c, %d : <8 x i16>
+  %h2 = uadd_sat %h1, %c : <8 x i16>
+  %h3 = smin %h2, %d : <8 x i16>
+  %hq = bitcast %h3 : <2 x i64>
+  %rq = bitcast %r4 : <2 x i64>
+  %e0 = extractelement %hq, 0 : i64
+  %e1 = extractelement %rq, 1 : i64
+  %o = xor %e0, %e1 : i64
+  ret %o
+}
+"#;
+
+#[test]
+fn min_max_and_saturating_ops_are_expanded_exactly() {
+    let vals = [0i64, 1, -1, 0x7f, 0x80, 0xff, 0x7fff_ffff, -0x8000_0000, 0x1234_5678_9abc_def0, i64::MIN];
+    for &x in &vals {
+        for &y in &vals {
+            check(MINMAX_SAT, &ScalarOnly, "s", &[int(64, x), int(64, y)]);
+            check(MINMAX_SAT, &ScalarOnly, "v", &[int(64, x), int(64, y)]);
+            check(MINMAX_SAT, &OnlyAdd4, "v", &[int(64, x), int(64, y)]);
+        }
+    }
+    let (mut m, _) = parse(MINMAX_SAT);
+    legalize_vectors(&mut m, &ScalarOnly);
+    assert!(!super::uses_minmax_sat(&m), "every min/max/saturating op is expanded");
+}
+
 #[test]
 fn modules_without_vectors_are_borrowed_unchanged() {
     let src = "module \"s\"\nfunc @f(i32) -> i32 {\nentry ^0(%x: i32):\n  ret %x\n}\n";

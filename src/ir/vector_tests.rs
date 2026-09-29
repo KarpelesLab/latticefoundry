@@ -41,7 +41,11 @@ entry ^0(%a: <4 x i32>, %x: <4 x f32>, %s: i32):
   store %fz, @g align 16 : <4 x i32>
   %sum = add %ld, %w : <4 x i32>
   %t = select i1 1, %sum, %sp : <4 x i32>
-  ret %t
+  %mn = smin %t, %a : <4 x i32>
+  %sat = uadd_sat %mn, %sum : <4 x i32>
+  %sc = ssub_sat %s, i32 7 : i32
+  %t2 = insertelement %sat, %sc, 1 : <4 x i32>
+  ret %t2
 }
 "#;
 

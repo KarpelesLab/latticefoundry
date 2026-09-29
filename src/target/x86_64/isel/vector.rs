@@ -20,6 +20,8 @@
 //! | `add`/`sub` i8/i16/i32/i64 | `padd{b,w,d,q}` / `psub{b,w,d,q}` |
 //! | `mul` i16 | `pmullw` |
 //! | `mul` i32 | `pmuludq` ×2 + `pshufd` ×4 + `punpckldq` (no SSE4.1 `pmulld`) |
+//! | `umin`/`umax` i8, `smin`/`smax` i16 | `pminub`/`pmaxub`, `pminsw`/`pmaxsw` |
+//! | `sadd_sat`/`uadd_sat`/`ssub_sat`/`usub_sat` i8/i16 | `padds{b,w}`/`paddus{b,w}`/`psubs{b,w}`/`psubus{b,w}` |
 //! | `and`/`or`/`xor` (any, incl. masks) | `pand` / `por` / `pxor` |
 //! | `shl`/`lshr` i16/i32/i64, `ashr` i16/i32, by a uniform constant | `psll`/`psrl`/`psra` `imm8` |
 //! | `fadd`/`fsub`/`fmul`/`fdiv` | `addps`/… / `addpd`/… |
@@ -40,6 +42,8 @@
 //! | `load`/`store` | `movdqa` (align ≥ 16) / `movdqu` |
 //! | constants | `pxor` (zero), `pcmpeqd` (all-ones), else `movq` ×2 + `punpcklqdq` |
 //!
+//! The other min/max/saturating ops are expanded by the legalizer into
+//! compares and selects (vector ones stay vector code where those are legal).
 //! Scalarized instead: integer division and remainder, `frem`, `mul` i8/i64,
 //! variable or non-uniform shifts, byte shifts, `ashr` i64, ordered/unsigned
 //! compares of i64, compares of masks, other casts, other shuffles (8/16-bit
@@ -155,6 +159,7 @@ impl VectorLegality for Sse2Legality {
                     BinOp::Mul => w == 16 || w == 32,
                     BinOp::Shl | BinOp::LShr => w >= 16 && uniform_const(consts, func, ops[1]).is_some(),
                     BinOp::AShr => (w == 16 || w == 32) && uniform_const(consts, func, ops[1]).is_some(),
+                    op if op.is_minmax_sat() => minmax_sat_opcode(*op, w).is_some(),
                     _ => false,
                 },
                 None => false,
@@ -262,6 +267,27 @@ const PMULUDQ: u8 = 0xF4;
 const PUNPCKLDQ: u8 = 0x62;
 const PUNPCKLQDQ: u8 = 0x6C;
 const PSHUFD: u8 = 0x70;
+
+/// The SSE2 opcode (and commutativity) of a min/max/saturating op on `w`-bit
+/// lanes, where SSE2 has one: unsigned byte and signed word min/max, and
+/// byte/word saturating add/subtract. The rest is expanded by the legalizer.
+fn minmax_sat_opcode(op: BinOp, w: u32) -> Option<(u8, bool)> {
+    Some(match (op, w) {
+        (BinOp::UMin, 8) => (0xDA, true),      // pminub
+        (BinOp::UMax, 8) => (0xDE, true),      // pmaxub
+        (BinOp::SMin, 16) => (0xEA, true),     // pminsw
+        (BinOp::SMax, 16) => (0xEE, true),     // pmaxsw
+        (BinOp::SAddSat, 8) => (0xEC, true),   // paddsb
+        (BinOp::SAddSat, 16) => (0xED, true),  // paddsw
+        (BinOp::UAddSat, 8) => (0xDC, true),   // paddusb
+        (BinOp::UAddSat, 16) => (0xDD, true),  // paddusw
+        (BinOp::SSubSat, 8) => (0xE8, false),  // psubsb
+        (BinOp::SSubSat, 16) => (0xE9, false), // psubsw
+        (BinOp::USubSat, 8) => (0xD8, false),  // psubusb
+        (BinOp::USubSat, 16) => (0xD9, false), // psubusw
+        _ => return None,
+    })
+}
 
 /// The index of an integer lane width in the `PADD`/`PSUB`/`PCMPEQ` tables.
 fn widx(w: u32) -> usize {
@@ -466,6 +492,11 @@ impl X86_64Target {
             (Lanes::Int(32), BinOp::Mul) => {
                 let b = self.oper(lo, ops[1]);
                 self.mul32(lo, a, b)
+            }
+            (Lanes::Int(w), op) if op.is_minmax_sat() => {
+                let (opc, comm) = minmax_sat_opcode(op, w).expect("a direct SSE2 min/max/saturating form");
+                let b = self.oper(lo, ops[1]);
+                self.pop(lo, a, b, opc, comm)
             }
             (_, _) => {
                 let b = self.oper(lo, ops[1]);

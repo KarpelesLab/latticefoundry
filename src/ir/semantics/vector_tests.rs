@@ -292,7 +292,15 @@ fn refinement_is_lanewise() {
 // model.
 // ---------------------------------------------------------------------------
 
-const INT_BINOPS: [BinOp; 13] = [
+const INT_BINOPS: [BinOp; 21] = [
+    BinOp::SMin,
+    BinOp::SMax,
+    BinOp::UMin,
+    BinOp::UMax,
+    BinOp::SAddSat,
+    BinOp::UAddSat,
+    BinOp::SSubSat,
+    BinOp::USubSat,
     BinOp::Add,
     BinOp::Sub,
     BinOp::Mul,
@@ -362,6 +370,17 @@ fn native_bin(op: BinOp, width: u32, a: u64, b: u64) -> Option<Option<u64>> {
         BinOp::Shl => a << b,
         BinOp::LShr => a >> b,
         BinOp::AShr => (sa >> b) as u64,
+        BinOp::SMin => if sa <= sb { a } else { b },
+        BinOp::SMax => if sa >= sb { a } else { b },
+        BinOp::UMin => a.min(b),
+        BinOp::UMax => a.max(b),
+        BinOp::SAddSat | BinOp::SSubSat => {
+            let max = if width == 64 { i64::MAX } else { (1i64 << (width - 1)) - 1 };
+            let exact = if op == BinOp::SAddSat { i128::from(sa) + i128::from(sb) } else { i128::from(sa) - i128::from(sb) };
+            exact.clamp(i128::from(min), i128::from(max)) as i64 as u64
+        }
+        BinOp::UAddSat => a.checked_add(b).filter(|&s| s <= mask).unwrap_or(mask),
+        BinOp::USubSat => a.saturating_sub(b),
         _ => unreachable!(),
     };
     Some(Some(r & mask))

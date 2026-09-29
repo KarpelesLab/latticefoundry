@@ -249,7 +249,10 @@ fn random_function(rng: &mut Rng, name: &str, steps: usize, floats: bool) -> Str
         } else {
             match choice {
                 0..=2 => {
-                    let op = *rng.pick(&["add", "sub", "mul", "and", "or", "xor"]);
+                    let op = *rng.pick(&[
+                        "add", "sub", "mul", "and", "or", "xor", "smin", "smax", "umin", "umax", "sadd_sat",
+                        "uadd_sat", "ssub_sat", "usub_sat",
+                    ]);
                     b += &format!("  {r} = {op} {x}, {y} : {}\n", t.name());
                 }
                 3 => {

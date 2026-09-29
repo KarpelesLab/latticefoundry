@@ -908,6 +908,31 @@ fn enc_bin(
         BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FRem => {
             return Err(unsupported("floating-point arithmetic"));
         }
+        BinOp::SMin => format!("(ite (bvsle {a} {b}) {a} {b})", a = a.val, b = b.val),
+        BinOp::SMax => format!("(ite (bvsge {a} {b}) {a} {b})", a = a.val, b = b.val),
+        BinOp::UMin => format!("(ite (bvule {a} {b}) {a} {b})", a = a.val, b = b.val),
+        BinOp::UMax => format!("(ite (bvuge {a} {b}) {a} {b})", a = a.val, b = b.val),
+        BinOp::UAddSat => {
+            let s = format!("(bvadd {} {})", a.val, b.val);
+            format!("(ite (bvult {s} {}) {} {s})", a.val, bv_all_ones(w))
+        }
+        BinOp::USubSat => {
+            format!("(ite (bvugt {a} {b}) (bvsub {a} {b}) {})", bv_zero(w), a = a.val, b = b.val)
+        }
+        BinOp::SAddSat | BinOp::SSubSat => {
+            // Signed overflow of `a ± b` (the sign rule), clamped toward the
+            // sign of `a`.
+            let (av, bv, z) = (&a.val, &b.val, bv_zero(w));
+            let s = format!("({} {av} {bv})", if op == BinOp::SAddSat { "bvadd" } else { "bvsub" });
+            let ov = if op == BinOp::SAddSat {
+                format!("(bvslt (bvand (bvxor {s} {av}) (bvxor {s} {bv})) {z})")
+            } else {
+                format!("(bvslt (bvand (bvxor {av} {bv}) (bvxor {av} {s})) {z})", av = a.val, bv = b.val, z = bv_zero(w))
+            };
+            let min = bv_int_min(w);
+            let sat = format!("(ite (bvslt {} {}) {min} (bvnot {min}))", a.val, bv_zero(w));
+            format!("(ite {ov} {sat} {s})")
+        }
     };
     Ok((val, or_terms(&poison)))
 }

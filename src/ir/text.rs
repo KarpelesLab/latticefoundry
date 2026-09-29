@@ -80,6 +80,8 @@
 //! binop       ::= ("add"|"sub"|"mul"|"shl") iflags operand "," operand ":" type
 //!               | ("udiv"|"sdiv"|"lshr"|"ashr") iflags operand "," operand ":" type
 //!               | ("urem"|"srem"|"and"|"or"|"xor") operand "," operand ":" type
+//!               | ("smin"|"smax"|"umin"|"umax"|"sadd_sat"|"uadd_sat"|"ssub_sat"
+//!                 |"usub_sat") operand "," operand ":" type
 //!               | ("fadd"|"fsub"|"fmul"|"fdiv"|"frem") fm operand "," operand ":" type
 //! iflags      ::= { "nsw" | "nuw" | "exact" }
 //! ordering    ::= "relaxed" | "acquire" | "release" | "acq_rel" | "seq_cst"
@@ -890,6 +892,14 @@ fn binop_name(b: BinOp) -> &'static str {
         BinOp::FMul => "fmul",
         BinOp::FDiv => "fdiv",
         BinOp::FRem => "frem",
+        BinOp::SMin => "smin",
+        BinOp::SMax => "smax",
+        BinOp::UMin => "umin",
+        BinOp::UMax => "umax",
+        BinOp::SAddSat => "sadd_sat",
+        BinOp::UAddSat => "uadd_sat",
+        BinOp::SSubSat => "ssub_sat",
+        BinOp::USubSat => "usub_sat",
     }
 }
 
@@ -2727,6 +2737,14 @@ fn binop_from_name(s: &str) -> Option<BinOp> {
         "fmul" => BinOp::FMul,
         "fdiv" => BinOp::FDiv,
         "frem" => BinOp::FRem,
+        "smin" => BinOp::SMin,
+        "smax" => BinOp::SMax,
+        "umin" => BinOp::UMin,
+        "umax" => BinOp::UMax,
+        "sadd_sat" => BinOp::SAddSat,
+        "uadd_sat" => BinOp::UAddSat,
+        "ssub_sat" => BinOp::SSubSat,
+        "usub_sat" => BinOp::USubSat,
         _ => return None,
     })
 }

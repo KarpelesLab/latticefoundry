@@ -111,12 +111,17 @@ fn is_q(_lhs: &str, rhs: &str, body: &str) -> bool {
     body.lines().any(|l| l.trim_start().starts_with(&format!("{src} = ")) && l.ends_with(": <2 x i64>"))
 }
 
+const INT_OPS: [&str; 18] = [
+    "add", "sub", "mul", "and", "or", "xor", "udiv", "shl", "lshr", "ashr", "smin", "smax", "umin", "umax",
+    "sadd_sat", "uadd_sat", "ssub_sat", "usub_sat",
+];
+
 /// Integer arithmetic on every SSE2 integer lane width.
 fn int_arith_src() -> String {
     let mut s = String::from("module \"vint\"\n");
     for (t, n) in [("i8", 16), ("i16", 8), ("i32", 4), ("i64", 2)] {
         let ty = format!("<{n} x {t}>");
-        for op in ["add", "sub", "mul", "and", "or", "xor", "udiv", "shl", "lshr", "ashr"] {
+        for op in INT_OPS {
             let body = if op == "udiv" {
                 // A divisor forced odd (nonzero): scalarized on SSE2.
                 format!(
@@ -141,7 +146,7 @@ fn integer_vector_arithmetic_matches_the_reference() {
     let src = int_arith_src();
     let names: Vec<String> = ["i8", "i16", "i32", "i64"]
         .iter()
-        .flat_map(|t| ["add", "sub", "mul", "and", "or", "xor", "udiv", "shl", "lshr", "ashr"].map(|o| format!("{o}_{t}")))
+        .flat_map(|t| INT_OPS.map(|o| format!("{o}_{t}")))
         .collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     check_native(&src, &cases(&refs, &INPUTS), "int");
@@ -473,6 +478,13 @@ fn legal_ops_select_sse2_and_the_rest_is_scalarized() {
     assert_eq!(count(&ops, X86Op::Imul), base + 16, "{ops:?}");
     // A byte shift has no SSE2 form either.
     assert!(!mir_ops(&src, "shl_i8").contains(&X86Op::VShiftI));
+    // pminub / paddsw are direct; smin <4 x i32> is a vector compare + blend
+    // (no scalar code); signed i64 compares have no SSE2 form (scalarized).
+    for f in ["umin_i8", "sadd_sat_i16", "smin_i32", "uadd_sat_i32"] {
+        let ops = mir_ops(&src, f);
+        assert!(count(&ops, X86Op::SetccCmp) == 0 && count(&ops, X86Op::Cmovne) == 0, "{f}: {ops:?}");
+    }
+    assert!(count(&mir_ops(&src, "smin_i64"), X86Op::SetccCmp) == 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +571,19 @@ fn sse2_encodings_match_llvm_mc() {
             // d == a, so the op is emitted alone.
             cases.push((X86Op::VOp, vec![d(x(a)), u(x(a)), u(x(b)), i(VEnc::op(pfx, opc, false))], ""));
         }
+        exps.push(format!("{mn} %xmm{b}, %xmm{a}\n"));
+    }
+    // Min/max and saturating forms.
+    for (k, (opc, mn)) in [
+        (0xDAu8, "pminub"), (0xDE, "pmaxub"), (0xEA, "pminsw"), (0xEE, "pmaxsw"), (0xEC, "paddsb"),
+        (0xED, "paddsw"), (0xDC, "paddusb"), (0xDD, "paddusw"), (0xE8, "psubsb"), (0xE9, "psubsw"),
+        (0xD8, "psubusb"), (0xD9, "psubusw"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (a, b) = if k % 2 == 0 { (14u16, 2u16) } else { (5, 10) };
+        cases.push((X86Op::VOp, vec![d(x(a)), u(x(a)), u(x(b)), i(VEnc::op(0x66, opc, true))], ""));
         exps.push(format!("{mn} %xmm{b}, %xmm{a}\n"));
     }
     // Immediate forms.

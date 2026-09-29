@@ -172,6 +172,24 @@ pub enum BinOp {
     FDiv,
     /// Floating-point remainder (IEEE remainder / `frem`).
     FRem,
+    /// Signed minimum. No flags; poison only from a poison operand. (With
+    /// the saturating ops below, a SIMD staple; valid on scalars and vectors.)
+    SMin,
+    /// Signed maximum.
+    SMax,
+    /// Unsigned minimum.
+    UMin,
+    /// Unsigned maximum.
+    UMax,
+    /// Signed saturating addition: the exact sum clamped to the signed range.
+    SAddSat,
+    /// Unsigned saturating addition: the exact sum clamped to `2ⁿ - 1`.
+    UAddSat,
+    /// Signed saturating subtraction: the exact difference clamped to the
+    /// signed range.
+    SSubSat,
+    /// Unsigned saturating subtraction: the exact difference clamped at 0.
+    USubSat,
 }
 
 impl BinOp {
@@ -179,6 +197,23 @@ impl BinOp {
     /// float type and fast-math flags apply).
     pub fn is_float(self) -> bool {
         matches!(self, BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FRem)
+    }
+
+    /// Whether this is one of the min/max or saturating integer ops, which
+    /// backends without a direct form get expanded into compares, selects and
+    /// ordinary arithmetic (`crate::codegen::legalize`).
+    pub fn is_minmax_sat(self) -> bool {
+        matches!(
+            self,
+            BinOp::SMin
+                | BinOp::SMax
+                | BinOp::UMin
+                | BinOp::UMax
+                | BinOp::SAddSat
+                | BinOp::UAddSat
+                | BinOp::SSubSat
+                | BinOp::USubSat
+        )
     }
 }
 

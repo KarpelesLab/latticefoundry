@@ -347,7 +347,8 @@ fn binop_code(op: BinOp) -> u8 {
     match op {
         Add => 0, Sub => 1, Mul => 2, UDiv => 3, SDiv => 4, URem => 5, SRem => 6, And => 7,
         Or => 8, Xor => 9, Shl => 10, LShr => 11, AShr => 12, FAdd => 13, FSub => 14, FMul => 15,
-        FDiv => 16, FRem => 17,
+        FDiv => 16, FRem => 17, SMin => 18, SMax => 19, UMin => 20, UMax => 21, SAddSat => 22,
+        UAddSat => 23, SSubSat => 24, USubSat => 25,
     }
 }
 
@@ -356,7 +357,8 @@ fn binop_from(c: u8) -> Result<BinOp, DecodeError> {
     Ok(match c {
         0 => Add, 1 => Sub, 2 => Mul, 3 => UDiv, 4 => SDiv, 5 => URem, 6 => SRem, 7 => And,
         8 => Or, 9 => Xor, 10 => Shl, 11 => LShr, 12 => AShr, 13 => FAdd, 14 => FSub, 15 => FMul,
-        16 => FDiv, 17 => FRem,
+        16 => FDiv, 17 => FRem, 18 => SMin, 19 => SMax, 20 => UMin, 21 => UMax, 22 => SAddSat,
+        23 => UAddSat, 24 => SSubSat, 25 => USubSat,
         _ => return Err(DecodeError::InvalidTag { what: "binop", tag: u32::from(c) }),
     })
 }

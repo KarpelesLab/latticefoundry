@@ -29,6 +29,13 @@
 //!   integer shifts, truncations, extensions and ors (never through memory, so
 //!   it is exact for `i1` lanes as well), preserving per-lane poison.
 //!
+//! - **Min/max and saturating ops** (`smin`, `uadd_sat`, …) with no direct
+//!   form on the target — every scalar one, and vector ones the target does not
+//!   select — are first expanded into compares, selects and wrapping
+//!   arithmetic of the same (scalar or vector) type, which are then legalized
+//!   like any other op (so a vector `smin` becomes a vector `icmp` + `select`
+//!   where those are legal, rather than scalar code).
+//!
 //! Every rewrite is a refinement of the reference semantics lane by lane
 //! (per-lane poison stays in its lane; a UB lane keeps the whole op UB); the
 //! tests check this by executing programs before and after legalization with
@@ -42,6 +49,8 @@ use crate::ir::inst::{BinOp, CastOp, Flags, InstData, InstKind, IntPred, ReduceO
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ConstPool, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, Module};
+
+use puremp::Int;
 
 /// What a target lowers natively. See the module docs.
 pub trait VectorLegality {
@@ -74,7 +83,7 @@ impl VectorLegality for ScalarOnly {
 /// `module` legalized for `legality`: borrowed unchanged when it contains no
 /// vector code at all (the common case costs one scan), else a legalized copy.
 pub fn legalized<'m>(module: &'m Module, legality: &dyn VectorLegality) -> Cow<'m, Module> {
-    if !uses_vectors(module) {
+    if !uses_vectors(module) && !uses_minmax_sat(module) {
         return Cow::Borrowed(module);
     }
     let mut m = module.clone();
@@ -96,6 +105,15 @@ pub fn uses_vectors(module: &Module) -> bool {
     })
 }
 
+/// Whether any function of `module` uses a min/max or saturating op.
+fn uses_minmax_sat(module: &Module) -> bool {
+    module.functions().any(|f| {
+        (0..f.inst_count()).any(|i| {
+            matches!(f.inst(crate::ir::InstId::from_index(i)).kind, InstKind::Bin(op) if op.is_minmax_sat())
+        })
+    })
+}
+
 fn sig_has_vector(types: &TypeContext, sig: TypeId) -> bool {
     match types.get(sig) {
         Type::Func(ft) => ft.params.iter().chain(std::iter::once(&ft.ret)).any(|&t| types.is_vector(t)),
@@ -105,6 +123,7 @@ fn sig_has_vector(types: &TypeContext, sig: TypeId) -> bool {
 
 /// Legalize every function of `module` in place for `legality`.
 pub fn legalize_vectors(module: &mut Module, legality: &dyn VectorLegality) {
+    expand_minmax_sat(module, legality);
     // New signatures first (they intern types), then each body.
     let n = module.function_count();
     let mut new_sigs = Vec::with_capacity(n);
@@ -202,6 +221,147 @@ fn always_legal(kind: &InstKind) -> bool {
             | InstKind::Switch(_)
             | InstKind::Unreachable
     )
+}
+
+// ---------------------------------------------------------------------------
+// Min/max and saturating ops
+// ---------------------------------------------------------------------------
+
+/// Whether `inst` is a min/max/saturating op the target does not select: any
+/// scalar one, or a vector one on a type or with an op it lacks.
+fn needs_expansion(types: &TypeContext, consts: &ConstPool, legality: &dyn VectorLegality, f: &Function, inst: &InstData) -> bool {
+    let InstKind::Bin(op) = inst.kind else {
+        return false;
+    };
+    if !op.is_minmax_sat() {
+        return false;
+    }
+    !(types.is_vector(inst.ty) && legality.legal_type(types, inst.ty) && legality.legal_inst(types, consts, f, inst))
+}
+
+/// Expand every min/max/saturating op the target lacks (see the module docs).
+fn expand_minmax_sat(module: &mut Module, legality: &dyn VectorLegality) {
+    for i in 0..module.function_count() {
+        let id = FuncId::from_index(i);
+        let f = module.function(id);
+        let any = (0..f.inst_count()).any(|k| {
+            needs_expansion(module.types(), module.consts(), legality, f, f.inst(crate::ir::InstId::from_index(k)))
+        });
+        if !any {
+            continue;
+        }
+        let decl_line = f.decl_line;
+        let (mut fresh, ()) = module.map_function(id, |old, b| expand_function(old, b, legality));
+        fresh.decl_line = decl_line;
+        module.replace_function(id, fresh);
+    }
+}
+
+/// Rebuild `old` into `b`, expanding the min/max/saturating ops that need it.
+fn expand_function(old: &Function, b: &mut FunctionBuilder<'_>, legality: &dyn VectorLegality) {
+    use crate::transform::{rebuild_terminator, remap_value};
+    let entry = old.entry().expect("a body has an entry block");
+    let mut blocks = Vec::with_capacity(old.block_count());
+    let mut vmap: Vec<Option<ValueId>> = vec![None; old.value_count()];
+    for bi in 0..old.block_count() {
+        let bid = BlockId::from_index(bi);
+        let nb = if bid == entry {
+            b.create_entry_block()
+        } else {
+            let tys: Vec<TypeId> = old.block(bid).params().iter().map(|&p| old.value_type(p)).collect();
+            b.create_block(&tys)
+        };
+        for (&p, &np) in old.block(bid).params().iter().zip(b.block_params(nb)) {
+            vmap[p.index()] = Some(np);
+        }
+        blocks.push(nb);
+    }
+    let cfg = ControlFlowGraph::new(old);
+    let doms = Dominators::new(old, &cfg);
+    for bi in crate::transform::dom_preorder(old, &doms) {
+        let bid = BlockId::from_index(bi);
+        b.switch_to(blocks[bi]);
+        for &iid in old.block(bid).insts() {
+            b.set_line(old.inst_line(iid).unwrap_or(0));
+            let inst = old.inst(iid);
+            let ops: Vec<ValueId> = inst.operands().iter().map(|&o| remap_value(&mut vmap, old, b, o)).collect();
+            let expand = needs_expansion(b.types(), b.consts(), legality, old, inst);
+            let r = match inst.kind {
+                InstKind::Bin(op) if expand => Some(expand_op(b, op, inst.ty, ops[0], ops[1])),
+                _ => b.append_inst(inst.kind.clone(), ops, inst.flags, inst.result().map(|_| inst.ty)),
+            };
+            if let (Some(old_r), Some(nr)) = (inst.result(), r) {
+                vmap[old_r.index()] = Some(nr);
+            }
+        }
+        if let Some(t) = old.block(bid).terminator() {
+            b.set_line(old.inst_line(t).unwrap_or(0));
+        }
+        rebuild_terminator(&mut vmap, old, b, &blocks, bid, |_, _, _| {});
+    }
+}
+
+/// A constant of type `ty` (a scalar integer, or every lane of a vector).
+fn int_const(b: &mut FunctionBuilder<'_>, ty: TypeId, value: Int) -> ValueId {
+    match b.types().vector_parts(ty) {
+        Some((elem, n)) => {
+            let lane = b.intern_const(Const::Int { ty: elem, value });
+            b.const_vector(ty, vec![lane; n as usize])
+        }
+        None => b.const_int(ty, value),
+    }
+}
+
+/// Expand one min/max/saturating op on `a`, `b` of type `ty` (scalar or
+/// vector) into compares, selects and wrapping arithmetic of that type.
+fn expand_op(b: &mut FunctionBuilder<'_>, op: BinOp, ty: TypeId, x: ValueId, y: ValueId) -> ValueId {
+    let w = b.types().bit_width(b.types().scalar_of(ty)).expect("an integer lane type");
+    let pick = |b: &mut FunctionBuilder<'_>, pred: IntPred| {
+        let keep_x = b.icmp(pred, x, y);
+        b.select(keep_x, x, y)
+    };
+    match op {
+        BinOp::SMin => pick(b, IntPred::Sle),
+        BinOp::SMax => pick(b, IntPred::Sge),
+        BinOp::UMin => pick(b, IntPred::Ule),
+        BinOp::UMax => pick(b, IntPred::Uge),
+        BinOp::UAddSat => {
+            // The wrapped sum is below `x` exactly when the add carried out.
+            let s = b.bin(BinOp::Add, x, y, Flags::NONE);
+            let carry = b.icmp(IntPred::Ult, s, x);
+            let max = int_const(b, ty, Int::ONE.mul_2k(w).sub(&Int::ONE));
+            b.select(carry, max, s)
+        }
+        BinOp::USubSat => {
+            let d = b.bin(BinOp::Sub, x, y, Flags::NONE);
+            let ok = b.icmp(IntPred::Ugt, x, y);
+            let zero = int_const(b, ty, Int::ZERO);
+            b.select(ok, d, zero)
+        }
+        BinOp::SAddSat | BinOp::SSubSat => {
+            let add = op == BinOp::SAddSat;
+            let s = b.bin(if add { BinOp::Add } else { BinOp::Sub }, x, y, Flags::NONE);
+            // Signed overflow: for `x + y`, both operands' signs differ from
+            // the result's; for `x - y`, the operands' signs differ and the
+            // result's differs from `x`'s.
+            let (p, q) = if add {
+                (b.bin(BinOp::Xor, s, x, Flags::NONE), b.bin(BinOp::Xor, s, y, Flags::NONE))
+            } else {
+                (b.bin(BinOp::Xor, x, y, Flags::NONE), b.bin(BinOp::Xor, x, s, Flags::NONE))
+            };
+            let both = b.bin(BinOp::And, p, q, Flags::NONE);
+            let zero = int_const(b, ty, Int::ZERO);
+            let ov = b.icmp(IntPred::Slt, both, zero);
+            // Saturate toward `x`'s sign: `(x >>s (w-1)) ^ INT_MAX` is INT_MAX
+            // for a non-negative `x` and INT_MIN for a negative one.
+            let amt = int_const(b, ty, Int::from_u64(u64::from(w - 1)));
+            let sign = b.bin(BinOp::AShr, x, amt, Flags::NONE);
+            let max = int_const(b, ty, Int::ONE.mul_2k(w - 1).sub(&Int::ONE));
+            let sat = b.bin(BinOp::Xor, sign, max, Flags::NONE);
+            b.select(ov, sat, s)
+        }
+        _ => unreachable!("not a min/max/saturating op: {op:?}"),
+    }
 }
 
 /// A rewritten value: one new value, or the lanes of a split vector.
