@@ -23,6 +23,9 @@
 //! through a safe API; the caller can neither observe a dangling pointer nor
 //! double-unmap.
 
+// The syscall constants are only used on x86-64 Linux, the one JIT host.
+#![cfg_attr(not(all(target_arch = "x86_64", target_os = "linux")), allow(dead_code))]
+
 use std::io;
 
 // x86-64 Linux syscall numbers (from the kernel's syscall table; stable ABI).
@@ -54,6 +57,7 @@ fn page_round_up(x: usize) -> usize {
 /// exactly once. Only ever called by [`ExecBuffer::new`] with `addr = 0`, an
 /// anonymous private mapping, `fd = -1`, `offset = 0`, so no existing mapping is
 /// displaced and no file is involved.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(unsafe_code)]
 unsafe fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: isize, off: usize) -> isize {
     let ret: isize;
@@ -86,6 +90,7 @@ unsafe fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: isize
 /// and `len` describing a mapping it owns; changing protections of memory it does
 /// not own is undefined. Only ever called by [`ExecBuffer::make_executable`] with
 /// this buffer's own mapping.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(unsafe_code)]
 unsafe fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     let ret: isize;
@@ -111,6 +116,7 @@ unsafe fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 /// Unmaps an existing mapping. The caller must pass an `addr`/`len` it owns and
 /// must not use the region afterwards. Only ever called once, from
 /// [`ExecBuffer`]'s `Drop`, with this buffer's own mapping.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(unsafe_code)]
 unsafe fn sys_munmap(addr: usize, len: usize) -> isize {
     let ret: isize;
@@ -127,6 +133,27 @@ unsafe fn sys_munmap(addr: usize, len: usize) -> isize {
         );
     }
     ret
+}
+
+/// Hosts other than x86-64 Linux have no executable-memory backend: the raw
+/// syscalls above are x86-64 Linux ABI. These stand-ins let the crate build
+/// everywhere; [`ExecBuffer::new`] refuses before reaching them.
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+#[allow(unsafe_code, clippy::missing_safety_doc)]
+unsafe fn sys_mmap(_: usize, _: usize, _: usize, _: usize, _: isize, _: usize) -> isize {
+    -38 // ENOSYS
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+#[allow(unsafe_code, clippy::missing_safety_doc)]
+unsafe fn sys_mprotect(_: usize, _: usize, _: usize) -> isize {
+    -38 // ENOSYS
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+#[allow(unsafe_code, clippy::missing_safety_doc)]
+unsafe fn sys_munmap(_: usize, _: usize) -> isize {
+    -38 // ENOSYS
 }
 
 /// A syscall result in the error range `-4095..=-1` is `-errno`; anything else is
@@ -164,6 +191,12 @@ impl ExecBuffer {
     pub fn new(size: usize) -> io::Result<ExecBuffer> {
         if size == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero-length JIT buffer"));
+        }
+        if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the JIT's executable memory is only implemented for x86-64 Linux hosts",
+            ));
         }
         let len = page_round_up(size);
         // SAFETY: an anonymous, private, fixed-nothing mapping (`addr = 0` lets
