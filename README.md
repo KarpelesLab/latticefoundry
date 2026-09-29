@@ -1,5 +1,10 @@
 # LatticeFoundry
 
+[![CI](https://github.com/KarpelesLab/latticefoundry/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/latticefoundry/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/latticefoundry.svg)](https://crates.io/crates/latticefoundry)
+[![docs.rs](https://img.shields.io/docsrs/latticefoundry)](https://docs.rs/latticefoundry)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **A clean-room compiler construction framework in pure Rust.**
 
 LatticeFoundry is a from-scratch toolkit for building compiler back ends —
@@ -180,4 +185,4 @@ Requires a Rust toolchain supporting the 2024 edition (1.89+, per `rsasm` and
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+Licensed under the [MIT License](LICENSE).

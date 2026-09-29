@@ -5,3 +5,6 @@
 # lf-cc is a separate nested crate with its own target/
 /lf-cc/target
 /lf-cc/Cargo.lock
+
+# Claude Code local state (agent worktrees etc.)
+/.claude/

@@ -10,8 +10,8 @@
 name = "lf-cc"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
-license = "Apache-2.0"
+rust-version = "1.89"
+license = "MIT"
 authors = ["Mark Karpeles <admin@echelle.co.jp>"]
 description = "A C frontend that compiles to LatticeFoundry IR"
 
