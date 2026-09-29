@@ -17,6 +17,13 @@
 //!   legalization, whose expansions are all selects and compares), and its
 //!   bytes are scanned for conditional branches (`b<cond>`, `b<cond>.w`,
 //!   `cbz`/`cbnz`) with the Thumb length rule.
+//! - **AVR** likewise, on its prepared module (vector scalarization, soft
+//!   float with libgcc names, 16-bit legalization), with its words scanned
+//!   for conditional branches *and skips* (`brbs`/`brbc`, `sbrc`/`sbrs`,
+//!   `sbic`/`sbis`, `cpse`). AVR picks per operation: secret-derived operands
+//!   get branch-free compares (the flag read out of `SREG`), barrel-shifter
+//!   variable shifts and shift-pair sign extension, public ones the compact
+//!   branching forms (which the audit counts separately).
 //! - **Branchy lowerings are rejected on secrets**: every opcode whose lowering
 //!   is inherently branchy or variable-time (the `u64`↔float fix-ups, the
 //!   atomic retry loops, `dyn_alloca`'s probe loop, division) has its secret
@@ -34,6 +41,7 @@ use crate::transform::pipeline::{OptLevel, optimize};
 use crate::verify::{CtPolicy, ct_violations, verify_module};
 
 use super::aarch64::{A64Op, AArch64Target};
+use super::avr::{AvrOp, AvrTarget};
 use super::riscv::{RiscvTarget, RvOp};
 use super::thumb::{ThOp, ThumbTarget};
 use super::x86_64::{X86Op, X86_64Target};
@@ -129,6 +137,66 @@ fn assert_isel_adds_no_branches(m: &Module, syms: &StrInterner, what: &str) {
         assert_eq!(got, want, "{what}: riscv64 function #{i}");
     }
     assert_thumb_adds_no_branches(m, syms, what);
+    assert_avr_adds_no_branches(m, syms, what);
+}
+
+/// Whether an AVR MIR instruction is the compact (branching) form of a
+/// lowering that also has a constant-time form: isel picks those only for
+/// public operands (checked by `avr_picks_the_constant_time_form_per_operand`).
+fn avr_compact(mi: &crate::codegen::mir::MachineInst) -> bool {
+    let op = AvrOp::decode(mi.opcode);
+    matches!(op, AvrOp::SetCmp | AvrOp::ShlV | AvrOp::LshrV | AvrOp::AshrV | AvrOp::Ext)
+        && op.may_branch_on_data(&mi.operands)
+}
+
+/// The AVR backend selects from its prepared module; every defined function
+/// there keeps exactly its IR branches (besides the compact forms on public
+/// operands), and preparing adds none.
+fn assert_avr_adds_no_branches(m: &Module, syms: &StrInterner, what: &str) {
+    let (pm, _, helpers) =
+        super::avr::prepare::prepare(m, syms, &super::avr::Device::ATMEGA328P).expect("prepares for AVR");
+    let target = AvrTarget::new(true).with_helpers(helpers);
+    for i in 0..pm.function_count() {
+        let f = FuncId::from_index(i);
+        if pm.function(f).is_declaration() {
+            continue;
+        }
+        let mf = target.select(&pm, f);
+        let got =
+            mir_branches(&mf, |mi| AvrOp::decode(mi.opcode).may_branch_on_data(&mi.operands) && !avr_compact(mi));
+        assert_eq!(got, ir_branches(&pm, f), "{what}: avr function #{i}");
+        if i < m.function_count() {
+            assert_eq!(ir_branches(&pm, f), ir_branches(m, f), "{what}: preparing for AVR adds no branch (#{i})");
+        }
+    }
+}
+
+/// The conditional control transfers in AVR code (walking it with the
+/// 2-word `jmp`/`call`/`lds`/`sts` rule): `brbs`/`brbc` (every `br<cond>`),
+/// and the skips `sbrc`/`sbrs`, `sbic`/`sbis` and `cpse`, whose timing
+/// depends on the tested value.
+fn avr_cond_branches(bytes: &[u8]) -> Vec<(usize, u16)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        let w = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let branch = w & 0xf800 == 0xf000 // brbs / brbc
+            || w & 0xfc08 == 0xfc00 // sbrc / sbrs
+            || w & 0xfd00 == 0x9900 // sbic / sbis
+            || w & 0xfc00 == 0x1000; // cpse
+        if branch {
+            out.push((at, w));
+        }
+        let two = w & 0xfe0c == 0x940c || w & 0xfe0f == 0x9000 || w & 0xfe0f == 0x9200;
+        at += if two { 4 } else { 2 };
+    }
+    out
+}
+
+/// The code of every function the AVR backend compiles from `m`.
+fn avr_text(m: &Module, syms: &StrInterner) -> Vec<u8> {
+    let obj = super::avr::compile_module(m, syms);
+    obj.sections().iter().filter(|s| s.name == ".text").flat_map(|s| s.bytes.iter().copied()).collect()
 }
 
 /// The Thumb backend selects from its prepared module; every defined
@@ -228,6 +296,12 @@ fn branch_scanners_recognize_branches() {
     assert_eq!(thumb_cond_branches(&[0x08, 0xb1]).len(), 1);
     assert!(thumb_cond_branches(&[0x00, 0xe0, 0xff, 0xf7, 0xfe, 0xff, 0x08, 0xbf]).is_empty());
     assert!(!rv_is_cond_branch(0x0000_006F)); // jal x0, 0
+    // AVR: breq, brlt, sbrc, sbis, cpse; not rjmp, jmp (whose second word
+    // looks like anything), an `in` of SREG, or bst/bld.
+    for w in [0xf001u16, 0xf004, 0xfd83, 0x9b00, 0x1001] {
+        assert_eq!(avr_cond_branches(&w.to_le_bytes()).len(), 1, "{w:#06x}");
+    }
+    assert!(avr_cond_branches(&[0xff, 0xcf, 0x0c, 0x94, 0x01, 0xf0, 0xef, 0xb7, 0x80, 0xfb, 0x10, 0xf8]).is_empty());
     if let Some(text) = x86_disasm(&[0x74, 0x00, 0x48, 0x0F, 0x45, 0xC1]) {
         assert!(text.contains("je") && text.contains("cmovne"), "{text}");
     }
@@ -256,6 +330,13 @@ fn allowed_operations_compile_without_branches_on_every_target() {
         assert!(!th.bytes.is_empty());
         let bad = thumb_cond_branches(&th.bytes);
         assert!(bad.is_empty(), "thumb conditional branches {bad:04x?} at {level:?}");
+
+        // AVR: the only function of the module (its 64-bit multiply is a call
+        // to __muldi3, compiled elsewhere).
+        let avr = avr_text(&m, &syms);
+        assert!(!avr.is_empty());
+        let bad = avr_cond_branches(&avr);
+        assert!(bad.is_empty(), "avr conditional branches/skips {bad:04x?} at {level:?}");
 
         let x86 = super::x86_64::compile_function(&m, f, &syms);
         match x86_disasm(&x86.bytes) {
@@ -362,7 +443,114 @@ entry ^0(%c: i1, %a: i64, %b: i64):
     assert!(t.contains(&ThOp::Select.opcode().0) && !t.contains(&ThOp::BrCond.opcode().0));
     assert!(!ThOp::Select.may_branch_on_data(&[]) && !ThOp::SetCmp.may_branch_on_data(&[]));
     assert!(thumb_cond_branches(&super::thumb::compile_function(&m, f, &syms).bytes).is_empty());
+    // AVR: a mask from the condition (`0 - c`) and `f ^ ((t ^ f) & mask)` on
+    // each 16-bit part — no branch, and no skip.
+    let (pm, _, h) = super::avr::prepare::prepare(&m, &syms, &super::avr::Device::ATMEGA328P).unwrap();
+    let v = ops(&AvrTarget::new(true).with_helpers(h).select(&pm, f));
+    assert!(v.contains(&AvrOp::Mask.opcode().0) && v.contains(&AvrOp::Xor.opcode().0));
+    assert!(!v.contains(&AvrOp::BrCond.opcode().0) && !v.contains(&AvrOp::CmpBr.opcode().0));
+    for op in [AvrOp::Mask, AvrOp::Xor, AvrOp::And] {
+        assert!(!op.may_branch_on_data(&[]), "{op:?}");
+    }
+    assert!(avr_cond_branches(&avr_text(&m, &syms)).is_empty());
     assert_isel_adds_no_branches(&m, &syms, "sel");
+}
+
+/// AVR picks per operation: an operation on a secret-derived operand gets
+/// the constant-time form, the same operation on public operands the compact
+/// one (which branches or skips) — within one function.
+#[test]
+fn avr_picks_the_constant_time_form_per_operand() {
+    let src = r#"module "mix"
+func @mix(secret i16, i16, secret i4, i4) -> secret i16 {
+entry ^0(%s: i16, %p: i16, %s4: i4, %p4: i4):
+  %c1 = icmp ult %s, %p : i1
+  %c2 = icmp ult %p, i16 5 : i1
+  %k = and %p, i16 7 : i16
+  %h1 = shl %s, %k : i16
+  %h2 = lshr %p, %k : i16
+  %x1 = sext %s4 : i16
+  %x2 = sext %p4 : i16
+  %z1 = zext %c1 : i16
+  %z2 = zext %c2 : i16
+  %a = add %z1, %z2 : i16
+  %b = add %a, %h1 : i16
+  %c = add %b, %h2 : i16
+  %d = add %c, %x1 : i16
+  %r = add %d, %x2 : i16
+  ret %r
+}
+"#;
+    use crate::codegen::mir::{MachineInst, MachineOperand};
+    let (m, syms) = parse(src);
+    let (pm, _, h) = super::avr::prepare::prepare(&m, &syms, &super::avr::Device::ATMEGA328P).unwrap();
+    let mf = AvrTarget::new(true).with_helpers(h).select(&pm, FuncId::from_index(0));
+    let insts: Vec<&MachineInst> = mf.block_ids().flat_map(|b| mf.block(b).insts.iter()).collect();
+    let count = |ops: &[AvrOp], compact: bool| {
+        insts.iter().filter(|i| ops.contains(&AvrOp::decode(i.opcode)) && avr_compact(i) == compact).count()
+    };
+    assert_eq!((count(&[AvrOp::SetCmp], false), count(&[AvrOp::SetCmp], true)), (1, 1), "compares");
+    let shifts = [AvrOp::ShlV, AvrOp::LshrV];
+    assert_eq!((count(&shifts, false), count(&shifts, true)), (1, 1), "variable shifts");
+    // Only a sub-byte sign extension has two forms.
+    let imm = |i: &MachineInst, k: usize| match &i.operands[k] {
+        MachineOperand::Imm(v) => v.to_u64(),
+        _ => None,
+    };
+    let sext4 = |compact: bool| {
+        insts
+            .iter()
+            .filter(|i| AvrOp::decode(i.opcode) == AvrOp::Ext && imm(i, 3) == Some(1) && imm(i, 2) == Some(4))
+            .filter(|i| avr_compact(i) == compact)
+            .count()
+    };
+    assert_eq!((sext4(false), sext4(true)), (1, 1), "sign extensions");
+}
+
+/// On AVR, soft-float arithmetic, all division and multiplication wider than
+/// 16 bits are calls to the runtime. As on Thumb, the verifier rejects the
+/// float and division operations on secrets in the source, and the helper
+/// calls take public parameters, so a secret reaching one — a secret 32- or
+/// 64-bit multiply, which [`CtPolicy::DEFAULT`] allows — is a violation in
+/// the prepared module: verify that (or use [`CtPolicy::STRICT`]) for AVR
+/// code. An 8- or 16-bit multiply is `mul` on AVR5; on a core without it,
+/// it is a call the prepared IR does not show, to a runtime helper that runs
+/// a fixed number of branch-free iterations (the 32/64-bit helpers stop early,
+/// but a secret never reaches them without a verifier violation).
+#[test]
+fn avr_helper_calls_are_rejected_on_secrets() {
+    let dev = super::avr::Device::ATMEGA328P;
+    let cases: [(&str, &str, &str, bool); 7] = [
+        ("soft-float add", "f32", "  %r = fadd %x, %x : f32\n  %o = bitcast %r : i32\n  %w = zext %o : i64\n  ret %w\n", true),
+        ("soft-float compare", "f32", "  %c = fcmp olt %x, %x : i1\n  %w = zext %c : i64\n  ret %w\n", true),
+        ("soft-float conversion", "f32", "  %r = fptosi %x : i64\n  ret %r\n", true),
+        ("16-bit division", "i16", "  %r = udiv i16 1000, %x : i16\n  %w = zext %r : i64\n  ret %w\n", true),
+        ("32-bit remainder", "i32", "  %r = srem i32 1000, %x : i32\n  %w = sext %r : i64\n  ret %w\n", true),
+        ("32-bit multiply", "i32", "  %r = mul %x, %x : i32\n  %w = zext %r : i64\n  ret %w\n", false),
+        ("64-bit multiply", "i64", "  %r = mul %x, %x : i64\n  ret %r\n", false),
+    ];
+    for (what, ty, body, source_rejects) in cases {
+        for secret in [false, true] {
+            let kw = if secret { "secret " } else { "" };
+            let src = format!("module \"b\"\nfunc @f({kw}{ty}) -> {kw}i64 {{\nentry ^0(%x: {ty}):\n{body}}}\n");
+            let mut syms = StrInterner::new();
+            let m = crate::ir::text::parse_module(&src, FileId::new(0), &mut syms)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let f = FuncId::from_index(0);
+            let v = ct_violations(&m, f, CtPolicy::DEFAULT);
+            assert_eq!(!v.is_empty(), secret && source_rejects, "{what}: the source verdict");
+            let (pm, _, _) = super::avr::prepare::prepare(&m, &syms, &dev).expect("prepares");
+            let pv = ct_violations(&pm, f, CtPolicy::DEFAULT);
+            assert_eq!(!pv.is_empty(), secret, "{what}: the prepared module's verdict");
+        }
+    }
+    // The documented exception: a secret 16-bit multiply stays a `mul` in the
+    // prepared IR (allowed), and on AVR5 it is the `mul` instruction.
+    let src = "module \"m\"\nfunc @f(secret i16) -> secret i16 {\nentry ^0(%x: i16):\n  %r = mul %x, %x : i16\n  ret %r\n}\n";
+    let (m, syms) = parse(src);
+    let (pm, _, _) = super::avr::prepare::prepare(&m, &syms, &dev).unwrap();
+    assert!(ct_violations(&pm, FuncId::from_index(0), CtPolicy::DEFAULT).is_empty());
+    assert!(avr_cond_branches(&avr_text(&m, &syms)).is_empty());
 }
 
 /// On Thumb, soft-float arithmetic, division and 64-bit multiplication are

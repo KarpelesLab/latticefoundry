@@ -1129,8 +1129,8 @@ impl TargetIsel for AvrTarget {
                 lo.emit(inst(AvrOp::Add, vec![def_v(d), use_v(base), use_v(off), imm(16)]));
             }
             InstKind::Select => self.lower_select(lo, i),
-            InstKind::Freeze => {
-                let res = i.result().expect("freeze has a result");
+            InstKind::Freeze | InstKind::Declassify => {
+                let res = i.result().expect("freeze and declassify have a result");
                 if Self::is_wide(lo, res) {
                     let p = self.parts(lo, i.operands()[0]);
                     return self.def_parts(lo, res, p);

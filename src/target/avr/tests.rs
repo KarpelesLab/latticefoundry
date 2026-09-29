@@ -1282,6 +1282,11 @@ fn elf_object_has_every_avr_relocation() {
     ] {
         assert!(kinds.contains(&k), "{k:?} is emitted");
     }
+    // Every AVR kind survives the .lfo form (codes 14-20, after Thumb's).
+    for o in [&obj, &crt] {
+        let back = crate::mc::lfo::decode(&crate::mc::lfo::encode(o)).expect("decodes");
+        assert_eq!(&back, o);
+    }
     // The flash table of function pointers is in .progmem.data with _PM
     // relocations; the SRAM data in .data.
     let pm = obj.sections().iter().position(|s| s.name == super::data::PROGMEM).expect(".progmem.data");

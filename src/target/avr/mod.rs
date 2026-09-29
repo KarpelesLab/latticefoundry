@@ -79,6 +79,23 @@
 //! every vector operation is scalarized before soft float and integer
 //! legalization.
 //!
+//! # Constant time
+//!
+//! Secret code stays constant-time (`docs/ir-design.md` §6d, §6g) without
+//! making public code pay for it: isel runs the secret-taint analysis
+//! ([`SecretTaint`](crate::analysis::secret::SecretTaint)) on each prepared
+//! function and picks, **per operation**, between two forms of the lowerings
+//! that would otherwise branch or skip on data. On public operands it emits
+//! the compact ones — a compare skipping over an `ldi`, a counted-loop
+//! variable shift, an `sbrc` sign fill; on secret-derived operands the
+//! branch-free ones — the compare's flag read out of `SREG`, a barrel shifter
+//! (about 60 words instead of 9), a shift-pair sign extension. `select` is
+//! always a mask blend. [`AvrOp::may_branch_on_data`] is the audit. Helper
+//! calls take public parameters, so a secret reaching one (a secret 32- or
+//! 64-bit multiply) is a verifier violation in the prepared module; the 8/16-bit
+//! multiply helpers a core without `mul` calls run a fixed number of
+//! iterations.
+//!
 //! # Calls and frames
 //!
 //! The avr-gcc calling convention ([`regs`]); `Y` (`r29:r28`) is

@@ -868,6 +868,13 @@ mod tests {
             (RelocKind::ThumbCall, MachOCpu::Arm64),
             (RelocKind::ThumbMovwAbsNc, MachOCpu::X86_64),
             (RelocKind::ThumbMovtAbs, MachOCpu::Arm64),
+            (RelocKind::AvrCall, MachOCpu::X86_64),
+            (RelocKind::Avr13Pcrel, MachOCpu::Arm64),
+            (RelocKind::Avr16Pm, MachOCpu::X86_64),
+            (RelocKind::AvrLo8Ldi, MachOCpu::Arm64),
+            (RelocKind::AvrHi8Ldi, MachOCpu::X86_64),
+            (RelocKind::AvrLo8LdiPm, MachOCpu::Arm64),
+            (RelocKind::AvrHi8LdiPm, MachOCpu::X86_64),
         ] {
             let mut m = ObjectModule::new("e");
             let t = m.add_section(Section::new(".text", SectionKind::Text, 1));
