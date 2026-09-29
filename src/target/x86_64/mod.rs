@@ -32,12 +32,15 @@ pub(crate) mod regs;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod stack_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod syscall_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod data_tests;
 
 pub use encode::{
-    DebugSource, compile_function, compile_module, compile_module_debug, compile_to_elf,
+    DebugSource, compile_function, compile_module, compile_module_debug, compile_module_debug_with,
+    compile_module_with, compile_to_elf,
 };
 pub use isel::{X86Op, X86_64Target};

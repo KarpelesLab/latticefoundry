@@ -20,7 +20,12 @@
 //!   executable semantics isel + regalloc are validated against;
 //! - [`data`] — the target-independent emission of global data (initializer
 //!   serialization, `.rodata`/`.data`/`.bss` placement, data relocations) that
-//!   each backend's `compile_module` calls with its absolute-pointer reloc kind.
+//!   each backend's `compile_module` calls with its absolute-pointer reloc kind;
+//! - [`options`] — the [`CodegenOptions`] knobs (stack probes) and the
+//!   [`CompiledModule`] result of the backends' `compile_module_with`;
+//! - [`stack`] — per-function [`StackUsage`] reports taken
+//!   from the frame layouts, worst-case stack-depth analysis over the call
+//!   graph, and the stack-probing contract.
 //!
 //! Real ISAs (x86-64, AArch64, RISC-V) and instruction *encoding* are Phases
 //! 6–7; this phase produces MIR, not bytes.
@@ -29,11 +34,15 @@ pub mod data;
 pub mod interp;
 pub mod isel;
 pub mod mir;
+pub mod options;
 pub mod regalloc;
+pub mod stack;
 pub mod target;
 pub mod vtarget;
 
 pub use mir::MachineFunction;
+pub use options::{CodegenOptions, CompiledModule};
+pub use stack::{StackAssumptions, StackBound, StackBoundError, StackReport, StackUsage};
 pub use target::MachineTarget;
 pub use vtarget::VirtualTarget;
 

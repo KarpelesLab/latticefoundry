@@ -16,12 +16,33 @@
 //!    [`Emitter`]'s label mechanism and turning `call`/global references into
 //!    relocations;
 //! 4. assembles the functions of a module into an [`ObjectModule`]
-//!    ([`compile_module`]) and, via [`crate::mc::elf`], an ELF64 object.
+//!    ([`compile_module`]) and, via [`crate::mc::elf`], an ELF64 object;
+//!    [`compile_module_with`] also takes [`CodegenOptions`] and returns each
+//!    function's [`StackUsage`] (read off the same [`FrameLayout`] the prologue
+//!    is built from).
+//!
+//! **Stack probes** (on by default, see [`crate::codegen::stack`]): a frame whose
+//! `sub rsp` amount is at least [`STACK_PROBE_INTERVAL`] is allocated one
+//! interval at a time, each step followed by `or qword [rsp], 0`:
+//!
+//! ```text
+//! sub rsp, 4096 ; or qword [rsp], 0      ; × pages, when pages <= 4
+//!
+//! mov r11d, pages                        ; otherwise, a counted loop
+//! L: sub rsp, 4096 ; or qword [rsp], 0 ; dec r11 ; jnz L
+//! sub rsp, remainder                     ; < 4096, if nonzero
+//! ```
+//!
+//! and a `dyn_alloca` probes at run time: `or qword [rsp], 0`, then while the
+//! (rounded) size is at least 4096, `sub rsp, 4096; or qword [rsp], 0` and
+//! subtract 4096 from it, then `sub rsp` by the remainder.
 //!
 //! The encoding tables are implemented from the published x86-64 instruction-set
 //! reference (tenet T1), not copied from any assembler.
 
 use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, RegClass, StackSlot};
+use crate::codegen::options::{CodegenOptions, CompiledModule};
+use crate::codegen::stack::{STACK_PROBE_INTERVAL, StackReport, StackUsage, scan_calls};
 use crate::codegen::regalloc;
 use crate::ir::Module;
 use crate::mc::emit::{Emitted, Emitter, Ref};
@@ -524,6 +545,43 @@ pub struct FrameLayout {
     /// carved block so `[rsp + k]` stack-argument addressing survives a moving
     /// `rsp`.
     outgoing: i64,
+    /// Whether the prologue's `sub rsp` and every `DynAlloca` emit stack probes.
+    probes: bool,
+}
+
+impl FrameLayout {
+    /// The stack usage this layout gives `mf` (whose MIR supplies the call
+    /// information; `func_name` resolves a function index — the callees and `mf`
+    /// itself — to its symbol name): the return address, `push rbp`, the
+    /// callee-saved pushes, and the `sub rsp` amount — exactly what the prologue
+    /// built from this layout moves `rsp` by.
+    pub fn stack_usage(
+        &self,
+        mf: &MachineFunction,
+        func_name: &dyn Fn(u32) -> String,
+    ) -> StackUsage {
+        let scan = scan_calls(
+            mf,
+            X86Op::Call.opcode(),
+            X86Op::Syscall.opcode(),
+            Some(X86Op::DynAlloca.opcode()),
+        );
+        let saved = 8 + self.cs_bytes as u64; // rbp + callee-saved pushes
+        let sub = self.sub_size as u64;
+        StackUsage {
+            name: func_name(mf.info().source),
+            frame_size: 8 + saved + sub,
+            return_address: 8,
+            saved_registers: saved,
+            sp_adjust: sub,
+            outgoing_args: self.outgoing as u64,
+            dynamic_alloca: scan.dynamic_alloca,
+            direct_callees: scan.direct.iter().map(|&f| func_name(f)).collect(),
+            indirect_calls: scan.indirect,
+            syscalls: scan.syscalls,
+            probed: self.probes,
+        }
+    }
 }
 
 /// Round `value` up to a multiple of `align` (a power of two ≥ 1).
@@ -531,8 +589,18 @@ fn align_up(value: i64, align: i64) -> i64 {
     (value + align - 1) / align * align
 }
 
-/// Compute the frame layout of an allocated machine function.
+/// Compute the frame layout of an allocated machine function, with the default
+/// [`CodegenOptions`] (stack probes on).
 pub fn layout_frame(mf: &MachineFunction, target: &X86_64Target) -> FrameLayout {
+    layout_frame_with(mf, target, &CodegenOptions::default())
+}
+
+/// Compute the frame layout of an allocated machine function under `opts`.
+pub fn layout_frame_with(
+    mf: &MachineFunction,
+    target: &X86_64Target,
+    opts: &CodegenOptions,
+) -> FrameLayout {
     use crate::codegen::target::MachineTarget;
     let callee: Vec<u8> = target.callee_saved().iter().map(|p| p.num as u8).collect();
 
@@ -568,7 +636,7 @@ pub fn layout_frame(mf: &MachineFunction, target: &X86_64Target) -> FrameLayout 
     let padded = align_up(total, 16);
     let sub_size = (padded - cs_bytes as i64) as i32;
 
-    FrameLayout { slot_off, cs_regs, cs_bytes, sub_size, outgoing }
+    FrameLayout { slot_off, cs_regs, cs_bytes, sub_size, outgoing, probes: opts.stack_probes }
 }
 
 fn phys(r: u16) -> MachineOperand {
@@ -586,6 +654,7 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
     let entry = mf.entry().expect("a function being compiled has an entry block");
 
     // --- prologue: push rbp; mov rbp,rsp; push callee-saved; sub rsp,frame ---
+    // (`SubRsp`'s second operand requests the probed form.)
     let mut prologue = vec![
         MachineInst::new(X86Op::Push.opcode(), vec![phys_use(RBP)]),
         MachineInst::new(X86Op::MovRbpRsp.opcode(), Vec::new()),
@@ -594,8 +663,10 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
         prologue.push(MachineInst::new(X86Op::Push.opcode(), vec![phys_use(u16::from(cs))]));
     }
     if layout.sub_size > 0 {
-        prologue
-            .push(MachineInst::new(X86Op::SubRsp.opcode(), vec![imm_op(layout.sub_size as u64)]));
+        prologue.push(MachineInst::new(
+            X86Op::SubRsp.opcode(),
+            vec![imm_op(layout.sub_size as u64), imm_op(u64::from(layout.probes))],
+        ));
     }
     let old = std::mem::take(&mut mf.block_mut(entry).insts);
     prologue.extend(old);
@@ -965,10 +1036,8 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::Pop => pop_r(e, rnum(&ops[0])),
         X86Op::MovRbpRsp => mov_rr(e, RBP as u8, RSP as u8, true),
         X86Op::SubRsp => {
-            e.u8(0x48);
-            e.u8(0x81);
-            e.u8(modrm(3, 5, RSP as u8));
-            e.u32(uimm(&ops[0]) as u32);
+            let probe = ops.get(1).is_some_and(|o| uimm(o) != 0);
+            sub_rsp(e, uimm(&ops[0]), probe);
         }
         X86Op::LeaRspRbp => {
             let k = uimm(&ops[0]) as i64;
@@ -1015,6 +1084,25 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             // the mask rounds only the `n + 15` part).
             alu_ri32(e, 0, d, (15 + c) as i32, true); // add d, 15 + C
             and_ri8(e, d, -16, true); // and d, ~15
+            if ctx.layout.probes {
+                // Touch the current top, then move down one probe interval at a
+                // time touching each step, leaving a remainder < the interval.
+                let step = STACK_PROBE_INTERVAL as i32;
+                probe_rsp(e); // or qword [rsp], 0
+                alu_ri32(e, 7, d, step, true); // cmp d, 4096
+                let done = e.create_label();
+                e.bytes(&[0x0F, 0x82]); // jb done
+                e.pcrel32(Ref::Label(done), 0);
+                let top = e.create_label();
+                e.bind_label(top);
+                sub_rsp_imm(e, STACK_PROBE_INTERVAL as u32); // sub rsp, 4096
+                probe_rsp(e); // or qword [rsp], 0
+                alu_ri32(e, 5, d, step, true); // sub d, 4096
+                alu_ri32(e, 7, d, step, true); // cmp d, 4096
+                e.bytes(&[0x0F, 0x83]); // jae top
+                e.pcrel32(Ref::Label(top), 0);
+                e.bind_label(done);
+            }
             alu_rr(e, 0x29, RSP as u8, d, true); // sub rsp, d
             // result = rsp + outgoing (its own alignment), rounded up to `align`.
             mem(e, &[0x8D], d, RSP as u8, outgoing as i32, true, false); // lea d,[rsp+outgoing]
@@ -1122,6 +1210,51 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
     }
 }
 
+/// `sub rsp, imm32`.
+fn sub_rsp_imm(e: &mut Emitter, n: u32) {
+    e.bytes(&[0x48, 0x81, modrm(3, 5, RSP as u8)]);
+    e.u32(n);
+}
+
+/// `or qword [rsp], 0` — a stack probe: a read-modify-write of the new top that
+/// faults if it lies in the guard region, and changes nothing otherwise.
+fn probe_rsp(e: &mut Emitter) {
+    e.bytes(&[0x48, 0x83, modrm(0, 1, 4), sib(0, 4, RSP as u8), 0x00]);
+}
+
+/// Pages up to which a probed `sub rsp` is unrolled rather than looped.
+const PROBE_UNROLL: u64 = 4;
+
+/// The prologue's stack allocation of `size` bytes: one `sub rsp`, or with
+/// `probe` and a size of at least [`STACK_PROBE_INTERVAL`], the probed sequence
+/// (see the module docs). `r11` (encoder scratch, never allocated, and free at
+/// function entry) counts the loop.
+fn sub_rsp(e: &mut Emitter, size: u64, probe: bool) {
+    if !probe || size < STACK_PROBE_INTERVAL {
+        sub_rsp_imm(e, size as u32);
+        return;
+    }
+    let pages = size / STACK_PROBE_INTERVAL;
+    let rem = size % STACK_PROBE_INTERVAL;
+    if pages <= PROBE_UNROLL {
+        for _ in 0..pages {
+            sub_rsp_imm(e, STACK_PROBE_INTERVAL as u32);
+            probe_rsp(e);
+        }
+    } else {
+        mov_ri(e, regs::R11 as u8, pages); // mov r11d, pages
+        let top = e.offset();
+        sub_rsp_imm(e, STACK_PROBE_INTERVAL as u32); // sub rsp, 4096
+        probe_rsp(e); // or qword [rsp], 0
+        e.bytes(&[rex(true, false, false, true), 0xFF, modrm(3, 1, regs::R11 as u8)]); // dec r11
+        let back = top as i64 - (e.offset() as i64 + 2);
+        e.bytes(&[0x75, back as i8 as u8]); // jnz top
+    }
+    if rem > 0 {
+        sub_rsp_imm(e, rem as u32);
+    }
+}
+
 fn slot_index(op: &MachineOperand) -> usize {
     match op {
         MachineOperand::Frame(s) => s.index(),
@@ -1202,13 +1335,27 @@ fn encode_function_inner(
     e.finish().expect("intra-function branch resolution never overflows")
 }
 
-/// Compile one function of `module` to its encoded bytes and relocations. Runs
-/// isel → register allocation → frame layout → prologue/epilogue → encoding.
-pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
+/// One function's compile output: bytes + relocations, the `.debug_line`
+/// statement rows (when requested), and its stack usage.
+struct FunctionOutput {
+    emitted: Emitted,
+    rows: Vec<(u64, u32)>,
+    stack: StackUsage,
+}
+
+/// Run isel → register allocation → frame layout → prologue/epilogue →
+/// encoding for one function under `opts`, collecting line rows if `lines`.
+fn compile_function_full(
+    module: &Module,
+    func: crate::ir::FuncId,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+    lines: bool,
+) -> FunctionOutput {
     let target = X86_64Target::new();
     let mut mf = target.select_with_syms(module, func, syms);
     regalloc::allocate(&mut mf, &target);
-    let layout = layout_frame(&mf, &target);
+    let layout = layout_frame_with(&mf, &target, opts);
     insert_prologue_epilogue(&mut mf, &layout);
     let func_name = |idx: u32| -> String {
         syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
@@ -1216,7 +1363,22 @@ pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInte
     let global_name = |idx: u32| -> String {
         syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
     };
-    encode_function(&mf, &layout, &func_name, &global_name)
+    let stack = layout.stack_usage(&mf, &func_name);
+    let mut rows = Vec::new();
+    let emitted = encode_function_inner(
+        &mf,
+        &layout,
+        &func_name,
+        &global_name,
+        if lines { Some(&mut rows) } else { None },
+    );
+    FunctionOutput { emitted, rows, stack }
+}
+
+/// Compile one function of `module` to its encoded bytes and relocations. Runs
+/// isel → register allocation → frame layout → prologue/epilogue → encoding.
+pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
+    compile_function_full(module, func, syms, &CodegenOptions::default(), false).emitted
 }
 
 /// Compile every defined function of `module` into a relocatable
@@ -1225,50 +1387,20 @@ pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInte
 /// symbols; then every defined global's storage into `.rodata`/`.data`/`.bss`
 /// with `R_X86_64_64` data relocations for address-valued initializers (see
 /// [`crate::codegen::data`]). `syms` resolves the interned function/global
-/// names.
+/// names. Uses the default [`CodegenOptions`] (stack probes on); see
+/// [`compile_module_with`] for options and the stack-usage report.
 pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
-    let mut obj = ObjectModule::new(module.name.clone());
-    let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));
+    build_module(module, syms, &CodegenOptions::default(), None).object
+}
 
-    for (i, f) in module.functions().enumerate() {
-        if f.is_declaration() {
-            continue;
-        }
-        let fid = crate::ir::FuncId::from_index(i);
-        let emitted = compile_function(module, fid, syms);
-        // 16-align this function's start within .text.
-        {
-            let sec = obj.section_mut(text);
-            while !sec.bytes.len().is_multiple_of(16) {
-                sec.bytes.push(0x90); // nop padding
-            }
-        }
-        let off = obj.section(text).bytes.len() as u64;
-        let len = emitted.bytes.len() as u64;
-        obj.section_mut(text).bytes.extend_from_slice(&emitted.bytes);
-
-        let name = syms.resolve(f.name).to_owned();
-        obj.add_symbol(Symbol::defined(
-            name,
-            SymbolBinding::Global,
-            SymbolType::Func,
-            text,
-            off,
-            len,
-        ));
-        for r in &emitted.relocations {
-            let sym = obj.reference_symbol(&r.symbol);
-            obj.add_relocation(crate::mc::object::Relocation {
-                section: text,
-                offset: off + r.offset,
-                symbol: sym,
-                kind: r.kind,
-                addend: r.addend,
-            });
-        }
-    }
-    crate::codegen::data::emit_globals(module, syms, &mut obj, RelocKind::Abs64);
-    obj
+/// Like [`compile_module`], under `opts`, and also returning every defined
+/// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
+pub fn compile_module_with(
+    module: &Module,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+) -> CompiledModule {
+    build_module(module, syms, opts, None)
 }
 
 /// Like [`compile_function`], but also returns the `(offset, line)` statement
@@ -1278,18 +1410,8 @@ pub fn compile_function_lines(
     func: crate::ir::FuncId,
     syms: &StrInterner,
 ) -> (Emitted, Vec<(u64, u32)>) {
-    let target = X86_64Target::new();
-    let mut mf = target.select_with_syms(module, func, syms);
-    regalloc::allocate(&mut mf, &target);
-    let layout = layout_frame(&mf, &target);
-    insert_prologue_epilogue(&mut mf, &layout);
-    let func_name = |idx: u32| -> String {
-        syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
-    };
-    let global_name = |idx: u32| -> String {
-        syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
-    };
-    encode_function_lines(&mf, &layout, &func_name, &global_name)
+    let out = compile_function_full(module, func, syms, &CodegenOptions::default(), true);
+    (out.emitted, out.rows)
 }
 
 /// Metadata identifying the `.lf` source a debug build was compiled from.
@@ -1312,18 +1434,43 @@ pub fn compile_module_debug(
     syms: &StrInterner,
     source: &DebugSource,
 ) -> ObjectModule {
+    build_module(module, syms, &CodegenOptions::default(), Some(source)).object
+}
+
+/// Like [`compile_module_debug`], under `opts`, and also returning the
+/// stack-usage report (see [`compile_module_with`]).
+pub fn compile_module_debug_with(
+    module: &Module,
+    syms: &StrInterner,
+    source: &DebugSource,
+    opts: &CodegenOptions,
+) -> CompiledModule {
+    build_module(module, syms, opts, Some(source))
+}
+
+/// The shared module driver behind [`compile_module_with`] and
+/// [`compile_module_debug_with`] (DWARF when `debug` is given).
+fn build_module(
+    module: &Module,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+    debug: Option<&DebugSource>,
+) -> CompiledModule {
     use crate::mc::dwarf::{DebugUnit, FuncDebug};
 
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));
     let mut funcs: Vec<FuncDebug> = Vec::new();
+    let mut stack = StackReport::new();
 
     for (i, f) in module.functions().enumerate() {
         if f.is_declaration() {
             continue;
         }
         let fid = crate::ir::FuncId::from_index(i);
-        let (emitted, stmt_rows) = compile_function_lines(module, fid, syms);
+        let out = compile_function_full(module, fid, syms, opts, debug.is_some());
+        let emitted = out.emitted;
+        stack.push(out.stack);
         // 16-align this function's start within .text.
         {
             let sec = obj.section_mut(text);
@@ -1355,38 +1502,42 @@ pub fn compile_module_debug(
             });
         }
 
-        // Build the function's line rows: a function-entry row at the decl line,
-        // then the statement rows (dropping runs of the same line).
-        let decl_line = f.decl_line.unwrap_or(1);
-        let mut rows = vec![(0u64, decl_line)];
-        for (roff, line) in stmt_rows {
-            if rows.last().map(|&(_, l)| l) != Some(line) {
-                rows.push((roff, line));
+        if debug.is_some() {
+            // Build the function's line rows: a function-entry row at the decl
+            // line, then the statement rows (dropping runs of the same line).
+            let decl_line = f.decl_line.unwrap_or(1);
+            let mut rows = vec![(0u64, decl_line)];
+            for (roff, line) in out.rows {
+                if rows.last().map(|&(_, l)| l) != Some(line) {
+                    rows.push((roff, line));
+                }
             }
+            funcs.push(FuncDebug { name, decl_line, size: len, rows });
         }
-        funcs.push(FuncDebug { name, decl_line, size: len, rows });
     }
 
     crate::codegen::data::emit_globals(module, syms, &mut obj, RelocKind::Abs64);
 
-    let text_size = obj.section(text).bytes.len() as u64;
-    let unit = DebugUnit {
-        file_name: source.file_name.clone(),
-        comp_dir: source.comp_dir.clone(),
-        producer: "LatticeFoundry".to_owned(),
-        text_size,
-        funcs,
-    };
-    let dw = crate::mc::dwarf::build(&unit);
+    if let Some(source) = debug {
+        let text_size = obj.section(text).bytes.len() as u64;
+        let unit = DebugUnit {
+            file_name: source.file_name.clone(),
+            comp_dir: source.comp_dir.clone(),
+            producer: "LatticeFoundry".to_owned(),
+            text_size,
+            funcs,
+        };
+        let dw = crate::mc::dwarf::build(&unit);
 
-    // Plain (relocation-free) sections.
-    obj.add_section(debug_section(".debug_abbrev", dw.abbrev));
-    obj.add_section(debug_section(".debug_str", dw.str));
-    // Sections carrying address relocations against the function symbols.
-    obj.add_emitted_section(".debug_info", SectionKind::Debug, 1, dw.info);
-    obj.add_emitted_section(".debug_line", SectionKind::Debug, 1, dw.line);
+        // Plain (relocation-free) sections.
+        obj.add_section(debug_section(".debug_abbrev", dw.abbrev));
+        obj.add_section(debug_section(".debug_str", dw.str));
+        // Sections carrying address relocations against the function symbols.
+        obj.add_emitted_section(".debug_info", SectionKind::Debug, 1, dw.info);
+        obj.add_emitted_section(".debug_line", SectionKind::Debug, 1, dw.line);
+    }
 
-    obj
+    CompiledModule { object: obj, stack }
 }
 
 /// A non-allocated debug [`Section`] holding `bytes`.
