@@ -19,9 +19,11 @@
 //! [`Triple::parse`] accepts the usual spellings, e.g. `x86_64-linux`,
 //! `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
 //! `x86_64-w64-mingw32`, `x86_64-apple-darwin`, `aarch64-apple-macos`,
-//! `arm64-apple-darwin`, `aarch64-pc-windows-msvc`, `aarch64-none-elf` and
-//! `riscv64-unknown-linux-gnu`: the first component is the architecture, and
-//! the OS is recognized from any later component.
+//! `arm64-apple-darwin`, `aarch64-pc-windows-msvc`, `aarch64-none-elf`,
+//! `riscv64-unknown-linux-gnu`, `thumbv7m-none-eabi` and `thumbv7em-none-eabi`:
+//! the first component is the architecture, and the OS is recognized from any
+//! later component. A bare `thumbv7m` means bare metal (a Cortex-M runs no
+//! Linux); every other bare architecture means Linux.
 
 use std::fmt;
 
@@ -95,6 +97,9 @@ pub enum CallConvKind {
     Aapcs64,
     /// The RISC-V LP64 integer calling convention.
     RiscvLp64,
+    /// The 32-bit Arm AAPCS, base standard (soft-float: floating-point values
+    /// in core registers), as Cortex-M code uses it.
+    Aapcs,
 }
 
 /// An architecture plus an operating system.
@@ -128,6 +133,9 @@ impl Triple {
             "x86_64" | "x86-64" | "amd64" | "x64" => TargetArch::X86_64,
             "aarch64" | "arm64" => TargetArch::AArch64,
             "riscv64" | "riscv64gc" | "riscv64imac" => TargetArch::Riscv64,
+            // ARMv7-M (Cortex-M3) and ARMv7E-M (Cortex-M4/M7, whose DSP and
+            // FPU extensions the backend does not use) share the backend.
+            "thumbv7m" | "thumbv7em" | "thumb" | "thumbv7" => TargetArch::Thumb,
             _ => return None,
         };
         let rest: Vec<&str> = parts.collect();
@@ -160,6 +168,7 @@ impl Triple {
         // with no `--target`; any other unrecognized OS is an error.
         let os = match os {
             Some(os) => os,
+            None if rest.is_empty() && arch == TargetArch::Thumb => TargetOs::None,
             None if rest.is_empty() => TargetOs::Linux,
             None => return None,
         };
@@ -182,6 +191,7 @@ impl Triple {
             (TargetArch::X86_64, _) => CallConvKind::SysV,
             (TargetArch::AArch64, _) => CallConvKind::Aapcs64,
             (TargetArch::Riscv64, _) => CallConvKind::RiscvLp64,
+            (TargetArch::Thumb, _) => CallConvKind::Aapcs,
         }
     }
 
@@ -229,12 +239,18 @@ mod tests {
             ("aarch64-none-elf", TargetArch::AArch64, TargetOs::None),
             ("aarch64-unknown-none", TargetArch::AArch64, TargetOs::None),
             ("riscv64-unknown-linux-gnu", TargetArch::Riscv64, TargetOs::Linux),
+            ("thumbv7m-none-eabi", TargetArch::Thumb, TargetOs::None),
+            ("thumbv7em-none-eabi", TargetArch::Thumb, TargetOs::None),
+            ("thumbv7m", TargetArch::Thumb, TargetOs::None),
         ];
         for (s, arch, os) in cases {
             assert_eq!(Triple::parse(s), Some(Triple::new(arch, os)), "{s}");
         }
         assert_eq!(Triple::parse("mips-linux"), None);
         assert_eq!(Triple::parse("x86_64-plan9"), None);
+        assert_eq!(Triple::parse("thumbv6m-none-eabi"), None, "ARMv6-M is not supported");
+        let t = Triple::parse("thumbv7m-none-eabi").unwrap();
+        assert_eq!((t.call_conv(), t.object_format()), (CallConvKind::Aapcs, ObjectFormat::Elf));
     }
 
     #[test]

@@ -11,7 +11,12 @@
 //!   (AArch64 and RISC-V by decoding the fixed-width words, x86-64 with
 //!   `llvm-mc --disassemble` when it is installed).
 //! - **`select` is branchless**: `cmov` on x86-64, `csel` on AArch64, the
-//!   mask blend on RISC-V.
+//!   mask blend on RISC-V, an `IT`-predicated pair of `mov`s on Thumb.
+//! - **Thumb** is checked on the module its backend actually selects from
+//!   (after vector scalarization, soft-float lowering and 64-bit
+//!   legalization, whose expansions are all selects and compares), and its
+//!   bytes are scanned for conditional branches (`b<cond>`, `b<cond>.w`,
+//!   `cbz`/`cbnz`) with the Thumb length rule.
 //! - **Branchy lowerings are rejected on secrets**: every opcode whose lowering
 //!   is inherently branchy or variable-time (the `u64`↔float fix-ups, the
 //!   atomic retry loops, `dyn_alloca`'s probe loop, division) has its secret
@@ -30,6 +35,7 @@ use crate::verify::{CtPolicy, ct_violations, verify_module};
 
 use super::aarch64::{A64Op, AArch64Target};
 use super::riscv::{RiscvTarget, RvOp};
+use super::thumb::{ThOp, ThumbTarget};
 use super::x86_64::{X86Op, X86_64Target};
 
 /// Every operation the verifier allows on a secret, at several widths, in one
@@ -122,6 +128,54 @@ fn assert_isel_adds_no_branches(m: &Module, syms: &StrInterner, what: &str) {
         let got = mir_branches(&mf, |mi| RvOp::decode(mi.opcode).may_branch_on_data(&mi.operands));
         assert_eq!(got, want, "{what}: riscv64 function #{i}");
     }
+    assert_thumb_adds_no_branches(m, syms, what);
+}
+
+/// The Thumb backend selects from its prepared module; every defined
+/// function there keeps exactly its IR branches.
+fn assert_thumb_adds_no_branches(m: &Module, syms: &StrInterner, what: &str) {
+    let topts = super::thumb::ThumbOptions::default();
+    let (pm, ps) = super::thumb::prepare_module(m, syms, &topts).expect("prepares");
+    let target = ThumbTarget::new().with_helpers(super::thumb::isel::Helpers::resolve(&pm, &ps));
+    for i in 0..pm.function_count() {
+        let f = FuncId::from_index(i);
+        if pm.function(f).is_declaration() {
+            continue;
+        }
+        let mf = target.select(&pm, f, &ps);
+        let got = mir_branches(&mf, |mi| ThOp::decode(mi.opcode).may_branch_on_data(&mi.operands));
+        assert_eq!(got, ir_branches(&pm, f), "{what}: thumb function #{i}");
+        if i < m.function_count() {
+            assert_eq!(ir_branches(&pm, f), ir_branches(m, f), "{what}: preparing adds no branch (#{i})");
+        }
+    }
+}
+
+/// The conditional branches in Thumb code (walking it with the 16/32-bit
+/// length rule): `b<cond>` (T1), `b<cond>.w` (T3), `cbz`/`cbnz`.
+fn thumb_cond_branches(bytes: &[u8]) -> Vec<(usize, u16)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        let h = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let wide = matches!(h >> 11, 0b11101..=0b11111);
+        if wide {
+            let h2 = u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]);
+            let cond = (h >> 6) & 0xf;
+            if h >> 11 == 0b11110 && h2 & 0xd000 == 0x8000 && cond < 0xe {
+                out.push((at, h));
+            }
+            at += 4;
+        } else {
+            let bcc = h >> 12 == 0xd && ((h >> 8) & 0xf) < 0xe;
+            let cbz = h & 0xf500 == 0xb100;
+            if bcc || cbz {
+                out.push((at, h));
+            }
+            at += 2;
+        }
+    }
+    out
 }
 
 /// Whether the little-endian A64 word `w` is a conditional branch
@@ -168,6 +222,11 @@ fn branch_scanners_recognize_branches() {
     assert!(!a64_is_cond_branch(0x9A80_1000)); // csel x0, x0, x0, ne
     assert!(!a64_is_cond_branch(0x1400_0000)); // b
     assert!(rv_is_cond_branch(0x0000_0063)); // beq x0, x0, 0
+    // Thumb: beq (T1), bne.w (T3), cbz; not b (T2), bl, or an IT block.
+    assert_eq!(thumb_cond_branches(&[0x00, 0xd0]).len(), 1);
+    assert_eq!(thumb_cond_branches(&[0x40, 0xf0, 0x00, 0x80]).len(), 1);
+    assert_eq!(thumb_cond_branches(&[0x08, 0xb1]).len(), 1);
+    assert!(thumb_cond_branches(&[0x00, 0xe0, 0xff, 0xf7, 0xfe, 0xff, 0x08, 0xbf]).is_empty());
     assert!(!rv_is_cond_branch(0x0000_006F)); // jal x0, 0
     if let Some(text) = x86_disasm(&[0x74, 0x00, 0x48, 0x0F, 0x45, 0xC1]) {
         assert!(text.contains("je") && text.contains("cmovne"), "{text}");
@@ -192,6 +251,11 @@ fn allowed_operations_compile_without_branches_on_every_target() {
         let rv = super::riscv::compile_function(&m, f);
         let bad: Vec<u32> = words(&rv.bytes).filter(|&w| rv_is_cond_branch(w)).collect();
         assert!(bad.is_empty(), "riscv conditional branches {bad:08x?} at {level:?}");
+
+        let th = super::thumb::compile_function(&m, f, &syms);
+        assert!(!th.bytes.is_empty());
+        let bad = thumb_cond_branches(&th.bytes);
+        assert!(bad.is_empty(), "thumb conditional branches {bad:04x?} at {level:?}");
 
         let x86 = super::x86_64::compile_function(&m, f, &syms);
         match x86_disasm(&x86.bytes) {
@@ -293,7 +357,50 @@ entry ^0(%c: i1, %a: i64, %b: i64):
     let r = ops(&RiscvTarget::new().select(&m, f));
     assert!(r.contains(&RvOp::Xor.opcode().0) && r.contains(&RvOp::And.opcode().0));
     assert!(!r.contains(&RvOp::BrCond.opcode().0));
+    // Thumb: `tst c, #1; ite ne; mov; mov` — conditional execution, no branch.
+    let t = ops(&ThumbTarget::new().select(&m, f, &syms));
+    assert!(t.contains(&ThOp::Select.opcode().0) && !t.contains(&ThOp::BrCond.opcode().0));
+    assert!(!ThOp::Select.may_branch_on_data(&[]) && !ThOp::SetCmp.may_branch_on_data(&[]));
+    assert!(thumb_cond_branches(&super::thumb::compile_function(&m, f, &syms).bytes).is_empty());
     assert_isel_adds_no_branches(&m, &syms, "sel");
+}
+
+/// On Thumb, soft-float arithmetic, division and 64-bit multiplication are
+/// calls to run-time helpers or divide instructions. The verifier rejects the
+/// floating-point and division operations on secrets in the source IR; and
+/// every helper call the preparation introduces takes public parameters, so a
+/// secret reaching one is a violation in the prepared module as well — which
+/// is how a secret 64-bit multiply (allowed by [`CtPolicy::DEFAULT`], but an
+/// `__aeabi_lmul` call on Thumb) is caught: verify the prepared module, or use
+/// [`CtPolicy::STRICT`] for Cortex-M code.
+#[test]
+fn thumb_helper_calls_are_rejected_on_secrets() {
+    let cases: [(&str, &str, &str, bool); 6] = [
+        ("soft-float add", "f32", "  %r = fadd %x, %x : f32\n  %o = bitcast %r : i32\n  %w = zext %o : i64\n  ret %w\n", true),
+        ("soft-float compare", "f64", "  %c = fcmp olt %x, %x : i1\n  %w = zext %c : i64\n  ret %w\n", true),
+        ("soft-float conversion", "f64", "  %r = fptosi %x : i64\n  ret %r\n", true),
+        ("32-bit division", "i32", "  %r = udiv i32 1000, %x : i32\n  %w = zext %r : i64\n  ret %w\n", true),
+        ("64-bit remainder", "i64", "  %r = srem i64 1000, %x : i64\n  ret %r\n", true),
+        ("64-bit multiply", "i64", "  %r = mul %x, %x : i64\n  ret %r\n", false),
+    ];
+    for (what, ty, body, source_rejects) in cases {
+        for secret in [false, true] {
+            let kw = if secret { "secret " } else { "" };
+            let src = format!("module \"b\"\nfunc @f({kw}{ty}) -> {kw}i64 {{\nentry ^0(%x: {ty}):\n{body}}}\n");
+            let mut syms = StrInterner::new();
+            let m = crate::ir::text::parse_module(&src, FileId::new(0), &mut syms)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let f = FuncId::from_index(0);
+            let v = ct_violations(&m, f, CtPolicy::DEFAULT);
+            assert_eq!(!v.is_empty(), secret && source_rejects, "{what}: the source verdict");
+            for hw_div in [true, false] {
+                let topts = super::thumb::ThumbOptions::default().with_hw_div(hw_div);
+                let (pm, _) = super::thumb::prepare_module(&m, &syms, &topts).expect("prepares");
+                let pv = ct_violations(&pm, f, CtPolicy::DEFAULT);
+                assert_eq!(!pv.is_empty(), secret, "{what}: the prepared module's verdict");
+            }
+        }
+    }
 }
 
 #[test]

@@ -53,6 +53,9 @@ fn rsasm_arch(arch: TargetArch) -> &'static str {
         TargetArch::X86_64 => "x86-64",
         TargetArch::AArch64 => "aarch64",
         TargetArch::Riscv64 => "riscv64",
+        // Needs rsasm's `arm` feature; without it `assemble` reports the
+        // missing backend.
+        TargetArch::Thumb => "thumb",
     }
 }
 

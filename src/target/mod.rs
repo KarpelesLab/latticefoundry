@@ -6,6 +6,7 @@
 
 pub mod aarch64;
 pub mod riscv;
+pub mod thumb;
 pub mod triple;
 pub mod x86_64;
 
@@ -34,6 +35,9 @@ pub enum TargetArch {
     AArch64,
     /// 64-bit RISC-V.
     Riscv64,
+    /// 32-bit Arm Cortex-M, Thumb-2 (ARMv7-M / ARMv7E-M), soft-float AAPCS
+    /// ([`thumb`]).
+    Thumb,
 }
 
 impl TargetArch {
@@ -43,6 +47,7 @@ impl TargetArch {
             TargetArch::X86_64 => "x86_64",
             TargetArch::AArch64 => "aarch64",
             TargetArch::Riscv64 => "riscv64",
+            TargetArch::Thumb => "thumbv7m",
         }
     }
 }
@@ -116,5 +121,6 @@ pub fn compile_module_for(
         TargetArch::X86_64 => x86_64::compile_module_with(module, syms, opts),
         TargetArch::AArch64 => aarch64::compile_module_with(module, syms, opts),
         TargetArch::Riscv64 => riscv::compile_module_with(module, syms, opts),
+        TargetArch::Thumb => thumb::compile_module_with(module, syms, opts),
     })
 }

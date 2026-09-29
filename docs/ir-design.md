@@ -585,7 +585,10 @@ the same whichever OS it runs on. The choice is made once per compilation by a
 - **Calling convention** (`Triple::call_conv`): x86-64 uses the Microsoft x64
   convention on Windows and System V elsewhere; AArch64 uses AAPCS64 (the Apple
   and Microsoft variants differ only in variadic calls, which the AArch64
-  backend does not lower, and in reserving `x18`, which it never allocates).
+  backend does not lower, and in reserving `x18`, which it never allocates);
+  Cortex-M Thumb (`thumbv7m`) uses the 32-bit AAPCS base standard, so a
+  floating-point value travels in core registers like the integer of its width
+  (the soft-float lowering makes it one before isel).
   Every function in a module follows the same convention; there is no
   per-function `ms_abi`/`sysv_abi` attribute yet.
 - **Object format** (`Triple::object_format`): ELF on Linux and bare metal,
@@ -777,7 +780,10 @@ that may take a conditional branch depending on a register value:
 
 - x86-64: the terminators, the `u64`↔float fix-ups, the `lock cmpxchg` loop,
   and `dyn_alloca`'s probe loop;
-- AArch64 and RISC-V: the terminators and the atomic retry loops.
+- AArch64 and RISC-V: the terminators and the atomic retry loops;
+- Thumb: the terminators only. Its compare-and-set and `select` are `IT`
+  blocks (`cmp`/`tst`, `ite`, two `mov`s), which issue every instruction
+  whatever the condition, so they are not branches.
 
 Instruction selection creates no blocks of its own. The tests check, on all
 three targets, that every function's data-dependent MIR branches are exactly
@@ -787,8 +793,15 @@ compiles to code with no conditional branch at all. The A64 and RISC-V words
 are decoded directly; x86-64 is disassembled with `llvm-mc` when it is
 installed.
 
-`select` is `cmov` on x86-64, `csel` on AArch64 and a mask blend on RISC-V,
-asserted at each lowering site. Every inherently branchy or variable-time
+`select` is `cmov` on x86-64, `csel` on AArch64, a mask blend on RISC-V and
+an `IT`-predicated pair of `mov`s on Thumb, asserted at each lowering site.
+Thumb is checked on the module it selects from, after soft-float lowering and
+64-bit legalization. Those add calls to run-time helpers with public
+parameters (`__aeabi_fadd`, `__aeabi_ldivmod`, `__aeabi_lmul`, …), so a secret
+reaching one is a violation of the prepared module: float operations and
+division are already rejected in the source, and a secret 64-bit multiply,
+allowed by the default policy, is caught there (or up front by the strict
+policy, the right one for Cortex-M). Every inherently branchy or variable-time
 lowering (the float conversions, atomics, `dyn_alloca`, division) has its
 secret operands rejected by the verifier.
 
@@ -944,6 +957,7 @@ the target to make that type legal.
 | x86-64 (SSE2, the baseline) | `<16 x i8>`, `<8 x i16>`, `<4 x i32>`, `<2 x i64>`, `<4 x f32>`, `<2 x f64>`, masks `<16/8/4/2 x i1>` | see below; System V passes them in `xmm0..7` and returns in `xmm0` (`__m128`); Win64 passes them by reference (a 16-byte-aligned caller copy) and returns in `xmm0` (§6c) |
 | AArch64 (NEON) | the same ten | see below; passed in `v0..v7`, returned in `v0` (AAPCS64 short vectors) |
 | RISC-V | none (the V extension is out of scope) | fully scalarized |
+| Thumb (Cortex-M) | none | fully scalarized, before soft-float lowering and 64-bit legalization |
 
 On both SIMD targets a mask `<N x i1>` lives in a vector register as `N`
 lanes of `128 / N` bits, each all-ones or all-zeros — what their compares

@@ -6,11 +6,11 @@
 
 use std::fmt;
 
-use crate::mc::object::{ObjectModule, RelocKind};
+use crate::mc::object::ObjectModule;
 use crate::target::{ObjectFormat, TargetArch, Triple};
 
 /// Why an [`ObjectModule`] could not be written in the requested format:
-/// typically a [`RelocKind`] the format (or the architecture within it) has
+/// typically a [`RelocKind`](crate::mc::object::RelocKind) the format (or the architecture within it) has
 /// no relocation for, or an addend that does not fit the in-place field a
 /// REL-style format keeps it in.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -53,14 +53,18 @@ pub fn write_object(obj: &ObjectModule, triple: Triple) -> Result<Vec<u8>, Objec
 /// # Errors
 ///
 /// Returns an error when the format has no writer for `arch` (ELF is written
-/// for x86-64 only; COFF and Mach-O for x86-64 and AArch64), or when the
-/// module holds a relocation the format cannot express.
+/// for x86-64 and 32-bit Arm Thumb; COFF and Mach-O for x86-64 and AArch64),
+/// or when the module holds a relocation the format cannot express.
 pub fn write_object_as(
     obj: &ObjectModule,
     arch: TargetArch,
     format: ObjectFormat,
 ) -> Result<Vec<u8>, ObjectWriteError> {
     match format {
+        ObjectFormat::Elf if arch == TargetArch::Thumb => {
+            crate::mc::elf::write_with(obj, &crate::mc::elf::ElfTarget::ARM)
+                .map_err(|e| ObjectWriteError::new(format!("Arm ELF object: {e}")))
+        }
         ObjectFormat::Elf => {
             if arch != TargetArch::X86_64 {
                 return Err(ObjectWriteError::new(format!(
@@ -69,12 +73,7 @@ pub fn write_object_as(
                 )));
             }
             if let Some(r) = obj.relocations().iter().find(|r| {
-                matches!(
-                    r.kind,
-                    RelocKind::Aarch64Call26
-                        | RelocKind::Aarch64AdrPrelPgHi21
-                        | RelocKind::Aarch64AddAbsLo12Nc
-                )
+                r.kind.is_instruction_field()
             }) {
                 return Err(ObjectWriteError::new(format!(
                     "relocation {:?} cannot appear in an x86-64 ELF object",
@@ -136,7 +135,7 @@ pub(crate) fn log2_align(align: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mc::object::{Relocation, Section, SectionKind, Symbol, SymbolBinding, SymbolType};
+    use crate::mc::object::{RelocKind, Relocation, Section, SectionKind, Symbol, SymbolBinding, SymbolType};
     use crate::target::TargetOs;
 
     fn tiny() -> ObjectModule {

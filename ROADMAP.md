@@ -429,7 +429,22 @@ baseline; no SSE3+), passing `__m128`-class vectors in xmm registers under
 System V and by reference under Win64; AArch64 selects NEON for the same types
 (encodings diffed with `llvm-mc`); RISC-V (no V extension) scalarizes.
 Execution tests on x86-64 and interpreter tests on AArch64/RISC-V check random
-vector programs against the reference evaluator.
+vector programs against the reference evaluator (Thumb, like RISC-V, scalarizes).
+
+*Arm Cortex-M (Thumb-2)* ✅ (`target::thumb`, triples `thumbv7m-none-eabi` /
+`thumbv7em-none-eabi`): ARMv7-M code under the AAPCS base (soft-float)
+standard — `r0`–`r3`/stack argument passing with doubleword alignment, split
+composites, `sret`; 16/32-bit encodings with `IT` blocks, `movw`/`movt` and
+relaxed branches; `sdiv`/`udiv` or the `__aeabi_idiv` helpers; `i64` through
+`legalize_int` at `W = 32` with register pairs at the ABI boundary; floating
+point lowered to the RTABI helpers (`__aeabi_fadd`, `__aeabi_dcmplt`,
+`__aeabi_f2iz`, …); ELF32 `EM_ARM` EABI5 objects with `R_ARM_THM_CALL`,
+`R_ARM_THM_MOVW_ABS_NC`/`MOVT_ABS` and `R_ARM_ABS32`; stack report and probes;
+and firmware: a generated vector table and reset handler, a linker script, a
+qld link, and `lf build --oformat binary|ihex`. Validated against `llvm-mc` and
+by running every program three ways (reference evaluator, MIR interpreter, a
+Thumb-2 simulator over the encoded bytes). Deferred: FPv4-SP hard float,
+ARMv6-M, `ldrex`/`strex` atomics, `dyn_alloca`, DWARF, PIC.
 
 ### **Phase 8 — Linker & first end-to-end**  ✅
 
