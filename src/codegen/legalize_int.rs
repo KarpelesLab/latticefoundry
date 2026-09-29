@@ -240,7 +240,12 @@ pub fn legalize_ints(
     // 3. Rebuild each function.
     let big_endian = module.data_layout().endian() == Endian::Big;
     for fid in work {
+        // `map_function` carries the attributes (linkage, visibility,
+        // secrecy) over; the declaration line is kept here.
         let (fresh, ()) = module.map_function(fid, |old, b| {
+            if let Some(line) = old.decl_line {
+                b.set_decl_line(line);
+            }
             let part_ty = b.types_mut().int(w);
             let mut lz = Lz { b, old, w, part_ty, vmap: vec![None; old.value_count()], libcalls: &libcalls, big_endian };
             lz.run();

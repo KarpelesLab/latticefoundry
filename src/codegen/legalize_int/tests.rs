@@ -340,3 +340,27 @@ fn nothing_to_do_and_errors() {
     assert_eq!(libgcc_libcall(BinOp::URem, 128), "__umodti3");
     assert_eq!(libgcc_libcall(BinOp::Mul, 16), "__lf_mul_i16");
 }
+
+/// A rebuilt function keeps its linkage, visibility, secrecy and declaration
+/// line (an `internal` helper must not become a global symbol after
+/// legalization).
+#[test]
+fn rebuilt_functions_keep_their_attributes() {
+    let src = "module \"a\"\n\
+        func internal hidden @f(secret i64, i64) -> secret i64 {\n\
+        entry ^0(%a: i64, %b: i64):\n  %s = add %a, %b : i64\n  ret %s\n}\n";
+    let mut syms = StrInterner::new();
+    let mut m = crate::ir::text::parse_module(src, crate::support::diagnostics::FileId::new(0), &mut syms).unwrap();
+    let f = FuncId::from_index(0);
+    let mut b = m.build(f);
+    b.set_decl_line(7);
+    let before = m.function(f).attrs.clone();
+    assert!(before.is_param_secret(0) && before.secret_ret);
+    let report = legalize_ints(&mut m, &mut syms, &LegalizeOptions::new(32)).unwrap();
+    assert!(report.functions.contains(&f), "the function was rebuilt");
+    assert_eq!(m.function(f).attrs, before);
+    assert_eq!(m.function(f).decl_line, Some(7));
+    let obj = crate::target::x86_64::compile_module(&m, &syms);
+    let sym = obj.symbol(obj.symbol_id("f").unwrap());
+    assert_eq!(sym.binding, crate::mc::object::SymbolBinding::Local);
+}
