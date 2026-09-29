@@ -90,7 +90,7 @@ pub fn check_options(arch: TargetArch, opts: &CodegenOptions) -> Result<(), Code
 /// point over each backend's `compile_module_with`. With
 /// [`RelocModel::Pic`] (e.g. `CodegenOptions::default().with_pic(true)`) the
 /// result is a position-independent relocatable object ready for a shared
-/// library.
+/// library (link it with [`crate::link::gnu::shared_library_args`]).
 ///
 /// # Errors
 ///

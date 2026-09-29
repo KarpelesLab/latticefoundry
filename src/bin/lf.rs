@@ -5,11 +5,17 @@
 //! text or `.lfb` binary), verifies it, lowers it to x86-64 machine code, links
 //! it into a **static native executable** with our own linker, and marks it
 //! executable — no system linker or libc involved.
+//!
+//! Other outputs: `--shared` builds a **shared library** of position-
+//! independent code (linked by `qld`, optional `-soname`), `--pie` a
+//! position-independent executable against the host C library (its `main` is
+//! called by the C runtime), and `-c` stops at the relocatable ELF object
+//! (`--pic`/`--pie` pick its relocation model).
 
 use std::path::Path;
 use std::process::ExitCode;
 
-use latticefoundry::codegen::{CodegenOptions, StackAssumptions, StackReport};
+use latticefoundry::codegen::{CodegenOptions, RelocModel, StackAssumptions, StackReport};
 use latticefoundry::ir::{Module, binary, merge_modules, text};
 use latticefoundry::link::{self, ImageOptions};
 use latticefoundry::support::StrInterner;
@@ -49,12 +55,19 @@ fn print_usage() {
         "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3] [--entry <name>] [-g] [--lto] [--no-verify]"
     );
     println!("           [--stack-usage] [--no-stack-probes]");
+    println!("           [--shared [-soname <name>] | --pie | -c [--pic|--pie]] [-L<dir>] [-l<lib>]");
     println!("  lf --version | --help\n");
     println!("  -O0..-O3       optimization level (default: -O0)");
     println!("  -g / --debug   emit DWARF debug info (source lines, symbols)");
     println!("  --lto          link-time optimize across inputs (implied by 2+ inputs)");
     println!("  --stack-usage  print each function's stack frame and the worst-case depth");
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
+    println!("  --shared       build a shared library (position-independent; default lib<input>.so)");
+    println!("  -soname <name> set the shared library's DT_SONAME");
+    println!("  --pie          build a position-independent executable against the host C library");
+    println!("  -c             emit the relocatable ELF object only (default <input>.o)");
+    println!("  --pic          with -c: position-independent code for a shared library");
+    println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie)");
     println!("`lf build` compiles one or more IR modules to a static native executable.");
     println!("With several inputs (or --lto), the modules are IR-linked into one, the");
     println!("-O pipeline runs over the whole program (cross-module inlining), then codegen.");
@@ -70,6 +83,40 @@ struct BuildOptions {
     lto: bool,
     stack_usage: bool,
     stack_probes: bool,
+    output_kind: OutputKind,
+    /// `-c --pic`: shared-library (PIC) object code.
+    pic: bool,
+    /// `-c --pie`: PIE object code.
+    pie: bool,
+    soname: Option<String>,
+    /// `-L<dir>` / `-l<lib>` arguments passed through to the linker.
+    link_extra: Vec<String>,
+}
+
+/// What `lf build` produces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputKind {
+    /// A static executable linked by our own linker (the default).
+    Static,
+    /// A shared library (`--shared`), linked by qld.
+    Shared,
+    /// A PIE executable against the host C library (`--pie`), linked by qld.
+    Pie,
+    /// A relocatable ELF object (`-c`).
+    Object,
+}
+
+impl BuildOptions {
+    /// The relocation model the requested output needs.
+    fn reloc_model(&self) -> RelocModel {
+        match self.output_kind {
+            OutputKind::Shared => RelocModel::Pic,
+            OutputKind::Pie => RelocModel::Pie,
+            OutputKind::Object if self.pic => RelocModel::Pic,
+            OutputKind::Object if self.pie => RelocModel::Pie,
+            OutputKind::Static | OutputKind::Object => RelocModel::Static,
+        }
+    }
 }
 
 fn build(args: &[String]) -> Result<(), String> {
@@ -112,7 +159,9 @@ fn build(args: &[String]) -> Result<(), String> {
     // Lower to a relocatable object, then link into a static executable. With
     // `-g`, also emit DWARF debug info and a debuggable image (section headers +
     // symbol table + `.debug_*`).
-    let cg = CodegenOptions::default().with_stack_probes(opts.stack_probes);
+    let cg = CodegenOptions::default()
+        .with_stack_probes(opts.stack_probes)
+        .with_reloc_model(opts.reloc_model());
     let compiled = if opts.debug {
         let comp_dir = std::env::current_dir()
             .ok()
@@ -129,6 +178,9 @@ fn build(args: &[String]) -> Result<(), String> {
         print_stack_usage(&compiled.stack, &entry);
     }
     let obj = compiled.object;
+    if opts.output_kind != OutputKind::Static {
+        return link_with_qld(&opts, &obj);
+    }
     let image_opts = ImageOptions {
         debug: opts.debug,
         entry,
@@ -143,6 +195,42 @@ fn build(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| default_output(&opts.inputs[0]));
     link::write_executable(&output, &image)?;
     Ok(())
+}
+
+/// Write `obj` as an ELF object and, unless `-c`, link it with qld into a
+/// shared library (`--shared`) or a PIE executable (`--pie`).
+fn link_with_qld(opts: &BuildOptions, obj: &latticefoundry::mc::object::ObjectModule) -> Result<(), String> {
+    use latticefoundry::link::gnu::{self, HostCrt};
+    let stem = default_output(&opts.inputs[0]);
+    let output = opts.output.clone().unwrap_or_else(|| match opts.output_kind {
+        OutputKind::Shared => format!("lib{stem}.so"),
+        OutputKind::Object => format!("{stem}.o"),
+        OutputKind::Pie | OutputKind::Static => stem.clone(),
+    });
+    let elf = latticefoundry::mc::elf::write(obj);
+    if opts.output_kind == OutputKind::Object {
+        return std::fs::write(&output, elf).map_err(|e| format!("cannot write {output}: {e}"));
+    }
+    // qld reads its inputs from files: stage the object in the temp directory.
+    let tmp = std::env::temp_dir().join(format!("lf-{}-{stem}.o", std::process::id()));
+    std::fs::write(&tmp, elf).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    let out = Path::new(&output);
+    let crt = HostCrt::discover();
+    let args = match opts.output_kind {
+        OutputKind::Shared => {
+            gnu::shared_library_args(crt.as_ref(), &[&tmp], opts.soname.as_deref(), &opts.link_extra, out)
+        }
+        _ => {
+            let Some(crt) = crt else {
+                let _ = std::fs::remove_file(&tmp);
+                return Err("--pie links against the host C library, but no crt1.o was found".to_owned());
+            };
+            gnu::host_c_pie_link_args(&crt, &[&tmp], &opts.link_extra, out)
+        }
+    };
+    let result = gnu::link_gnu("lf", &args).map_err(|e| format!("link error: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    result
 }
 
 /// Print the `--stack-usage` table and the worst-case stack depth from `entry`
@@ -182,6 +270,11 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut lto = false;
     let mut stack_usage = false;
     let mut stack_probes = true;
+    let mut output_kind = OutputKind::Static;
+    let mut pic = false;
+    let mut pie = false;
+    let mut soname: Option<String> = None;
+    let mut link_extra: Vec<String> = Vec::new();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -193,6 +286,17 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "--lto" => lto = true,
             "--stack-usage" => stack_usage = true,
             "--no-stack-probes" => stack_probes = false,
+            "--shared" | "-shared" => output_kind = OutputKind::Shared,
+            "--pie" | "-pie" => pie = true,
+            "-c" => output_kind = OutputKind::Object,
+            "--pic" | "-fPIC" | "-fpic" => pic = true,
+            "-soname" | "--soname" => {
+                soname = Some(it.next().ok_or("-soname requires a name")?.clone());
+            }
+            flag if flag.starts_with("--soname=") => soname = Some(flag["--soname=".len()..].to_owned()),
+            flag if (flag.starts_with("-L") || flag.starts_with("-l")) && flag.len() > 2 => {
+                link_extra.push(flag.to_owned());
+            }
             tok if OptLevel::parse_flag(tok).is_some() => {
                 opt = OptLevel::parse_flag(tok).expect("checked");
             }
@@ -206,8 +310,40 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     if inputs.is_empty() {
         return Err("no input file (see `lf --help`)".to_owned());
     }
-
-    Ok(BuildOptions { inputs, output, entry, verify, debug, opt, lto, stack_usage, stack_probes })
+    match output_kind {
+        OutputKind::Shared if pie => return Err("--shared and --pie are exclusive".to_owned()),
+        OutputKind::Static if pie => output_kind = OutputKind::Pie,
+        OutputKind::Object if pie && pic => return Err("--pic and --pie are exclusive".to_owned()),
+        _ => {}
+    }
+    if pic && output_kind != OutputKind::Object && output_kind != OutputKind::Shared {
+        return Err("--pic only applies to -c (use --shared for a shared library)".to_owned());
+    }
+    if soname.is_some() && output_kind != OutputKind::Shared {
+        return Err("-soname only applies to --shared".to_owned());
+    }
+    if !link_extra.is_empty() && !matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
+        return Err("-L/-l only apply to --shared and --pie".to_owned());
+    }
+    if entry.is_some() && output_kind != OutputKind::Static {
+        return Err("--entry only applies to static executables".to_owned());
+    }
+    Ok(BuildOptions {
+        inputs,
+        output,
+        entry,
+        verify,
+        debug,
+        opt,
+        lto,
+        stack_usage,
+        stack_probes,
+        output_kind,
+        pic,
+        pie,
+        soname,
+        link_extra,
+    })
 }
 
 /// The default output path: the input with any extension stripped, or `a.out`.

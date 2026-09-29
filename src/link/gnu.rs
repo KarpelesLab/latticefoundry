@@ -8,6 +8,13 @@
 //! `ld` command line, so this module is a thin bridge onto it. `lf-ld` uses it
 //! for non-`.lfo` inputs, and front ends use [`host_c_link_args`] to link
 //! against the host's C library without a system compiler driver.
+//!
+//! **Shared libraries** and **PIE executables** are built here too, from
+//! objects compiled with a position-independent
+//! [`RelocModel`](crate::codegen::RelocModel): [`shared_library_args`] builds the
+//! `-shared` command line (optional `-soname`), [`host_c_pie_link_args`] the
+//! `-pie` one. Both pass `-z text` (a text relocation is an error — PIC output
+//! never needs one) and `-z noexecstack`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -128,17 +135,50 @@ pub fn host_c_link_args(
     extra: &[String],
     output: &Path,
 ) -> Vec<OsString> {
+    host_c_args(crt, objects, extra, output, false)
+}
+
+/// Like [`host_c_link_args`], for a **position-independent executable**
+/// (`-pie`, with the PIE start files `Scrt1.o`/`crtbeginS.o`/`crtendS.o`).
+/// The objects must be compiled with [`RelocModel::Pie`] or
+/// [`RelocModel::Pic`](crate::codegen::RelocModel::Pic).
+///
+/// [`RelocModel::Pie`]: crate::codegen::RelocModel::Pie
+#[must_use]
+pub fn host_c_pie_link_args(
+    crt: &HostCrt,
+    objects: &[&Path],
+    extra: &[String],
+    output: &Path,
+) -> Vec<OsString> {
+    host_c_args(crt, objects, extra, output, true)
+}
+
+fn host_c_args(
+    crt: &HostCrt,
+    objects: &[&Path],
+    extra: &[String],
+    output: &Path,
+    pie: bool,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |a: &dyn AsRef<std::ffi::OsStr>| args.push(a.as_ref().to_owned());
+    if pie {
+        for a in ["-pie", "-z", "text", "-z", "noexecstack"] {
+            push(&a);
+        }
+    }
+    let (crt1, begin, end) =
+        if pie { ("Scrt1.o", "crtbeginS.o", "crtendS.o") } else { ("crt1.o", "crtbegin.o", "crtend.o") };
     push(&"-o");
     push(&output);
     push(&"--dynamic-linker");
     push(&crt.dynamic_linker);
     push(&"--eh-frame-hdr");
-    push(&crt.libdir.join("crt1.o"));
+    push(&crt.libdir.join(crt1));
     push(&crt.libdir.join("crti.o"));
     if let Some(gcc) = &crt.gcc_libdir {
-        push(&gcc.join("crtbegin.o"));
+        push(&gcc.join(begin));
         push(&format!("-L{}", gcc.display()));
     }
     push(&format!("-L{}", crt.libdir.display()));
@@ -151,9 +191,52 @@ pub fn host_c_link_args(
     push(&"-lc");
     if let Some(gcc) = &crt.gcc_libdir {
         push(&"-lgcc");
-        push(&gcc.join("crtend.o"));
+        push(&gcc.join(end));
     }
     push(&crt.libdir.join("crtn.o"));
+    args
+}
+
+/// The GNU `ld` command line (without `argv[0]`) linking `objects` into the
+/// **shared library** `output`, with `DT_SONAME` set to `soname` when given.
+/// `extra` (e.g. `-L<dir>`, `-lm`) goes after the objects. With a host C
+/// runtime the library also records its dependency on the C library
+/// (`DT_NEEDED libc.so.6`), so C functions it calls resolve even when the
+/// loading program does not itself link libc.
+///
+/// The objects must be position-independent: compile them with
+/// [`RelocModel::Pic`](crate::codegen::RelocModel::Pic) (e.g.
+/// [`crate::target::compile_module_for`] with
+/// `CodegenOptions::default().with_pic(true)`). `-z text` makes any text
+/// relocation a link error.
+#[must_use]
+pub fn shared_library_args(
+    crt: Option<&HostCrt>,
+    objects: &[&Path],
+    soname: Option<&str>,
+    extra: &[String],
+    output: &Path,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+    let mut push = |a: &dyn AsRef<std::ffi::OsStr>| args.push(a.as_ref().to_owned());
+    for a in ["-shared", "-z", "text", "-z", "noexecstack", "--eh-frame-hdr", "-o"] {
+        push(&a);
+    }
+    push(&output);
+    if let Some(soname) = soname {
+        push(&"-soname");
+        push(&soname);
+    }
+    for obj in objects {
+        push(obj);
+    }
+    for e in extra {
+        push(e);
+    }
+    if let Some(crt) = crt {
+        push(&format!("-L{}", crt.libdir.display()));
+        push(&"-lc");
+    }
     args
 }
 
@@ -185,6 +268,29 @@ mod tests {
             .unwrap();
         let status = std::process::Command::new(&exe).status().unwrap();
         assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn pic_object_links_into_a_shared_library() {
+        // The library-level path: compile to a PIC object, link with qld -shared.
+        let src = "module \"s\"\n\
+                   global @g : i64 = i64 5\n\
+                   func @strlen(ptr) -> i64\n\
+                   func @get() -> i64 {\nentry ^0:\n  %v = load @g align 8 : i64\n  ret %v\n}\n";
+        let mut syms = crate::support::StrInterner::new();
+        let m = crate::ir::text::parse_module(src, crate::support::diagnostics::FileId::new(0), &mut syms)
+            .unwrap();
+        let pic = crate::codegen::CodegenOptions::default().with_pic(true);
+        let obj = crate::target::compile_module_for(TargetArch::X86_64, &m, &syms, &pic).unwrap().object;
+        let dir = scratch("shared");
+        let (o, so) = (dir.join("s.o"), dir.join("libs.so"));
+        std::fs::write(&o, crate::mc::elf::write(&obj)).unwrap();
+        let crt = HostCrt::discover();
+        link_gnu("test", &shared_library_args(crt.as_ref(), &[&o], Some("libs.so.0"), &[], &so)).unwrap();
+        let bytes = std::fs::read(&so).unwrap();
+        assert_eq!(&bytes[..4], b"\x7fELF");
+        assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 3, "ET_DYN");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
