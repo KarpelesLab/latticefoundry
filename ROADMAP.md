@@ -353,7 +353,12 @@ for the target's ABI; encodings match the architecture manual.
 and variadics; executes natively). AArch64 ✅ integer + scalar FP + AAPCS64
 aggregates (validated vs `llvm-mc` + an A64-MIR interpreter; no native
 execution on the x86-64 host). RISC-V 🔶 RV64IM integer only (validated vs
-`llvm-mc` + interpreter); F/D, C and relocations remain.
+`llvm-mc` + interpreter); F/D, C and relocations remain. Global data is
+first-class on x86-64: `compile_module` emits every defined global into
+`.rodata` (`constant`) / `.data` / `.bss` (all-zero) with its linkage as the
+symbol binding and `R_X86_64_64` relocations for address-valued initializers
+(`ptr @sym ± off`), through the shared `codegen::data` emitter that AArch64 and
+RISC-V can adopt by passing their absolute-pointer relocation.
 
 ### **Phase 8 — Linker & first end-to-end**  ✅
 
@@ -370,7 +375,12 @@ Produce a runnable program.
 *Progress:* the static linker core is done for `.lfo` and in-memory objects.
 ELF objects, archives, shared libraries and hosted (libc) executables are linked
 by our own `qld` through `link::gnu`; `lf-ld` sends each input to the right
-linker.
+linker. Programs with static data link and run: `.rodata` maps into an `R`
+segment, `.data`+`.bss` into one `RW` segment (`.bss` zero-filled through
+`memsz > filesz`), and data relocations are applied in place; execution tests
+cover a `.rodata` string written by `syscall`, a `.data` counter, a 512 KiB
+`.bss` array, and a pointer table driving an indirect call, plus `lf build`
+end to end and the same objects linked by `qld`.
 
 ### Phase 9 — Certified tier: proof-carrying IR  *(is bet B3)*  ✅
 

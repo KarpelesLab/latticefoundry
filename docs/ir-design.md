@@ -78,6 +78,63 @@ Constants are interned; integer/rational constants are `puremp`-backed and thus
 arbitrary-precision and host-independent. Use-def and def-use edges are
 first-class (they make replace-all-uses and most rewrites cheap).
 
+## 4a. Global data: attributes, address constants, emission  *(decided)*
+
+A `global @x : T [= init]` is a named storage cell; `@x` as an operand is its
+address. With an initializer the module **defines** it; without one it is an
+external reference. Each global carries attributes:
+
+```text
+global [internal | weak] [constant] [detached] @x : T [= init]
+```
+
+- **Linkage** picks the object symbol binding of a definition: external
+  (default, `STB_GLOBAL`), `internal` (`STB_LOCAL`, private to the module), or
+  `weak` (`STB_WEAK`, yields to a strong definition). IR-level linking (LTO
+  merge) resolves by the same strengths: strong beats weak beats detached beats
+  a declaration; two strong definitions of one name are an error.
+- **`constant`** promises the program never stores to it. The backend places it
+  in read-only `.rodata` (a store faults at run time) and optimizations may rely
+  on its initial contents.
+- **`detached`** says the global's storage is supplied *outside the IR* — e.g. a
+  front end that serializes its own data section. The backend emits no storage
+  and no symbol definition for it, exactly as for a declaration; its
+  initializer only keeps it typed. This is what the original builder call
+  `Module::add_global` records, so existing builder clients keep their meaning;
+  `Module::define_global` takes explicit attributes. (Attributes live beside
+  the `Global` in the module so `Global { name, ty, init }` stays source
+  compatible.)
+
+**Initializers** are constants of the global's exact type (the verifier checks
+this recursively): integers, floats, `null`, `poison`, aggregates, and the
+**address constant** `ptr @sym ± offset` — the address of a global or function
+plus a byte offset, a link-time constant. Names in an initializer may refer
+forward. The text parser also accepts `[N x i8] "…"` as input sugar for a byte
+array (exactly `N` UTF-8 bytes; escapes `\n \t \r \0 \\ \" \xHH`), printed back
+in element form. Aggregate and address constants are initializer-only; they are
+never instruction operands (use `@sym` / `ptr_add` there). The `.lfb` format
+carries both from version 2 (version-1 streams still decode, with default
+attributes).
+
+**Emission** (`codegen::data`, shared by every backend; each target supplies
+only its absolute-pointer relocation): every defined, non-detached global is
+serialized per the data layout, little-endian — integers two's-complement at
+their store size, floats as IEEE bits, `null`/`poison` as zeros (zero refines
+poison), arrays at the element stride, structs at natural field offsets with
+zero padding — and placed at its type's alignment in
+
+| global | section |
+|---|---|
+| `constant` | `.rodata` (`PROGBITS`, `A`) |
+| mutable, some nonzero byte or an address field | `.data` (`PROGBITS`, `WA`) |
+| mutable, all zero / poison | `.bss` (`NOBITS`, `WA`) |
+
+with an `STT_OBJECT` symbol of the global's size. An address field becomes a
+pointer-sized zero plus an absolute relocation `S + offset` (`R_X86_64_64` on
+x86-64). The static linker maps `.rodata` into an `R` segment and `.data`+`.bss`
+into one `RW` segment whose `memsz` exceeds its `filesz` by the zero-filled
+`.bss`.
+
 ## 5. Value semantics: poison + freeze, **no `undef`**  *(decided)*
 
 This is the core B1 decision and it must be right before the opcode table exists.
