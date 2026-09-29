@@ -727,6 +727,7 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         }
         RvOp::Unreachable => b.word(ebreak()),
         RvOp::Ecall => b.word(ecall()),
+        RvOp::SextW => b.word(addiw(rnum(&ops[0]), rnum(&ops[1]), 0)),
     }
 }
 

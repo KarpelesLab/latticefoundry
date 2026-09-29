@@ -23,10 +23,24 @@
 //! has hardware divide/remainder, so `div`/`divu`/`rem`/`remu` lower directly —
 //! no fixed-register dance.
 //!
-//! Deferred (noted for a follow-up): the RV32-word forms (`addw`/`sllw`/...) for
-//! sub-64-bit widths — the interpreter masks narrow results to width, so isel is
-//! validated regardless; scalar floating-point (F/D), the compressed (C) and
-//! atomic (A) extensions; and `> 8` integer arguments passed on the stack.
+//! ## Narrow values
+//!
+//! Every data-processing op is the full-width RV64 form, so a narrow value
+//! (`i1`/`i8`/`i16`/`i32`, or an odd `_BitInt` width) lives in a 64-bit register
+//! whose bits above its width are **not** kept clean: an `i8` add of 200 + 100
+//! leaves 300 there, and a `trunc` is a plain move. Ops that only feed the low
+//! bits (`add`, `mul`, `shl`, logic, stores) don't care; every op whose result
+//! depends on the upper bits (compares, right shifts, division, `zext`/`sext`,
+//! branch/select conditions, `switch`) first extends via
+//! [`RiscvTarget::extend64`] (`sext.w`, `andi`, or an `slli`+`srai`/`srli` pair).
+//! At call boundaries the LP64 psABI's signedness-independent rules are
+//! honored: an `i32` argument/return is sign-extended (`sext.w`) and an `i1`
+//! zero-extended, so foreign callees see ABI-conformant registers.
+//!
+//! Deferred (noted for a follow-up): the RV64 word forms (`addw`/`divw`/
+//! `sraw`/...) as a cheaper `i32` lowering; scalar floating-point (F/D), the
+//! compressed (C) and atomic (A) extensions; and `> 8` integer arguments passed
+//! on the stack.
 
 use crate::codegen::isel::{Lower, TargetIsel};
 use crate::codegen::mir::{
@@ -34,6 +48,7 @@ use crate::codegen::mir::{
 };
 use crate::codegen::target::{CallConv, MachineTarget};
 use crate::ir::inst::{BinOp, CastOp, InstKind, IntPred, UnaryOp};
+use crate::ir::types::Type;
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{InstData, Module, ValueId};
 
@@ -43,8 +58,9 @@ use super::regs::RegFile;
 
 /// The RV64IM MIR opcode vocabulary. Operand layouts are documented per variant;
 /// `Def`/`Use` are register operands, the rest are immediates, frame slots, branch
-/// labels, or symbol references. `Imm width` is the operation's integer bit width
-/// (carried for the interpreter's masking; the RV64 encoder uses the 64-bit form).
+/// labels, or symbol references. `Imm width` is the operation's IR integer bit
+/// width, informational only: the encoder always emits the full 64-bit form and
+/// the interpreter models exactly that (see "Narrow values" above).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum RvOp {
@@ -134,6 +150,9 @@ pub enum RvOp {
     /// isel as one consecutive run right before); the kernel returns in `a0` and
     /// preserves every other register, so `a0` is the only def.
     Ecall = 40,
+    /// `[Def d, Use s]` — `sext.w d, s` (`addiw d, s, 0`): sign-extend the low
+    /// 32 bits of `s` to 64.
+    SextW = 41,
 }
 
 impl RvOp {
@@ -146,14 +165,25 @@ impl RvOp {
     /// Decode a MIR [`Opcode`] back to an [`RvOp`].
     pub fn decode(op: Opcode) -> RvOp {
         use RvOp::*;
-        const TABLE: [RvOp; 41] = [
+        const TABLE: [RvOp; 42] = [
             Mv, Li, Add, Sub, And, Or, Xor, Mul, Mulh, Addi, Andi, Ori, Xori, Div, Divu, Rem, Remu,
             Slli, Srli, Srai, Sll, Srl, Sra, SetCmp, Select, Load, Store, FrameAddr, GlobalAddr,
             Call, Ret, J, BrCond, Switch, Unreachable, StoreFrame, LoadFrame, AddiSp, SaveReg,
-            RestoreReg, Ecall,
+            RestoreReg, Ecall, SextW,
         ];
         TABLE[op.0 as usize]
     }
+}
+
+/// A switch case value sign-extended from the scrutinee's `width` to 64 bits,
+/// matching the sign-extended scrutinee it is compared against.
+fn sext_case(value: &Int, width: u32) -> Int {
+    if width >= 64 {
+        return value.clone();
+    }
+    let raw = value.to_i64().map(|v| v as u64).or_else(|| value.to_u64()).unwrap_or(0);
+    let shift = 64 - width;
+    Int::from_i64(((raw << shift) as i64) >> shift)
 }
 
 /// A dense code for an [`IntPred`], packed into the [`RvOp::SetCmp`] immediate and
@@ -233,6 +263,65 @@ impl RiscvTarget {
         if (-2048..=2047).contains(&v) { Some((v as u64) & 0xFFF) } else { None }
     }
 
+    /// Whether `v` is a compare result, whose register holds exactly 0 or 1.
+    fn is_compare(lo: &Lower<'_, Self>, v: ValueId) -> bool {
+        matches!(lo.func().value(v).def, ValueDef::Inst(id)
+            if matches!(lo.func().inst(id).kind, InstKind::ICmp(_) | InstKind::FCmp(_)))
+    }
+
+    /// `v` sign- or zero-extended from its width to all 64 bits of a register.
+    /// Narrow values live in 64-bit registers whose upper bits are not kept
+    /// clean, so anything that reads those bits extends first: `sext.w` for a
+    /// signed `i32`, `andi` for an unsigned width of at most 11 bits (the mask
+    /// fits the sign-extended 12-bit immediate), else an `slli` + `srai`/`srli`
+    /// pair. A 64-bit value, and a compare result being zero-extended, are
+    /// already clean.
+    fn extend64(&self, lo: &mut Lower<'_, Self>, v: ValueId, signed: bool) -> VReg {
+        let r = lo.reg(v);
+        let width = lo.int_width(v);
+        if width >= 64 || (!signed && Self::is_compare(lo, v)) {
+            return r;
+        }
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        if signed && width == 32 {
+            lo.emit(MachineInst::new(RvOp::SextW.opcode(), vec![def_v(d), use_v(r)]));
+        } else if !signed && width <= 11 {
+            let m = (1u64 << width) - 1;
+            lo.emit(MachineInst::new(
+                RvOp::Andi.opcode(),
+                vec![def_v(d), use_v(r), imm(m), imm(64)],
+            ));
+        } else {
+            let k = u64::from(64 - width);
+            let t = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(MachineInst::new(RvOp::Slli.opcode(), vec![def_v(t), use_v(r), imm(k), imm(64)]));
+            let right = if signed { RvOp::Srai } else { RvOp::Srli };
+            lo.emit(MachineInst::new(right.opcode(), vec![def_v(d), use_v(t), imm(k), imm(64)]));
+        }
+        d
+    }
+
+    /// An `i1` branch/select condition as a register holding exactly 0 or 1
+    /// (`bnez` tests all 64 bits, and the branchless select blends with
+    /// `0 - cond`). A compare's result already is; anything else (e.g. a
+    /// `trunc` to `i1`) may carry garbage above bit 0.
+    fn clean_cond(&self, lo: &mut Lower<'_, Self>, v: ValueId) -> VReg {
+        self.extend64(lo, v, false)
+    }
+
+    /// A call argument / return value as the LP64 psABI wants it in a register:
+    /// an `i32` sign-extended to 64 bits (whatever its C signedness) and an `i1`
+    /// (`_Bool`) zero-extended. Other narrow widths depend on the C type's
+    /// signedness, which the IR does not carry, and are passed as is.
+    fn abi_value(&self, lo: &mut Lower<'_, Self>, v: ValueId) -> VReg {
+        let is_int = matches!(lo.types().get(lo.func().value_type(v)), Type::Int(_));
+        match lo.int_width(v) {
+            32 if is_int => self.extend64(lo, v, true),
+            1 if is_int => self.extend64(lo, v, false),
+            _ => lo.reg(v),
+        }
+    }
+
     fn lower_bin(&self, lo: &mut Lower<'_, Self>, op: BinOp, inst: &InstData) {
         let d = lo.result_reg(inst);
         let width = lo.int_width(inst.operands()[0]);
@@ -279,26 +368,31 @@ impl RiscvTarget {
             BinOp::Shl => self.lower_shift(lo, RvOp::Slli, RvOp::Sll, d, inst, width),
             BinOp::LShr => self.lower_shift(lo, RvOp::Srli, RvOp::Srl, d, inst, width),
             BinOp::AShr => self.lower_shift(lo, RvOp::Srai, RvOp::Sra, d, inst, width),
-            BinOp::UDiv => self.lower_rr(lo, RvOp::Divu, d, inst, width),
-            BinOp::SDiv => self.lower_rr(lo, RvOp::Div, d, inst, width),
-            BinOp::URem => self.lower_rr(lo, RvOp::Remu, d, inst, width),
-            BinOp::SRem => self.lower_rr(lo, RvOp::Rem, d, inst, width),
+            BinOp::UDiv => self.lower_div(lo, RvOp::Divu, false, d, inst, width),
+            BinOp::SDiv => self.lower_div(lo, RvOp::Div, true, d, inst, width),
+            BinOp::URem => self.lower_div(lo, RvOp::Remu, false, d, inst, width),
+            BinOp::SRem => self.lower_div(lo, RvOp::Rem, true, d, inst, width),
             // Floating-point binops are out of the integer subset (deferred); a
             // zero keeps the MIR well-formed (never reached by the integer tests).
             _ => lo.emit(MachineInst::new(RvOp::Li.opcode(), vec![def_v(d), imm(0)])),
         }
     }
 
-    fn lower_rr(
+    /// Division / remainder. The 64-bit `div`/`rem` see every bit of both
+    /// operands, so a narrow dividend and divisor are extended by the
+    /// operation's signedness first.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_div(
         &self,
         lo: &mut Lower<'_, Self>,
         rop: RvOp,
+        signed: bool,
         d: VReg,
         inst: &InstData,
         width: u32,
     ) {
-        let a = lo.reg(inst.operands()[0]);
-        let b = lo.reg(inst.operands()[1]);
+        let a = self.extend64(lo, inst.operands()[0], signed);
+        let b = self.extend64(lo, inst.operands()[1], signed);
         lo.emit(MachineInst::new(
             rop.opcode(),
             vec![def_v(d), use_v(a), use_v(b), imm(u64::from(width))],
@@ -314,7 +408,12 @@ impl RiscvTarget {
         inst: &InstData,
         width: u32,
     ) {
-        let a = lo.reg(inst.operands()[0]);
+        // A right shift brings the bits above the width down into the result.
+        let a = match imm_op {
+            RvOp::Srli => self.extend64(lo, inst.operands()[0], false),
+            RvOp::Srai => self.extend64(lo, inst.operands()[0], true),
+            _ => lo.reg(inst.operands()[0]),
+        };
         if let Some(c) = Self::const_of(lo, inst.operands()[1]) {
             let shmask = if width >= 64 { 63 } else { u64::from(width) - 1 };
             let shamt = c.to_u64().unwrap_or(0) & shmask;
@@ -323,7 +422,13 @@ impl RiscvTarget {
                 vec![def_v(d), use_v(a), imm(shamt), imm(u64::from(width))],
             ));
         } else {
-            let b = lo.reg(inst.operands()[1]);
+            // The hardware takes the count from the low 6 bits of `rs2`; a count
+            // narrower than that may carry garbage inside those bits.
+            let b = if lo.int_width(inst.operands()[1]) < 6 {
+                self.extend64(lo, inst.operands()[1], false)
+            } else {
+                lo.reg(inst.operands()[1])
+            };
             lo.emit(MachineInst::new(
                 var_op.opcode(),
                 vec![def_v(d), use_v(a), use_v(b), imm(u64::from(width))],
@@ -331,13 +436,19 @@ impl RiscvTarget {
         }
     }
 
-    /// Conversions. Every integer cast (width change, ptr↔int, bitcast) is a
-    /// low-bits-preserving copy — the interpreter masks each op's result to its
-    /// width, so a narrowing/widening cast needs no explicit sign/zero extension
-    /// in the integer subset. Float conversions are deferred.
-    fn lower_cast(&self, lo: &mut Lower<'_, Self>, _op: CastOp, inst: &InstData) {
+    /// Conversions. `zext`/`sext` (and `inttoptr` from a narrower integer)
+    /// extend from the source's width, since its register's upper bits are not
+    /// clean; truncation, ptr→int and bitcasts are low-bits-preserving copies.
+    /// Float conversions are deferred (a plain copy keeps the MIR well-formed).
+    fn lower_cast(&self, lo: &mut Lower<'_, Self>, op: CastOp, inst: &InstData) {
         let d = lo.result_reg(inst);
-        let s = lo.reg(inst.operands()[0]);
+        let src = inst.operands()[0];
+        let s = match op {
+            CastOp::ZExt | CastOp::SExt | CastOp::IntToPtr => {
+                self.extend64(lo, src, op == CastOp::SExt)
+            }
+            _ => lo.reg(src),
+        };
         lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(s)]));
     }
 
@@ -356,7 +467,7 @@ impl RiscvTarget {
         let mut reg_moves: Vec<(PReg, VReg)> = Vec::new();
         let mut int_i = 0usize;
         for &arg in args {
-            let v = lo.reg(arg);
+            let v = self.abi_value(lo, arg);
             if int_i < cc.arg_regs.len() {
                 let areg = cc.arg_regs[int_i];
                 int_i += 1;
@@ -479,9 +590,17 @@ impl TargetIsel for RiscvTarget {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
             InstKind::ICmp(pred) => {
                 let d = lo.result_reg(inst);
-                let a = lo.reg(inst.operands()[0]);
-                let b = lo.reg(inst.operands()[1]);
+                // `slt`/`sltu`/`sub` read all 64 bits: extend a narrow pair
+                // first. A signed predicate needs sign-extension; for the others
+                // either extension works (sign-extending both sides preserves
+                // equality and unsigned order), so an `i32` uses the single
+                // `sext.w` and anything else zero-extends.
                 let width = lo.int_width(inst.operands()[0]);
+                let signed =
+                    matches!(pred, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge)
+                        || width == 32;
+                let a = self.extend64(lo, inst.operands()[0], signed);
+                let b = self.extend64(lo, inst.operands()[1], signed);
                 lo.emit(MachineInst::new(
                     RvOp::SetCmp.opcode(),
                     vec![
@@ -528,7 +647,8 @@ impl TargetIsel for RiscvTarget {
             InstKind::PtrAdd { .. } => {
                 let d = lo.result_reg(inst);
                 let base = lo.reg(inst.operands()[0]);
-                let off = lo.reg(inst.operands()[1]);
+                // The byte offset is signed; a narrow one is sign-extended.
+                let off = self.extend64(lo, inst.operands()[1], true);
                 lo.emit(MachineInst::new(
                     RvOp::Add.opcode(),
                     vec![def_v(d), use_v(base), use_v(off), imm(64)],
@@ -536,7 +656,7 @@ impl TargetIsel for RiscvTarget {
             }
             InstKind::Select => {
                 let d = lo.result_reg(inst);
-                let c = lo.reg(inst.operands()[0]);
+                let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = lo.reg(inst.operands()[1]);
                 let f = lo.reg(inst.operands()[2]);
                 lo.emit(MachineInst::new(
@@ -585,7 +705,7 @@ impl TargetIsel for RiscvTarget {
         match &inst.kind {
             InstKind::Ret => {
                 if let Some(&v) = inst.operands().first() {
-                    let r = lo.reg(v);
+                    let r = self.abi_value(lo, v);
                     let ret = self.rf.cc.ret_reg;
                     lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(ret), use_v(r)]));
                 }
@@ -597,7 +717,7 @@ impl TargetIsel for RiscvTarget {
                 lo.emit(self.jump(e));
             }
             InstKind::CondBr { if_true, if_false, true_args, false_args } => {
-                let cond = lo.reg(inst.operands()[0]);
+                let cond = self.clean_cond(lo, inst.operands()[0]);
                 let ops = inst.operands();
                 let tb = 1 + *true_args as usize;
                 let fb = tb + *false_args as usize;
@@ -611,7 +731,10 @@ impl TargetIsel for RiscvTarget {
                 ));
             }
             InstKind::Switch(data) => {
-                let cond = lo.reg(inst.operands()[0]);
+                // Cases are compared as 64-bit values: sign-extend the scrutinee
+                // and each case value from the scrutinee's width.
+                let width = lo.int_width(inst.operands()[0]);
+                let cond = self.extend64(lo, inst.operands()[0], true);
                 let ops = inst.operands();
                 let mut idx = 1usize;
                 let dcount = data.default_args as usize;
@@ -625,7 +748,7 @@ impl TargetIsel for RiscvTarget {
                     let cvals: Vec<_> = ops[idx..idx + n].to_vec();
                     idx += n;
                     let ce = lo.edge_to(case.target, &cvals);
-                    operands.push(MachineOperand::Imm(case.value.clone()));
+                    operands.push(MachineOperand::Imm(sext_case(&case.value, width)));
                     operands.push(MachineOperand::Label(ce));
                 }
                 lo.emit(MachineInst::new(RvOp::Switch.opcode(), operands));

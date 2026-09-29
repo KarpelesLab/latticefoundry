@@ -15,6 +15,16 @@
 //! handed across a call (a by-reference argument, an `alloca`'d slot) resolves in
 //! the callee exactly as on hardware; a call's inputs are its `Use(physical)`
 //! argument-register operands and its output the return register `a0`.
+//!
+//! ## Register width
+//!
+//! Every register is modeled as the 64-bit pattern the hardware holds, and each
+//! op as the RV64 instruction the encoder emits: the encoder always uses the
+//! full-width forms (`add`, `sra`, `div`, `slt`, ...), so the MIR `width`
+//! immediate is ignored here. A narrow value therefore keeps whatever bits its
+//! computation left above its width (an `i8` add of 200 + 100 holds 300), and
+//! an isel that forgets to extend before an op that reads those bits is caught.
+//! The only 32-bit form, `sext.w` (`addiw rd, rs, 0`), sign-extends its low word.
 
 use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, PReg, Reg, StackSlot};
 use crate::codegen::target::MachineTarget;
@@ -193,7 +203,12 @@ impl Machine<'_> {
         match op {
             RvOp::Li => {
                 let d = def(ops, 0)?;
-                fr.regs.insert(d, imm(ops, 1)?.clone());
+                fr.regs.insert(d, mask(imm(ops, 1)?, 64));
+            }
+            RvOp::SextW => {
+                let d = def(ops, 0)?;
+                let s = self.rd(fr, use_reg(ops, 1)?);
+                fr.regs.insert(d, mask(&signed(&mask(&s, 32), 32), 64));
             }
             RvOp::Mv => {
                 let d = def(ops, 0)?;
@@ -208,7 +223,7 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let bb = self.rd(fr, use_reg(ops, 2)?);
-                let w = imm_u32(ops, 3)?;
+                let w = 64;
                 let res = match op {
                     RvOp::Add => a.add(&bb),
                     RvOp::Sub => a.sub(&bb),
@@ -217,12 +232,13 @@ impl Machine<'_> {
                     RvOp::Xor => a.bitxor(&bb),
                     RvOp::Mul => a.mul(&bb),
                     RvOp::Mulh => {
-                        // Signed high half of the `w`-bit product.
-                        let p = signed(&mask(&a, w), w).mul(&signed(&mask(&bb, w), w));
-                        p.div_2k_trunc(w)
+                        // Signed high half of the 128-bit product.
+                        let p = signed(&a, w).mul(&signed(&bb, w));
+                        p.div_floor(&Int::ONE.mul_2k(w))
                     }
                     RvOp::Sll | RvOp::Srl | RvOp::Sra => {
-                        let k = (bb.to_u64().unwrap_or(0) % u64::from(w.max(1))) as u32;
+                        // The count is the low 6 bits of `rs2`.
+                        let k = (bb.to_u64().unwrap_or(0) % 64) as u32;
                         return self.set_shift(fr, d, op, &a, k, w);
                     }
                     _ => unreachable!(),
@@ -233,7 +249,7 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let k = imm(ops, 2)?.clone();
-                let w = imm_u32(ops, 3)?;
+                let w = 64;
                 // The 12-bit immediate is sign-extended before the operation.
                 let k = signed(&k.mod_2k(12), 12);
                 let res = match op {
@@ -249,7 +265,7 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let k = imm(ops, 2)?.to_u64().unwrap_or(0) as u32;
-                let w = imm_u32(ops, 3)?;
+                let w = 64;
                 let sop = match op {
                     RvOp::Slli => RvOp::Sll,
                     RvOp::Srli => RvOp::Srl,
@@ -261,16 +277,14 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let bb = self.rd(fr, use_reg(ops, 2)?);
-                let w = imm_u32(ops, 3)?;
-                fr.regs.insert(d, self.divrem(op, &a, &bb, w)?);
+                fr.regs.insert(d, self.divrem(op, &a, &bb, 64)?);
             }
             RvOp::SetCmp => {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let bb = self.rd(fr, use_reg(ops, 2)?);
                 let pred = imm(ops, 3)?.to_u64().unwrap_or(0) as u8;
-                let w = imm_u32(ops, 4)?;
-                let r = eval_pred(pred, &a, &bb, w);
+                let r = eval_pred(pred, &a, &bb, 64);
                 fr.regs.insert(d, if r { Int::ONE } else { Int::ZERO });
             }
             RvOp::Select => {
@@ -278,7 +292,13 @@ impl Machine<'_> {
                 let c = self.rd(fr, use_reg(ops, 1)?);
                 let t = self.rd(fr, use_reg(ops, 2)?);
                 let f = self.rd(fr, use_reg(ops, 3)?);
-                fr.regs.insert(d, if c.is_zero() { f } else { t });
+                // The encoder's branchless blend: `mask = 0 - c`, then
+                // `(t & mask) | (f & !mask)`. Only a condition of exactly 0 or 1
+                // selects cleanly; anything else mixes the two operands' bits.
+                let all = Int::ONE.mul_2k(64).sub(&Int::ONE);
+                let m = mask(&Int::ZERO.sub(&c), 64);
+                let res = t.bitand(&m).bitor(&f.bitand(&all.bitxor(&m)));
+                fr.regs.insert(d, res);
             }
             RvOp::Load => {
                 let d = def(ops, 0)?;
@@ -337,12 +357,14 @@ impl Machine<'_> {
                 return Ok(Flow::Goto(target));
             }
             RvOp::Switch => {
+                // Each case value is materialized (`li t2`) as a 64-bit pattern
+                // and compared with all 64 bits of the scrutinee (`beq`).
                 let c = self.rd(fr, use_reg(ops, 0)?);
                 let mut target = label(ops, 1)?;
                 let mut i = 2;
                 while i + 1 < ops.len() {
                     if let (MachineOperand::Imm(v), MachineOperand::Label(b)) = (&ops[i], &ops[i + 1])
-                        && *v == c
+                        && mask(v, 64) == c
                     {
                         target = *b;
                         break;
@@ -429,7 +451,9 @@ impl Machine<'_> {
         if r == Reg::Physical(gpr(super::regs::ZERO)) {
             return Int::ZERO;
         }
-        fr.regs.get(&r).cloned().unwrap_or(Int::ZERO)
+        // Inputs handed in as negative `Int`s are normalized to their 64-bit
+        // two's-complement pattern.
+        fr.regs.get(&r).map(|v| mask(v, 64)).unwrap_or(Int::ZERO)
     }
 }
 
