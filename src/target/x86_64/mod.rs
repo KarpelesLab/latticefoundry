@@ -32,6 +32,8 @@ pub(crate) mod regs;
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod syscall_tests;
 
 pub use encode::{
     DebugSource, compile_function, compile_module, compile_module_debug, compile_to_elf,

@@ -124,6 +124,7 @@ impl AbstractDomain for ConstLattice {
                 | InstKind::DynAlloca { .. }
                 | InstKind::Load { .. }
                 | InstKind::Call
+                | InstKind::Syscall
         ) {
             return ConstLattice::Top;
         }

@@ -299,6 +299,45 @@ fn lower_dyn_alloca_runs() {
 }
 
 #[test]
+fn syscall_lowers_and_the_interpreter_refuses_it() {
+    // The virtual target has no kernel: `syscall` lowers to a well-formed opaque
+    // `VOp::Syscall` whose operands stay live (so register allocation keeps them),
+    // and the interpreter reports a clean "unsupported side effect" instead of
+    // inventing a result.
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("sys"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let nr = b.const_i64(i64t, 60);
+        let r = b.syscall(nr, &[x, x, x, x, x, x]);
+        b.ret(Some(r));
+    }
+    let target = VirtualTarget::new();
+    let mut mf = target.select(&m, f);
+    assert_well_formed(&mf, &target);
+    let sys = mf
+        .block_ids()
+        .flat_map(|b| mf.block(b).insts.clone())
+        .find(|i| VOp::decode(i.opcode) == VOp::Syscall)
+        .expect("a VOp::Syscall is emitted");
+    assert_eq!(sys.defs().count(), 1, "one result");
+    assert_eq!(sys.uses().count(), 7, "number + six arguments");
+
+    let funcs = vec![mf.clone()];
+    let err = interp::run(&target, &funcs, 0, &[Int::from_i64(1)]).unwrap_err();
+    assert!(err.contains("unsupported side effect: syscall"), "{err}");
+
+    // Register allocation handles it like any other instruction.
+    regalloc::allocate(&mut mf, &target);
+    assert_all_physical(&mf);
+}
+
+#[test]
 fn lower_call_runs() {
     let target = VirtualTarget::new();
     let (m, callee, caller) = build_call();

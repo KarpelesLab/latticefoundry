@@ -48,7 +48,8 @@
 //! ## What is *not* here
 //!
 //! Stateful and positional ops — `Alloca`, `DynAlloca`, `Load`, `Store`,
-//! `Call`, and the
+//! `Call`, `Syscall` (an opaque effect on the outside world, which no pure
+//! evaluator can perform), and the
 //! terminators `Ret`/`Br`/`CondBr`/`Switch`/`Unreachable` — are about memory
 //! and control-flow *state*, not pure value production. They belong to the
 //! interpreter / verifier layer built in a later phase, and [`eval`] panics if
@@ -241,7 +242,7 @@ fn float_kind(types: &TypeContext, ty: TypeId) -> Option<FloatKind> {
 /// # Panics
 ///
 /// Panics if `kind` is a stateful or terminator opcode (`Alloca`, `DynAlloca`,
-/// `Load`, `Store`, `Call`, `Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`); those are
+/// `Load`, `Store`, `Call`, `Syscall`, `Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`); those are
 /// not pure value production and are handled by the interpreter/verifier layer,
 /// not here. Callers must only pass value-producing opcodes.
 pub fn eval(
@@ -271,6 +272,7 @@ pub fn eval(
         | InstKind::Load { .. }
         | InstKind::Store { .. }
         | InstKind::Call
+        | InstKind::Syscall
         | InstKind::Ret
         | InstKind::Br(_)
         | InstKind::CondBr { .. }

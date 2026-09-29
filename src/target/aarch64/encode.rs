@@ -207,6 +207,10 @@ pub(crate) fn blr(rn: u32) -> u32 {
 pub(crate) fn ret(rn: u32) -> u32 {
     0xD65F_0000 | (rn << 5)
 }
+/// `svc #imm16` (supervisor call; Linux uses `svc #0`).
+pub(crate) fn svc(imm16: u32) -> u32 {
+    0xD400_0001 | ((imm16 & 0xFFFF) << 5)
+}
 /// `brk #imm16`.
 pub(crate) fn brk(imm16: u32) -> u32 {
     0xD420_0000 | ((imm16 & 0xFFFF) << 5)
@@ -790,6 +794,7 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             b.branch(b_uncond(0), default, FixupKind::Imm26);
         }
         A64Op::Unreachable => b.word(brk(1)),
+        A64Op::Svc => b.word(svc(0)),
         A64Op::StpFpLr => b.word(stp_pre(FP.into(), LR.into(), SP.into(), -2)),
         A64Op::LdpFpLr => b.word(ldp_post(FP.into(), LR.into(), SP.into(), 2)),
         A64Op::MovFpSp => b.word(add_imm(1, FP.into(), SP.into(), 0)),

@@ -402,7 +402,8 @@ programs.
 
 *Progress:* JIT ✅, DWARF line tables (`lf build -g`, gdb-loadable) ✅,
 `-O0..-O3` + LTO ✅, z3rs superoptimizer ✅, native dynamic stack allocation
-(`DynAlloca`, x86-64) ✅. Open: dynamic linking, PGO hooks, sanitizers, richer
+(`DynAlloca`, x86-64) ✅, native `syscall` op (Linux ABI on all three targets;
+x86-64 execution-tested, freestanding) ✅. Open: dynamic linking, PGO hooks, sanitizers, richer
 alias analysis.
 
 ## 5. Testing strategy

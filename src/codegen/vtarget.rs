@@ -100,6 +100,11 @@ pub enum VOp {
     /// (`dyn_alloca`): bump-allocate `n` bytes of `align`-aligned frame memory and
     /// put the base address in `dst`. Modeled by the interpreter's flat memory.
     DynAlloca = 31,
+    /// `[Def dst, Use nr, Use args...]` — an operating-system call (`syscall`).
+    /// The virtual target has no kernel: it is kept structurally well-formed (an
+    /// opaque effect whose operands stay live) and the interpreter refuses to
+    /// execute it rather than invent a result.
+    Syscall = 32,
 }
 
 impl VOp {
@@ -112,10 +117,10 @@ impl VOp {
     /// Decode a target [`Opcode`] back to a [`VOp`].
     pub fn decode(op: Opcode) -> VOp {
         use VOp::*;
-        const TABLE: [VOp; 32] = [
+        const TABLE: [VOp; 33] = [
             Li, Move, Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, ICmp,
             Select, Cast, Load, Store, FrameAddr, GlobalAddr, Call, Ret, Jmp, BrCond, Switch,
-            Unreachable, StackStore, StackLoad, Unsupported, DynAlloca,
+            Unreachable, StackStore, StackLoad, Unsupported, DynAlloca, Syscall,
         ];
         TABLE[op.0 as usize]
     }
@@ -487,6 +492,14 @@ impl TargetIsel for VirtualTarget {
                 lo.emit(self.emit_move(Reg::Virtual(d), Reg::Virtual(s)));
             }
             InstKind::Call => self.lower_call(lo, inst),
+            InstKind::Syscall => {
+                let d = lo.result_reg(inst);
+                let mut operands = vec![MachineOperand::Def(Reg::Virtual(d))];
+                for &o in inst.operands() {
+                    operands.push(MachineOperand::Use(Reg::Virtual(lo.reg(o))));
+                }
+                lo.emit(MachineInst::new(VOp::Syscall.opcode(), operands));
+            }
             // Float / unmodeled value ops: keep structurally well-formed.
             InstKind::Unary(_) | InstKind::FCmp(_) | InstKind::Cast(_) => {
                 let d = lo.result_reg(inst);

@@ -573,3 +573,131 @@ fn dce_is_deterministic() {
     run_dce(&mut m2, f2);
     assert_eq!(canon(m1.function(f1)), canon(m2.function(f2)));
 }
+
+// ---------------------------------------------------------------------------
+// `syscall`: an opaque effect every pass must keep, in place and in order.
+// ---------------------------------------------------------------------------
+
+/// `f(n) -> i64`: a stack slot initialized to 5 whose address escapes into a
+/// syscall, then a loop running two syscalls per iteration with loop-invariant
+/// operands (one result used, one unused), then a reload of the slot:
+///
+/// ```text
+/// entry:  slot = alloca i64; store 5 -> slot; s0 = syscall 0, 0, slot, 8
+///         br header(0, 0)
+/// header(i, acc): cond_br (i < n), body, exit
+/// body:   r = syscall 1, 1, slot, 8; syscall 39 (dead); br header(i+1, acc+r)
+/// exit:   v = load slot; ret v + acc
+/// ```
+fn build_syscall_loop() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("sys");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("f"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let n = b.param(entry, 0);
+        let header = b.create_block(&[i64t, i64t]);
+        let body = b.create_block(&[]);
+        let exit = b.create_block(&[]);
+
+        b.switch_to(entry);
+        let slot = b.alloca(i64t);
+        let five = b.const_i64(i64t, 5);
+        b.store(i64t, slot, five, 8);
+        let zero = b.const_i64(i64t, 0);
+        let eight = b.const_i64(i64t, 8);
+        // read(0, slot, 8): the kernel may overwrite the slot.
+        b.syscall(zero, &[zero, slot, eight]);
+        b.br(header, &[zero, zero]);
+
+        b.switch_to(header);
+        let i = b.param(header, 0);
+        let acc = b.param(header, 1);
+        let c = b.icmp(IntPred::Slt, i, n);
+        b.cond_br(c, body, &[], exit, &[]);
+
+        b.switch_to(body);
+        let one = b.const_i64(i64t, 1);
+        let r = b.syscall(one, &[one, slot, eight]);
+        let getpid = b.const_i64(i64t, 39);
+        b.syscall(getpid, &[]);
+        let acc2 = b.add(acc, r, Flags::NONE);
+        let i2 = b.add(i, one, Flags::NONE);
+        b.br(header, &[i2, acc2]);
+
+        b.switch_to(exit);
+        let v = b.load(i64t, slot, 8);
+        let s = b.add(v, acc, Flags::NONE);
+        b.ret(Some(s));
+    }
+    (m, f)
+}
+
+fn n_syscall(f: &Function) -> usize {
+    count_kind(f, |k| matches!(k, InstKind::Syscall))
+}
+
+/// The blocks holding a syscall, as the number of syscalls per such block.
+fn syscalls_per_block(f: &Function) -> Vec<usize> {
+    f.blocks()
+        .map(|(_, blk)| blk.insts().iter().filter(|&&i| matches!(f.inst(i).kind, InstKind::Syscall)).count())
+        .filter(|&c| c > 0)
+        .collect()
+}
+
+#[test]
+fn every_pass_keeps_syscalls_in_place() {
+    for name in ["dce", "sccp", "licm", "egraph", "simplify_cfg", "mem2reg", "inline"] {
+        let (mut m, f) = build_syscall_loop();
+        let before = syscalls_per_block(m.function(f));
+        crate::transform::pipeline::run_passes(
+            &mut m,
+            vec![crate::transform::pipeline::pass_by_name(name).unwrap()],
+        );
+        assert!(verify_module(&m).is_ok(), "{name} keeps the module valid");
+        let func = m.function(f);
+        assert_eq!(n_syscall(func), 3, "{name} must keep all three syscalls");
+        // One in the entry, two together in the loop body: nothing hoisted
+        // (LICM), sunk, split or merged across blocks.
+        assert_eq!(syscalls_per_block(func), before, "{name} must not move a syscall");
+    }
+}
+
+#[test]
+fn syscall_escapes_its_pointer_and_clobbers_memory() {
+    // Even the full -O3 pipeline must keep the slot in memory (its address
+    // escaped into a syscall that may write it) and must not forward the stored
+    // 5 into the final load, nor fold the syscall-derived result.
+    let (mut m, f) = build_syscall_loop();
+    crate::transform::pipeline::optimize(&mut m, crate::transform::pipeline::OptLevel::O3);
+    assert!(verify_module(&m).is_ok());
+    let func = m.function(f);
+    assert_eq!(n_syscall(func), 3, "no syscall dropped at -O3");
+    assert_eq!(n_alloca(func), 1, "the escaped slot is not promoted");
+    assert_eq!(n_load(func), 1, "the reload after the syscalls survives");
+    assert!(ret_value_const(&m, f).is_top(), "a syscall-dependent result is unknown");
+}
+
+#[test]
+fn syscall_result_is_never_a_constant() {
+    // `ret syscall(39)`: the constant domain (SCCP's lattice) knows nothing.
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("sys-top");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![], i64t, false);
+    let f = m.declare_function(syms.intern("g"), sig);
+    {
+        let mut b = m.build(f);
+        b.create_entry_block();
+        let nr = b.const_i64(i64t, 39);
+        let r = b.syscall(nr, &[]);
+        b.ret(Some(r));
+    }
+    assert!(ret_value_const(&m, f).is_top());
+    crate::transform::pipeline::optimize(&mut m, crate::transform::pipeline::OptLevel::O2);
+    assert_eq!(n_syscall(m.function(f)), 1);
+    assert!(ret_value_const(&m, f).is_top());
+}

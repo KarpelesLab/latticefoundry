@@ -167,6 +167,11 @@ pub enum A64Op {
     /// stack-passed parameter's home (`[x29 + 16 + k]`, above the saved
     /// frame-pointer/link-register pair).
     LeaFpOff = 53,
+    /// `[Def x0, Use x8, Use x0.., ]` — the Linux supervisor call `svc #0`. The
+    /// syscall number is in `x8` and the arguments in `x0..x5` (moved there by
+    /// isel as one consecutive run right before); the kernel returns in `x0` and
+    /// preserves every other register, so `x0` is the only def.
+    Svc = 54,
 }
 
 impl A64Op {
@@ -179,12 +184,12 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 54] = [
+        const TABLE: [A64Op; 55] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
             AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
-            Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff,
+            Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc,
         ];
         TABLE[op.0 as usize]
     }
@@ -1249,6 +1254,27 @@ impl TargetIsel for AArch64Target {
                 lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
             }
             InstKind::Call => self.lower_call(lo, inst),
+            InstKind::Syscall => {
+                // Linux AArch64 syscall ABI: number in `x8`, arguments in
+                // `x0..x5`, result in `x0`. Materialize every operand first, then
+                // move them into the fixed registers as one consecutive run right
+                // before the `svc` (as `lower_call` does), so no vreg definition
+                // sits between an ABI register's write and its read.
+                let vals: Vec<VReg> = inst.operands().iter().map(|&o| lo.reg(o)).collect();
+                let mut moves: Vec<(PReg, VReg)> = vec![(regs::gpr(8), vals[0])];
+                for (k, &v) in vals[1..].iter().enumerate() {
+                    moves.push((regs::gpr(k as u16), v));
+                }
+                let x0 = regs::gpr(0);
+                let mut operands = vec![def(x0)];
+                for &(r, v) in &moves {
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(r), use_v(v)]));
+                    operands.push(use_p(r));
+                }
+                lo.emit(MachineInst::new(A64Op::Svc.opcode(), operands));
+                let d = lo.result_reg(inst);
+                lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_p(x0)]));
+            }
             InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),
             InstKind::FCmp(pred) => self.lower_fcmp(lo, *pred, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),

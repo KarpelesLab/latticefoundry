@@ -426,6 +426,37 @@ impl<'a> Ctx<'a> {
                 }
             }
             InstKind::Call => self.check_call(inst, data),
+            InstKind::Syscall => {
+                // `[nr, args...]`: the number plus 0..=6 arguments (the Linux
+                // register ABI on every target carries at most six).
+                if ops.is_empty() || ops.len() > 7 {
+                    self.err(format!(
+                        "instruction #{}: syscall takes a number and 0..=6 arguments, found {} operand(s)",
+                        inst.index(),
+                        ops.len(),
+                    ));
+                }
+                // Each operand fills one 64-bit register exactly: `i64` or
+                // `ptr` (front ends extend narrower integers explicitly).
+                for (i, &o) in ops.iter().enumerate() {
+                    let ot = func.value_type(o);
+                    if !is_ptr(module, ot) && !is_int_width(module, ot, 64) {
+                        let what = if i == 0 { "number".to_string() } else { format!("argument {}", i - 1) };
+                        self.err(format!(
+                            "instruction #{}: syscall {what} must be i64 or ptr, found {}",
+                            inst.index(),
+                            render_type(module, ot),
+                        ));
+                    }
+                }
+                if !is_int_width(module, ty, 64) {
+                    self.err(format!(
+                        "instruction #{}: syscall result must be i64, found {}",
+                        inst.index(),
+                        render_type(module, ty),
+                    ));
+                }
+            }
             InstKind::Ret => self.check_ret(inst, ops),
             InstKind::Br(_) | InstKind::CondBr { .. } | InstKind::Switch(_) => {
                 self.check_terminator_conds(inst, data);
@@ -1006,6 +1037,10 @@ fn is_int(m: &Module, t: TypeId) -> bool {
     matches!(m.types().get(t), Type::Int(_))
 }
 
+fn is_int_width(m: &Module, t: TypeId, width: u32) -> bool {
+    matches!(m.types().get(t), Type::Int(w) if *w == width)
+}
+
 fn is_bool(m: &Module, t: TypeId) -> bool {
     matches!(m.types().get(t), Type::Int(1))
 }
@@ -1322,5 +1357,95 @@ mod dyn_alloca_tests {
             "expected an alignment diagnostic, got: {:?}",
             diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the operating-system call op `syscall`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod syscall_tests {
+    use crate::ir::builder::FunctionBuilder;
+    use crate::ir::inst::{CastOp, Flags, InstKind};
+    use crate::ir::types::{FloatKind, TypeId};
+    use crate::ir::{Module, ValueId};
+    use crate::support::StrInterner;
+    use crate::verify::verify_module;
+
+    /// Build `s(i64, ptr, i32, f64) -> i64` whose body is `body(b, params,
+    /// [i64, ptr])` (its value is returned) and collect the verifier's messages
+    /// (empty when the module verifies).
+    fn check(
+        body: impl FnOnce(&mut FunctionBuilder<'_>, &[ValueId], [TypeId; 2]) -> ValueId,
+    ) -> Vec<String> {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("t");
+        let i64t = m.types_mut().int(64);
+        let i32t = m.types_mut().int(32);
+        let f64t = m.types_mut().float(FloatKind::F64);
+        let ptr = m.types_mut().ptr();
+        let sig = m.types_mut().func(vec![i64t, ptr, i32t, f64t], i64t, false);
+        let f = m.declare_function(syms.intern("s"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let params: Vec<ValueId> = (0..4).map(|i| b.param(e, i)).collect();
+            let r = body(&mut b, &params, [i64t, ptr]);
+            b.ret(Some(r));
+        }
+        match verify_module(&m) {
+            Ok(()) => Vec::new(),
+            Err(diags) => diags.into_iter().map(|d| d.message).collect(),
+        }
+    }
+
+    #[test]
+    fn valid_syscalls_verify() {
+        let diags = check(|b, p, _| {
+            b.syscall(p[0], &[]);
+            b.syscall(p[0], &[p[0], p[1], p[0], p[1], p[0], p[1]])
+        });
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn more_than_six_arguments_rejected() {
+        let diags = check(|b, p, _| b.syscall(p[0], &[p[0]; 7]));
+        assert!(
+            diags.iter().any(|d| d.contains("syscall takes a number and 0..=6 arguments, found 8")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn missing_number_rejected() {
+        let diags = check(|b, _, [i64t, _]| {
+            b.append_inst(InstKind::Syscall, vec![], Flags::NONE, Some(i64t)).unwrap()
+        });
+        assert!(diags.iter().any(|d| d.contains("found 0 operand(s)")), "{diags:?}");
+    }
+
+    #[test]
+    fn narrow_or_float_operands_rejected() {
+        // An i32 number and an f64 argument: neither is i64/ptr (there is no
+        // implicit extension — front ends `zext`/`sext` explicitly).
+        let diags = check(|b, p, _| b.syscall(p[2], &[p[3]]));
+        assert!(
+            diags.iter().any(|d| d.contains("syscall number must be i64 or ptr, found i32")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("syscall argument 0 must be i64 or ptr, found f64")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_i64_result_rejected() {
+        let diags = check(|b, p, [i64t, ptr]| {
+            let r = b.append_inst(InstKind::Syscall, vec![p[0]], Flags::NONE, Some(ptr)).unwrap();
+            b.cast(CastOp::PtrToInt, r, i64t)
+        });
+        assert!(diags.iter().any(|d| d.contains("syscall result must be i64, found ptr")), "{diags:?}");
     }
 }

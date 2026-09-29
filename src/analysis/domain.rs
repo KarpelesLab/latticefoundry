@@ -178,7 +178,8 @@ pub(crate) fn concrete_eval(
         | crate::ir::InstKind::DynAlloca { .. }
         | crate::ir::InstKind::Load { .. }
         | crate::ir::InstKind::Store { .. }
-        | crate::ir::InstKind::Call => None,
+        | crate::ir::InstKind::Call
+        | crate::ir::InstKind::Syscall => None,
         kind => match eval(types, inst.ty, kind, &inst.flags, operands) {
             EvalOutcome::Value(v) => Some(v),
             EvalOutcome::UndefinedBehavior => None,

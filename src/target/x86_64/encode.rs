@@ -955,6 +955,12 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             e.u8(0x0F);
             e.u8(0x0B); // ud2
         }
+        X86Op::Syscall => {
+            // The operands only document the fixed-register contract for the
+            // allocator; the instruction itself is operand-free.
+            e.u8(0x0F);
+            e.u8(0x05); // syscall
+        }
         X86Op::Push => push_r(e, rnum(&ops[0])),
         X86Op::Pop => pop_r(e, rnum(&ops[0])),
         X86Op::MovRbpRsp => mov_rr(e, RBP as u8, RSP as u8, true),

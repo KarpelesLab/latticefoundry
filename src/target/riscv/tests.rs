@@ -581,3 +581,98 @@ fn frame_and_spill_round_trip() {
         assert!(text.contains(needle), "expected `{needle}` in caller disassembly:\n{text}");
     }
 }
+
+// ===========================================================================
+// `syscall` — Linux RISC-V ABI (number a7, args a0..a5, `ecall`, result a0)
+// ===========================================================================
+
+/// `lfsys(x) = syscall(64, x, x+1, .., x+5) + 1` — a 6-argument syscall whose
+/// arguments are computed values.
+fn build_syscall6() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("lfsys"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let mut args = vec![x];
+        for k in 1..6 {
+            let c = b.const_i64(i64t, k);
+            args.push(b.add(x, c, Flags::NONE));
+        }
+        let nr = b.const_i64(i64t, 64);
+        let r = b.syscall(nr, &args);
+        let one = b.const_i64(i64t, 1);
+        let s = b.add(r, one, Flags::NONE);
+        b.ret(Some(s));
+    }
+    (m, f)
+}
+
+#[test]
+fn syscall_lowers_to_the_linux_register_convention() {
+    use super::isel::RvOp;
+    use super::regs::gpr;
+    use crate::codegen::mir::{MachineOperand, Reg};
+    let (m, _) = build_syscall6();
+    let (_, funcs) = lower_all(&m);
+    let insts: Vec<_> = funcs[0].block_ids().flat_map(|b| funcs[0].block(b).insts.clone()).collect();
+    let at = insts
+        .iter()
+        .position(|i| RvOp::decode(i.opcode) == RvOp::Ecall)
+        .expect("an Ecall is emitted");
+    let ecall_inst = &insts[at];
+    let uses: Vec<Reg> = ecall_inst.uses().collect();
+    let expect: Vec<Reg> = [17u16, 10, 11, 12, 13, 14, 15].iter().map(|&n| Reg::Physical(gpr(n))).collect();
+    assert_eq!(uses, expect, "number in a7, arguments in a0..a5");
+    assert_eq!(ecall_inst.defs().collect::<Vec<_>>(), vec![Reg::Physical(gpr(10))], "result in a0 only");
+    // The seven fixed-register moves form one consecutive run right before it.
+    for (k, want) in expect.iter().enumerate() {
+        let mv = &insts[at - 7 + k];
+        assert_eq!(RvOp::decode(mv.opcode), RvOp::Mv);
+        assert_eq!(mv.operands[0], MachineOperand::Def(*want));
+    }
+    // And the result is read back out of a0 immediately after.
+    assert_eq!(insts[at + 1].uses().collect::<Vec<_>>(), vec![Reg::Physical(gpr(10))]);
+}
+
+#[test]
+fn syscall_interpreter_hook_and_clean_error() {
+    let (m, _) = build_syscall6();
+    let (target, funcs) = lower_all(&m);
+    // No kernel: a clean "unsupported side effect" error, not an invented value.
+    let err = interp::run(&target, &funcs, 0, &[i(10)]).unwrap_err();
+    assert!(err.contains("unsupported side effect: syscall"), "{err}");
+
+    // With a hook: it sees exactly (a7, a0..a5) and its raw -errno comes back.
+    let mut seen: Vec<(Int, Vec<Int>)> = Vec::new();
+    let mut hook = |nr: &Int, args: &[Int]| -> Result<Int, String> {
+        seen.push((nr.clone(), args.to_vec()));
+        Ok(i(-9))
+    };
+    let got = interp::run_with_syscalls(&target, &funcs, 0, &[i(10)], Some(&mut hook)).unwrap();
+    // -9 + 1 as a 64-bit pattern.
+    assert_eq!(got, Some(i(-8).mod_2k(64)));
+    assert_eq!(seen, vec![(i(64), (10..16).map(i).collect())]);
+}
+
+#[test]
+fn syscall_encodes_ecall() {
+    assert_eq!(ecall(), 0x0000_0073);
+    if let Some(bytes) = llvm_mc("ecall") {
+        assert_eq!(ecall().to_le_bytes().to_vec(), bytes, "ecall matches llvm-mc");
+    } else {
+        eprintln!("skipping llvm-mc cross-check of ecall: no llvm-mc");
+    }
+    // The compiled function contains the instruction word.
+    let (m, f) = build_syscall6();
+    let code = compile_function(&m, f);
+    assert!(
+        code.bytes.chunks(4).any(|w| w == 0x0000_0073u32.to_le_bytes()),
+        "the encoded body contains `ecall`"
+    );
+}
+

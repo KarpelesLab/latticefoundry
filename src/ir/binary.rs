@@ -818,6 +818,7 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
         InstKind::Select => w.u8(9),
         InstKind::Freeze => w.u8(10),
         InstKind::Call => w.u8(11),
+        InstKind::Syscall => w.u8(18),
         InstKind::Ret => w.u8(12),
         InstKind::Br(target) => {
             w.u8(13);
@@ -1172,6 +1173,7 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
         }
         16 => InstKind::Unreachable,
         17 => InstKind::DynAlloca { align: r.u32()? },
+        18 => InstKind::Syscall,
         t => return Err(DecodeError::InvalidTag { what: "opcode", tag: u32::from(t) }),
     })
 }
@@ -1408,6 +1410,38 @@ mod tests {
             )
         });
         assert!(has, "decoded module must contain dyn_alloca align 64");
+    }
+
+    #[test]
+    fn syscall_round_trips() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("sys");
+        let i64t = m.types_mut().int(64);
+        let ptr = m.types_mut().ptr();
+        let sig = m.types_mut().func(vec![i64t, ptr], i64t, false);
+        let f = m.declare_function(interner.intern("s"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let x = b.param(e, 0);
+            let p = b.param(e, 1);
+            let nr = b.const_i64(i64t, 9);
+            b.syscall(nr, &[]);
+            let r = b.syscall(nr, &[x, p, x, x, p, x]);
+            b.ret(Some(r));
+        }
+        let bytes = encode(&m, &interner);
+        let mut back = StrInterner::new();
+        let m2 = decode(&bytes, &mut back).expect("decode should succeed");
+        assert_eq!(encode(&m2, &back), bytes, "binary form must be stable");
+        let func = m2.function(crate::ir::FuncId::from_index(0));
+        let arities: Vec<usize> = (0..func.inst_count())
+            .map(|i| func.inst(crate::ir::InstId::from_index(i)))
+            .filter(|d| matches!(d.kind, crate::ir::InstKind::Syscall))
+            .map(|d| d.operands().len())
+            .collect();
+        assert_eq!(arities, vec![1, 7], "decoded syscalls keep their operands");
+        assert!(crate::verify::verify_module(&m2).is_ok());
     }
 
     #[test]

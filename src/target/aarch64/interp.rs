@@ -56,7 +56,27 @@ pub(super) fn run(
     entry: usize,
     args: &[Int],
 ) -> Result<Option<Int>, String> {
-    let mut m = Machine { target, funcs, budget: STEP_BUDGET, mem: vec![0u8; 64], heap: 16 };
+    run_with_syscalls(target, funcs, entry, args, None)
+}
+
+/// The interpreter's (optional) operating-system environment: called for each
+/// executed syscall with the number (`x8`) and the argument registers it
+/// reads, in ABI order, and returning the raw 64-bit kernel result. There is no
+/// real kernel here, so without a hook a syscall is a clean "unsupported side
+/// effect" error rather than an invented result.
+pub(super) type SyscallHook<'h> = &'h mut dyn FnMut(&Int, &[Int]) -> Result<Int, String>;
+
+/// [`run`] with a [`SyscallHook`] servicing the program's syscalls (`None`
+/// makes any executed syscall an error, as in [`run`]).
+pub(super) fn run_with_syscalls<'a>(
+    target: &'a AArch64Target,
+    funcs: &'a [MachineFunction],
+    entry: usize,
+    args: &[Int],
+    syscalls: Option<SyscallHook<'a>>,
+) -> Result<Option<Int>, String> {
+    let mut m =
+        Machine { target, funcs, budget: STEP_BUDGET, mem: vec![0u8; 64], heap: 16, syscalls };
 
     // Route each positional argument into its physical argument register by the
     // entry parameter's register class: integers into x0.. and floats into v0..
@@ -96,6 +116,8 @@ struct Machine<'a> {
     mem: Vec<u8>,
     /// The bump cursor for the next activation's slot region.
     heap: u64,
+    /// The syscall environment, if any (see [`SyscallHook`]).
+    syscalls: Option<SyscallHook<'a>>,
 }
 
 /// One function activation's mutable state.
@@ -316,6 +338,25 @@ impl Machine<'_> {
                 fr.regs.insert(d, v);
             }
             A64Op::Call => return self.exec_call(fr, inst),
+            A64Op::Svc => {
+                // Inputs: the `Use(physical)` operands, number first then the
+                // arguments in ABI order; output: the result register (the def).
+                let d = def(ops, 0)?;
+                let uses: Vec<Int> = ops
+                    .iter()
+                    .filter_map(|o| match o {
+                        MachineOperand::Use(r) => Some(self.rd(fr, *r)),
+                        _ => None,
+                    })
+                    .collect();
+                let hook = self
+                    .syscalls
+                    .as_mut()
+                    .ok_or("unsupported side effect: syscall (no syscall hook installed)")?;
+                let (nr, args) = uses.split_first().ok_or("syscall without a number operand")?;
+                let r = hook(nr, args)?;
+                fr.regs.insert(d, mask(&r, 64));
+            }
             A64Op::Ret => {
                 // Return registers (scalar `x0`/`v0`, aggregate `x0`/`x1`/`v0..v3`)
                 // are already set; the caller snapshots them.

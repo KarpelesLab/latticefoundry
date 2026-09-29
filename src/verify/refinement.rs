@@ -742,6 +742,9 @@ impl Enc<'_> {
             | InstKind::Load { .. }
             | InstKind::Store { .. }
             | InstKind::Call => return Err(unsupported("memory / call op")),
+            // An opaque effect on the outside world: the checker has no model of
+            // the kernel, so a function containing one is skipped, never proved.
+            InstKind::Syscall => return Err(unsupported("syscall (opaque external effect)")),
             InstKind::Ret
             | InstKind::Br(_)
             | InstKind::CondBr { .. }

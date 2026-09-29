@@ -236,6 +236,13 @@ pub enum X86Op {
     /// epilogue reclaims the whole dynamic region on return. See [`encode_inst`]
     /// (`super::encode`) for the exact expansion.
     DynAlloca = 54,
+    /// `[Def rax, Def rcx, Def r11, Use rax, Use arg-regs...]` — the Linux
+    /// `syscall` instruction (`0F 05`). The number is in `rax` and the arguments
+    /// in `rdi, rsi, rdx, r10, r8, r9` (moved there by isel right before, as a
+    /// consecutive run); the kernel returns in `rax` and the instruction itself
+    /// clobbers `rcx` (return `rip`) and `r11` (saved `rflags`). Every other
+    /// register is preserved by the kernel, so only those three are defs.
+    Syscall = 55,
 }
 
 impl X86Op {
@@ -248,12 +255,13 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 55] = [
+        const TABLE: [X86Op; 56] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
             StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
+            Syscall,
         ];
         TABLE[op.0 as usize]
     }
@@ -1111,6 +1119,44 @@ impl X86_64Target {
         }
     }
 
+    /// Lower a `syscall` under the Linux x86-64 kernel ABI: number in `rax`,
+    /// arguments in `rdi, rsi, rdx, r10, r8, r9`, result in `rax`; the `syscall`
+    /// instruction clobbers `rcx` and `r11`.
+    ///
+    /// As in [`Self::lower_call`], every operand is materialized into a vreg
+    /// *first*, and only then are the fixed-register moves emitted as one
+    /// consecutive run right before the instruction, so no vreg definition sits
+    /// in the gap between an ABI register's write and its read. `r10` is special:
+    /// it is not allocatable but one of the spill/reload **scratch** registers, so
+    /// a later reload (of a spilled operand moved into another register) could
+    /// overwrite it. Its move is therefore emitted **last**: after it nothing but
+    /// the `syscall` itself runs, and a reload feeding that very move targets the
+    /// move's own source, which is harmless.
+    fn lower_syscall(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        use regs::{R8, R9, R10, R11, RAX, RCX, RDI, RDX, RSI};
+        const ARG_REGS: [u16; 6] = [RDI, RSI, RDX, R10, R8, R9];
+        let ops = inst.operands();
+        let vals: Vec<VReg> = ops.iter().map(|&o| self.oper(lo, o)).collect();
+
+        let mut reg_moves: Vec<(PReg, VReg)> = vec![(regs::gpr(RAX), vals[0])];
+        for (k, &v) in vals[1..].iter().enumerate() {
+            reg_moves.push((regs::gpr(ARG_REGS[k]), v));
+        }
+        // Stable: `r10` last, everything else in ABI order.
+        reg_moves.sort_by_key(|&(r, _)| r.num == R10);
+        let used: Vec<PReg> = reg_moves.iter().map(|&(r, _)| r).collect();
+        for (r, v) in reg_moves {
+            lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(r), use_v(v)]));
+        }
+
+        let rax = regs::gpr(RAX);
+        let mut operands = vec![def(rax), def(regs::gpr(RCX)), def(regs::gpr(R11))];
+        operands.extend(used.into_iter().map(use_p));
+        lo.emit(MachineInst::new(X86Op::Syscall.opcode(), operands));
+        let d = lo.result_reg(inst);
+        lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(rax)]));
+    }
+
     /// Lower the entry prologue with System V aggregate/`sret`/stack-parameter
     /// support. A register-passed struct parameter is stored into a private home
     /// slot (so the body sees it in memory) and its vreg is that slot's address; a
@@ -1464,6 +1510,7 @@ impl TargetIsel for X86_64Target {
                 lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
             }
             InstKind::Call => self.lower_call(lo, inst),
+            InstKind::Syscall => self.lower_syscall(lo, inst),
             InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),
             InstKind::FCmp(pred) => self.lower_fcmp(lo, *pred, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),

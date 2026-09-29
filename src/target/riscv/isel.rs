@@ -129,6 +129,11 @@ pub enum RvOp {
     SaveReg = 38,
     /// `[Def r, Imm off]` — `ld r, [sp, #off]` (callee-saved / ra restore).
     RestoreReg = 39,
+    /// `[Def a0, Use a7, Use a0..]` — the Linux environment call `ecall`. The
+    /// syscall number is in `a7` and the arguments in `a0..a5` (moved there by
+    /// isel as one consecutive run right before); the kernel returns in `a0` and
+    /// preserves every other register, so `a0` is the only def.
+    Ecall = 40,
 }
 
 impl RvOp {
@@ -141,11 +146,11 @@ impl RvOp {
     /// Decode a MIR [`Opcode`] back to an [`RvOp`].
     pub fn decode(op: Opcode) -> RvOp {
         use RvOp::*;
-        const TABLE: [RvOp; 40] = [
+        const TABLE: [RvOp; 41] = [
             Mv, Li, Add, Sub, And, Or, Xor, Mul, Mulh, Addi, Andi, Ori, Xori, Div, Divu, Rem, Remu,
             Slli, Srli, Srai, Sll, Srl, Sra, SetCmp, Select, Load, Store, FrameAddr, GlobalAddr,
             Call, Ret, J, BrCond, Switch, Unreachable, StoreFrame, LoadFrame, AddiSp, SaveReg,
-            RestoreReg,
+            RestoreReg, Ecall,
         ];
         TABLE[op.0 as usize]
     }
@@ -545,6 +550,28 @@ impl TargetIsel for RiscvTarget {
                 lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(s)]));
             }
             InstKind::Call => self.lower_call(lo, inst),
+            InstKind::Syscall => {
+                // Linux RISC-V syscall ABI: number in `a7`, arguments in
+                // `a0..a5`, result in `a0`. Materialize every operand first, then
+                // move them into the fixed registers as one consecutive run right
+                // before the `ecall` (as `lower_call` does), so no vreg definition
+                // sits between an ABI register's write and its read.
+                let cc = &self.rf.cc;
+                let vals: Vec<VReg> = inst.operands().iter().map(|&o| lo.reg(o)).collect();
+                let mut moves: Vec<(PReg, VReg)> = vec![(super::regs::gpr(17), vals[0])]; // a7
+                for (k, &v) in vals[1..].iter().enumerate() {
+                    moves.push((cc.arg_regs[k], v));
+                }
+                let a0 = cc.ret_reg;
+                let mut operands = vec![def(a0)];
+                for &(r, v) in &moves {
+                    lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(r), use_v(v)]));
+                    operands.push(use_p(r));
+                }
+                lo.emit(MachineInst::new(RvOp::Ecall.opcode(), operands));
+                let d = lo.result_reg(inst);
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_p(a0)]));
+            }
             // Floating-point negation / compares are out of the integer subset.
             InstKind::Unary(UnaryOp::FNeg) | InstKind::FCmp(_) => {
                 let d = lo.result_reg(inst);

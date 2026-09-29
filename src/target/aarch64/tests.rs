@@ -1326,3 +1326,99 @@ fn struct_encoding_is_deterministic() {
     let b = compile_function(&m, FuncId::from_index(0), &syms);
     assert_eq!(a, b, "identical struct input must yield identical bytes");
 }
+
+// ===========================================================================
+// `syscall` — Linux AArch64 ABI (number x8, args x0..x5, `svc #0`, result x0)
+// ===========================================================================
+
+/// `lfsys(x) = syscall(64, x, x+1, .., x+5) + 1` — a 6-argument syscall whose
+/// arguments are computed values.
+fn build_syscall6() -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let sig = m.types_mut().func(vec![i64t], i64t, false);
+    let f = m.declare_function(syms.intern("lfsys"), sig);
+    {
+        let mut b = m.build(f);
+        let entry = b.create_entry_block();
+        let x = b.param(entry, 0);
+        let mut args = vec![x];
+        for k in 1..6 {
+            let c = b.const_i64(i64t, k);
+            args.push(b.add(x, c, Flags::NONE));
+        }
+        let nr = b.const_i64(i64t, 64);
+        let r = b.syscall(nr, &args);
+        let one = b.const_i64(i64t, 1);
+        let s = b.add(r, one, Flags::NONE);
+        b.ret(Some(s));
+    }
+    (m, f)
+}
+
+#[test]
+fn syscall_lowers_to_the_linux_register_convention() {
+    use super::isel::A64Op;
+    use super::regs::gpr;
+    use crate::codegen::mir::{MachineOperand, Reg};
+    let (m, _) = build_syscall6();
+    let (_, funcs) = lower_all(&m);
+    let insts: Vec<_> = funcs[0].block_ids().flat_map(|b| funcs[0].block(b).insts.clone()).collect();
+    let at = insts
+        .iter()
+        .position(|i| A64Op::decode(i.opcode) == A64Op::Svc)
+        .expect("an Svc is emitted");
+    let svc = &insts[at];
+    let uses: Vec<Reg> = svc.uses().collect();
+    let expect: Vec<Reg> = [8u16, 0, 1, 2, 3, 4, 5].iter().map(|&n| Reg::Physical(gpr(n))).collect();
+    assert_eq!(uses, expect, "number in x8, arguments in x0..x5");
+    assert_eq!(svc.defs().collect::<Vec<_>>(), vec![Reg::Physical(gpr(0))], "result in x0 only");
+    // The seven fixed-register moves form one consecutive run right before it.
+    for (k, want) in expect.iter().enumerate() {
+        let mv = &insts[at - 7 + k];
+        assert_eq!(A64Op::decode(mv.opcode), A64Op::MovRR);
+        assert_eq!(mv.operands[0], MachineOperand::Def(*want));
+    }
+    // And the result is read back out of x0 immediately after.
+    assert_eq!(insts[at + 1].uses().collect::<Vec<_>>(), vec![Reg::Physical(gpr(0))]);
+}
+
+#[test]
+fn syscall_interpreter_hook_and_clean_error() {
+    let (m, _) = build_syscall6();
+    let (target, funcs) = lower_all(&m);
+    // No kernel: a clean "unsupported side effect" error, not an invented value.
+    let err = interp::run(&target, &funcs, 0, &[i(10)]).unwrap_err();
+    assert!(err.contains("unsupported side effect: syscall"), "{err}");
+
+    // With a hook: it sees exactly (x8, x0..x5) and its raw -errno comes back.
+    let mut seen: Vec<(Int, Vec<Int>)> = Vec::new();
+    let mut hook = |nr: &Int, args: &[Int]| -> Result<Int, String> {
+        seen.push((nr.clone(), args.to_vec()));
+        Ok(i(-9))
+    };
+    let got = interp::run_with_syscalls(&target, &funcs, 0, &[i(10)], Some(&mut hook)).unwrap();
+    // -9 + 1 as a 64-bit pattern.
+    assert_eq!(got, Some(i(-8).mod_2k(64)));
+    assert_eq!(seen, vec![(i(64), (10..16).map(i).collect())]);
+}
+
+#[test]
+fn syscall_encodes_svc_0() {
+    assert_eq!(svc(0), 0xD400_0001);
+    if let Some(bytes) = llvm_mc("svc #0") {
+        assert_eq!(svc(0).to_le_bytes().to_vec(), bytes, "svc #0 matches llvm-mc");
+    } else {
+        eprintln!("skipping llvm-mc cross-check of svc: no llvm-mc");
+    }
+    // The compiled function contains the instruction word.
+    let (m, f) = build_syscall6();
+    let mut syms = StrInterner::new();
+    syms.intern("lfsys");
+    let code = compile_function(&m, f, &syms);
+    assert!(
+        code.bytes.chunks(4).any(|w| w == 0xD400_0001u32.to_le_bytes()),
+        "the encoded body contains `svc #0`"
+    );
+}
