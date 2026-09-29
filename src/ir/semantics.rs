@@ -83,12 +83,15 @@ use crate::ir::value::{Const, FloatBits};
 
 use puremp::{Float, Int, RoundingMode};
 
-/// The width, in bits, of the abstract pointer address model.
+/// The widest pointer the abstract address model holds.
 ///
-/// Pointers are modeled as an opaque byte address held in `[0, 2⁶⁴)`, matching
-/// the provisional 64-bit data layout in [`crate::ir::types`]. This is enough
-/// for the pure address arithmetic (`ptr_add`, `ptrtoint`, `inttoptr`) the
-/// evaluator must model; a richer provenance model is bet B10, deferred.
+/// Pointers are modeled as an opaque byte address. An address produced by the
+/// evaluator (`ptr_add`, `inttoptr`) is wrapped to the width of its result's
+/// address space in the module's [`DataLayout`](crate::ir::DataLayout) — 64
+/// bits under the default LP64 layout, 32 or 16 bits on smaller targets — and
+/// [`SemValue::ptr`] normalizes to this maximum. That is enough for the pure
+/// address arithmetic (`ptr_add`, `ptrtoint`, `inttoptr`) the evaluator must
+/// model; a richer provenance model is bet B10, deferred.
 const POINTER_BITS: u32 = 64;
 
 /// A concrete semantic value: the runtime denotation of an SSA value.
@@ -110,7 +113,8 @@ pub enum SemValue {
     },
     /// A floating-point value, as its exact IEEE-754 bit pattern.
     Float(FloatBits),
-    /// An abstract pointer: an opaque byte address in `[0, 2⁶⁴)`.
+    /// An abstract pointer: an opaque byte address in `[0, 2ⁿ)`, `n` the
+    /// pointer width of its address space (at most 64).
     Ptr(Int),
     /// Poison — a deferred error that taints any dependent operation.
     Poison,
@@ -154,13 +158,13 @@ impl SemValue {
         }
     }
 
-    /// This value re-read as an integer operand: pointers become a 64-bit
-    /// unsigned address, integers pass through. Used by `icmp`, which the IR
-    /// permits on pointers as well as integers.
-    fn to_int_operand(&self) -> Option<(u32, Int)> {
+    /// This value re-read as an integer operand: a pointer becomes its unsigned
+    /// address at `ptr_bits` width, integers pass through. Used by `icmp`, which
+    /// the IR permits on pointers as well as integers.
+    fn to_int_operand(&self, ptr_bits: u32) -> Option<(u32, Int)> {
         match self {
             SemValue::Int { width, bits } => Some((*width, bits.clone())),
-            SemValue::Ptr(addr) => Some((POINTER_BITS, addr.clone())),
+            SemValue::Ptr(addr) => Some((ptr_bits, addr.clone())),
             _ => None,
         }
     }
@@ -224,6 +228,12 @@ fn int_width(types: &TypeContext, ty: TypeId) -> Option<u32> {
     }
 }
 
+/// The pointer width of `ty`'s address space under the data layout, or
+/// [`POINTER_BITS`] if `ty` is not a pointer.
+fn ptr_width(types: &TypeContext, ty: TypeId) -> u32 {
+    types.pointer_bits(ty).unwrap_or(POINTER_BITS)
+}
+
 /// The float format of `ty`, or `None` if it is not a float type.
 fn float_kind(types: &TypeContext, ty: TypeId) -> Option<FloatKind> {
     match types.get(ty) {
@@ -266,10 +276,14 @@ pub fn eval(
 
         InstKind::Bin(op) => eval_bin(*op, flags, operands),
         InstKind::Unary(op) => eval_unary(*op, flags, operands),
-        InstKind::ICmp(pred) => eval_icmp(*pred, operands),
+        // `icmp` does not see its operand type; a pointer compares at the
+        // default address space's width (exact for every predicate there, and
+        // for `eq`/`ne`/unsigned predicates in any space, since addresses are
+        // kept wrapped to their space's width).
+        InstKind::ICmp(pred) => eval_icmp(*pred, operands, types.data_layout().pointer_bits(0)),
         InstKind::FCmp(pred) => eval_fcmp(*pred, flags, operands),
         InstKind::Cast(op) => eval_cast(types, result_ty, *op, operands),
-        InstKind::PtrAdd { .. } => eval_ptr_add(operands),
+        InstKind::PtrAdd { .. } => eval_ptr_add(operands, ptr_width(types, result_ty)),
 
         InstKind::Alloca { .. }
         | InstKind::DynAlloca { .. }
@@ -498,10 +512,10 @@ fn fneg_bits(v: FloatBits) -> FloatBits {
 // Comparisons.
 // ---------------------------------------------------------------------------
 
-fn eval_icmp(pred: IntPred, operands: &[SemValue]) -> EvalOutcome {
+fn eval_icmp(pred: IntPred, operands: &[SemValue], ptr_bits: u32) -> EvalOutcome {
     let (Some((wa, a)), Some((wb, b))) = (
-        operands.first().and_then(SemValue::to_int_operand),
-        operands.get(1).and_then(SemValue::to_int_operand),
+        operands.first().and_then(|v| v.to_int_operand(ptr_bits)),
+        operands.get(1).and_then(|v| v.to_int_operand(ptr_bits)),
     ) else {
         return poison();
     };
@@ -613,7 +627,7 @@ fn eval_cast(
             let Some((_, bits)) = src.as_int() else {
                 return poison();
             };
-            ok(SemValue::ptr(bits.clone()))
+            ok(SemValue::Ptr(mask(bits, ptr_width(types, result_ty))))
         }
         CastOp::Bitcast => eval_bitcast(types, result_ty, src),
     }
@@ -657,7 +671,12 @@ fn eval_bitcast(types: &TypeContext, result_ty: TypeId, src: &SemValue) -> EvalO
         (SemValue::Float(fb), Type::Float(k)) if float_kind_of(*fb) == *k => {
             ok(SemValue::Float(*fb))
         }
-        (SemValue::Ptr(_), Type::Ptr) => ok(src.clone()),
+        (SemValue::Ptr(_), Type::Ptr | Type::PtrIn(_)) => ok(src.clone()),
+        // integer ⇄ pointer of the same width (the verifier checks the width)
+        (SemValue::Int { bits, .. }, t) if t.is_ptr() => {
+            ok(SemValue::Ptr(mask(bits, ptr_width(types, result_ty))))
+        }
+        (SemValue::Ptr(addr), Type::Int(w)) => ok(SemValue::int(*w, addr.clone())),
         // An aggregate value is the address of its storage.
         (SemValue::Ptr(_), Type::Struct(_) | Type::Array(..)) => ok(src.clone()),
         // Any other bitcast is ill-typed for this evaluator.
@@ -700,7 +719,7 @@ fn eval_freeze(types: &TypeContext, result_ty: TypeId, operands: &[SemValue]) ->
     match types.get(result_ty) {
         Type::Int(w) => ok(SemValue::Int { width: *w, bits: Int::ZERO }),
         Type::Float(k) => ok(SemValue::Float(bits_to_float(0, *k))),
-        Type::Ptr => ok(SemValue::ptr(Int::ZERO)),
+        Type::Ptr | Type::PtrIn(_) => ok(SemValue::ptr(Int::ZERO)),
         // Aggregates/void/func are out of scope for the scalar evaluator; a
         // poison of such a type is left as poison.
         _ => poison(),
@@ -708,17 +727,18 @@ fn eval_freeze(types: &TypeContext, result_ty: TypeId, operands: &[SemValue]) ->
 }
 
 /// `ptr_add base, off`: byte-address arithmetic, `base + signed(off)` wrapped to
-/// the pointer width. `inbounds` cannot be checked without a memory/allocation
-/// model, so it is not enforced here (that check belongs to the memory-model
-/// layer); poison only propagates from the operands.
-fn eval_ptr_add(operands: &[SemValue]) -> EvalOutcome {
+/// the pointer width `pw` of the result's address space. `inbounds` cannot be
+/// checked without a memory/allocation model, so it is not enforced here (that
+/// check belongs to the memory-model layer); poison only propagates from the
+/// operands.
+fn eval_ptr_add(operands: &[SemValue], pw: u32) -> EvalOutcome {
     let (Some(SemValue::Ptr(base)), Some((ow, off))) =
         (operands.first(), operands.get(1).and_then(SemValue::as_int))
     else {
         return poison();
     };
     let addr = base.add(&signed(off, ow));
-    ok(SemValue::ptr(addr))
+    ok(SemValue::Ptr(mask(&addr, pw)))
 }
 
 // ---------------------------------------------------------------------------

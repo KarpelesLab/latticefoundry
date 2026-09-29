@@ -28,11 +28,12 @@
 //! # Grammar (EBNF-ish)
 //!
 //! ```text
-//! module      ::= "module" STRING { item }
+//! module      ::= "module" STRING [ "target" STRING ] [ "datalayout" STRING ]
+//!                 { item }
 //! item        ::= global | func
 //!
 //! global      ::= "global" [ linkage ] [ visibility ] [ "constant" ] [ "detached" ]
-//!                 "@" name ":" type [ "=" init ]
+//!                 [ "addrspace" "(" INT ")" ] "@" name ":" type [ "=" init ]
 //! func        ::= "func" [ linkage ] [ visibility ] "@" name fnsig [ body ]
 //! linkage     ::= "internal" | "weak"
 //! visibility  ::= "hidden" | "protected"
@@ -84,11 +85,21 @@
 //!                       | "(" [ init { "," init } ] ")"
 //!                       | "@" name [ ( "+" | "-" ) INT ]
 //!                       | STRING )
-//! type        ::= "void" | "i" INT | "f16" | "f32" | "f64" | "ptr"
+//! type        ::= "void" | "i" INT | "f16" | "f32" | "f64"
+//!               | "ptr" [ "addrspace" "(" INT ")" ]
 //!               | "[" INT "x" type "]" | "{" [ type { "," type } ] "}"
 //!               | "fn" fnsig
 //! name        ::= IDENT | STRING
 //! ```
+//!
+//! The module header may name the target (`target "x86_64"`, informational) and
+//! give the [data layout](crate::ir::DataLayout) as its spec string
+//! (`datalayout "e-p:32:32-…"`, `docs/ir-design.md` §3a). Both are optional and
+//! printed only when present / not the default LP64 layout, so a module that
+//! never sets them prints exactly as before. `ptr addrspace(N)` is a pointer
+//! into address space `N` (`addrspace(0)` is plain `ptr`, which is how it
+//! prints), and a global's `addrspace(N)` attribute places it in space `N`, so
+//! `@x` is then a `ptr addrspace(N)`.
 //!
 //! Global attributes (`docs/ir-design.md` §4a): the linkage keyword picks the
 //! symbol binding of a definition (external when omitted); the visibility
@@ -165,10 +176,20 @@ pub fn write_module<W: fmt::Write>(f: &mut W, module: &Module, syms: &StrInterne
     write!(f, "module ")?;
     write_quoted(f, &module.name)?;
     writeln!(f)?;
+    if let Some(target) = module.target() {
+        write!(f, "target ")?;
+        write_quoted(f, target)?;
+        writeln!(f)?;
+    }
+    if *module.data_layout() != crate::ir::DataLayout::lp64() {
+        write!(f, "datalayout ")?;
+        write_quoted(f, &module.data_layout().to_spec())?;
+        writeln!(f)?;
+    }
 
     for (gi, g) in module.globals().enumerate() {
         writeln!(f)?;
-        write_global(f, module, syms, g, module.global_attrs(GlobalId::from_index(gi)))?;
+        write_global(f, module, syms, gi, g, module.global_attrs(GlobalId::from_index(gi)))?;
     }
 
     for func in module.functions() {
@@ -182,6 +203,7 @@ fn write_global<W: fmt::Write>(
     f: &mut W,
     module: &Module,
     syms: &StrInterner,
+    gi: usize,
     g: &Global,
     attrs: GlobalAttrs,
 ) -> fmt::Result {
@@ -192,6 +214,10 @@ fn write_global<W: fmt::Write>(
     }
     if attrs.detached {
         write!(f, "detached ")?;
+    }
+    let space = module.global_addr_space(GlobalId::from_index(gi));
+    if space != 0 {
+        write!(f, "addrspace({space}) ")?;
     }
     write_name(f, syms.resolve(g.name))?;
     write!(f, " : ")?;
@@ -639,6 +665,7 @@ fn write_type<W: fmt::Write>(f: &mut W, module: &Module, ty: TypeId) -> fmt::Res
         Type::Float(FloatKind::F32) => write!(f, "f32"),
         Type::Float(FloatKind::F64) => write!(f, "f64"),
         Type::Ptr => write!(f, "ptr"),
+        Type::PtrIn(space) => write!(f, "ptr addrspace({space})"),
         Type::Array(elem, n) => {
             write!(f, "[{n} x ")?;
             write_type(f, module, *elem)?;
@@ -1349,6 +1376,31 @@ impl Parser {
         };
         module.name = name;
 
+        // Optional header declarations: the target name, then the data layout.
+        if self.eat_ident("target") {
+            let sp = self.span();
+            match self.peek_kind().clone() {
+                TokKind::Str(s) => {
+                    self.bump();
+                    module.set_target(Some(s));
+                }
+                _ => return self.err(sp, "expected a target name string"),
+            }
+        }
+        if self.eat_ident("datalayout") {
+            let sp = self.span();
+            match self.peek_kind().clone() {
+                TokKind::Str(s) => {
+                    self.bump();
+                    match crate::ir::DataLayout::parse(&s) {
+                        Ok(dl) => module.set_data_layout(dl),
+                        Err(e) => return self.err(sp, e.to_string()),
+                    }
+                }
+                _ => return self.err(sp, "expected a data layout spec string"),
+            }
+        }
+
         let mut func_names: HashMap<String, FuncId> = HashMap::new();
         let mut global_names: HashMap<String, GlobalId> = HashMap::new();
         let mut pending: Vec<(FuncId, BodyAst, u32)> = Vec::new();
@@ -1398,6 +1450,14 @@ impl Parser {
         (attrs.linkage, attrs.visibility) = self.parse_linkage_visibility();
         attrs.constant = self.eat_ident("constant");
         attrs.detached = self.eat_ident("detached");
+        let space = if self.eat_ident("addrspace") {
+            self.expect(&TokKind::LParen, "`(`")?;
+            let space = self.parse_u32()?;
+            self.expect(&TokKind::RParen, "`)`")?;
+            space
+        } else {
+            0
+        };
         let name = self.parse_name()?;
         self.expect(&TokKind::Colon, "`:`")?;
         let ty = self.parse_type(module)?;
@@ -1405,6 +1465,7 @@ impl Parser {
         let sym = syms.intern(&name);
         // The initializer is attached once every name is known (`lower_init`).
         let gid = module.define_global(Global { name: sym, ty, init: None }, attrs);
+        module.set_global_addr_space(gid, space);
         global_names.insert(name, gid);
         Ok((gid, init))
     }
@@ -1982,7 +2043,16 @@ impl Parser {
                 self.bump();
                 match id.as_str() {
                     "void" => Ok(module.types_mut().void()),
-                    "ptr" => Ok(module.types_mut().ptr()),
+                    "ptr" => {
+                        if self.eat_ident("addrspace") {
+                            self.expect(&TokKind::LParen, "`(`")?;
+                            let space = self.parse_u32()?;
+                            self.expect(&TokKind::RParen, "`)`")?;
+                            Ok(module.types_mut().ptr_in(space))
+                        } else {
+                            Ok(module.types_mut().ptr())
+                        }
+                    }
                     "f16" => Ok(module.types_mut().float(FloatKind::F16)),
                     "f32" => Ok(module.types_mut().float(FloatKind::F32)),
                     "f64" => Ok(module.types_mut().float(FloatKind::F64)),
@@ -3015,5 +3085,104 @@ entry ^0:
             let mut syms = StrInterner::new();
             assert!(parse_module(&wrap(body), file(), &mut syms).is_err(), "{why}: `{body}` should not parse");
         }
+    }
+
+    /// A module for a 16-bit target with a second (program-memory) address
+    /// space: its `target`/`datalayout` header, a global placed in space 1, and
+    /// `ptr addrspace(1)` values all round-trip, and it verifies.
+    const ADDRSPACE_SRC: &str = "module \"avr\"
+target \"avr\"
+datalayout \"e-p:16:8-p1:16:8-i8:8-i16:8-i32:8-i64:8-f16:8-f32:8-f64:8-S8-n8-P1\"
+
+global constant addrspace(1) @tbl : [2 x i8] = [2 x i8] (i8 1, i8 2)
+
+global @ptab : ptr addrspace(1) = ptr addrspace(1) @tbl + 1
+
+func @rd(i16) -> i8 {
+entry ^0(%0: i16):
+  %1 = ptr_add @tbl, %0 : ptr addrspace(1)
+  %2 = load %1 align 1 : i8
+  ret %2
+}
+";
+
+    #[test]
+    fn target_datalayout_and_addrspace_round_trip() {
+        let mut syms = StrInterner::new();
+        let m = parse_module(ADDRSPACE_SRC, file(), &mut syms).expect("parse");
+        assert_eq!(print_module(&m, &syms), ADDRSPACE_SRC, "the source is in canonical form");
+        let parsed = round_trip(&m, &mut syms);
+        assert_eq!(parsed.target(), Some("avr"));
+        assert_eq!(parsed.data_layout().pointer_bits(0), 16);
+        assert_eq!(parsed.data_layout().program_addr_space(), 1);
+        assert_eq!(parsed.global_addr_space(GlobalId::from_index(0)), 1);
+        assert_eq!(parsed.global_addr_space(GlobalId::from_index(1)), 0);
+        crate::verify::verify_module(&parsed).expect("verifies");
+        // Function references are pointers into the program address space.
+        let f = parsed.function(FuncId::from_index(0));
+        let at = (0..f.value_count())
+            .map(crate::ir::ValueId::from_index)
+            .find(|&v| matches!(f.value(v).def, ValueDef::Global(_)))
+            .expect("a global reference");
+        assert_eq!(parsed.types().get(f.value_type(at)), &Type::PtrIn(1));
+    }
+
+    /// Every combination of global linkage, visibility, `constant`, `detached`
+    /// and `addrspace`, and of function linkage and visibility, in a module
+    /// with a target and a data layout, parses and prints back verbatim.
+    #[test]
+    fn every_attribute_combination_round_trips() {
+        let mut src = String::from(
+            "module \"combo\"\ntarget \"avr\"\ndatalayout \"e-p:16:8-p1:16:8-i8:8-i16:8-i32:8-i64:8-f16:8-f32:8-f64:8-S8-n8-P1\"\n",
+        );
+        // The printer writes every global before every function.
+        let mut funcs = String::new();
+        let mut n = 0;
+        for linkage in ["", "internal ", "weak "] {
+            for vis in ["", "hidden ", "protected "] {
+                for constant in ["", "constant "] {
+                    for detached in ["", "detached "] {
+                        for space in ["", "addrspace(1) "] {
+                            src.push_str(&format!(
+                                "\nglobal {linkage}{vis}{constant}{detached}{space}@g{n} : i16 = i16 {n}\n"
+                            ));
+                            n += 1;
+                        }
+                    }
+                }
+                funcs.push_str(&format!("\nfunc {linkage}{vis}@f{n}(ptr addrspace(1)) -> i8 {{\nentry ^0(%0: ptr addrspace(1)):\n  %1 = load %0 align 1 : i8\n  ret %1\n}}\n"));
+                n += 1;
+            }
+        }
+        src.push_str(&funcs);
+        let mut syms = StrInterner::new();
+        let m = parse_module(&src, file(), &mut syms).expect("parse");
+        assert_eq!(print_module(&m, &syms), src, "every combination prints back verbatim");
+        let parsed = round_trip(&m, &mut syms);
+        assert_eq!(parsed.global_count(), 72);
+        let spaces: Vec<u32> = (0..72).map(|g| parsed.global_addr_space(GlobalId::from_index(g))).collect();
+        assert_eq!(spaces.iter().filter(|&&s| s == 1).count(), 36);
+        // And through the binary form.
+        let bytes = crate::ir::binary::encode(&parsed, &syms);
+        let back = crate::ir::binary::decode(&bytes, &mut syms).expect("decode");
+        assert_eq!(print_module(&back, &syms), src);
+    }
+
+    #[test]
+    fn default_layout_and_space_zero_print_as_before() {
+        // No `target`, the LP64 layout, and `addrspace(0)` print nothing new.
+        let src = "module \"x\"\ndatalayout \"e\"\n\nglobal addrspace(0) @g : ptr addrspace(0) = ptr null\n";
+        let mut syms = StrInterner::new();
+        let m = parse_module(src, file(), &mut syms).expect("parse");
+        assert_eq!(print_module(&m, &syms), "module \"x\"\n\nglobal @g : ptr = ptr null\n");
+    }
+
+    #[test]
+    fn bad_datalayout_is_a_parse_error() {
+        let mut syms = StrInterner::new();
+        let err = parse_module("module \"x\"\ndatalayout \"p:12:8\"\n", file(), &mut syms).unwrap_err();
+        assert!(format!("{err:?}").contains("pointer width 12"), "{err:?}");
+        assert!(parse_module("module \"x\"\ntarget x86\n", file(), &mut syms).is_err());
+        assert!(parse_module("module \"x\"\nfunc @f(ptr addrspace) -> void\n", file(), &mut syms).is_err());
     }
 }

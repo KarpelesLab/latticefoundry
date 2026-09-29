@@ -12,7 +12,9 @@
 //! varints (implemented here, no dependencies) plus a handful of fixed
 //! little-endian scalars (float bit patterns). The body is, in order:
 //!
-//! 1. the module name (a length-prefixed UTF-8 string);
+//! 1. the module name (a length-prefixed UTF-8 string), then (from version 3)
+//!    the target name (a presence byte and a string) and the data-layout spec
+//!    string (empty for the default LP64 layout);
 //! 2. the **type table** — every type *reachable* from the module, emitted in a
 //!    topological order (a composite type after its components) so each entry
 //!    references only earlier ones;
@@ -77,7 +79,13 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 ///   and a per-function attribute byte ([`FuncAttrs`]: linkage in bits 0–1,
 ///   visibility in bits 2–3) after each function's signature. Older streams
 ///   decode with default visibility and [`FuncAttrs::DEFAULT`].
-pub const VERSION: u32 = 3;
+/// - **4** — adds the module's target name and data layout after the module
+///   name, and a per-global address space: bit 6 of the global attribute byte
+///   says a varint address space follows the byte. The
+///   `ptr addrspace(N)` type (tag 7) needs no bump, as older streams never
+///   contain it. Version-1/2/3 streams still decode, with no target, the LP64
+///   layout and every global in space 0.
+pub const VERSION: u32 = 4;
 
 /// The oldest format version [`decode`] still reads.
 pub const MIN_VERSION: u32 = 1;
@@ -117,6 +125,9 @@ pub enum DecodeError {
     },
     /// Decoding finished with unconsumed trailing bytes (corrupt stream).
     TrailingBytes,
+    /// The module header's data-layout spec string was not valid (see
+    /// [`DataLayout::parse`](crate::ir::DataLayout::parse)).
+    InvalidDataLayout,
 }
 
 impl fmt::Display for DecodeError {
@@ -134,6 +145,7 @@ impl fmt::Display for DecodeError {
                 write!(f, "{what} index {index} out of range")
             }
             DecodeError::TrailingBytes => write!(f, "trailing bytes after end of module"),
+            DecodeError::InvalidDataLayout => write!(f, "invalid data layout in module header"),
         }
     }
 }
@@ -601,6 +613,18 @@ pub fn encode(module: &Module, names: &StrInterner) -> Vec<u8> {
     w.uvarint(u64::from(VERSION));
 
     w.str(&module.name);
+    match module.target() {
+        Some(t) => {
+            w.u8(1);
+            w.str(t);
+        }
+        None => w.u8(0),
+    }
+    if *module.data_layout() == crate::ir::DataLayout::lp64() {
+        w.str("");
+    } else {
+        w.str(&module.data_layout().to_spec());
+    }
 
     // --- type table (topological order) ---
     w.uvarint(tables.types.len() as u64);
@@ -627,7 +651,12 @@ pub fn encode(module: &Module, names: &StrInterner) -> Vec<u8> {
             }
             None => w.u8(0),
         }
-        w.u8(attrs_bits(module.global_attrs(GlobalId::from_index(gi))));
+        let gid = GlobalId::from_index(gi);
+        let space = module.global_addr_space(gid);
+        w.u8(attrs_bits(module.global_attrs(gid)) | if space != 0 { ADDR_SPACE_BIT } else { 0 });
+        if space != 0 {
+            w.uvarint(u64::from(space));
+        }
     }
 
     // --- functions (module order) ---
@@ -652,6 +681,10 @@ fn write_type(w: &mut Writer, ty: &Type, t: &Tables) {
             w.u8(floatkind_code(*kind));
         }
         Type::Ptr => w.u8(3),
+        Type::PtrIn(space) => {
+            w.u8(7);
+            w.uvarint(u64::from(*space));
+        }
         Type::Array(elem, len) => {
             w.u8(4);
             w.uvarint(t.ty(*elem));
@@ -736,6 +769,10 @@ fn write_const(w: &mut Writer, c: &Const, t: &Tables) {
     }
 }
 
+/// Bit 6 of a global's attribute byte (version 4): a varint address space
+/// follows the byte.
+const ADDR_SPACE_BIT: u8 = 1 << 6;
+
 fn linkage_code(l: Linkage) -> u8 {
     match l {
         Linkage::External => 0,
@@ -773,6 +810,7 @@ fn visibility_from(c: u8) -> Option<Visibility> {
 /// Pack a global's attributes into one byte: linkage in bits 0–1
 /// (`0` external, `1` internal, `2` weak), `constant` in bit 2, `detached` in
 /// bit 3, visibility in bits 4–5 (`0` default, `1` hidden, `2` protected).
+/// (Bit 6, [`ADDR_SPACE_BIT`], is added by the encoder from version 4.)
 fn attrs_bits(a: GlobalAttrs) -> u8 {
     linkage_code(a.linkage)
         | (u8::from(a.constant) << 2)
@@ -1030,6 +1068,16 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
 
     let module_name = r.str()?.to_owned();
     let mut module = Module::new(module_name);
+    if version >= 4 {
+        match r.u8()? {
+            0 => {}
+            1 => module.set_target(Some(r.str()?.to_owned())),
+            t => return Err(DecodeError::InvalidTag { what: "target", tag: u32::from(t) }),
+        }
+        let spec = r.str()?;
+        let layout = crate::ir::DataLayout::parse(spec).map_err(|_| DecodeError::InvalidDataLayout)?;
+        module.set_data_layout(layout);
+    }
 
     // --- type table: intern in order, mapping serialized index -> real TypeId ---
     let ntypes = r.uindex()?;
@@ -1059,8 +1107,15 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
             1 => Some(consts[checked(r.uindex()?, consts.len(), "const")?]),
             t => return Err(DecodeError::InvalidTag { what: "global-init", tag: u32::from(t) }),
         };
-        let attrs = if version >= 2 { attrs_from_bits(r.u8()?)? } else { GlobalAttrs::DEFAULT };
-        module.define_global(Global { name, ty, init }, attrs);
+        let (attrs, space) = if version >= 2 {
+            let b = r.u8()?;
+            let space = if version >= 4 && b & ADDR_SPACE_BIT != 0 { r.u32()? } else { 0 };
+            (attrs_from_bits(if version >= 4 { b & !ADDR_SPACE_BIT } else { b })?, space)
+        } else {
+            (GlobalAttrs::DEFAULT, 0)
+        };
+        let gid = module.define_global(Global { name, ty, init }, attrs);
+        module.set_global_addr_space(gid, space);
     }
 
     // --- functions ---
@@ -1099,6 +1154,8 @@ fn read_type(r: &mut Reader<'_>, types: &[TypeId]) -> Result<Type, DecodeError> 
         1 => Type::Int(r.u32()?),
         2 => Type::Float(floatkind_from(r.u8()?)?),
         3 => Type::Ptr,
+        // `intern` normalizes a (malformed) `PtrIn(0)` back to `Ptr`.
+        7 => Type::PtrIn(r.u32()?),
         4 => {
             let elem = resolve(r.uindex()?)?;
             let len = r.uvarint()?;
@@ -1715,6 +1772,9 @@ mod tests {
         assert_eq!(w.buf[0], 19, "volatile load uses tag 19");
         let bytes = encode(&m, &interner);
         assert_eq!(bytes[4], VERSION as u8);
+        // Volatile/atomics needed no bump (version 2); version 4 is the
+        // target/data-layout header and per-global address spaces.
+        assert_eq!(VERSION, 4);
         let m2 = decode(&bytes, &mut interner).expect("decode");
         let func = m2.function(crate::ir::FuncId::from_index(0));
         assert!((0..func.inst_count()).all(|i| !func.inst(crate::ir::InstId::from_index(i)).kind.is_volatile()));
@@ -1900,6 +1960,9 @@ mod tests {
         let n = bytes.len();
         assert_eq!(&bytes[n - 5..], &[0, 0, 0, 0, 0]);
         bytes.remove(n - 5);
+        // Also drop the v4 header's `<no target> <empty layout>` after `"v2"`.
+        assert_eq!(&bytes[5..10], &[2, b'v', b'2', 0, 0]);
+        bytes.drain(8..10);
         bytes[4] = 2;
         let m2 = decode(&bytes, &mut interner).expect("v2 decodes");
         assert_eq!(m2.function(FuncId::from_index(0)).attrs, FuncAttrs::DEFAULT);
@@ -1917,11 +1980,14 @@ mod tests {
         m.define_global(g, GlobalAttrs::DEFAULT);
         let mut bytes = encode(&m, &interner);
         // With no functions the stream ends `<attrs byte> <nfuncs = 0>`; drop the
-        // attribute byte and relabel the version to reconstruct the v1 layout.
+        // attribute byte, and the v4 header's `<no target> <empty layout>` after
+        // the name `"v1"`, and relabel the version to reconstruct the v1 layout.
         assert_eq!(bytes[4], VERSION as u8);
         let n = bytes.len();
         assert_eq!(&bytes[n - 2..], &[0, 0]);
         bytes.remove(n - 2);
+        assert_eq!(&bytes[5..10], &[2, b'v', b'1', 0, 0]);
+        bytes.drain(8..10);
         bytes[4] = 1;
         let m2 = decode(&bytes, &mut interner).expect("v1 decodes");
         assert_eq!(m2.global_count(), 1);
@@ -1929,6 +1995,104 @@ mod tests {
         assert_eq!(m2.global_attrs(GlobalId::from_index(0)), GlobalAttrs::DEFAULT);
         let init = m2.consts().get(g2.init.expect("initializer kept"));
         assert_eq!(init, &Const::Int { ty: g2.ty, value: Int::from_i64(9) });
+    }
+
+    /// The target name, the data layout, `ptr addrspace(N)` types and a
+    /// global's address space survive an encode/decode round trip.
+    #[test]
+    fn target_datalayout_and_addrspaces_round_trip() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("avr");
+        m.set_target(Some("avr".to_owned()));
+        let dl = crate::ir::DataLayout::parse("e-p:16:8-p1:16:8-i16:8-i32:8-i64:8-S8-n8-P1").unwrap();
+        m.set_data_layout(dl.clone());
+        let i8t = m.types_mut().int(8);
+        let arr = m.types_mut().array(i8t, 2);
+        let flash = m.types_mut().ptr_in(1);
+        let c1 = m.intern_const(Const::Int { ty: i8t, value: Int::from_i64(7) });
+        let init = m.intern_const(Const::Aggregate { ty: arr, elems: vec![c1, c1] });
+        let g = m.define_global(
+            Global { name: interner.intern("tbl"), ty: arr, init: Some(init) },
+            GlobalAttrs { constant: true, ..GlobalAttrs::DEFAULT },
+        );
+        m.set_global_addr_space(g, 1);
+        let sig = m.types_mut().func(vec![flash], i8t, false);
+        let f = m.declare_function(interner.intern("rd"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let p = b.param(e, 0);
+            let v = b.load(i8t, p, 1);
+            b.ret(Some(v));
+        }
+        let bytes = encode(&m, &interner);
+        let m2 = decode(&bytes, &mut interner).expect("decode");
+        assert_eq!(m2.target(), Some("avr"));
+        assert_eq!(m2.data_layout(), &dl);
+        assert_eq!(m2.global_addr_space(GlobalId::from_index(0)), 1);
+        let f2 = m2.function(crate::ir::FuncId::from_index(0));
+        let crate::ir::Type::Func(ft) = m2.types().get(f2.sig) else { panic!("signature") };
+        assert_eq!(m2.types().get(ft.params[0]), &crate::ir::Type::PtrIn(1));
+        assert_eq!(encode(&m2, &interner), bytes, "re-encoding is byte-identical");
+    }
+
+    /// Version-2 and version-3 streams (no target/layout header, no
+    /// address-space bit) still decode, as LP64 modules with no target; a v3
+    /// stream keeps its visibility and function attributes exactly.
+    #[test]
+    fn version_2_and_3_streams_decode_as_lp64() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("v3");
+        let i32t = m.types_mut().int(32);
+        let c = m.intern_const(Const::Int { ty: i32t, value: Int::from_i64(1) });
+        let hidden = GlobalAttrs { visibility: Visibility::Hidden, constant: true, ..GlobalAttrs::DEFAULT };
+        m.define_global(Global { name: interner.intern("g"), ty: i32t, init: Some(c) }, hidden);
+        let sig = m.types_mut().func(vec![], i32t, false);
+        let f = m.declare_function(interner.intern("f"), sig);
+        let fattrs = FuncAttrs { linkage: Linkage::Weak, visibility: Visibility::Protected };
+        m.set_func_attrs(f, fattrs);
+        let v4 = encode(&m, &interner);
+        // A master-v3 stream is the v4 stream without `<no target> <empty layout>`.
+        assert_eq!(&v4[5..10], &[2, b'v', b'3', 0, 0]);
+        let mut v3 = v4.clone();
+        v3.drain(8..10);
+        v3[4] = 3;
+        let m3 = decode(&v3, &mut interner).expect("v3 decodes");
+        assert_eq!(m3.target(), None);
+        assert_eq!(m3.data_layout(), &crate::ir::DataLayout::lp64());
+        assert_eq!(m3.global_addr_space(GlobalId::from_index(0)), 0);
+        assert_eq!(m3.global_attrs(GlobalId::from_index(0)), hidden);
+        assert_eq!(m3.function(FuncId::from_index(0)).attrs, fattrs);
+        // In a v3 stream bit 6 of the global attribute byte is not an address
+        // space flag: it is rejected like any other unknown bit.
+        let gattr = v3.iter().rposition(|&b| b == super::attrs_bits(hidden)).expect("attribute byte");
+        let mut bad = v3.clone();
+        bad[gattr] |= super::ADDR_SPACE_BIT;
+        assert!(decode(&bad, &mut interner).is_err());
+        // A v2 stream of a module without visibility or function attributes.
+        let mut m = Module::new("v2");
+        let i32t = m.types_mut().int(32);
+        m.define_global(Global { name: interner.intern("h"), ty: i32t, init: None }, GlobalAttrs::DEFAULT);
+        let mut v2 = encode(&m, &interner);
+        v2.drain(8..10);
+        v2[4] = 2;
+        let m2 = decode(&v2, &mut interner).expect("v2 decodes");
+        assert_eq!(m2.data_layout(), &crate::ir::DataLayout::lp64());
+        assert_eq!(m2.global_addr_space(GlobalId::from_index(0)), 0);
+    }
+
+    /// A malformed data-layout spec in the header is a clean decode error.
+    #[test]
+    fn bad_datalayout_is_rejected() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("x");
+        m.set_data_layout(crate::ir::DataLayout::ilp32());
+        let mut bytes = encode(&m, &interner);
+        // Corrupt the first byte of the spec string (`e`) into an unknown item.
+        let spec_at = 5 + 2 + 1 + 1; // version, name, no-target byte, spec length
+        assert_eq!(bytes[spec_at], b'e');
+        bytes[spec_at] = b'z';
+        assert_eq!(decode(&bytes, &mut interner).unwrap_err(), DecodeError::InvalidDataLayout);
     }
 
     /// An address constant naming a nonexistent global is a decode error.

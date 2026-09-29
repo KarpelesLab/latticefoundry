@@ -444,3 +444,65 @@ fn ordering_and_rmw_codes_round_trip() {
     assert!(SeqCst.is_acquire() && SeqCst.is_release() && AcqRel.is_acquire() && AcqRel.is_release());
     assert!(!Relaxed.is_acquire() && !Relaxed.is_release() && !Acquire.is_release() && !Release.is_acquire());
 }
+
+/// Under a 16-bit layout the builder's `struct_field` offsets are `i16`
+/// constants at the layout's offsets, a global in address space 1 is referenced
+/// as a `ptr addrspace(1)`, and `ptr_add` keeps its base's space.
+#[test]
+fn builder_follows_the_data_layout_and_address_spaces() {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("avr");
+    m.set_data_layout(DataLayout::parse("p:16:8-p1:16:8-i16:8-i32:8-n8").unwrap());
+    let i8t = m.types_mut().int(8);
+    let i32t = m.types_mut().int(32);
+    let st = m.types_mut().struct_(vec![i8t, i32t]);
+    let ptr = m.types_mut().ptr();
+    let sig = m.types_mut().func(vec![ptr], ptr, false);
+    let g = m.define_global(Global { name: syms.intern("tbl"), ty: i8t, init: None }, GlobalAttrs::DEFAULT);
+    m.set_global_addr_space(g, 1);
+    let f = m.declare_function(syms.intern("f"), sig);
+    let (field, gref, moved) = {
+        let mut b = m.build(f);
+        let e = b.create_entry_block();
+        let p = b.param(e, 0);
+        let field = b.struct_field(p, st, 1);
+        let gref = b.global_ref(g);
+        let one = b.const_i64(i8t, 1);
+        let moved = b.ptr_add(gref, one, false);
+        b.ret(Some(field));
+        (field, gref, moved)
+    };
+    let func = m.function(f);
+    let ValueDef::Inst(add) = func.value(field).def else { panic!("ptr_add result") };
+    let off = func.inst(add).operands()[1];
+    let ValueDef::Const(c) = func.value(off).def else { panic!("constant offset") };
+    let Const::Int { value, .. } = m.consts().get(c) else { panic!("integer offset") };
+    assert_eq!(*value, puremp::Int::from_i64(1), "i32 is byte-aligned, so field 1 is at offset 1");
+    assert_eq!(m.types().get(func.value_type(off)), &Type::Int(16), "offsets are pointer-width");
+    assert_eq!(m.types().get(func.value_type(gref)), &Type::PtrIn(1));
+    assert_eq!(m.types().get(func.value_type(moved)), &Type::PtrIn(1));
+    assert_eq!(m.global_ref_type(g), m.types_mut().ptr_in(1));
+}
+
+/// Linking modules with different data layouts is refused; an empty module
+/// adopts the first input's target and layout.
+#[test]
+fn merging_checks_data_layouts() {
+    let mut a = Module::new("a");
+    a.set_target(Some("thumbv7m".to_owned()));
+    a.set_data_layout(DataLayout::ilp32());
+    let mut syms = StrInterner::new();
+    let i32t = a.types_mut().int(32);
+    let sig = a.types_mut().func(vec![], i32t, false);
+    a.declare_function(syms.intern("f"), sig);
+    let merged = merge_modules([a], "lto").expect("one module merges");
+    assert_eq!(merged.target(), Some("thumbv7m"));
+    assert_eq!(merged.data_layout(), &DataLayout::ilp32());
+
+    let mut b = Module::new("b");
+    let i32t = b.types_mut().int(32);
+    let sig = b.types_mut().func(vec![], i32t, false);
+    b.declare_function(syms.intern("g"), sig);
+    let mut merged = merged;
+    assert_eq!(merged.link_module(b), Err(MergeError::DataLayoutMismatch));
+}

@@ -157,11 +157,14 @@ fn build(args: &[String]) -> Result<(), String> {
         modules.into_iter().next().expect("one module")
     } else {
         merge_modules(modules, "lto").map_err(|e| {
-            let name = syms.resolve(e.symbol());
             let kind = match e {
                 latticefoundry::ir::MergeError::DuplicateFunction(_) => "function",
                 latticefoundry::ir::MergeError::DuplicateGlobal(_) => "global",
+                latticefoundry::ir::MergeError::DataLayoutMismatch => {
+                    return format!("link (LTO) error: {e}");
+                }
             };
+            let name = e.symbol().map_or("?", |s| syms.resolve(s));
             format!("link (LTO) error: duplicate definition of {kind} '{name}'")
         })?
     };

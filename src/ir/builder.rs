@@ -33,6 +33,11 @@ pub struct FunctionBuilder<'a> {
     /// The source line attributed to instructions emitted next (0 = none). Set
     /// via [`FunctionBuilder::set_line`] when building with debug provenance.
     cur_line: u32,
+    /// The module's per-global address spaces (indexed by `GlobalId`), so
+    /// [`FunctionBuilder::global_ref`] types a reference by its global's space.
+    /// Empty (every global in space 0) for a builder made with
+    /// [`FunctionBuilder::new`] alone.
+    global_spaces: &'a [u32],
 }
 
 impl<'a> FunctionBuilder<'a> {
@@ -42,7 +47,15 @@ impl<'a> FunctionBuilder<'a> {
         types: &'a mut TypeContext,
         consts: &'a mut ConstPool,
     ) -> Self {
-        Self { func, types, consts, cur: None, cur_line: 0 }
+        Self { func, types, consts, cur: None, cur_line: 0, global_spaces: &[] }
+    }
+
+    /// Tell the builder which address space each global lives in (indexed by
+    /// `GlobalId`; see [`crate::ir::Module::global_addr_space`]).
+    /// [`crate::ir::Module::build`] does this for you.
+    pub fn with_global_spaces(mut self, spaces: &'a [u32]) -> Self {
+        self.global_spaces = spaces;
+        self
     }
 
     // --- debug source-line provenance --------------------------------------
@@ -164,15 +177,19 @@ impl<'a> FunctionBuilder<'a> {
         self.func.get_or_make_value(ValueDef::Const(c), ty)
     }
 
-    /// A reference to a function (its address / callable), typed as a pointer.
+    /// A reference to a function (its address / callable), typed as a pointer
+    /// into the data layout's program address space (`ptr` by default).
     pub fn func_ref(&mut self, func: FuncId) -> ValueId {
-        let ty = self.types.ptr();
+        let space = self.types.data_layout().program_addr_space();
+        let ty = self.types.ptr_in(space);
         self.func.get_or_make_value(ValueDef::Func(func), ty)
     }
 
-    /// A reference to a global (its address), typed as a pointer.
+    /// A reference to a global (its address), typed as a pointer into the
+    /// global's address space (`ptr` by default).
     pub fn global_ref(&mut self, global: GlobalId) -> ValueId {
-        let ty = self.types.ptr();
+        let space = self.global_spaces.get(global.index()).copied().unwrap_or(0);
+        let ty = self.types.ptr_in(space);
         self.func.get_or_make_value(ValueDef::Global(global), ty)
     }
 
@@ -385,9 +402,12 @@ impl<'a> FunctionBuilder<'a> {
         self.emit(InstKind::Fence(ordering), Vec::new(), Flags::NONE, None);
     }
 
-    /// Displace a pointer by a byte offset; result is a pointer.
+    /// Displace a pointer by a byte offset; the result is a pointer into the
+    /// base's address space (an aggregate base denotes an address in space 0).
     pub fn ptr_add(&mut self, base: ValueId, byte_offset: ValueId, inbounds: bool) -> ValueId {
-        let ptr = self.types.ptr();
+        let base_ty = self.func.value_type(base);
+        let space = self.types.addr_space(base_ty).unwrap_or(0);
+        let ptr = self.types.ptr_in(space);
         self.emit(InstKind::PtrAdd { inbounds }, vec![base, byte_offset], Flags::NONE, Some(ptr))
             .expect("ptr_add has a result")
     }
@@ -396,21 +416,26 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Address of struct field `field_idx` of `struct_ty` at base pointer
     /// `base`. Computes the field's byte offset from the data layout and emits a
-    /// `ptr_add` (in-bounds). Returns the field pointer.
+    /// `ptr_add` (in-bounds) whose offset is an integer of the base's pointer
+    /// width (`i64` under LP64). Returns the field pointer.
     pub fn struct_field(&mut self, base: ValueId, struct_ty: TypeId, field_idx: u32) -> ValueId {
         let (offset, _field_ty) = self.types.field_offset(struct_ty, field_idx);
-        let i64_ = self.types.int(64);
-        let off = self.const_i64(i64_, offset as i64);
+        let base_ty = self.func.value_type(base);
+        let space = self.types.addr_space(base_ty).unwrap_or(0);
+        let bits = self.types.data_layout().pointer_bits(space);
+        let idx_ty = self.types.int(bits);
+        let off = self.const_i64(idx_ty, offset as i64);
         self.ptr_add(base, off, true)
     }
 
     /// Address of element `index` of an array of `elem_ty` at base pointer
-    /// `base`. Computes `index * stride(elem_ty)` (with `index` an `i64`) and
-    /// emits a `ptr_add` (in-bounds). Returns the element pointer.
+    /// `base`. Computes `index * stride(elem_ty)` in `index`'s integer type
+    /// (conventionally the pointer width: `i64` under LP64) and emits a
+    /// `ptr_add` (in-bounds). Returns the element pointer.
     pub fn array_elem(&mut self, base: ValueId, elem_ty: TypeId, index: ValueId) -> ValueId {
         let stride = self.types.stride(elem_ty);
-        let i64_ = self.types.int(64);
-        let stride_v = self.const_i64(i64_, stride as i64);
+        let idx_ty = self.func.value_type(index);
+        let stride_v = self.const_i64(idx_ty, stride as i64);
         let scaled = self.mul(index, stride_v, Flags::NONE);
         self.ptr_add(base, scaled, true)
     }

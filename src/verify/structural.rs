@@ -52,11 +52,30 @@
 //! newly compatible. The single predicate that encodes this is
 //! [`addr_compatible`]; the base / address sites use [`is_aggregate`] alongside
 //! [`is_ptr`].
+//!
+//! ## Address spaces
+//!
+//! A pointer lives in an address space (`ptr` is space 0, `ptr addrspace(N)`
+//! space `N`; `docs/ir-design.md` §3a). The rules:
+//!
+//! - every address space a type mentions, and every global's space, must be
+//!   declared by the module's [`DataLayout`](crate::ir::DataLayout);
+//! - pointers of different spaces are **different types**: they never unify at
+//!   a call/return boundary, a block argument, a `select` or an `icmp`, and
+//!   there is **no `addrspacecast`** — `bitcast` between pointer types is
+//!   rejected. Code that really means to reinterpret an address in another
+//!   space says so with `ptrtoint` + `inttoptr`;
+//! - `ptr_add` stays in its base's space (an aggregate base is a space-0
+//!   address), and `alloca` / `dyn_alloca` produce space-0 pointers;
+//! - a reference to a global is a pointer into the global's space, a reference
+//!   to a function a pointer into the layout's program address space, and an
+//!   indirect callee must be a pointer into the program address space;
+//! - only a space-0 `ptr` is interchangeable with an aggregate value.
 
 use crate::ir::inst::{AtomicOrdering, BinOp, CastOp, InstData, InstId, InstKind, RmwOp, UnaryOp};
 use crate::ir::types::{FloatKind, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, ValueDef, ValueId};
-use crate::ir::{BlockId, FuncId, Function, Module};
+use crate::ir::{BlockId, FuncId, Function, GlobalId, Module};
 use crate::support::diagnostics::Diagnostic;
 
 use super::cfg::DomTree;
@@ -82,6 +101,19 @@ pub fn verify_function(module: &Module, func: FuncId) -> Vec<Diagnostic> {
 pub fn verify_globals(module: &Module) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for (gi, g) in module.globals().enumerate() {
+        let space = module.global_addr_space(GlobalId::from_index(gi));
+        if module.data_layout().pointer(space).is_none() {
+            diags.push(global_err(
+                gi,
+                format!("lives in address space {space}, which the data layout does not declare"),
+            ));
+        }
+        if let Some(s) = undeclared_space(module, g.ty) {
+            diags.push(global_err(
+                gi,
+                format!("type {} uses address space {s}, which the data layout does not declare", render_type(module, g.ty)),
+            ));
+        }
         let Some(init) = g.init else { continue };
         let ity = module.consts().type_of(init);
         if ity != g.ty {
@@ -137,6 +169,21 @@ fn check_init_const(m: &Module, gi: usize, cid: ConstId, diags: &mut Vec<Diagnos
                     gi,
                     format!("address constant names a nonexistent symbol ({target:?})"),
                 ));
+            } else if let Some(space) = m.types().addr_space(*ty) {
+                // The address of a symbol is a pointer into the symbol's space.
+                let want = match target {
+                    AddrTarget::Global(g) => m.global_addr_space(*g),
+                    AddrTarget::Func(_) => m.data_layout().program_addr_space(),
+                };
+                if space != want {
+                    diags.push(global_err(
+                        gi,
+                        format!(
+                            "address constant has type {} but its symbol lives in address space {want}",
+                            render_type(m, *ty)
+                        ),
+                    ));
+                }
             }
         }
         Const::Aggregate { ty, elems } => {
@@ -410,9 +457,9 @@ impl<'a> Ctx<'a> {
             }
             InstKind::Alloca { .. } => {
                 self.arity(inst, ops, 0);
-                if !is_ptr(module, ty) {
+                if !is_ptr0(module, ty) {
                     self.err(format!(
-                        "instruction #{}: alloca result must be a pointer, found {}",
+                        "instruction #{}: alloca result must be a pointer (address space 0), found {}",
                         inst.index(),
                         render_type(module, ty),
                     ));
@@ -436,9 +483,9 @@ impl<'a> Ctx<'a> {
                         render_type(module, n),
                     ));
                 }
-                if !is_ptr(module, ty) {
+                if !is_ptr0(module, ty) {
                     self.err(format!(
-                        "instruction #{}: dyn_alloca result must be a pointer, found {}",
+                        "instruction #{}: dyn_alloca result must be a pointer (address space 0), found {}",
                         inst.index(),
                         render_type(module, ty),
                     ));
@@ -575,6 +622,17 @@ impl<'a> Ctx<'a> {
                         "instruction #{}: ptr_add result must be a pointer",
                         inst.index()
                     ));
+                } else if is_ptr(module, base) || is_aggregate(module, base) {
+                    // Address arithmetic never leaves its address space.
+                    let want = module.types().addr_space(base).unwrap_or(0);
+                    let got = module.types().addr_space(ty).unwrap_or(0);
+                    if got != want {
+                        self.err(format!(
+                            "instruction #{}: ptr_add result {} must stay in its base's address space {want}",
+                            inst.index(),
+                            render_type(module, ty),
+                        ));
+                    }
                 }
             }
             InstKind::Select => {
@@ -672,15 +730,20 @@ impl<'a> Ctx<'a> {
             CastOp::PtrToInt => is_ptr(m, from) && is_int(m, to),
             CastOp::IntToPtr => is_int(m, from) && is_ptr(m, to),
             CastOp::Bitcast => {
-                // Same-size reinterpretation; pointers count as machine-word
-                // sized via the layout, so ptr<->ptr and ptr<->iN(word) agree.
-                // An aggregate value *is* the address of its storage (see the
-                // module docs), so `ptr` <-> aggregate is the identity on that
-                // address: it is how a frontend turns storage it filled into a
-                // by-value struct argument.
-                (from != to && bit_size(m, from) == bit_size(m, to) && bit_size(m, from).is_some())
-                    || (is_ptr(m, from) && is_aggregate(m, to))
-                    || (is_aggregate(m, from) && is_ptr(m, to))
+                // Same-size reinterpretation; a pointer counts at its address
+                // space's width from the data layout, so ptr<->iN(ptr width)
+                // agree. Two pointer types never bitcast: they differ only in
+                // address space, and there is no `addrspacecast` (see the
+                // module docs). An aggregate value *is* the address of its
+                // storage, so a space-0 `ptr` <-> aggregate is the identity on
+                // that address: it is how a frontend turns storage it filled
+                // into a by-value struct argument.
+                (from != to
+                    && !(is_ptr(m, from) && is_ptr(m, to))
+                    && bit_size(m, from) == bit_size(m, to)
+                    && bit_size(m, from).is_some())
+                    || (is_ptr0(m, from) && is_aggregate(m, to))
+                    || (is_aggregate(m, from) && is_ptr0(m, to))
             }
         };
         if !ok {
@@ -772,11 +835,12 @@ impl<'a> Ctx<'a> {
             )),
             _ => {
                 // Indirect call: signature unknown, but the callee must be a
-                // pointer value.
+                // pointer into the program address space.
                 let ct = func.value_type(callee);
-                if !is_ptr(module, ct) {
+                let program = module.data_layout().program_addr_space();
+                if module.types().addr_space(ct) != Some(program) {
                     self.err(format!(
-                        "instruction #{}: indirect call callee must be a pointer, found {}",
+                        "instruction #{}: indirect call callee must be a pointer into the program address space {program}, found {}",
                         inst.index(),
                         render_type(module, ct),
                     ));
@@ -964,12 +1028,31 @@ impl<'a> Ctx<'a> {
 
     // --- values: constants and references -----------------------------------
 
+    /// A reference to a symbol living in address space `space` must be typed
+    /// as a pointer into that space.
+    fn check_ref_type(&mut self, v: ValueId, ty: TypeId, space: u32, what: &str) {
+        if self.module.types().addr_space(ty) != Some(space) {
+            self.err(format!(
+                "value {}: a {what} reference must be a pointer into address space {space}, found {}",
+                v.index(),
+                render_type(self.module, ty),
+            ));
+        }
+    }
+
     fn check_values(&mut self) {
         let func = self.func;
         let module = self.module;
         for vi in 0..func.value_count() {
             let v = ValueId::from_index(vi);
             let val = func.value(v).clone();
+            if let Some(s) = undeclared_space(module, val.ty) {
+                self.err(format!(
+                    "value {}: type {} uses address space {s}, which the data layout does not declare",
+                    v.index(),
+                    render_type(module, val.ty),
+                ));
+            }
             match &val.def {
                 ValueDef::Const(cid) => {
                     let c = module.consts().get(*cid).clone();
@@ -985,6 +1068,9 @@ impl<'a> Ctx<'a> {
                             v.index(),
                             fid.index()
                         ));
+                    } else {
+                        let want = module.data_layout().program_addr_space();
+                        self.check_ref_type(v, val.ty, want, "function");
                     }
                 }
                 ValueDef::Global(gid) => {
@@ -994,6 +1080,8 @@ impl<'a> Ctx<'a> {
                             v.index(),
                             gid.index()
                         ));
+                    } else {
+                        self.check_ref_type(v, val.ty, module.global_addr_space(*gid), "global");
                     }
                 }
                 ValueDef::Param(b, idx) => {
@@ -1260,6 +1348,7 @@ fn render_type(m: &Module, t: TypeId) -> String {
         Type::Float(FloatKind::F32) => "f32".to_string(),
         Type::Float(FloatKind::F64) => "f64".to_string(),
         Type::Ptr => "ptr".to_string(),
+        Type::PtrIn(space) => format!("ptr addrspace({space})"),
         Type::Array(e, n) => format!("[{n} x {}]", render_type(m, *e)),
         Type::Struct(fs) => {
             let inner: Vec<String> = fs.iter().map(|&f| render_type(m, f)).collect();
@@ -1285,8 +1374,28 @@ fn is_float(m: &Module, t: TypeId) -> bool {
     matches!(m.types().get(t), Type::Float(_))
 }
 
+/// A pointer in any address space.
 fn is_ptr(m: &Module, t: TypeId) -> bool {
+    m.types().is_ptr(t)
+}
+
+/// A pointer in the default address space 0 (`ptr`).
+fn is_ptr0(m: &Module, t: TypeId) -> bool {
     matches!(m.types().get(t), Type::Ptr)
+}
+
+/// The first address space mentioned by `t` (through arrays, structs and
+/// function signatures) that the module's data layout does not declare.
+fn undeclared_space(m: &Module, t: TypeId) -> Option<u32> {
+    match m.types().get(t) {
+        Type::PtrIn(s) => m.data_layout().pointer(*s).is_none().then_some(*s),
+        Type::Array(e, _) => undeclared_space(m, *e),
+        Type::Struct(fs) => fs.iter().find_map(|&f| undeclared_space(m, f)),
+        Type::Func(ft) => {
+            ft.params.iter().chain(std::iter::once(&ft.ret)).find_map(|&p| undeclared_space(m, p))
+        }
+        _ => None,
+    }
 }
 
 /// An aggregate type (`Struct`/`Array`). A value of such a type denotes the
@@ -1296,15 +1405,15 @@ fn is_aggregate(m: &Module, t: TypeId) -> bool {
 }
 
 /// Whether types `a` and `b` are **address-compatible** under the struct-by-value
-/// convention: they are equal, both pointers, or one is `ptr` and the other an
-/// aggregate (whose value *is* an address). This is the *only* relaxation over
-/// exact type equality — scalars (`Int`/`Float`) remain strictly typed. Used at
-/// the ABI boundaries (`call` arguments and `ret`).
+/// convention: they are equal (two pointers are equal iff they share an address
+/// space), or one is a space-0 `ptr` and the other an aggregate (whose value
+/// *is* an address). This is the *only* relaxation over exact type equality —
+/// scalars (`Int`/`Float`) remain strictly typed. Used at the ABI boundaries
+/// (`call` arguments and `ret`).
 fn addr_compatible(m: &Module, a: TypeId, b: TypeId) -> bool {
     a == b
-        || (is_ptr(m, a) && is_ptr(m, b))
-        || (is_ptr(m, a) && is_aggregate(m, b))
-        || (is_aggregate(m, a) && is_ptr(m, b))
+        || (is_ptr0(m, a) && is_aggregate(m, b))
+        || (is_aggregate(m, a) && is_ptr0(m, b))
 }
 
 fn int_width(m: &Module, t: TypeId) -> Option<u32> {
@@ -1321,14 +1430,14 @@ fn float_width(m: &Module, t: TypeId) -> Option<u32> {
     }
 }
 
-/// The bit size of a bit-reinterpretable type: scalar width, or the machine word
-/// (64) for a pointer. Aggregates and functions have no single bit width here.
+/// The bit size of a bit-reinterpretable type: scalar width, or the data
+/// layout's width of the pointer's address space. Aggregates and functions have
+/// no single bit width here.
 fn bit_size(m: &Module, t: TypeId) -> Option<u32> {
     match m.types().get(t) {
         Type::Int(w) => Some(*w),
         Type::Float(k) => Some(k.bit_width()),
-        Type::Ptr => Some(64),
-        _ => None,
+        _ => m.types().pointer_bits(t),
     }
 }
 
@@ -1802,5 +1911,120 @@ mod atomic_tests {
         );
         // The address must be a pointer (not an aggregate, unlike plain load).
         assert_rejects("  %a = atomic_load relaxed %w align 8 : i64", "atomic_load address operand must be a pointer");
+    }
+}
+
+#[cfg(test)]
+mod addrspace_tests {
+    use crate::support::StrInterner;
+    use crate::support::diagnostics::FileId;
+    use crate::verify::verify_module;
+
+    /// A 16-bit layout with a program address space 1 and a data space 2.
+    const LAYOUT: &str = "e-p:16:8-p1:16:8-p2:32:8-n8:16-P1";
+
+    /// Parse a module with [`LAYOUT`], `globals`, and a one-block function
+    /// `f(ptr %p, ptr addrspace(1) %q, ptr addrspace(2) %r, i16 %i)`, whose
+    /// body is `body`; return the verifier's messages (empty when valid).
+    fn check(globals: &str, body: &str) -> Vec<String> {
+        let src = format!(
+            "module \"t\"\ndatalayout \"{LAYOUT}\"\n{globals}\nfunc @f(ptr, ptr addrspace(1), ptr addrspace(2), i16) -> void {{\nentry ^0(%p: ptr, %q: ptr addrspace(1), %r: ptr addrspace(2), %i: i16):\n{body}\n  ret\n}}\n"
+        );
+        let mut syms = StrInterner::new();
+        let m = crate::ir::text::parse_module(&src, FileId::new(0), &mut syms)
+            .unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+        match verify_module(&m) {
+            Ok(()) => Vec::new(),
+            Err(diags) => diags.into_iter().map(|d| d.message).collect(),
+        }
+    }
+
+    fn assert_rejects(globals: &str, body: &str, needle: &str) {
+        let diags = check(globals, body);
+        assert!(diags.iter().any(|d| d.contains(needle)), "expected `{needle}` for `{body}`, got {diags:?}");
+    }
+
+    #[test]
+    fn valid_address_space_code_verifies() {
+        let globals = "global constant addrspace(1) @tbl : [4 x i8] = [4 x i8] (i8 1, i8 2, i8 3, i8 4)\nglobal @pt : ptr addrspace(1) = ptr addrspace(1) @tbl + 2\nglobal @pf : ptr addrspace(1) = ptr addrspace(1) @f";
+        let body = "  %a = ptr_add @tbl, %i : ptr addrspace(1)\n  %b = load %a align 1 : i8\n  %c = load %r align 1 : i16\n  store %b, %p align 1 : i8\n  %d = ptrtoint %q : i16\n  %e = inttoptr %d : ptr\n  %x = icmp eq %q, %a : i1\n  %y = ptrtoint %r : i32\n  %z = bitcast %y : ptr addrspace(2)";
+        assert_eq!(check(globals, body), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pointer_casts_between_spaces_are_rejected() {
+        // There is no addrspacecast: a bitcast between pointer types is invalid.
+        assert_rejects("", "  %a = bitcast %p : ptr addrspace(1)", "bitcast from ptr to ptr addrspace(1)");
+        // Bit sizes follow the layout: a 16-bit pointer does not bitcast to i64.
+        assert_rejects("", "  %a = bitcast %p : i64", "bitcast from ptr to i64");
+        assert!(check("", "  %a = bitcast %p : i16").is_empty());
+    }
+
+    #[test]
+    fn spaces_never_unify() {
+        assert_rejects("", "  %x = icmp eq %p, %q : i1", "icmp operands");
+        assert_rejects("", "  %s = select i1 1, %p, %q : ptr", "select arms");
+    }
+
+    /// Build `f(ptr addrspace(1) %q, i16 %i)` whose body appends the raw
+    /// instruction `kind` with `operands(q, i)` and result type `result(types)`
+    /// (bypassing the builder's typing helpers), and verify it.
+    fn check_raw(
+        kind: crate::ir::InstKind,
+        operands: impl FnOnce(crate::ir::ValueId, crate::ir::ValueId) -> Vec<crate::ir::ValueId>,
+        result: impl FnOnce(&mut crate::ir::TypeContext) -> crate::ir::TypeId,
+    ) -> Vec<String> {
+        let mut syms = StrInterner::new();
+        let mut m = crate::ir::Module::new("t");
+        m.set_data_layout(crate::ir::DataLayout::parse(LAYOUT).unwrap());
+        let q = m.types_mut().ptr_in(1);
+        let i16t = m.types_mut().int(16);
+        let void = m.types_mut().void();
+        let rt = result(m.types_mut());
+        let sig = m.types_mut().func(vec![q, i16t], void, false);
+        let f = m.declare_function(syms.intern("f"), sig);
+        {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let (qv, iv) = (b.param(e, 0), b.param(e, 1));
+            b.append_inst(kind, operands(qv, iv), crate::ir::Flags::NONE, Some(rt));
+            b.ret(None);
+        }
+        match verify_module(&m) {
+            Ok(()) => Vec::new(),
+            Err(diags) => diags.into_iter().map(|d| d.message).collect(),
+        }
+    }
+
+    #[test]
+    fn ptr_add_stays_in_its_space() {
+        use crate::ir::InstKind;
+        let add = InstKind::PtrAdd { inbounds: false };
+        assert!(check_raw(add.clone(), |q, i| vec![q, i], |t| t.ptr_in(1)).is_empty());
+        let d = check_raw(add, |q, i| vec![q, i], |t| t.ptr());
+        assert!(d.iter().any(|d| d.contains("must stay in its base's address space 1")), "{d:?}");
+    }
+
+    #[test]
+    fn allocas_live_in_space_zero_and_calls_in_the_program_space() {
+        use crate::ir::InstKind;
+        assert!(check("", "  %a = alloca i8 : ptr").is_empty());
+        let d = check_raw(InstKind::DynAlloca { align: 1 }, |_, i| vec![i], |t| t.ptr_in(2));
+        assert!(d.iter().any(|d| d.contains("dyn_alloca result must be a pointer (address space 0)")), "{d:?}");
+        // An indirect call goes through a program-space pointer.
+        assert!(check("", "  call %q() : void").is_empty());
+        assert_rejects("", "  call %p() : void", "program address space 1");
+    }
+
+    #[test]
+    fn undeclared_spaces_and_mismatched_addresses_are_rejected() {
+        assert_rejects("", "  %a = inttoptr %i : ptr addrspace(7)", "address space 7, which the data layout does not declare");
+        assert_rejects("global addrspace(9) @g : i8 = i8 0", "", "lives in address space 9");
+        // The address of a space-1 global is a space-1 pointer.
+        assert_rejects(
+            "global addrspace(1) @g : i8 = i8 0\nglobal @h : ptr = ptr @g",
+            "",
+            "its symbol lives in address space 1",
+        );
     }
 }

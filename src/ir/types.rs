@@ -10,8 +10,15 @@
 //! type lives on the memory operation that dereferences the pointer (see
 //! [`crate::ir::inst`]). This is the design LLVM converged on after years of
 //! typed-pointer pain, and we start there. See `docs/ir-design.md` §3.
+//!
+//! A pointer lives in an **address space**: [`Type::Ptr`] is the default space
+//! `0`, [`Type::PtrIn`] any other (`ptr addrspace(N)` in the text form). Sizes
+//! and alignments follow the context's [`DataLayout`], LP64 unless the module
+//! sets another (`docs/ir-design.md` §3a).
 
 use std::collections::HashMap;
+
+use crate::ir::datalayout::DataLayout;
 
 /// A `Copy` handle to an interned [`Type`] within a [`TypeContext`].
 ///
@@ -75,9 +82,14 @@ pub enum Type {
     Int(u32),
     /// An IEEE-754 floating-point value.
     Float(FloatKind),
-    /// An opaque (untyped) pointer. Address spaces are deferred; the single
-    /// default address space is implied.
+    /// An opaque (untyped) pointer into the default address space `0`.
     Ptr,
+    /// An opaque pointer into address space `n`, **`n ≥ 1`** (`ptr
+    /// addrspace(n)`). A separate variant, rather than a field on [`Type::Ptr`],
+    /// so that code written before address spaces keeps compiling; interning
+    /// normalizes `PtrIn(0)` to [`Type::Ptr`], so each space has exactly one
+    /// type. Use [`Type::is_ptr`] / [`Type::addr_space`] to handle both.
+    PtrIn(u32),
     /// A fixed-length array `[N x T]`.
     Array(TypeId, u64),
     /// An anonymous aggregate of fields, laid out in declaration order.
@@ -97,6 +109,23 @@ impl Type {
     #[inline]
     pub fn is_float(&self) -> bool {
         matches!(self, Type::Float(_))
+    }
+
+    /// Whether this is a pointer type, in any address space.
+    #[inline]
+    pub fn is_ptr(&self) -> bool {
+        matches!(self, Type::Ptr | Type::PtrIn(_))
+    }
+
+    /// The address space of a pointer type (`0` for [`Type::Ptr`]), or `None`
+    /// for a non-pointer.
+    #[inline]
+    pub fn addr_space(&self) -> Option<u32> {
+        match self {
+            Type::Ptr => Some(0),
+            Type::PtrIn(n) => Some(*n),
+            _ => None,
+        }
     }
 
     /// The width in bits of a scalar (integer or float) type, if it has one.
@@ -122,7 +151,7 @@ pub struct FuncType {
     pub variadic: bool,
 }
 
-/// The size and alignment of a type under the default data layout.
+/// The size and alignment of a type under a [`DataLayout`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Layout {
     /// Size in bytes (excluding trailing tail padding for a bare value).
@@ -137,10 +166,14 @@ pub struct Layout {
 /// insertion, so [`TypeContext::intern`] of two structurally equal types yields
 /// the same [`TypeId`]. Convenience constructors (`int`, `ptr`, `array`, ...)
 /// intern in one step.
+///
+/// The context also carries the module's [`DataLayout`] (LP64 by default), which
+/// every size/alignment query follows.
 #[derive(Debug, Default)]
 pub struct TypeContext {
     types: Vec<Type>,
     dedup: HashMap<Type, TypeId>,
+    layout: DataLayout,
 }
 
 impl TypeContext {
@@ -151,6 +184,8 @@ impl TypeContext {
 
     /// Intern a type, returning its stable handle. Equal types intern equal.
     pub fn intern(&mut self, ty: Type) -> TypeId {
+        // One type per address space: `PtrIn(0)` *is* `Ptr`.
+        let ty = if ty == Type::PtrIn(0) { Type::Ptr } else { ty };
         if let Some(&id) = self.dedup.get(&ty) {
             return id;
         }
@@ -205,9 +240,14 @@ impl TypeContext {
         self.intern(Type::Float(kind))
     }
 
-    /// The opaque pointer type.
+    /// The opaque pointer type (address space 0).
     pub fn ptr(&mut self) -> TypeId {
         self.intern(Type::Ptr)
+    }
+
+    /// The opaque pointer type of address space `addr_space` (`ptr` for 0).
+    pub fn ptr_in(&mut self, addr_space: u32) -> TypeId {
+        self.intern(Type::PtrIn(addr_space))
     }
 
     /// A fixed-length array type `[len x elem]`.
@@ -237,28 +277,70 @@ impl TypeContext {
         self.get(id).bit_width()
     }
 
+    /// Whether the referenced type is a pointer (any address space).
+    pub fn is_ptr(&self, id: TypeId) -> bool {
+        self.get(id).is_ptr()
+    }
+
+    /// The address space of a pointer type, or `None` for a non-pointer.
+    pub fn addr_space(&self, id: TypeId) -> Option<u32> {
+        self.get(id).addr_space()
+    }
+
+    /// The width in bits of a pointer type under the data layout, or `None`
+    /// for a non-pointer.
+    pub fn pointer_bits(&self, id: TypeId) -> Option<u32> {
+        self.addr_space(id).map(|a| self.layout.pointer_bits(a))
+    }
+
+    /// The bit width of an integer or pointer type (a pointer counts at its
+    /// address space's width), or `None` for anything else. This is the width
+    /// at which `icmp` compares and `ptrtoint`/`inttoptr` convert.
+    pub fn int_or_ptr_bits(&self, id: TypeId) -> Option<u32> {
+        match self.get(id) {
+            Type::Int(w) => Some(*w),
+            t => t.addr_space().map(|a| self.layout.pointer_bits(a)),
+        }
+    }
+
     // --- data layout --------------------------------------------------------
     //
-    // A provisional, target-independent default layout used by the builder's
-    // offset helpers (`struct_field` / `array_elem`) and by `alloca`. It models
-    // a 64-bit byte-addressed machine with natural alignment. A real per-target
-    // data layout replaces this in a later phase; nothing in the IR *encodes*
-    // these numbers, so swapping the layout is a local change.
+    // Every size/alignment query follows the context's `DataLayout`, which the
+    // module sets (LP64 unless told otherwise). The builder's offset helpers
+    // (`struct_field` / `array_elem`), `alloca`, the verifier and global-data
+    // emission all go through these.
 
-    /// The [`Layout`] (size and alignment) of a type under the default layout.
+    /// The data layout the size/alignment queries follow.
+    #[inline]
+    pub fn data_layout(&self) -> &DataLayout {
+        &self.layout
+    }
+
+    /// Replace the data layout. Types are layout-independent, so every interned
+    /// id stays valid; only sizes, alignments and offsets change.
+    pub fn set_data_layout(&mut self, layout: DataLayout) {
+        self.layout = layout;
+    }
+
+    /// The [`Layout`] (size and alignment) of a type under the data layout.
     pub fn layout(&self, id: TypeId) -> Layout {
+        let dl = &self.layout;
         match self.get(id) {
             Type::Void => Layout { size: 0, align: 1 },
             Type::Int(bits) => {
                 let size = u64::from(bits.div_ceil(8));
-                Layout { size, align: align_for(size) }
+                Layout { size, align: dl.int_align(*bits) }
             }
             Type::Float(k) => {
                 let size = u64::from(k.bit_width() / 8);
-                Layout { size, align: size.max(1) }
+                Layout { size, align: dl.float_align(k.bit_width()) }
             }
-            // Pointers and function references are pointer-sized on a 64-bit machine.
-            Type::Ptr | Type::Func(_) => Layout { size: 8, align: 8 },
+            // A function reference is a pointer into the program address space.
+            Type::Ptr | Type::PtrIn(_) | Type::Func(_) => {
+                let space = self.get(id).addr_space().unwrap_or(dl.program_addr_space());
+                let p = dl.pointer_or_default(space);
+                Layout { size: p.bytes(), align: p.align }
+            }
             Type::Array(elem, len) => {
                 let stride = self.stride(*elem);
                 let align = self.layout(*elem).align;
@@ -330,16 +412,6 @@ fn round_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 
-/// The natural alignment for an integer of the given byte size: the size
-/// rounded up to a power of two, capped at 8 (the machine word).
-#[inline]
-fn align_for(size: u64) -> u64 {
-    if size == 0 {
-        return 1;
-    }
-    size.next_power_of_two().min(8)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +464,72 @@ mod tests {
         let arr = cx.array(i32_, 3);
         assert_eq!(cx.stride(i32_), 4);
         assert_eq!(cx.size_of(arr), 12);
+    }
+
+    /// `{ i8, ptr, i64, f64, fn }` and scalars under LP64, ILP32 (with a 4-byte
+    /// `i64`, as i386 System V), and an AVR-like 16-bit, byte-aligned layout.
+    #[test]
+    fn layouts_follow_the_data_layout() {
+        let mut cx = TypeContext::new();
+        let i8_ = cx.int(8);
+        let i16_ = cx.int(16);
+        let i64_ = cx.int(64);
+        let f64_ = cx.float(FloatKind::F64);
+        let p = cx.ptr();
+        let void = cx.void();
+        let fnty = cx.func(vec![], void, false);
+        let s = cx.struct_(vec![i8_, p, i64_, f64_, fnty]);
+        let arr = cx.array(p, 3);
+
+        // LP64: 8-byte pointers; i8@0 ptr@8 i64@16 f64@24 fn@32, size 40.
+        assert_eq!((cx.size_of(p), cx.align_of(p)), (8, 8));
+        assert_eq!(cx.field_offset(s, 4).0, 32);
+        assert_eq!((cx.size_of(s), cx.align_of(s)), (40, 8));
+        assert_eq!(cx.size_of(arr), 24);
+
+        // ILP32 with i64/f64 4-aligned: i8@0 ptr@4 i64@8 f64@16 fn@24, size 28.
+        let ilp32 = DataLayout::ilp32().with_int_align(64, 4).unwrap().with_float_align(64, 4).unwrap();
+        cx.set_data_layout(ilp32);
+        assert_eq!((cx.size_of(p), cx.align_of(p)), (4, 4));
+        assert_eq!((cx.size_of(fnty), cx.align_of(fnty)), (4, 4));
+        assert_eq!((cx.size_of(i64_), cx.align_of(i64_)), (8, 4));
+        assert_eq!(cx.field_offset(s, 2).0, 8);
+        assert_eq!(cx.field_offset(s, 4).0, 24);
+        assert_eq!((cx.size_of(s), cx.align_of(s)), (28, 4));
+        assert_eq!(cx.size_of(arr), 12);
+
+        // AVR-like: 16-bit pointers, everything byte-aligned, 24-bit flash
+        // pointers in address space 1 which holds the functions.
+        let avr = DataLayout::parse("p:16:8-p1:24:8-i16:8-i32:8-i64:8-f32:8-f64:8-S8-n8-P1").unwrap();
+        cx.set_data_layout(avr);
+        let flash = cx.ptr_in(1);
+        assert_eq!((cx.size_of(p), cx.align_of(p)), (2, 1));
+        assert_eq!((cx.size_of(flash), cx.align_of(flash)), (3, 1));
+        assert_eq!(cx.size_of(fnty), 3, "a function reference is a program-space pointer");
+        assert_eq!((cx.size_of(i16_), cx.align_of(i16_)), (2, 1));
+        assert_eq!(cx.field_offset(s, 1).0, 1);
+        assert_eq!(cx.field_offset(s, 2).0, 3);
+        assert_eq!(cx.field_offset(s, 4).0, 19);
+        assert_eq!((cx.size_of(s), cx.align_of(s)), (22, 1));
+        assert_eq!(cx.stride(p), 2);
+        assert_eq!(cx.size_of(arr), 6);
+        assert_eq!(cx.pointer_bits(flash), Some(24));
+        assert_eq!(cx.int_or_ptr_bits(p), Some(16));
+    }
+
+    #[test]
+    fn address_spaces_intern_to_one_type_each() {
+        let mut cx = TypeContext::new();
+        let p = cx.ptr();
+        assert_eq!(cx.ptr_in(0), p, "addrspace(0) is plain ptr");
+        assert_eq!(cx.intern(Type::PtrIn(0)), p);
+        let q = cx.ptr_in(1);
+        assert_ne!(q, p);
+        assert_eq!(cx.ptr_in(1), q);
+        assert_eq!(cx.addr_space(p), Some(0));
+        assert_eq!(cx.addr_space(q), Some(1));
+        assert!(cx.is_ptr(q) && cx.get(q).is_ptr());
+        let i8_ = cx.int(8);
+        assert_eq!(cx.addr_space(i8_), None);
     }
 }

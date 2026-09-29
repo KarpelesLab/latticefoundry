@@ -1815,7 +1815,7 @@ fn bitfield_mask(width: u32, work_bits: u16) -> i64 {
 fn sysv_eightbytes(types: &TypeContext, ty: TypeId) -> Option<Vec<bool>> {
     fn walk(types: &TypeContext, ty: TypeId, off: u64, ebs: &mut [Option<bool>]) {
         let sse = match types.get(ty) {
-            Type::Int(_) | Type::Ptr | Type::Func(_) => false,
+            Type::Int(_) | Type::Ptr | Type::PtrIn(_) | Type::Func(_) => false,
             Type::Float(_) => true,
             Type::Struct(fields) => {
                 for i in 0..fields.len() {

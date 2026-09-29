@@ -412,7 +412,7 @@ fn merge_class(acc: Option<Eightbyte>, cls: Eightbyte) -> Option<Eightbyte> {
 /// per-eightbyte class accumulators `ebs`.
 fn classify_into(types: &TypeContext, ty: TypeId, offset: u64, ebs: &mut [Option<Eightbyte>]) {
     let cls = match types.get(ty) {
-        Type::Int(_) | Type::Ptr | Type::Func(_) => Some(Eightbyte::Integer),
+        Type::Int(_) | Type::Ptr | Type::PtrIn(_) | Type::Func(_) => Some(Eightbyte::Integer),
         Type::Float(_) => Some(Eightbyte::Sse),
         Type::Struct(fields) => {
             let n = fields.len();

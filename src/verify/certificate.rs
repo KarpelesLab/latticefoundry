@@ -263,6 +263,10 @@ fn hash_type(h: &mut Fnv, types: &TypeContext, ty: TypeId) {
             h.write_u32(k.bit_width());
         }
         Type::Ptr => h.write_u8(3),
+        Type::PtrIn(space) => {
+            h.write_u8(7);
+            h.write_u32(*space);
+        }
         Type::Array(elem, n) => {
             h.write_u8(4);
             hash_type(h, types, *elem);

@@ -25,6 +25,7 @@
 
 pub mod binary;
 pub mod builder;
+pub mod datalayout;
 pub mod inst;
 pub mod merge;
 pub mod semantics;
@@ -36,6 +37,7 @@ pub use inst::{
     AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred,
     RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
+pub use datalayout::{DataLayout, DataLayoutError, Endian, PointerSpec};
 pub use merge::{MergeError, merge_modules};
 pub use semantics::{EvalOutcome, FoldResult, SemValue, eval, fold};
 pub use types::{FloatKind, FuncType, Layout, Type, TypeContext, TypeId};
@@ -212,15 +214,25 @@ impl FuncAttrs {
 /// The module owns the shared interning tables — the [`TypeContext`] and the
 /// [`ConstPool`] — so that types and constants are hash-consed across every
 /// function (tenet T5).
+///
+/// A module may name its **target** (an informational string such as
+/// `"x86_64"`, carried through the text and binary forms) and carries a
+/// [`DataLayout`] (inside its [`TypeContext`]; LP64 unless set), which every
+/// size, alignment and pointer-width question about its types follows
+/// (`docs/ir-design.md` §3a).
 #[derive(Debug, Default)]
 pub struct Module {
     /// Human-readable module identifier (typically the source file name).
     pub name: String,
+    target: Option<String>,
     types: TypeContext,
     consts: ConstPool,
     globals: Vec<Global>,
     /// `global_attrs[g]` holds the attributes of `globals[g]` (parallel vector).
     global_attrs: Vec<GlobalAttrs>,
+    /// `global_addr_space[g]` is the address space `globals[g]` lives in
+    /// (parallel vector; `0` unless set).
+    global_addr_space: Vec<u32>,
     functions: Vec<Function>,
 }
 
@@ -238,6 +250,30 @@ impl Module {
     /// The module's type-interning context, mutably (to intern new types).
     pub fn types_mut(&mut self) -> &mut TypeContext {
         &mut self.types
+    }
+
+    /// The target this module was written for, if it names one (the `.lf`
+    /// `target "…"` declaration). Informational: it does not change the meaning
+    /// of the IR, which the [data layout](Module::data_layout) pins down.
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// Set (or clear) the module's target name.
+    pub fn set_target(&mut self, target: Option<String>) {
+        self.target = target;
+    }
+
+    /// The module's data layout (see [`TypeContext::data_layout`]).
+    pub fn data_layout(&self) -> &DataLayout {
+        self.types.data_layout()
+    }
+
+    /// Set the module's data layout. Every size, alignment and offset query —
+    /// including the builder's `struct_field`/`array_elem` helpers — follows it
+    /// from then on; set it before building code that depends on layout.
+    pub fn set_data_layout(&mut self, layout: DataLayout) {
+        self.types.set_data_layout(layout);
     }
 
     /// The module's constant-interning pool.
@@ -275,7 +311,35 @@ impl Module {
         let id = GlobalId::from_index(self.globals.len());
         self.globals.push(global);
         self.global_attrs.push(attrs);
+        self.global_addr_space.push(0);
         id
+    }
+
+    /// The address space a global lives in (`0` unless set). A reference to
+    /// the global (`@x` as an operand, or `ptr @x` in an initializer) is a
+    /// pointer into this space.
+    pub fn global_addr_space(&self, id: GlobalId) -> u32 {
+        self.global_addr_space[id.index()]
+    }
+
+    /// Place a global in address space `addr_space` (e.g. AVR program memory).
+    /// Set it before building references to the global: the builder types
+    /// `global_ref` by it.
+    pub fn set_global_addr_space(&mut self, id: GlobalId, addr_space: u32) {
+        self.global_addr_space[id.index()] = addr_space;
+    }
+
+    /// The type of a reference to global `id`: a pointer into its address space.
+    pub fn global_ref_type(&mut self, id: GlobalId) -> TypeId {
+        let space = self.global_addr_space(id);
+        self.types.ptr_in(space)
+    }
+
+    /// The type of a reference to a function: a pointer into the data layout's
+    /// program address space.
+    pub fn func_ref_type(&mut self) -> TypeId {
+        let space = self.types.data_layout().program_addr_space();
+        self.types.ptr_in(space)
     }
 
     /// Borrow a global by handle.
@@ -327,8 +391,9 @@ impl Module {
     /// Open a [`builder::FunctionBuilder`] on the given function, borrowing the
     /// shared type context and constant pool alongside it.
     pub fn build(&mut self, func: FuncId) -> builder::FunctionBuilder<'_> {
-        let Module { types, consts, functions, .. } = self;
+        let Module { types, consts, functions, global_addr_space, .. } = self;
         builder::FunctionBuilder::new(&mut functions[func.index()], types, consts)
+            .with_global_spaces(global_addr_space)
     }
 
     /// The number of functions declared in this module.
@@ -351,11 +416,12 @@ impl Module {
         id: FuncId,
         build: impl FnOnce(&Function, &mut builder::FunctionBuilder<'_>) -> R,
     ) -> (Function, R) {
-        let Module { types, consts, functions, .. } = self;
+        let Module { types, consts, functions, global_addr_space, .. } = self;
         let old = &functions[id.index()];
         let mut fresh = Function::new(old.name, old.sig);
         let r = {
-            let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts);
+            let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts)
+                .with_global_spaces(global_addr_space);
             build(old, &mut b)
         };
         (fresh, r)
@@ -379,12 +445,13 @@ impl Module {
         id: FuncId,
         build: impl FnOnce(&Function, &[Function], &mut builder::FunctionBuilder<'_>) -> R,
     ) -> (Function, R) {
-        let Module { types, consts, functions, .. } = self;
+        let Module { types, consts, functions, global_addr_space, .. } = self;
         let funcs: &[Function] = functions.as_slice();
         let caller = &funcs[id.index()];
         let mut fresh = Function::new(caller.name, caller.sig);
         let r = {
-            let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts);
+            let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts)
+                .with_global_spaces(global_addr_space);
             build(caller, funcs, &mut b)
         };
         (fresh, r)

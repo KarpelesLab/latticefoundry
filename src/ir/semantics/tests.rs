@@ -561,3 +561,38 @@ fn f16_arithmetic_via_evaluator() {
     let out = eval(&cx, f16, &bin(BinOp::FAdd), &Flags::NONE, &[a, b]);
     assert_eq!(as_f64(out), 1.5);
 }
+
+/// Under a layout with 16-bit data pointers and a 24-bit address space 1,
+/// address arithmetic and `inttoptr` wrap at each space's width, and signed
+/// pointer compares use the default space's width.
+#[test]
+fn pointer_arithmetic_follows_the_data_layout() {
+    let mut c = Ctx::new();
+    c.cx.set_data_layout(crate::ir::DataLayout::parse("p:16:16-p1:24:8").unwrap());
+    let ptr = c.cx.ptr();
+    let far = c.cx.ptr_in(1);
+    let i1 = c.int(1);
+    let add = InstKind::PtrAdd { inbounds: false };
+    let addr = |out: EvalOutcome| match out {
+        EvalOutcome::Value(SemValue::Ptr(a)) => a.to_u64().expect("fits"),
+        other => panic!("expected ptr, got {other:?}"),
+    };
+    // 0 + (-1) wraps to 0xffff in space 0, 0xff_ffff in space 1.
+    assert_eq!(addr(c.eval(ptr, &add, &Flags::NONE, &[SemValue::ptr(Int::ZERO), iv(16, -1)])), 0xffff);
+    assert_eq!(addr(c.eval(far, &add, &Flags::NONE, &[SemValue::ptr(Int::ZERO), iv(16, -1)])), 0xff_ffff);
+    // 0xfff0 + 0x20 wraps to 0x10 in space 0.
+    assert_eq!(addr(c.eval(ptr, &add, &Flags::NONE, &[SemValue::ptr(Int::from_u64(0xfff0)), iv(16, 0x20)])), 0x10);
+    // inttoptr keeps the low 16 bits.
+    let cast = InstKind::Cast(CastOp::IntToPtr);
+    assert_eq!(addr(c.eval(ptr, &cast, &Flags::NONE, &[uv(32, 0x1_2345)])), 0x2345);
+    // 0x8000 is "negative" as a 16-bit pointer.
+    let slt = InstKind::ICmp(IntPred::Slt);
+    let hi = SemValue::ptr(Int::from_u64(0x8000));
+    let lo = SemValue::ptr(Int::from_u64(0x10));
+    assert_int(c.eval(i1, &slt, &Flags::NONE, &[hi.clone(), lo.clone()]), 1, 1);
+    assert_int(c.eval(i1, &InstKind::ICmp(IntPred::Ult), &Flags::NONE, &[hi, lo]), 1, 0);
+    // bitcast between a pointer and the same-width integer.
+    let i16t = c.int(16);
+    assert_int(c.eval(i16t, &InstKind::Cast(CastOp::Bitcast), &Flags::NONE, &[SemValue::ptr(Int::from_u64(0x1234))]), 16, 0x1234);
+    assert_eq!(addr(c.eval(ptr, &InstKind::Cast(CastOp::Bitcast), &Flags::NONE, &[uv(16, 0xbeef)])), 0xbeef);
+}

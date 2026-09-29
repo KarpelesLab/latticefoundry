@@ -50,20 +50,25 @@ use crate::support::Sym;
 use super::FuncId;
 
 /// A failure while linking IR modules: two modules each provide a *strong*
-/// (defined) version of the same symbol, which cannot be unified.
+/// (defined) version of the same symbol, which cannot be unified, or the
+/// modules were laid out for different machines.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MergeError {
     /// Two modules define a function with the same name. Carries the symbol.
     DuplicateFunction(Sym),
     /// Two modules define a global with the same name. Carries the symbol.
     DuplicateGlobal(Sym),
+    /// The modules have different [data layouts](crate::ir::DataLayout) (or
+    /// name different targets), so their types do not mean the same bytes.
+    DataLayoutMismatch,
 }
 
 impl MergeError {
-    /// The clashing symbol name.
-    pub fn symbol(self) -> Sym {
+    /// The clashing symbol name, if the error is about a symbol.
+    pub fn symbol(self) -> Option<Sym> {
         match self {
-            MergeError::DuplicateFunction(s) | MergeError::DuplicateGlobal(s) => s,
+            MergeError::DuplicateFunction(s) | MergeError::DuplicateGlobal(s) => Some(s),
+            MergeError::DataLayoutMismatch => None,
         }
     }
 }
@@ -76,6 +81,9 @@ impl std::fmt::Display for MergeError {
             }
             MergeError::DuplicateGlobal(s) => {
                 write!(f, "duplicate definition of global (symbol #{})", s.index())
+            }
+            MergeError::DataLayoutMismatch => {
+                write!(f, "modules have different targets or data layouts")
             }
         }
     }
@@ -107,6 +115,19 @@ impl Module {
     /// definitions. On a duplicate strong definition `self` is left partially
     /// modified and a [`MergeError`] is returned.
     pub fn link_module(&mut self, other: Module) -> Result<(), MergeError> {
+        // 0. Both sides must describe the same machine. An empty module (the
+        //    seed of `merge_modules`) adopts the incoming target and layout.
+        if self.functions.is_empty() && self.globals.is_empty() {
+            self.target = other.target.clone();
+            self.types.set_data_layout(other.types.data_layout().clone());
+        } else if self.types.data_layout() != other.types.data_layout()
+            || (self.target.is_some() && other.target.is_some() && self.target != other.target)
+        {
+            return Err(MergeError::DataLayoutMismatch);
+        } else if self.target.is_none() {
+            self.target = other.target.clone();
+        }
+
         // 1. Re-intern types in id order (components precede composites).
         let mut type_map: Vec<TypeId> = Vec::with_capacity(other.types.len());
         for ty in other.types.iter() {
@@ -151,6 +172,7 @@ impl Module {
                         Global { name: g.name, ty: g.ty, init: None },
                         other.global_attrs[gi],
                     );
+                    self.global_addr_space[id.index()] = other.global_addr_space[gi];
                     self_globals.insert(g.name, id);
                     global_installs.push((id, gi));
                     id
@@ -222,6 +244,7 @@ impl Module {
             let mut attrs = other.global_attrs[gi];
             attrs.visibility = attrs.visibility.most_constraining(vis);
             self.global_attrs[target.index()] = attrs;
+            self.global_addr_space[target.index()] = other.global_addr_space[gi];
         }
 
         // 4. Copy function bodies with every reference remapped.
@@ -241,7 +264,7 @@ impl Module {
 /// (only lower-id components, which are already present, are dereferenced).
 fn remap_type(ty: &Type, type_map: &[TypeId]) -> Type {
     match ty {
-        Type::Void | Type::Int(_) | Type::Float(_) | Type::Ptr => ty.clone(),
+        Type::Void | Type::Int(_) | Type::Float(_) | Type::Ptr | Type::PtrIn(_) => ty.clone(),
         Type::Array(elem, len) => Type::Array(type_map[elem.index()], *len),
         Type::Struct(fields) => {
             Type::Struct(fields.iter().map(|f| type_map[f.index()]).collect())
