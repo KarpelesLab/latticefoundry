@@ -870,7 +870,7 @@ fn atomic_mem_rr(e: &mut Emitter, lock: bool, op8: &[u8], op: &[u8], reg: u8, ba
 /// Test hook: [`atomic_mem_rr`] for the three atomic opcode families, named by
 /// the byte of their full-width form (`0xB1` cmpxchg, `0xC1` xadd, `0x87`
 /// xchg).
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn atomic_mem_rr_for_test(e: &mut Emitter, lock: bool, op: u8, reg: u8, base: u8, size: u64) {
     let (op8, opw): (&[u8], &[u8]) = match op {
         0xB1 => (&[0x0F, 0xB0], &[0x0F, 0xB1]),
