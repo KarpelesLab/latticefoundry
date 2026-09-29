@@ -274,8 +274,10 @@ fn sext12(val: i64) -> i32 {
 
 /// The materialization steps for a 64-bit constant into a register.
 ///
-/// A 12-bit constant is a single `addi rd, x0`. A 32-bit constant is
-/// `lui`+`addiw` (matching the assembler's `li`). A wider constant is built by
+/// A 12-bit constant is a single `addi rd, x0`. A 32-bit constant is `lui`
+/// followed by `addi` — or by `addiw` when the 64-bit add would overflow the
+/// sign-extended 32-bit range and the 32-bit wrap is needed (matching the
+/// assembler's `li`). A wider constant is built by
 /// recursion — establish the high part, `slli` it up by 12, and add the low 12
 /// bits — which is correct (though not always minimal) for the full 64-bit range.
 fn li_steps(val: i64) -> Vec<LiStep> {
@@ -287,7 +289,12 @@ fn li_steps(val: i64) -> Vec<LiStep> {
         if hi20 != 0 {
             steps.push(LiStep::Lui(hi20));
             if lo12 != 0 {
-                steps.push(LiStep::Addiw(lo12));
+                let upper = i64::from((hi20 << 12) as i32);
+                if upper + i64::from(lo12) == val {
+                    steps.push(LiStep::Addi(lo12));
+                } else {
+                    steps.push(LiStep::Addiw(lo12));
+                }
             }
         } else {
             steps.push(LiStep::AddiZero(lo12));

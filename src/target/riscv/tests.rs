@@ -190,13 +190,13 @@ fn differential_encoding_matches_llvm_mc() {
 
 #[test]
 fn differential_li_materialization() {
-    // The `li` materialization (12-bit `addi`, 32-bit `lui`+`addiw`) must match the
+    // The `li` materialization (12-bit `addi`, 32-bit `lui`+`addi`/`addiw`) must match the
     // assembler's `li` expansion byte-for-byte.
     if llvm_mc("ret").is_none() {
         eprintln!("skipping differential_li_materialization: no llvm-mc");
         return;
     }
-    for val in [0i64, 5, -5, 2047, -2048, 0x12345, -0x12345, 0x7FFF_FFFF, -0x8000_0000] {
+    for val in [0i64, 5, -5, 2047, -2048, 0x12345, -0x12345, 0x7FFF_FFFF, -0x8000_0000, 0x7FFF_F800] {
         let ours = emit_li_bytes(10, val);
         let asm = format!("li a0, {val}");
         let expected = llvm_mc(&asm).unwrap_or_else(|| panic!("llvm-mc failed on `{asm}`"));
