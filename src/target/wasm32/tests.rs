@@ -18,6 +18,7 @@ mod node;
 mod programs;
 mod random;
 mod refinterp;
+mod vectors;
 
 use super::{compile, data_layout};
 use crate::codegen::CodegenOptions;

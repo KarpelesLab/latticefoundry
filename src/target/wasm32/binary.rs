@@ -802,3 +802,105 @@ fn binding_flags(linkage: Linkage, visibility: Visibility) -> u32 {
     }
     flags
 }
+
+/// Test support: decoding function bodies back into instructions.
+#[cfg(test)]
+pub(crate) mod decode {
+    use super::{WasmObject, leb};
+
+    impl WasmObject {
+        /// The expression of the function called `name`, its holes filled with
+        /// zero (enough to decode it).
+        pub(crate) fn function_expr(&self, name: &str) -> Vec<u8> {
+            let f = self.funcs.iter().find(|f| f.name == name).expect("a function of that name");
+            let code = &f.body.as_ref().expect("a defined function").code;
+            let mut out = Vec::new();
+            let mut prev = 0;
+            for fx in &code.fixups {
+                out.extend_from_slice(&code.bytes[prev..fx.at]);
+                out.push(0);
+                prev = fx.at;
+            }
+            out.extend_from_slice(&code.bytes[prev..]);
+            out
+        }
+    }
+
+    /// The opcodes of an expression, in order: one byte, or `0xFC00 | sub` /
+    /// `0xFE00 | sub` for the prefixed forms. Immediates are skipped per the
+    /// Core Specification's instruction encodings (the subset this backend
+    /// emits).
+    ///
+    /// # Panics
+    ///
+    /// On an opcode outside that subset, or truncated input.
+    pub(crate) fn opcodes(expr: &[u8]) -> Vec<u32> {
+        let mut at = 0;
+        let mut out = Vec::new();
+        let u = |at: &mut usize| leb::read_u64(expr, at).expect("an immediate");
+        while at < expr.len() {
+            let op = expr[at];
+            at += 1;
+            let code = match op {
+                0x02..=0x04 => {
+                    at += 1; // the block type
+                    u32::from(op)
+                }
+                0x0c | 0x0d | 0x10 | 0x20..=0x24 => {
+                    u(&mut at);
+                    u32::from(op)
+                }
+                0x0e => {
+                    let n = u(&mut at);
+                    for _ in 0..=n {
+                        u(&mut at);
+                    }
+                    0x0e
+                }
+                0x11 => {
+                    u(&mut at);
+                    at += 1; // table 0
+                    0x11
+                }
+                0x28..=0x3e => {
+                    u(&mut at);
+                    u(&mut at);
+                    u32::from(op)
+                }
+                0x41 | 0x42 => {
+                    leb::read_i64(expr, &mut at).expect("a constant");
+                    u32::from(op)
+                }
+                0x43 => {
+                    at += 4;
+                    0x43
+                }
+                0x44 => {
+                    at += 8;
+                    0x44
+                }
+                0xfc => 0xfc00 | u(&mut at) as u32,
+                0xfe => {
+                    let sub = u(&mut at) as u32;
+                    if sub == 0x03 {
+                        at += 1;
+                    } else {
+                        u(&mut at);
+                        u(&mut at);
+                    }
+                    0xfe00 | sub
+                }
+                0x00 | 0x01 | 0x05 | 0x0b | 0x0f | 0x1a | 0x1b | 0x45..=0xc4 => u32::from(op),
+                other => panic!("opcode {other:#x} is not one this backend emits"),
+            };
+            out.push(code);
+        }
+        out
+    }
+
+    /// Whether an opcode transfers control conditionally (`if`, `br_if`,
+    /// `br_table`) or loops (`loop`).
+    pub(crate) fn is_branchy(op: u32) -> bool {
+        matches!(op, 0x03 | 0x04 | 0x0d | 0x0e)
+    }
+}

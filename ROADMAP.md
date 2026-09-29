@@ -458,7 +458,9 @@ relocatable object with `linking`/`reloc.*` sections that `wasm-ld` links
 (`-c`). Validated by differential execution under node against a reference
 interpreter (≈80 000 calls: every integer op at 12 widths, floats, casts,
 control flow, memory, calls, atomics, `i128`), `llvm-objdump` decoding, and
-`wasm-ld` links.
+`wasm-ld` links. Vectors are scalarized by the generic legalizer (the shared
+vector fixtures run under node), and constant-time code stays branch-free
+(`select` is wasm `select`; decoded bodies are scanned).
 
 ### **Phase 8 — Linker & first end-to-end**  ✅
 

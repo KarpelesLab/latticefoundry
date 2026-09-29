@@ -1069,6 +1069,16 @@ format:
   accesses; atomics use the threads proposal, with `nand`/`max`/`min`/`umax`/
   `umin` as compare-exchange loops and every fence an `atomic.fence`. `syscall`,
   `f16`, other address spaces and variadic calls are errors.
+- **Vectors** (§6e). wasm32 declares no legal vector type, so the generic
+  legalizer scalarizes all vector code before lowering (SIMD128 is not used
+  yet); min/max and saturating ops are expanded by the same pass.
+- **Constant time** (§6d). There is no MIR to audit, so the guarantee is
+  structural: the only conditional control flow the backend emits (`if`,
+  `br_if`, `br_table`) comes from IR `cond_br`/`switch` terminators (and the
+  atomic retry loops, which the verifier rejects on secrets); `select` is always
+  the branchless wasm `select`, and narrow-value masking, sign extension and
+  the `i128` expansion (a `select` ladder for variable shifts) are straight-line.
+  `declassify` is the identity. Tests decode the emitted bodies to check it.
 - **Output.** A self-contained module (memory, stack pointer, table, data;
   exports `memory`, `__heap_base`, `main` and the default/protected-visibility
   functions) whose shadow stack sits at the bottom of memory, so an overflow

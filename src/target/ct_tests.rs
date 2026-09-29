@@ -458,6 +458,117 @@ fn ladder_and_memcmp_isel_adds_no_branches() {
 }
 
 // ---------------------------------------------------------------------------
+// wasm32: lowered straight from the IR, so there is no MIR to audit; the
+// emitted function bodies are decoded and scanned instead.
+// ---------------------------------------------------------------------------
+
+/// Secret narrow values (whose results the wasm backend masks) and a secret
+/// `i128` (split into `i64` parts, variable shifts through a `select`
+/// ladder): neither may introduce a branch.
+const NARROW_WIDE_LF: &str = r#"
+module "narrowwide"
+
+func @narrow(secret i8, secret i16, secret i1, secret i24) -> secret i32 {
+entry ^0(%a: i8, %b: i16, %c: i1, %d: i24):
+  %x = add %a, i8 100 : i8
+  %y = mul %b, i16 300 : i16
+  %s = ashr %d, i24 3 : i24
+  %xe = sext %x : i32
+  %ye = zext %y : i32
+  %se = sext %s : i32
+  %t = add %xe, %ye : i32
+  %u = sub %t, %se : i32
+  %k = select %c, %u, %t : i32
+  ret %k
+}
+
+func @wide(secret i128, secret i128, i128) -> secret i128 {
+entry ^0(%a: i128, %b: i128, %p: i128):
+  %s = add %a, %b : i128
+  %d = sub %s, %p : i128
+  %m = and %b, i128 127 : i128
+  %x = shl %d, %m : i128
+  %y = lshr %x, %m : i128
+  %z = ashr %y, %m : i128
+  %lt = icmp slt %z, %a : i1
+  %eq = icmp eq %z, %b : i1
+  %r1 = select %lt, %z, %s : i128
+  %r2 = select %eq, %r1, %d : i128
+  ret %r2
+}
+"#;
+
+/// `src` parsed with the wasm32 layout, optimized at `level`, compiled, and
+/// each defined function's wasm opcodes with its IR branch count.
+fn wasm_bodies(src: &str, level: OptLevel) -> Vec<(String, Vec<u32>, usize)> {
+    use crate::target::wasm32::binary::decode::opcodes;
+    let (mut m, syms) = parse(src);
+    m.set_data_layout(crate::target::wasm32::data_layout());
+    optimize(&mut m, level);
+    verify_module(&m).unwrap_or_else(|d| panic!("{d:#?}"));
+    for f in (0..m.function_count()).map(FuncId::from_index) {
+        let v = ct_violations(&m, f, CtPolicy::default());
+        assert!(v.is_empty(), "the program is constant-time: {v:?}");
+    }
+    let c =crate::target::wasm32::compile(&m, &syms, &crate::codegen::CodegenOptions::default())
+        .unwrap_or_else(|e| panic!("{e}"));
+    (0..m.function_count())
+        .map(FuncId::from_index)
+        .filter(|&f| !m.function(f).is_declaration())
+        .map(|f| {
+            let name = syms.resolve(m.function(f).name).to_owned();
+            let ops = opcodes(&c.object.function_expr(&name));
+            (name, ops, ir_branches(&m, f))
+        })
+        .collect()
+}
+
+#[test]
+fn wasm32_straight_line_code_has_no_branches() {
+    use crate::target::wasm32::binary::decode::is_branchy;
+    for level in [OptLevel::O0, OptLevel::O2] {
+        for src in [ALLOWED_LF, NARROW_WIDE_LF] {
+            for (name, ops, ir) in wasm_bodies(src, level) {
+                assert_eq!(ir, 0, "{name} is straight-line");
+                let bad: Vec<u32> = ops.iter().copied().filter(|&o| is_branchy(o)).collect();
+                assert!(bad.is_empty(), "{name} at {level:?}: branchy opcodes {bad:x?} in {ops:x?}");
+                if name != "narrow" || level == OptLevel::O0 {
+                    assert!(ops.contains(&0x1b), "{name} at {level:?}: the selects are wasm `select`s");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn wasm32_select_is_branchless() {
+    let src = r#"module "sel"
+func @sel(secret i1, secret i64, secret i64) -> secret i64 {
+entry ^0(%c: i1, %a: i64, %b: i64):
+  %r = select %c, %a, %b : i64
+  ret %r
+}
+"#;
+    let bodies = wasm_bodies(src, OptLevel::O0);
+    let (_, ops, _) = &bodies[0];
+    // local.get ×3 (the i1 masked on entry first), select, return.
+    assert!(ops.contains(&0x1b), "{ops:x?}");
+    assert!(!ops.iter().any(|&o| crate::target::wasm32::binary::decode::is_branchy(o)), "{ops:x?}");
+}
+
+/// The ladder and memcmp keep only their public loop control: every `if`,
+/// `br_if` and `br_table` in the wasm comes from an IR `cond_br`/`switch`.
+#[test]
+fn wasm32_ladder_and_memcmp_add_no_branches() {
+    for level in [OptLevel::O0, OptLevel::O2, OptLevel::O3] {
+        for (name, ops, ir) in wasm_bodies(crate::transform::ct_tests::LADDER_LF, level) {
+            let conds = ops.iter().filter(|&&o| matches!(o, 0x04 | 0x0d | 0x0e)).count();
+            assert!(conds <= ir, "{name} at {level:?}: {conds} conditional branches for {ir} IR branches");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Native execution on x86-64.
 // ---------------------------------------------------------------------------
 
