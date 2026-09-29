@@ -300,6 +300,10 @@ impl Pp {
         ] {
             self.define_object(name, val);
         }
+        // The prefix the ABI prepends to C names at the symbol level: none on
+        // ELF. glibc builds its asm labels from it (`__ASMNAME`), so an undefined
+        // macro would leak its own name into every redirected symbol.
+        self.define_object("__USER_LABEL_PREFIX__", "");
         self.define_object("__DATE__", "\"Jan  1 2020\"");
         self.define_object("__TIME__", "\"00:00:00\"");
         if self.std.is_gnu() {
@@ -1563,8 +1567,9 @@ impl Pp {
     }
 
     /// Classify an identifier into a keyword/literal token, applying the standard
-    /// gating. Returns `None` (dropping the token) only when a gating error is
-    /// recorded.
+    /// gating. Returns `None` (dropping the token) when a gating error is
+    /// recorded, and for GNU `__extension__`, which only silences pedantic
+    /// diagnostics and so has no meaning to this compiler.
     fn classify_ident(&mut self, name: &str, span: Span) -> Option<TokenKind> {
         // Base C89 keywords.
         if let Some(kw) = base_keyword(name) {
@@ -1592,6 +1597,11 @@ impl Pp {
             "__const__" | "__const" => Some(TokenKind::Keyword(Keyword::Const)),
             "__volatile__" | "__volatile" => Some(TokenKind::Keyword(Keyword::Volatile)),
             "__signed__" | "__signed" => Some(TokenKind::Keyword(Keyword::Signed)),
+            // GNU `asm`: the reserved spellings everywhere, the plain keyword only
+            // under the GNU dialects (in ISO modes `asm` is an ordinary identifier).
+            "__asm__" | "__asm" => Some(TokenKind::Keyword(Keyword::Asm)),
+            "__extension__" => None,
+            "asm" if self.std.is_gnu() => Some(TokenKind::Keyword(Keyword::Asm)),
             "_Noreturn" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Noreturn, span),
             "_Alignof" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignof, span),
             "_Alignas" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignas, span),

@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records, Stmt,
-    StmtKind, Storage, StrKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records,
+    Stmt, StmtKind, Storage, StrKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
 use crate::layout;
@@ -33,6 +33,10 @@ pub struct Program {
     pub globals: Vec<TGlobal>,
     /// The `struct`/`union` registry, needed by lowering for layout.
     pub records: Records,
+    /// The templates of the file-scope `asm("...")` declarations, in source
+    /// order. They are assembled separately (see `lf_cc::assemble_toplevel_asm`)
+    /// and linked alongside the translation unit's object.
+    pub toplevel_asm: Vec<String>,
 }
 
 /// The plain `char` type on this target (signed 8-bit), used for string data.
@@ -68,7 +72,9 @@ pub struct AggStore {
 /// A function signature (a definition or a prototype).
 #[derive(Clone, Debug)]
 pub struct FuncSig {
-    /// The function name.
+    /// The function's *symbol* name: its C name, or the GNU asm label given on
+    /// a declaration (`int f(int) __asm__("g");` makes this `g`). C-level
+    /// lookup goes through the checker's name index, never through this field.
     pub name: String,
     /// The return type.
     pub ret: CType,
@@ -87,7 +93,7 @@ pub struct FuncSig {
 /// size; emitting it is a byte copy into a `.data`/`.rodata` section.
 #[derive(Clone, Debug)]
 pub struct TGlobal {
-    /// The global's name.
+    /// The global's symbol name (its C name, or its GNU asm label).
     pub name: String,
     /// The global's type.
     pub ty: CType,
@@ -451,6 +457,7 @@ pub fn check(unit: &TranslationUnit, std: CStd) -> Result<Program, Vec<Diagnosti
             sigs: checker.sigs,
             globals: checker.globals,
             records: checker.records,
+            toplevel_asm: checker.toplevel_asm,
         })
     } else {
         Err(checker.diags)
@@ -460,9 +467,19 @@ pub fn check(unit: &TranslationUnit, std: CStd) -> Result<Program, Vec<Diagnosti
 #[derive(Default)]
 struct Checker {
     sigs: Vec<FuncSig>,
+    /// C name → index in `sigs`. Two C names may share one signature when an
+    /// asm label binds them to the same symbol.
     sig_index: HashMap<String, usize>,
+    /// Symbol name → index in `sigs`, so a declaration whose C name or asm
+    /// label names an already-declared *symbol* joins that entity.
+    sig_by_symbol: HashMap<String, usize>,
     globals: Vec<TGlobal>,
+    /// C name → index in `globals` (file-scope and block-scope `extern` objects).
     global_index: HashMap<String, usize>,
+    /// Symbol name → index in `globals` (see `sig_by_symbol`).
+    global_by_symbol: HashMap<String, usize>,
+    /// File-scope asm templates, in source order.
+    toplevel_asm: Vec<String>,
     funcs: Vec<TFunc>,
     diags: Vec<Diagnostic>,
     /// The `struct`/`union` registry (from the parser).
@@ -525,16 +542,31 @@ impl Checker {
                 TopLevel::Proto(p) => {
                     let params = p.params.iter().map(|pp| pp.ty.clone()).collect();
                     self.register_sig(
-                        &p.name, p.ret.clone(), params, p.variadic, false, p.is_static, p.span,
+                        &p.name,
+                        p.ret.clone(),
+                        params,
+                        p.variadic,
+                        false,
+                        p.is_static,
+                        p.asm_label.as_deref(),
+                        p.span,
                     );
                 }
                 TopLevel::Func(f) => {
                     let params = f.params.iter().map(|pp| pp.ty.clone()).collect();
                     self.register_sig(
-                        &f.name, f.ret.clone(), params, f.variadic, true, f.is_static, f.span,
+                        &f.name,
+                        f.ret.clone(),
+                        params,
+                        f.variadic,
+                        true,
+                        f.is_static,
+                        f.asm_label.as_deref(),
+                        f.span,
                     );
                 }
                 TopLevel::Global(g) => self.register_global(g),
+                TopLevel::Asm(text) => self.toplevel_asm.push(text.clone()),
             }
         }
         // Pass 2: check each function body.
@@ -554,9 +586,36 @@ impl Checker {
         variadic: bool,
         defined: bool,
         is_static: bool,
+        asm_label: Option<&str>,
         span: Span,
     ) {
-        if let Some(&idx) = self.sig_index.get(name) {
+        // The entity this declaration refers to: a prior declaration of the same
+        // C name, or else one already bound to the same *symbol* (a GNU asm label
+        // can give two C names one link-level identity: `int my_abs(int)
+        // __asm__("abs");` next to `int abs(int);`).
+        let symbol = asm_label.unwrap_or(name);
+        let prior = self.sig_index.get(name).or_else(|| self.sig_by_symbol.get(symbol)).copied();
+        if let Some(idx) = prior {
+            self.sig_index.insert(name.to_owned(), idx);
+            if let Some(label) = asm_label
+                && self.sigs[idx].name != label
+            {
+                // A label on a redeclaration renames the entity, as long as no
+                // earlier declaration fixed a different label or emitted it.
+                if self.sigs[idx].name != name || self.sigs[idx].defined {
+                    self.error(
+                        span,
+                        format!(
+                            "asm label '{label}' for '{name}' conflicts with its earlier symbol '{}'",
+                            self.sigs[idx].name
+                        ),
+                    );
+                    return;
+                }
+                self.sig_by_symbol.remove(name);
+                self.sigs[idx].name = label.to_owned();
+                self.sig_by_symbol.insert(label.to_owned(), idx);
+            }
             let existing = &mut self.sigs[idx];
             // Any `static` declaration of the name gives the whole entity internal
             // linkage.
@@ -576,8 +635,9 @@ impl Checker {
             return;
         }
         let idx = self.sigs.len();
-        self.sigs.push(FuncSig { name: name.to_owned(), ret, params, variadic, defined, is_static });
+        self.sigs.push(FuncSig { name: symbol.to_owned(), ret, params, variadic, defined, is_static });
         self.sig_index.insert(name.to_owned(), idx);
+        self.sig_by_symbol.insert(symbol.to_owned(), idx);
     }
 
     fn register_global(&mut self, g: &VarDecl) {
@@ -600,8 +660,16 @@ impl Checker {
             ty = self.deduce_array_len(&ty, init);
         }
 
-        // Merge with any prior declaration of the same name.
-        if let Some(&idx) = self.global_index.get(&g.name) {
+        // Merge with any prior declaration of the same name — or of the same
+        // symbol, when an asm label binds this C name to an existing one.
+        let symbol = g.asm_label.as_deref().unwrap_or(&g.name);
+        let prior =
+            self.global_index.get(&g.name).or_else(|| self.global_by_symbol.get(symbol)).copied();
+        if let Some(idx) = prior {
+            self.global_index.insert(g.name.clone(), idx);
+            if !self.relabel_global(idx, g) {
+                return;
+            }
             // A second full definition (both with initializers) is an error.
             if has_init && self.globals[idx].defined && !self.globals[idx].tentative {
                 self.error(g.span, format!("redefinition of global '{}'", g.name));
@@ -635,8 +703,9 @@ impl Checker {
         };
         let idx = self.globals.len();
         self.global_index.insert(g.name.clone(), idx);
+        self.global_by_symbol.insert(symbol.to_owned(), idx);
         self.globals.push(TGlobal {
-            name: g.name.clone(),
+            name: symbol.to_owned(),
             ty,
             bytes,
             readonly: false,
@@ -645,6 +714,28 @@ impl Checker {
             tentative: !has_init && !is_decl_only,
             relocs,
         });
+    }
+
+    /// Apply the asm label of redeclaration `g` to the existing global `idx`.
+    /// Returns `false` (after reporting) when it conflicts with an earlier label
+    /// or with a definition already emitted under the old symbol.
+    fn relabel_global(&mut self, idx: usize, g: &VarDecl) -> bool {
+        let Some(label) = g.asm_label.as_deref() else { return true };
+        if self.globals[idx].name == label {
+            return true;
+        }
+        if self.globals[idx].name != g.name || self.globals[idx].defined {
+            let msg = format!(
+                "asm label '{label}' for '{}' conflicts with its earlier symbol '{}'",
+                g.name, self.globals[idx].name
+            );
+            self.error(g.span, msg);
+            return false;
+        }
+        self.global_by_symbol.remove(&g.name);
+        self.globals[idx].name = label.to_owned();
+        self.global_by_symbol.insert(label.to_owned(), idx);
+        true
     }
 
     /// Build the little-endian storage image (and any address relocations) for a
@@ -663,8 +754,10 @@ impl Checker {
     /// file-scope object types lets `sizeof <global>` (e.g. `sizeof table` for an
     /// array whose length is deduced from its initializer) reduce to a constant.
     fn const_eval(&self, e: &Expr) -> Option<i128> {
+        // Keyed by C name (a global's `name` is its symbol, which an asm label
+        // may have changed).
         let gtypes: HashMap<&str, &CType> =
-            self.globals.iter().map(|g| (g.name.as_str(), &g.ty)).collect();
+            self.global_index.iter().map(|(n, &i)| (n.as_str(), &self.globals[i].ty)).collect();
         const_eval_with(e, &self.enum_consts, &self.records, &gtypes)
     }
 
@@ -829,8 +922,8 @@ impl Checker {
             ExprKind::Cast(_, inner) => self.const_addr(inner),
             // An identifier of array or function type decays to its address.
             ExprKind::Ident(name) => {
-                if self.sig_index.contains_key(name) {
-                    return Some((Some(name.clone()), 0));
+                if let Some(&idx) = self.sig_index.get(name) {
+                    return Some((Some(self.sigs[idx].name.clone()), 0));
                 }
                 if let Some(&idx) = self.global_index.get(name)
                     && matches!(self.globals[idx].ty, CType::Array(..))
@@ -957,7 +1050,7 @@ impl Checker {
         let decl_line = f.span.start; // placeholder; refined to a real line by lower via source map
         self.funcs.push(TFunc {
             sig_index,
-            name: f.name.clone(),
+            name: self.sigs[sig_index].name.clone(),
             ret,
             locals: ctx.locals,
             params: ctx.params,
@@ -1005,6 +1098,32 @@ impl Checker {
     }
 
     // --- statements --------------------------------------------------------
+
+    /// Check a GNU `asm` statement. The backends encode machine code directly
+    /// (no textual assembly in the function pipeline), so the only form accepted
+    /// inside a function is the *compiler barrier*: an empty template with no
+    /// outputs and no goto labels, e.g. `__asm__ volatile ("" ::: "memory")` or
+    /// `asm("" : : "r"(x))`. It emits no instructions; its input operands are
+    /// evaluated for their side effects. (The current optimizer never moves
+    /// memory operations across statements in a way this barrier would forbid,
+    /// so treating it as a no-op is sound for now.) Everything else is rejected
+    /// with a clear diagnostic.
+    fn check_asm(&mut self, ctx: &mut FnCtx, asm: &AsmStmt, span: Span) -> Option<TStmt> {
+        let barrier = asm.template.trim().is_empty()
+            && asm.outputs.is_empty()
+            && asm.labels.is_empty()
+            && !asm.is_goto;
+        if !barrier {
+            self.error(span, "inline assembly with operands/instructions is not supported yet");
+            return None;
+        }
+        let mut out = Vec::with_capacity(asm.inputs.len());
+        for op in &asm.inputs {
+            let te = self.check_expr(ctx, &op.expr)?;
+            out.push(TStmt::Expr(Some(te)));
+        }
+        Some(TStmt::Block(out))
+    }
 
     fn check_stmt(&mut self, ctx: &mut FnCtx, stmt: &Stmt) -> Option<TStmt> {
         match &stmt.kind {
@@ -1107,6 +1226,7 @@ impl Checker {
                 let b = self.check_stmt(ctx, body)?;
                 Some(TStmt::Labeled(id, Box::new(b)))
             }
+            StmtKind::Asm(asm) => self.check_asm(ctx, asm, stmt.span),
             StmtKind::Goto(name) => match ctx.labels.get(name) {
                 Some(&id) => Some(TStmt::Goto(id)),
                 None => {
@@ -1212,6 +1332,7 @@ impl Checker {
                     ft.variadic,
                     false,
                     false,
+                    d.asm_label.as_deref(),
                     d.span,
                 );
                 continue;
@@ -1222,7 +1343,16 @@ impl Checker {
             // declaration-only if not yet seen. An incomplete array type here
             // (`extern char default_shell[];`) is legal — it is only a reference.
             if d.storage == Storage::Extern {
-                let idx = if let Some(&i) = self.global_index.get(&d.name) {
+                let symbol = d.asm_label.as_deref().unwrap_or(&d.name);
+                let prior = self
+                    .global_index
+                    .get(&d.name)
+                    .or_else(|| self.global_by_symbol.get(symbol))
+                    .copied();
+                let idx = if let Some(i) = prior {
+                    if !self.relabel_global(i, d) {
+                        continue;
+                    }
                     if ty_is_more_complete(&ty, &self.globals[i].ty) {
                         self.globals[i].ty = ty.clone();
                     }
@@ -1230,8 +1360,9 @@ impl Checker {
                 } else {
                     let i = self.globals.len();
                     self.global_index.insert(d.name.clone(), i);
+                    self.global_by_symbol.insert(symbol.to_owned(), i);
                     self.globals.push(TGlobal {
-                        name: d.name.clone(),
+                        name: symbol.to_owned(),
                         ty: ty.clone(),
                         bytes: Vec::new(),
                         readonly: false,
@@ -1311,8 +1442,12 @@ impl Checker {
         }
         let idx = self.globals.len();
         // A unique, internally-linked symbol name (the index disambiguates two
-        // functions that each declare a `static` of the same source name).
-        let sym = format!("{name}.static.{idx}");
+        // functions that each declare a `static` of the same source name) —
+        // unless an asm label names the symbol explicitly.
+        let sym = match &d.asm_label {
+            Some(label) => label.clone(),
+            None => format!("{name}.static.{idx}"),
+        };
         self.globals.push(TGlobal {
             name: sym,
             ty: ty.clone(),
@@ -2257,7 +2392,7 @@ impl Checker {
             // implicitly as `extern int name()` — an unprototyped (K&R) function,
             // modelled here as returning `int` with an unchecked argument list.
             if !self.std.is_c99() {
-                self.register_sig(name, CType::int(), Vec::new(), true, false, false, callee.span);
+                self.register_sig(name, CType::int(), Vec::new(), true, false, false, None, callee.span);
             }
         }
         // The callee decays to a function pointer: a bare function designator
@@ -2358,7 +2493,7 @@ impl Checker {
             } else {
                 CType::int()
             };
-            self.register_sig(base, ret, Vec::new(), true, false, false, callee_span);
+            self.register_sig(base, ret, Vec::new(), true, false, false, None, callee_span);
         }
         let new_callee = Expr { kind: ExprKind::Ident(base.to_owned()), span: callee_span };
         self.check_call(ctx, &new_callee, args, span)
