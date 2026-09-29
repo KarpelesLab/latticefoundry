@@ -697,6 +697,7 @@ impl Enc<'_> {
             Const::Float { .. } => Err(unsupported("floating-point constant")),
             Const::Null(_) => Err(unsupported("pointer constant")),
             Const::Aggregate { .. } => Err(unsupported("aggregate constant")),
+            Const::Addr { .. } => Err(unsupported("address constant")),
         }
     }
 

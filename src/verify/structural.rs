@@ -51,7 +51,7 @@
 
 use crate::ir::inst::{BinOp, CastOp, InstData, InstId, InstKind, UnaryOp};
 use crate::ir::types::{FloatKind, Type, TypeId};
-use crate::ir::value::{Const, ValueDef, ValueId};
+use crate::ir::value::{AddrTarget, Const, ConstId, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, Module};
 use crate::support::diagnostics::Diagnostic;
 
@@ -67,6 +67,114 @@ pub fn verify_function(module: &Module, func: FuncId) -> Vec<Diagnostic> {
     let mut ctx = Ctx::new(module, func);
     ctx.run();
     ctx.diags
+}
+
+/// Verify every global's initializer, returning each violation as an error
+/// [`Diagnostic`]: the initializer's type must equal the global's type, every
+/// aggregate must match its array/struct shape element-by-element, scalar leaves
+/// must be well-typed (`int`/`float`/`null`), and an address constant
+/// ([`Const::Addr`]) must be pointer-typed and name an existing global or
+/// function. Poison is accepted anywhere (it serializes as zero bytes).
+pub fn verify_globals(module: &Module) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for (gi, g) in module.globals().enumerate() {
+        let Some(init) = g.init else { continue };
+        let ity = module.consts().type_of(init);
+        if ity != g.ty {
+            diags.push(global_err(
+                gi,
+                format!(
+                    "initializer has type {} but the global has type {}",
+                    render_type(module, ity),
+                    render_type(module, g.ty)
+                ),
+            ));
+            continue;
+        }
+        check_init_const(module, gi, init, &mut diags);
+    }
+    diags
+}
+
+/// An error diagnostic about global `gi`.
+fn global_err(gi: usize, msg: String) -> Diagnostic {
+    Diagnostic::error(format!("global #{gi}: {msg}"))
+}
+
+/// Recursively check one global-initializer constant (see [`verify_globals`]).
+fn check_init_const(m: &Module, gi: usize, cid: ConstId, diags: &mut Vec<Diagnostic>) {
+    match m.consts().get(cid) {
+        Const::Int { ty, .. } if !is_int(m, *ty) => diags.push(global_err(
+            gi,
+            format!("integer constant has non-integer type {}", render_type(m, *ty)),
+        )),
+        Const::Float { ty, .. } if !is_float(m, *ty) => diags.push(global_err(
+            gi,
+            format!("float constant has non-float type {}", render_type(m, *ty)),
+        )),
+        Const::Null(ty) if !is_ptr(m, *ty) => diags.push(global_err(
+            gi,
+            format!("null constant has non-pointer type {}", render_type(m, *ty)),
+        )),
+        Const::Int { .. } | Const::Float { .. } | Const::Null(_) | Const::Poison(_) => {}
+        Const::Addr { ty, target, .. } => {
+            if !is_ptr(m, *ty) {
+                diags.push(global_err(
+                    gi,
+                    format!("address constant has non-pointer type {}", render_type(m, *ty)),
+                ));
+            }
+            let exists = match target {
+                AddrTarget::Global(g) => g.index() < m.global_count(),
+                AddrTarget::Func(f) => f.index() < m.function_count(),
+            };
+            if !exists {
+                diags.push(global_err(
+                    gi,
+                    format!("address constant names a nonexistent symbol ({target:?})"),
+                ));
+            }
+        }
+        Const::Aggregate { ty, elems } => {
+            let want: Vec<TypeId> = match m.types().get(*ty) {
+                Type::Array(elem, n) if elems.len() as u64 == *n => vec![*elem; elems.len()],
+                Type::Struct(fields) if elems.len() == fields.len() => fields.clone(),
+                Type::Array(..) | Type::Struct(_) => {
+                    diags.push(global_err(
+                        gi,
+                        format!(
+                            "aggregate constant has {} element(s) but type {} disagrees",
+                            elems.len(),
+                            render_type(m, *ty)
+                        ),
+                    ));
+                    return;
+                }
+                _ => {
+                    diags.push(global_err(
+                        gi,
+                        format!("aggregate constant has non-aggregate type {}", render_type(m, *ty)),
+                    ));
+                    return;
+                }
+            };
+            for (i, (&e, &w)) in elems.iter().zip(want.iter()).enumerate() {
+                let et = m.consts().type_of(e);
+                if et != w {
+                    diags.push(global_err(
+                        gi,
+                        format!(
+                            "aggregate element #{i} has type {} but expected {}",
+                            render_type(m, et),
+                            render_type(m, w)
+                        ),
+                    ));
+                } else {
+                    check_init_const(m, gi, e, diags);
+                }
+            }
+        }
+    }
 }
 
 /// Per-function verification state: the module and function under test, cheap
@@ -921,6 +1029,10 @@ impl<'a> Ctx<'a> {
                     render_type(m, *ty)
                 )),
             },
+            Const::Addr { .. } => self.err(format!(
+                "value {}: address constants are only allowed in global initializers",
+                v.index()
+            )),
         }
     }
 

@@ -420,3 +420,81 @@ fn build_loop() -> Module {
     }
     module
 }
+
+// --- global initializers ----------------------------------------------------
+
+/// Well-typed initializers (scalars, aggregates, address constants, poison)
+/// verify clean; each malformed initializer is rejected precisely.
+#[test]
+fn global_initializers_are_checked() {
+    use super::verify_globals;
+    use crate::ir::value::{AddrTarget, Const};
+    use crate::ir::{Global, GlobalAttrs, GlobalId};
+
+    let mut syms = StrInterner::new();
+    let def = GlobalAttrs::DEFAULT;
+    let mut m = Module::new("g");
+    let i32t = m.types_mut().int(32);
+    let i64t = m.types_mut().int(64);
+    let ptr = m.types_mut().ptr();
+    let pair = m.types_mut().struct_(vec![i32t, ptr]);
+    let one = m.intern_const(Const::Int { ty: i32t, value: puremp::Int::from_i64(1) });
+    let target = AddrTarget::Global(GlobalId::from_index(0));
+    let addr = m.intern_const(Const::Addr { ty: ptr, target, offset: 4 });
+    let agg = m.intern_const(Const::Aggregate { ty: pair, elems: vec![one, addr] });
+    m.define_global(Global { name: syms.intern("p"), ty: pair, init: Some(agg) }, def);
+    let poison = m.intern_const(Const::Poison(i64t));
+    m.define_global(Global { name: syms.intern("z"), ty: i64t, init: Some(poison) }, def);
+    assert_clean(&m);
+
+    // Initializer type differs from the global's type.
+    let mut bad = Module::new("b");
+    let i32b = bad.types_mut().int(32);
+    let i64b = bad.types_mut().int(64);
+    let c = bad.intern_const(Const::Int { ty: i32b, value: puremp::Int::from_i64(1) });
+    bad.define_global(Global { name: syms.intern("x"), ty: i64b, init: Some(c) }, def);
+    assert_one_error(&verify_globals(&bad), "initializer has type i32");
+
+    // An address constant naming a nonexistent function.
+    let mut bad = Module::new("b");
+    let ptrb = bad.types_mut().ptr();
+    let target = AddrTarget::Func(FuncId::from_index(3));
+    let c = bad.intern_const(Const::Addr { ty: ptrb, target, offset: 0 });
+    bad.define_global(Global { name: syms.intern("x"), ty: ptrb, init: Some(c) }, def);
+    assert_one_error(&verify_globals(&bad), "nonexistent symbol");
+
+    // A struct constant with the wrong field type.
+    let mut bad = Module::new("b");
+    let i8b = bad.types_mut().int(8);
+    let i32b = bad.types_mut().int(32);
+    let st = bad.types_mut().struct_(vec![i8b]);
+    let c = bad.intern_const(Const::Int { ty: i32b, value: puremp::Int::from_i64(1) });
+    let a = bad.intern_const(Const::Aggregate { ty: st, elems: vec![c] });
+    bad.define_global(Global { name: syms.intern("x"), ty: st, init: Some(a) }, def);
+    assert_one_error(&verify_globals(&bad), "element #0 has type i32");
+}
+
+/// An address constant used as an instruction operand is rejected: it is only
+/// meaningful inside a global initializer.
+#[test]
+fn address_constant_operand_is_rejected() {
+    use crate::ir::value::{AddrTarget, Const};
+    use crate::ir::{Global, GlobalAttrs};
+
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("m");
+    let ptr = m.types_mut().ptr();
+    let zero = m.intern_const(Const::Null(ptr));
+    let gdef = Global { name: syms.intern("g"), ty: ptr, init: Some(zero) };
+    let g = m.define_global(gdef, GlobalAttrs::DEFAULT);
+    let c = m.intern_const(Const::Addr { ty: ptr, target: AddrTarget::Global(g), offset: 0 });
+    let sig = m.types_mut().func(vec![], ptr, false);
+    let f = m.declare_function(syms.intern("f"), sig);
+    {
+        let mut b = m.build(f);
+        b.create_entry_block();
+        let v = b.use_const(c);
+        b.ret(Some(v));
+    }
+    assert_one_error(&verify_function(&m, f), "only allowed in global initializers");
+}

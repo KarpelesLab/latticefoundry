@@ -952,7 +952,8 @@ fn const_to_sem(types: &TypeContext, c: &Const) -> Option<SemValue> {
         Const::Float { bits, .. } => Some(SemValue::Float(*bits)),
         Const::Null(_) => Some(SemValue::ptr(Int::ZERO)),
         Const::Poison(_) => Some(SemValue::Poison),
-        Const::Aggregate { .. } => None,
+        // Aggregates and link-time addresses have no scalar semantic value.
+        Const::Aggregate { .. } | Const::Addr { .. } => None,
     }
 }
 

@@ -1040,7 +1040,7 @@ fn materialize(builder: &mut FunctionBuilder<'_>, c: &Const) -> ValueId {
         Const::Poison(ty) => builder.poison(*ty),
         // Modeled ops fold only to scalar constants; an aggregate never reaches
         // here, but poison of its type is a sound fallback rather than a panic.
-        Const::Aggregate { ty, .. } => builder.poison(*ty),
+        Const::Aggregate { ty, .. } | Const::Addr { ty, .. } => builder.poison(*ty),
     }
 }
 

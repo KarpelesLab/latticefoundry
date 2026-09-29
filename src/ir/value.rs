@@ -95,6 +95,15 @@ pub enum FloatBits {
     F64(u64),
 }
 
+/// The symbol an address constant ([`Const::Addr`]) points into.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AddrTarget {
+    /// A module global.
+    Global(GlobalId),
+    /// A function (its entry address).
+    Func(FuncId),
+}
+
 /// An interned constant value.
 ///
 /// The `TypeId` on each variant is the constant's type; it is part of the
@@ -130,6 +139,19 @@ pub enum Const {
         /// The element/field constants, in order.
         elems: Vec<ConstId>,
     },
+    /// The address of a global or function plus a byte offset, of a pointer
+    /// type. A link-time constant: the backend serializes it as a pointer-sized
+    /// zero field with an absolute data relocation (`S + offset`). Like
+    /// aggregates, it is only valid inside a **global initializer**, never as an
+    /// instruction operand (use a `global_ref` / `ptr_add` there instead).
+    Addr {
+        /// The pointer type of this constant.
+        ty: TypeId,
+        /// The symbol addressed.
+        target: AddrTarget,
+        /// The byte offset added to the symbol's address.
+        offset: i64,
+    },
 }
 
 impl Const {
@@ -140,7 +162,8 @@ impl Const {
             | Const::Float { ty, .. }
             | Const::Null(ty)
             | Const::Poison(ty)
-            | Const::Aggregate { ty, .. } => *ty,
+            | Const::Aggregate { ty, .. }
+            | Const::Addr { ty, .. } => *ty,
         }
     }
 }

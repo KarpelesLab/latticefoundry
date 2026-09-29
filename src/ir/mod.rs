@@ -39,7 +39,7 @@ pub use inst::{
 pub use merge::{MergeError, merge_modules};
 pub use semantics::{EvalOutcome, FoldResult, SemValue, eval, fold};
 pub use types::{FloatKind, FuncType, Layout, Type, TypeContext, TypeId};
-pub use value::{Const, ConstId, ConstPool, FloatBits, Value, ValueDef, ValueId};
+pub use value::{AddrTarget, Const, ConstId, ConstPool, FloatBits, Value, ValueDef, ValueId};
 
 use crate::support::Sym;
 
@@ -81,6 +81,11 @@ id_newtype!(
 
 /// A module-level global variable: a named, typed storage cell whose address is
 /// a pointer value in the IR.
+///
+/// The global's linkage and constness live in its [`GlobalAttrs`], kept by the
+/// [`Module`] beside the global (see [`Module::define_global`] /
+/// [`Module::global_attrs`]) so that this struct keeps its three public fields
+/// and existing builder-API callers (`Global { name, ty, init }`) stay valid.
 #[derive(Debug)]
 pub struct Global {
     /// The interned symbol name of the global.
@@ -89,6 +94,54 @@ pub struct Global {
     pub ty: TypeId,
     /// The initializer constant, if the global is defined here.
     pub init: Option<ConstId>,
+}
+
+/// How a *defined* global's symbol is bound in the emitted object.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Linkage {
+    /// Visible to other objects (an ELF `STB_GLOBAL` symbol). The default.
+    #[default]
+    External,
+    /// Private to this module (an ELF `STB_LOCAL` symbol); other objects may
+    /// define the same name independently.
+    Internal,
+    /// Visible, but yields to a strong definition elsewhere (`STB_WEAK`).
+    Weak,
+}
+
+/// Per-global attributes beyond name/type/initializer (`docs/ir-design.md` §4a).
+///
+/// - `linkage` picks the object symbol binding of a definition. A global with no
+///   initializer is always an external *reference* whatever its linkage.
+/// - `constant` promises the program never stores to the global, so the backend
+///   places it in read-only data (`.rodata`); a store to it faults at run time.
+/// - `detached` says the global's **storage is supplied outside the IR** (for
+///   example a frontend that serializes its own data section): the backend emits
+///   neither storage nor a symbol definition for it, and treats it exactly like
+///   a declaration, whatever its initializer. The initializer then only serves
+///   analyses and keeps the global well-typed. This is what
+///   [`Module::add_global`] records, preserving the pre-data-emission meaning of
+///   that API for existing builder clients.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct GlobalAttrs {
+    /// The symbol binding of a definition.
+    pub linkage: Linkage,
+    /// Read-only storage (`.rodata`).
+    pub constant: bool,
+    /// Storage is provided outside the IR; the backend emits nothing for it.
+    pub detached: bool,
+}
+
+impl GlobalAttrs {
+    /// External, mutable, backend-emitted: the attributes of a plain `.lf`
+    /// `global @x : T = c` definition.
+    pub const DEFAULT: GlobalAttrs =
+        GlobalAttrs { linkage: Linkage::External, constant: false, detached: false };
+
+    /// The attributes [`Module::add_global`] records: external, mutable, and
+    /// [`detached`](GlobalAttrs::detached).
+    pub const DETACHED: GlobalAttrs =
+        GlobalAttrs { linkage: Linkage::External, constant: false, detached: true };
 }
 
 /// A translation unit: the top-level container of IR.
@@ -103,6 +156,8 @@ pub struct Module {
     types: TypeContext,
     consts: ConstPool,
     globals: Vec<Global>,
+    /// `global_attrs[g]` holds the attributes of `globals[g]` (parallel vector).
+    global_attrs: Vec<GlobalAttrs>,
     functions: Vec<Function>,
 }
 
@@ -140,16 +195,50 @@ impl Module {
         id
     }
 
-    /// Append a global, returning its handle.
+    /// Append a global whose storage is supplied **outside the IR**, returning
+    /// its handle. The global gets [`GlobalAttrs::DETACHED`]: the backend emits
+    /// no storage or symbol definition for it (its initializer, if any, only
+    /// types it). This is the original builder API, kept with its original
+    /// meaning — a frontend that appends its own data section keeps working.
+    /// Use [`Module::define_global`] to have the backend emit the global.
     pub fn add_global(&mut self, global: Global) -> GlobalId {
+        self.define_global(global, GlobalAttrs::DETACHED)
+    }
+
+    /// Append a global with explicit attributes, returning its handle. With
+    /// [`GlobalAttrs::DEFAULT`] and an initializer this is an ordinary external,
+    /// mutable definition that the backend lays out in `.data`/`.bss`.
+    pub fn define_global(&mut self, global: Global, attrs: GlobalAttrs) -> GlobalId {
         let id = GlobalId::from_index(self.globals.len());
         self.globals.push(global);
+        self.global_attrs.push(attrs);
         id
     }
 
     /// Borrow a global by handle.
     pub fn global(&self, id: GlobalId) -> &Global {
         &self.globals[id.index()]
+    }
+
+    /// The attributes of a global.
+    pub fn global_attrs(&self, id: GlobalId) -> GlobalAttrs {
+        self.global_attrs[id.index()]
+    }
+
+    /// Replace the attributes of a global.
+    pub fn set_global_attrs(&mut self, id: GlobalId, attrs: GlobalAttrs) {
+        self.global_attrs[id.index()] = attrs;
+    }
+
+    /// Set (or clear) a global's initializer — e.g. to attach an initializer that
+    /// takes the address of a global or function created after it.
+    pub fn set_global_init(&mut self, id: GlobalId, init: Option<ConstId>) {
+        self.globals[id.index()].init = init;
+    }
+
+    /// Number of globals in the module.
+    pub fn global_count(&self) -> usize {
+        self.globals.len()
     }
 
     /// Borrow a function by handle.

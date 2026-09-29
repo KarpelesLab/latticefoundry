@@ -175,7 +175,7 @@ impl Plan {
             if let Some(c) = res.value(v).as_const() {
                 // Aggregates have no scalar-constant materialization; the domain
                 // reports ⊤ for them, but guard anyway.
-                if matches!(c, Const::Aggregate { .. }) {
+                if matches!(c, Const::Aggregate { .. } | Const::Addr { .. }) {
                     continue;
                 }
                 match func.value(v).def {
@@ -432,7 +432,9 @@ fn materialize(builder: &mut FunctionBuilder<'_>, c: &Const) -> ValueId {
         Const::Null(ty) => builder.null(*ty),
         Const::Poison(ty) => builder.poison(*ty),
         // Aggregates are ⊤ in the domain and are never queued for folding.
-        Const::Aggregate { .. } => unreachable!("aggregate constants are never folded"),
+        Const::Aggregate { .. } | Const::Addr { .. } => {
+            unreachable!("aggregate / address constants are never folded")
+        }
     }
 }
 

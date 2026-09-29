@@ -43,8 +43,8 @@ use std::collections::HashMap;
 
 use crate::ir::inst::{InstData, InstKind};
 use crate::ir::types::{FuncType, Type, TypeId};
-use crate::ir::value::{Const, ConstId, Value, ValueDef};
-use crate::ir::{Block, Function, Global, GlobalId, Module};
+use crate::ir::value::{AddrTarget, Const, ConstId, Value, ValueDef};
+use crate::ir::{Block, Function, Global, GlobalAttrs, GlobalId, Linkage, Module};
 use crate::support::Sym;
 
 use super::FuncId;
@@ -114,47 +114,47 @@ impl Module {
             type_map.push(self.types.intern(remapped));
         }
 
-        // 2. Re-intern constants in id order (children precede aggregates).
-        let mut const_map: Vec<ConstId> = Vec::with_capacity(other.consts.len());
-        for c in other.consts.iter() {
-            let remapped = remap_const(c, &type_map, &const_map);
-            const_map.push(self.consts.intern(remapped));
-        }
-
-        // 3a. Resolve globals by name.
+        // 2. Resolve globals by name. Initializers are remapped in step 3, once
+        //    the constant map exists (an address constant needs the global and
+        //    function maps, so constants are re-interned *after* symbols).
         let mut self_globals: HashMap<Sym, GlobalId> = HashMap::new();
         for (i, g) in self.globals.iter().enumerate() {
             self_globals.insert(g.name, GlobalId::from_index(i));
         }
         let mut global_map: Vec<GlobalId> = Vec::with_capacity(other.globals.len());
-        for g in &other.globals {
-            let ty = type_map[g.ty.index()];
-            let init = g.init.map(|c| const_map[c.index()]);
+        // (target, incoming global index) pairs whose type/init/attrs we install.
+        let mut global_installs: Vec<(GlobalId, usize)> = Vec::new();
+        for (gi, g) in other.globals.iter().enumerate() {
+            let incoming = def_rank(g, other.global_attrs[gi]);
             let target = match self_globals.get(&g.name).copied() {
                 Some(existing) => {
-                    let cur = &mut self.globals[existing.index()];
-                    match (cur.init.is_some(), init.is_some()) {
-                        (true, true) => return Err(MergeError::DuplicateGlobal(g.name)),
-                        // Upgrade a declaration to the incoming definition.
-                        (false, true) => {
-                            cur.ty = ty;
-                            cur.init = init;
-                        }
-                        // Keep the existing definition / declaration.
-                        (_, false) => {}
+                    let i = existing.index();
+                    let cur = def_rank(&self.globals[i], self.global_attrs[i]);
+                    if cur == DefRank::Strong && incoming == DefRank::Strong {
+                        return Err(MergeError::DuplicateGlobal(g.name));
+                    }
+                    // Upgrade to the stronger incoming definition; otherwise keep
+                    // the existing definition / declaration.
+                    if incoming > cur {
+                        global_installs.push((existing, gi));
                     }
                     existing
                 }
                 None => {
-                    let id = self.add_global(Global { name: g.name, ty, init });
+                    // Placeholder type/init; the install in step 3 fills them in.
+                    let id = self.define_global(
+                        Global { name: g.name, ty: g.ty, init: None },
+                        other.global_attrs[gi],
+                    );
                     self_globals.insert(g.name, id);
+                    global_installs.push((id, gi));
                     id
                 }
             };
             global_map.push(target);
         }
 
-        // 3b. Resolve functions by name, recording which incoming definitions must
+        // 2b. Resolve functions by name, recording which incoming definitions must
         //     have their bodies installed. Two definitions of one name is an error.
         let mut self_funcs: HashMap<Sym, FuncId> = HashMap::new();
         for i in 0..self.functions.len() {
@@ -193,6 +193,21 @@ impl Module {
             func_map.push(target);
         }
 
+        // 3. Re-intern constants in id order (children precede aggregates), then
+        //    install the resolved globals' types, initializers, and attributes.
+        let mut const_map: Vec<ConstId> = Vec::with_capacity(other.consts.len());
+        for c in other.consts.iter() {
+            let remapped = remap_const(c, &type_map, &const_map, &global_map, &func_map);
+            const_map.push(self.consts.intern(remapped));
+        }
+        for (target, gi) in global_installs {
+            let g = &other.globals[gi];
+            let cur = &mut self.globals[target.index()];
+            cur.ty = type_map[g.ty.index()];
+            cur.init = g.init.map(|c| const_map[c.index()]);
+            self.global_attrs[target.index()] = other.global_attrs[gi];
+        }
+
         // 4. Copy function bodies with every reference remapped.
         for (src_idx, target) in to_install {
             let src = &other.functions[src_idx];
@@ -221,8 +236,38 @@ fn remap_type(ty: &Type, type_map: &[TypeId]) -> Type {
     }
 }
 
-/// Remap a [`Const`]'s type and (for aggregates) child constant ids.
-fn remap_const(c: &Const, type_map: &[TypeId], const_map: &[ConstId]) -> Const {
+/// How strongly a global defines its symbol, for cross-module resolution.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum DefRank {
+    /// No initializer: a pure external declaration.
+    Decl,
+    /// A [`detached`](GlobalAttrs::detached) global: typed (maybe initialized)
+    /// but its storage lives outside the IR, so it defines nothing here.
+    Detached,
+    /// A weak definition: yields to a strong one.
+    Weak,
+    /// A strong (external or internal) definition.
+    Strong,
+}
+
+fn def_rank(g: &Global, attrs: GlobalAttrs) -> DefRank {
+    match (g.init, attrs.detached, attrs.linkage) {
+        (None, _, _) => DefRank::Decl,
+        (Some(_), true, _) => DefRank::Detached,
+        (Some(_), false, Linkage::Weak) => DefRank::Weak,
+        (Some(_), false, Linkage::External | Linkage::Internal) => DefRank::Strong,
+    }
+}
+
+/// Remap a [`Const`]'s type, (for aggregates) child constant ids, and (for
+/// address constants) the addressed global/function.
+fn remap_const(
+    c: &Const,
+    type_map: &[TypeId],
+    const_map: &[ConstId],
+    global_map: &[GlobalId],
+    func_map: &[FuncId],
+) -> Const {
     match c {
         Const::Int { ty, value } => Const::Int { ty: type_map[ty.index()], value: value.clone() },
         Const::Float { ty, bits } => Const::Float { ty: type_map[ty.index()], bits: *bits },
@@ -231,6 +276,14 @@ fn remap_const(c: &Const, type_map: &[TypeId], const_map: &[ConstId]) -> Const {
         Const::Aggregate { ty, elems } => Const::Aggregate {
             ty: type_map[ty.index()],
             elems: elems.iter().map(|e| const_map[e.index()]).collect(),
+        },
+        Const::Addr { ty, target, offset } => Const::Addr {
+            ty: type_map[ty.index()],
+            target: match target {
+                AddrTarget::Global(g) => AddrTarget::Global(global_map[g.index()]),
+                AddrTarget::Func(f) => AddrTarget::Func(func_map[f.index()]),
+            },
+            offset: *offset,
         },
     }
 }
@@ -493,5 +546,44 @@ mod tests {
         };
         let _ = std::fs::remove_file(&path);
         assert_eq!(status.code(), Some(42), "LTO program must return helper()+2 = 42");
+    }
+
+    /// Global definitions merge by strength (strong beats weak beats detached
+    /// beats declaration), keep their attributes, and address constants in
+    /// initializers are remapped to the merged globals/functions.
+    #[test]
+    fn merge_globals_attrs_and_address_constants() {
+        let a = "module \"a\"\n\
+                 global weak @w : i64 = i64 1\n\
+                 global internal constant @k : i64 = i64 3\n\
+                 global @x : i64 = i64 7\n\
+                 func @g() -> void {\nentry ^0:\n  ret\n}\n";
+        let b = "module \"b\"\n\
+                 global @tab : [2 x ptr] = [2 x ptr] (ptr @x + 8, ptr @g)\n\
+                 global @w : i64 = i64 2\n\
+                 global @x : i64\n\
+                 func @g() -> void\n";
+        let file = crate::support::diagnostics::FileId::new(0);
+        let mut syms = StrInterner::new();
+        let ma = text::parse_module(a, file, &mut syms).unwrap();
+        let mb = text::parse_module(b, file, &mut syms).unwrap();
+        let merged = merge_modules([ma, mb], "ab").expect("merge");
+        verify_module(&merged).expect("merged module verifies");
+        let out = text::print_module(&merged, &syms);
+        assert!(out.contains("global @w : i64 = i64 2\n"), "strong beats weak:\n{out}");
+        assert!(out.contains("global internal constant @k : i64 = i64 3\n"), "{out}");
+        assert!(out.contains("global @x : i64 = i64 7\n"), "{out}");
+        assert!(
+            out.contains("global @tab : [2 x ptr] = [2 x ptr] (ptr @x + 8, ptr @g)\n"),
+            "address constants remapped:\n{out}"
+        );
+        assert_eq!(merged.global_count(), 4);
+        assert_eq!(merged.function_count(), 1);
+
+        // Two strong definitions still clash.
+        let c = "module \"c\"\nglobal @x : i64 = i64 8\n";
+        let md = text::parse_module(a, file, &mut syms).unwrap();
+        let mc = text::parse_module(c, file, &mut syms).unwrap();
+        assert!(matches!(merge_modules([md, mc], "dc"), Err(MergeError::DuplicateGlobal(_))));
     }
 }

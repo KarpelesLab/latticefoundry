@@ -37,7 +37,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::ir::types::{Type, TypeContext, TypeId};
-use crate::ir::value::{Const, ConstId, ConstPool, FloatBits, ValueDef, ValueId};
+use crate::ir::value::{AddrTarget, Const, ConstId, ConstPool, FloatBits, ValueDef, ValueId};
 use crate::ir::{FuncId, Function, InstId, Module};
 use crate::pass::Changed;
 use crate::transform::FunctionTransform;
@@ -232,6 +232,21 @@ fn hash_const(h: &mut Fnv, types: &TypeContext, consts: &ConstPool, cid: ConstId
             for &e in elems {
                 hash_const(h, types, consts, e);
             }
+        }
+        Const::Addr { ty, target, offset } => {
+            h.write_u8(6);
+            hash_type(h, types, *ty);
+            match target {
+                AddrTarget::Global(g) => {
+                    h.write_u8(0);
+                    h.write_u32(g.index() as u32);
+                }
+                AddrTarget::Func(f) => {
+                    h.write_u8(1);
+                    h.write_u32(f.index() as u32);
+                }
+            }
+            h.write_u64(*offset as u64);
         }
     }
 }

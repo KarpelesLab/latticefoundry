@@ -26,7 +26,7 @@ use crate::codegen::regalloc;
 use crate::ir::Module;
 use crate::mc::emit::{Emitted, Emitter, Ref};
 use crate::mc::object::{
-    ObjectModule, Section, SectionKind, Symbol, SymbolBinding, SymbolType,
+    ObjectModule, RelocKind, Section, SectionKind, Symbol, SymbolBinding, SymbolType,
 };
 use crate::support::StrInterner;
 
@@ -1222,7 +1222,10 @@ pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInte
 /// Compile every defined function of `module` into a relocatable
 /// [`ObjectModule`]: a single `.text` section with one global function symbol
 /// per definition, and the call/global relocations wired to (undefined-if-new)
-/// symbols. `syms` resolves the interned function/global names.
+/// symbols; then every defined global's storage into `.rodata`/`.data`/`.bss`
+/// with `R_X86_64_64` data relocations for address-valued initializers (see
+/// [`crate::codegen::data`]). `syms` resolves the interned function/global
+/// names.
 pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));
@@ -1264,6 +1267,7 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
             });
         }
     }
+    crate::codegen::data::emit_globals(module, syms, &mut obj, RelocKind::Abs64);
     obj
 }
 
@@ -1362,6 +1366,8 @@ pub fn compile_module_debug(
         }
         funcs.push(FuncDebug { name, decl_line, size: len, rows });
     }
+
+    crate::codegen::data::emit_globals(module, syms, &mut obj, RelocKind::Abs64);
 
     let text_size = obj.section(text).bytes.len() as u64;
     let unit = DebugUnit {

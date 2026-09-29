@@ -31,7 +31,8 @@
 //! module      ::= "module" STRING { item }
 //! item        ::= global | func
 //!
-//! global      ::= "global" "@" name ":" type [ "=" const ]
+//! global      ::= "global" [ "internal" | "weak" ] [ "constant" ] [ "detached" ]
+//!                 "@" name ":" type [ "=" init ]
 //! func        ::= "func" "@" name fnsig [ body ]
 //! fnsig       ::= "(" [ type { "," type } [ "," "..." ] | "..." ] ")" "->" type
 //! body        ::= "{" { block } "}"
@@ -67,13 +68,28 @@
 //! case        ::= INT ":" target
 //!
 //! operand     ::= "%" name | "@" name | const
-//! const       ::= type ( INT | "0x" HEX | "null" | "poison"
-//!                       | "(" [ const { "," const } ] ")" )
+//! const       ::= type ( INT | "0x" HEX | "null" | "poison" )
+//! init        ::= type ( INT | "0x" HEX | "null" | "poison"
+//!                       | "(" [ init { "," init } ] ")"
+//!                       | "@" name [ ( "+" | "-" ) INT ]
+//!                       | STRING )
 //! type        ::= "void" | "i" INT | "f16" | "f32" | "f64" | "ptr"
 //!               | "[" INT "x" type "]" | "{" [ type { "," type } ] "}"
 //!               | "fn" fnsig
 //! name        ::= IDENT | STRING
 //! ```
+//!
+//! Global attributes (`docs/ir-design.md` §4a): the linkage keyword picks the
+//! symbol binding of a definition (external when omitted); `constant` places the
+//! global in read-only data; `detached` marks storage supplied outside the IR
+//! (the backend emits nothing for it). An `init` is a global initializer: it may
+//! be an aggregate (`(` … `)`), an **address constant** `ptr @sym + 8` (a global
+//! or function address plus a byte offset, resolved at link time; names may be
+//! forward references), or — as input-only sugar for an `[N x i8]` array — a
+//! string literal whose UTF-8 bytes number exactly `N` (escapes `\n \t \r \0
+//! \\ \" \xHH`, the last for `HH < 0x80`). The printer always writes the
+//! element form. Aggregate and address constants never appear as instruction
+//! operands.
 //!
 //! `;` begins a line comment. Integer constants are arbitrary precision
 //! (`puremp::Int`); floating-point constants print as the raw IEEE bit pattern in
@@ -87,8 +103,10 @@ use std::fmt;
 use crate::ir::builder::FunctionBuilder;
 use crate::ir::inst::{BinOp, CastOp, FastMath, Flags, FloatPred, InstId, InstKind, IntPred, UnaryOp};
 use crate::ir::types::{FloatKind, Type};
-use crate::ir::value::{Const, ConstId, FloatBits, ValueDef, ValueId};
-use crate::ir::{BlockId, FuncId, Function, Global, GlobalId, Module, TypeId};
+use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, ValueDef, ValueId};
+use crate::ir::{
+    BlockId, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module, TypeId,
+};
 use crate::support::StrInterner;
 use crate::support::diagnostics::{Diagnostic, FileId, Span};
 
@@ -131,9 +149,9 @@ pub fn write_module<W: fmt::Write>(f: &mut W, module: &Module, syms: &StrInterne
     write_quoted(f, &module.name)?;
     writeln!(f)?;
 
-    for g in module.globals() {
+    for (gi, g) in module.globals().enumerate() {
         writeln!(f)?;
-        write_global(f, module, syms, g)?;
+        write_global(f, module, syms, g, module.global_attrs(GlobalId::from_index(gi)))?;
     }
 
     for func in module.functions() {
@@ -148,14 +166,26 @@ fn write_global<W: fmt::Write>(
     module: &Module,
     syms: &StrInterner,
     g: &Global,
+    attrs: GlobalAttrs,
 ) -> fmt::Result {
     write!(f, "global ")?;
+    match attrs.linkage {
+        Linkage::External => {}
+        Linkage::Internal => write!(f, "internal ")?,
+        Linkage::Weak => write!(f, "weak ")?,
+    }
+    if attrs.constant {
+        write!(f, "constant ")?;
+    }
+    if attrs.detached {
+        write!(f, "detached ")?;
+    }
     write_name(f, syms.resolve(g.name))?;
     write!(f, " : ")?;
     write_type(f, module, g.ty)?;
     if let Some(init) = g.init {
         write!(f, " = ")?;
-        write_const(f, module, init)?;
+        write_const(f, module, syms, init)?;
     }
     writeln!(f)
 }
@@ -456,13 +486,18 @@ fn write_operand<W: fmt::Write>(
 ) -> fmt::Result {
     match &func.value(v).def {
         ValueDef::Inst(_) | ValueDef::Param(_, _) => write!(f, "%{}", names[&v]),
-        ValueDef::Const(cid) => write_const(f, module, *cid),
+        ValueDef::Const(cid) => write_const(f, module, syms, *cid),
         ValueDef::Global(g) => write_name(f, syms.resolve(module.global(*g).name)),
         ValueDef::Func(fu) => write_name(f, syms.resolve(module.function(*fu).name)),
     }
 }
 
-fn write_const<W: fmt::Write>(f: &mut W, module: &Module, cid: ConstId) -> fmt::Result {
+fn write_const<W: fmt::Write>(
+    f: &mut W,
+    module: &Module,
+    syms: &StrInterner,
+    cid: ConstId,
+) -> fmt::Result {
     let c = module.consts().get(cid);
     write_type(f, module, c.type_id())?;
     match c {
@@ -480,9 +515,22 @@ fn write_const<W: fmt::Write>(f: &mut W, module: &Module, cid: ConstId) -> fmt::
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write_const(f, module, e)?;
+                write_const(f, module, syms, e)?;
             }
             write!(f, ")")
+        }
+        Const::Addr { target, offset, .. } => {
+            let name = match *target {
+                AddrTarget::Global(g) => module.global(g).name,
+                AddrTarget::Func(fu) => module.function(fu).name,
+            };
+            write!(f, " ")?;
+            write_name(f, syms.resolve(name))?;
+            match offset.cmp(&0) {
+                std::cmp::Ordering::Greater => write!(f, " + {offset}"),
+                std::cmp::Ordering::Less => write!(f, " - {}", offset.unsigned_abs()),
+                std::cmp::Ordering::Equal => Ok(()),
+            }
         }
     }
 }
@@ -720,6 +768,7 @@ enum TokKind {
     Caret,
     At,
     Minus,
+    Plus,
     Ident(String),
     Num(String),
     Str(String),
@@ -824,6 +873,10 @@ fn lex(src: &str, file: FileId) -> Result<Vec<Tok>, Diagnostic> {
                 toks.push(Tok { kind: TokKind::At, span: sp(i, i + 1) });
                 i += 1;
             }
+            b'+' => {
+                toks.push(Tok { kind: TokKind::Plus, span: sp(i, i + 1) });
+                i += 1;
+            }
             b'-' => {
                 if i + 1 < n && b[i + 1] == b'>' {
                     toks.push(Tok { kind: TokKind::Arrow, span: sp(i, i + 2) });
@@ -866,6 +919,22 @@ fn lex(src: &str, file: FileId) -> Result<Vec<Tok>, Diagnostic> {
                                 b'\\' => s.push('\\'),
                                 b'n' => s.push('\n'),
                                 b't' => s.push('\t'),
+                                b'r' => s.push('\r'),
+                                b'0' => s.push('\0'),
+                                b'x' => {
+                                    // `\xHH`: an ASCII byte (HH < 0x80) in hex.
+                                    let hex = src.get(i + 2..i + 4).unwrap_or("");
+                                    match u8::from_str_radix(hex, 16) {
+                                        Ok(v) if hex.len() == 2 && v < 0x80 => s.push(char::from(v)),
+                                        _ => {
+                                            return Err(Diagnostic::error(
+                                                "`\\x` escape needs two hex digits below 80",
+                                            )
+                                            .with_span(sp(i, (i + 4).min(n))));
+                                        }
+                                    }
+                                    i += 2;
+                                }
                                 _ => {
                                     return Err(Diagnostic::error(format!(
                                         "unknown escape '\\{}'",
@@ -942,6 +1011,18 @@ enum ConstAst {
     Float(TypeId, FloatBits),
     Null(TypeId),
     Poison(TypeId),
+}
+
+/// A parsed global initializer, resolved to a [`ConstId`] only after every
+/// top-level item is known (address constants may name later symbols).
+#[derive(Debug)]
+enum InitAst {
+    /// A scalar leaf (`int`/`float`/`null`/`poison`), already interned.
+    Leaf(ConstId),
+    /// An aggregate of the given type.
+    Aggregate(TypeId, Vec<InitAst>),
+    /// `ptr @name ± offset`.
+    Addr(TypeId, String, i64, Span),
 }
 
 #[derive(Debug)]
@@ -1173,12 +1254,16 @@ impl Parser {
         let mut func_names: HashMap<String, FuncId> = HashMap::new();
         let mut global_names: HashMap<String, GlobalId> = HashMap::new();
         let mut pending: Vec<(FuncId, BodyAst, u32)> = Vec::new();
+        let mut pending_inits: Vec<(GlobalId, InitAst)> = Vec::new();
 
         loop {
             match self.peek_kind() {
                 TokKind::Eof => break,
                 TokKind::Ident(id) if id == "global" => {
-                    self.parse_global(&mut module, syms, &mut global_names)?;
+                    let (gid, init) = self.parse_global(&mut module, syms, &mut global_names)?;
+                    if let Some(init) = init {
+                        pending_inits.push((gid, init));
+                    }
                 }
                 TokKind::Ident(id) if id == "func" => {
                     let (fid, body, decl_line) =
@@ -1194,6 +1279,10 @@ impl Parser {
             }
         }
 
+        for (gid, init) in pending_inits {
+            let c = lower_init(&mut module, &init, &func_names, &global_names)?;
+            module.set_global_init(gid, Some(c));
+        }
         for (fid, body, decl_line) in pending {
             lower_body(&mut module, fid, &body, decl_line, &self.lines, &func_names, &global_names)?;
         }
@@ -1205,17 +1294,25 @@ impl Parser {
         module: &mut Module,
         syms: &mut StrInterner,
         global_names: &mut HashMap<String, GlobalId>,
-    ) -> PResult<()> {
+    ) -> PResult<(GlobalId, Option<InitAst>)> {
         self.expect_ident("global")?;
+        let mut attrs = GlobalAttrs::DEFAULT;
+        if self.eat_ident("internal") {
+            attrs.linkage = Linkage::Internal;
+        } else if self.eat_ident("weak") {
+            attrs.linkage = Linkage::Weak;
+        }
+        attrs.constant = self.eat_ident("constant");
+        attrs.detached = self.eat_ident("detached");
         let name = self.parse_name()?;
         self.expect(&TokKind::Colon, "`:`")?;
         let ty = self.parse_type(module)?;
-        let init =
-            if self.eat(&TokKind::Eq) { Some(self.parse_const(module)?) } else { None };
+        let init = if self.eat(&TokKind::Eq) { Some(self.parse_init(module)?) } else { None };
         let sym = syms.intern(&name);
-        let gid = module.add_global(Global { name: sym, ty, init });
+        // The initializer is attached once every name is known (`lower_init`).
+        let gid = module.define_global(Global { name: sym, ty, init: None }, attrs);
         global_names.insert(name, gid);
-        Ok(())
+        Ok((gid, init))
     }
 
     fn parse_func(
@@ -1604,23 +1701,24 @@ impl Parser {
         }
     }
 
-    /// Parse a constant used as a global initializer, interning it into the
-    /// module and returning its [`ConstId`]. Unlike operand constants, these may
-    /// be aggregates.
-    fn parse_const(&mut self, module: &mut Module) -> PResult<ConstId> {
+    /// Parse a global initializer. Unlike operand constants, these may be
+    /// aggregates, address constants (`ptr @sym + off`), or `[N x i8]` string
+    /// sugar. Scalar leaves are interned immediately; names are resolved later
+    /// by [`lower_init`], so an initializer may reference a later item.
+    fn parse_init(&mut self, module: &mut Module) -> PResult<InitAst> {
         let ty_sp = self.span();
         let ty = self.parse_type(module)?;
         if self.eat_ident("null") {
-            return Ok(module.intern_const(Const::Null(ty)));
+            return Ok(InitAst::Leaf(module.intern_const(Const::Null(ty))));
         }
         if self.eat_ident("poison") {
-            return Ok(module.intern_const(Const::Poison(ty)));
+            return Ok(InitAst::Leaf(module.intern_const(Const::Poison(ty))));
         }
         if self.eat(&TokKind::LParen) {
             let mut elems = Vec::new();
             if !matches!(self.peek_kind(), TokKind::RParen) {
                 loop {
-                    elems.push(self.parse_const(module)?);
+                    elems.push(self.parse_init(module)?);
                     if self.eat(&TokKind::Comma) {
                         continue;
                     }
@@ -1628,19 +1726,63 @@ impl Parser {
                 }
             }
             self.expect(&TokKind::RParen, "`)`")?;
-            return Ok(module.intern_const(Const::Aggregate { ty, elems }));
+            return Ok(InitAst::Aggregate(ty, elems));
+        }
+        if matches!(self.peek_kind(), TokKind::At) {
+            let sp = self.span();
+            let name = self.parse_name()?;
+            let offset = if self.eat(&TokKind::Plus) {
+                self.parse_offset(false)?
+            } else if self.eat(&TokKind::Minus) {
+                self.parse_offset(true)?
+            } else {
+                0
+            };
+            return Ok(InitAst::Addr(ty, name, offset, sp.merge(self.prev_span())));
+        }
+        if let TokKind::Str(text) = self.peek_kind().clone() {
+            let sp = self.span();
+            self.bump();
+            let i8t = module.types_mut().int(8);
+            let len = match module.types().get(ty) {
+                Type::Array(elem, n) if *elem == i8t => *n,
+                _ => return self.err(ty_sp, "a string initializer needs an `[N x i8]` type"),
+            };
+            if text.len() as u64 != len {
+                return self.err(
+                    sp,
+                    format!("string has {} byte(s) but the array type has {len}", text.len()),
+                );
+            }
+            let elems = text
+                .bytes()
+                .map(|b| {
+                    let value = puremp::Int::from_i64(i64::from(b));
+                    InitAst::Leaf(module.intern_const(Const::Int { ty: i8t, value }))
+                })
+                .collect();
+            return Ok(InitAst::Aggregate(ty, elems));
         }
         match module.types().get(ty).clone() {
             Type::Int(_) => {
                 let value = self.parse_signed_int()?;
-                Ok(module.intern_const(Const::Int { ty, value }))
+                Ok(InitAst::Leaf(module.intern_const(Const::Int { ty, value })))
             }
             Type::Float(k) => {
                 let bits = self.parse_float_bits(k)?;
-                Ok(module.intern_const(Const::Float { ty, bits }))
+                Ok(InitAst::Leaf(module.intern_const(Const::Float { ty, bits })))
             }
             _ => self.err(ty_sp, "expected a constant payload"),
         }
+    }
+
+    /// The unsigned byte offset after `+`/`-` in an address constant, negated
+    /// if `neg`.
+    fn parse_offset(&mut self, neg: bool) -> PResult<i64> {
+        let sp = self.span();
+        let mag = self.parse_u64()?;
+        let v = if neg { 0i64.checked_sub_unsigned(mag) } else { i64::try_from(mag).ok() };
+        v.ok_or_else(|| Diagnostic::error("address offset out of range").with_span(sp))
     }
 
     fn parse_signed_int(&mut self) -> PResult<puremp::Int> {
@@ -1964,6 +2106,36 @@ fn emit_inst(
         OpAst::Unreachable => {
             b.unreachable();
             None
+        }
+    })
+}
+
+/// Intern a parsed global initializer, resolving address-constant names against
+/// the module's functions (preferred, as for operands) and globals.
+fn lower_init(
+    module: &mut Module,
+    init: &InitAst,
+    func_names: &HashMap<String, FuncId>,
+    global_names: &HashMap<String, GlobalId>,
+) -> PResult<ConstId> {
+    Ok(match init {
+        InitAst::Leaf(c) => *c,
+        InitAst::Aggregate(ty, elems) => {
+            let mut ids = Vec::with_capacity(elems.len());
+            for e in elems {
+                ids.push(lower_init(module, e, func_names, global_names)?);
+            }
+            module.intern_const(Const::Aggregate { ty: *ty, elems: ids })
+        }
+        InitAst::Addr(ty, name, offset, sp) => {
+            let target = if let Some(&f) = func_names.get(name) {
+                AddrTarget::Func(f)
+            } else if let Some(&g) = global_names.get(name) {
+                AddrTarget::Global(g)
+            } else {
+                return Err(Diagnostic::error(format!("unknown reference `@{name}`")).with_span(*sp));
+            };
+            module.intern_const(Const::Addr { ty: *ty, target, offset: *offset })
         }
     })
 }
@@ -2468,5 +2640,113 @@ mod tests {
         let bad = "module \"x\"\nfunc @f(i64) -> i32 {\nentry ^0(%a: i64):\n  %r = syscall i64 60, %a : i32\n  ret %r\n}\n";
         let mut syms = StrInterner::new();
         assert!(parse_module(bad, file(), &mut syms).is_err(), "a syscall result must be i64");
+    }
+
+    /// Global attributes (linkage / constant / detached), address constants with
+    /// positive, negative, and forward references (to a later global and a later
+    /// function), and nested aggregates survive a print → parse → print round trip
+    /// and keep their structure.
+    const GLOBAL_DATA_SRC: &str = r#"module "gd"
+
+global internal constant @tab : [3 x ptr] = [3 x ptr] (ptr @x, ptr @x + 16, ptr @f)
+
+global weak @x : {i8, [2 x i32]} = {i8, [2 x i32]} (i8 -1, [2 x i32] (i32 1, i32 2))
+
+global constant detached @d : ptr = ptr @tab - 8
+
+global @ext : i32
+
+func @f() -> void {
+entry ^0:
+  ret
+}
+"#;
+
+    #[test]
+    fn global_attrs_and_address_constants_round_trip() {
+        let mut syms = StrInterner::new();
+        let m = parse_module(GLOBAL_DATA_SRC, file(), &mut syms).expect("parse");
+        assert_eq!(print_module(&m, &syms), GLOBAL_DATA_SRC, "the source is in canonical form");
+        let parsed = round_trip(&m, &mut syms);
+        crate::verify::verify_module(&parsed).expect("verifies");
+
+        let attrs: Vec<GlobalAttrs> =
+            (0..parsed.global_count()).map(|i| parsed.global_attrs(GlobalId::from_index(i))).collect();
+        assert_eq!(attrs[0], GlobalAttrs { linkage: Linkage::Internal, constant: true, detached: false });
+        assert_eq!(attrs[1], GlobalAttrs { linkage: Linkage::Weak, ..GlobalAttrs::DEFAULT });
+        assert_eq!(attrs[2], GlobalAttrs { constant: true, detached: true, ..GlobalAttrs::DEFAULT });
+        assert_eq!(attrs[3], GlobalAttrs::DEFAULT);
+
+        let tab = parsed.global(GlobalId::from_index(0)).init.unwrap();
+        let Const::Aggregate { elems, .. } = parsed.consts().get(tab) else { panic!("aggregate") };
+        let addrs: Vec<(AddrTarget, i64)> = elems
+            .iter()
+            .map(|&e| match parsed.consts().get(e) {
+                Const::Addr { target, offset, .. } => (*target, *offset),
+                other => panic!("expected an address constant, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            addrs,
+            [
+                (AddrTarget::Global(GlobalId::from_index(1)), 0),
+                (AddrTarget::Global(GlobalId::from_index(1)), 16),
+                (AddrTarget::Func(FuncId::from_index(0)), 0),
+            ]
+        );
+        let d = parsed.global(GlobalId::from_index(2)).init.unwrap();
+        assert!(matches!(parsed.consts().get(d), Const::Addr { offset: -8, .. }));
+    }
+
+    /// `[N x i8] "…"` is parse-only sugar for the element form, with the added
+    /// `\0`, `\r`, and `\xHH` escapes; the length must match exactly.
+    #[test]
+    fn string_initializer_sugar() {
+        let src = "module \"s\"\nglobal constant @m : [6 x i8] = [6 x i8] \"a\\x41\\n\\r\\t\\0\"\n";
+        let mut syms = StrInterner::new();
+        let m = parse_module(src, file(), &mut syms).expect("parse");
+        let text = print_module(&m, &syms);
+        assert!(
+            text.contains("[6 x i8] (i8 97, i8 65, i8 10, i8 13, i8 9, i8 0)"),
+            "printed in element form:\n{text}"
+        );
+        round_trip(&m, &mut syms);
+
+        for (bad, why) in [
+            ("global @m : [3 x i8] = [3 x i8] \"ab\"", "length mismatch"),
+            ("global @m : [2 x i32] = [2 x i32] \"ab\"", "non-i8 element type"),
+            ("global @m : [1 x i8] = [1 x i8] \"\\x80\"", "non-ASCII \\x escape"),
+        ] {
+            let src = format!("module \"s\"\n{bad}\n");
+            let mut syms = StrInterner::new();
+            assert!(parse_module(&src, file(), &mut syms).is_err(), "should reject: {why}");
+        }
+    }
+
+    #[test]
+    fn address_constant_errors() {
+        // Unknown symbol.
+        let src = "module \"e\"\nglobal @p : ptr = ptr @nope\n";
+        let mut syms = StrInterner::new();
+        assert!(parse_module(src, file(), &mut syms).is_err());
+        // An address constant is not an instruction operand.
+        let src = "module \"e\"\nglobal @g : i64 = i64 0\nfunc @f() -> ptr {\nentry ^0:\n  ret ptr @g\n}\n";
+        let mut syms = StrInterner::new();
+        assert!(parse_module(src, file(), &mut syms).is_err());
+    }
+
+    /// The pre-existing builder API (`Module::add_global`) records detached
+    /// globals, which print with the `detached` keyword and round-trip as such.
+    #[test]
+    fn builder_add_global_is_detached() {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("b");
+        let i32t = m.types_mut().int(32);
+        let c = m.intern_const(Const::Int { ty: i32t, value: puremp::Int::from_i64(3) });
+        m.add_global(Global { name: syms.intern("g"), ty: i32t, init: Some(c) });
+        let text = print_module(&m, &syms);
+        assert!(text.contains("global detached @g : i32 = i32 3"), "{text}");
+        let parsed = round_trip(&m, &mut syms);
+        assert_eq!(parsed.global_attrs(GlobalId::from_index(0)), GlobalAttrs::DETACHED);
     }
 }

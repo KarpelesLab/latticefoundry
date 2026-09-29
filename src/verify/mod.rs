@@ -50,14 +50,15 @@ pub use certificate::{
     is_certified, run_certified, run_pipeline_certified,
 };
 pub use refinement::{RefinementResult, RefinementTier, check_refinement};
-pub use structural::verify_function;
+pub use structural::{verify_function, verify_globals};
 
-/// Verify the structural + semantic invariants of every function in `module`.
+/// Verify the structural + semantic invariants of every function in `module`,
+/// and every global initializer ([`verify_globals`]).
 ///
 /// Returns `Ok(())` if the module is well-formed at the `Structural` tier, or
 /// `Err` with every error [`Diagnostic`] found across all functions.
 pub fn verify_module(module: &Module) -> Result<(), Vec<Diagnostic>> {
-    let mut diags = Vec::new();
+    let mut diags = verify_globals(module);
     for i in 0..module.functions().count() {
         diags.extend(verify_function(module, FuncId::from_index(i)));
     }
@@ -71,6 +72,9 @@ pub fn verify_module(module: &Module) -> Result<(), Vec<Diagnostic>> {
 /// [`has_errors`]: Diagnostics::has_errors
 pub fn structural_verify(module: &Module) -> Diagnostics {
     let mut sink = Diagnostics::new();
+    for d in verify_globals(module) {
+        sink.emit(d);
+    }
     for i in 0..module.functions().count() {
         for d in verify_function(module, FuncId::from_index(i)) {
             sink.emit(d);

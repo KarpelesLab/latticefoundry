@@ -51,8 +51,8 @@ use crate::ir::inst::{
     SwitchData, UnaryOp, Use,
 };
 use crate::ir::types::{FloatKind, FuncType, Type, TypeId};
-use crate::ir::value::{Const, ConstId, FloatBits, Value, ValueDef, ValueId};
-use crate::ir::{Block, BlockId, FuncId, Function, Global, GlobalId, Module};
+use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, Value, ValueDef, ValueId};
+use crate::ir::{Block, BlockId, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module};
 use crate::support::hash::{DetHashMap, DetHashSet};
 use crate::support::StrInterner;
 
@@ -63,7 +63,17 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 
 /// Format version. Bumped on any incompatible change to the byte layout; a
 /// decoder refuses a version it does not recognize.
-pub const VERSION: u32 = 1;
+///
+/// - **1** — the original layout.
+/// - **2** — adds a per-global attribute byte (linkage / constant / detached,
+///   see [`GlobalAttrs`]) after each global's initializer, and the
+///   address-constant tag ([`Const::Addr`]). Version-1 streams still decode:
+///   their globals get [`GlobalAttrs::DEFAULT`] (external, mutable, emitted —
+///   the meaning of a plain `.lf` `global` definition).
+pub const VERSION: u32 = 2;
+
+/// The oldest format version [`decode`] still reads.
+pub const MIN_VERSION: u32 = 1;
 
 // ===========================================================================
 // Errors
@@ -578,7 +588,7 @@ pub fn encode(module: &Module, names: &StrInterner) -> Vec<u8> {
     // --- globals (module order) ---
     let globals: Vec<&Global> = module.globals().collect();
     w.uvarint(globals.len() as u64);
-    for g in globals {
+    for (gi, g) in globals.into_iter().enumerate() {
         w.str(names.resolve(g.name));
         w.uvarint(tables.ty(g.ty));
         match g.init {
@@ -588,6 +598,7 @@ pub fn encode(module: &Module, names: &StrInterner) -> Vec<u8> {
             }
             None => w.u8(0),
         }
+        w.u8(attrs_bits(module.global_attrs(GlobalId::from_index(gi))));
     }
 
     // --- functions (module order) ---
@@ -677,7 +688,48 @@ fn write_const(w: &mut Writer, c: &Const, t: &Tables) {
                 w.uvarint(t.konst(*e));
             }
         }
+        Const::Addr { ty, target, offset } => {
+            w.u8(5);
+            w.uvarint(t.ty(*ty));
+            match target {
+                AddrTarget::Global(g) => {
+                    w.u8(0);
+                    w.uvarint(g.index() as u64);
+                }
+                AddrTarget::Func(f) => {
+                    w.u8(1);
+                    w.uvarint(f.index() as u64);
+                }
+            }
+            // Zigzag-encode the signed offset so small negatives stay short.
+            w.uvarint(((*offset << 1) ^ (*offset >> 63)) as u64);
+        }
     }
+}
+
+/// Pack a global's attributes into one byte: linkage in bits 0–1
+/// (`0` external, `1` internal, `2` weak), `constant` in bit 2, `detached` in
+/// bit 3.
+fn attrs_bits(a: GlobalAttrs) -> u8 {
+    let linkage = match a.linkage {
+        Linkage::External => 0,
+        Linkage::Internal => 1,
+        Linkage::Weak => 2,
+    };
+    linkage | (u8::from(a.constant) << 2) | (u8::from(a.detached) << 3)
+}
+
+fn attrs_from_bits(b: u8) -> Result<GlobalAttrs, DecodeError> {
+    let linkage = match b & 3 {
+        0 => Linkage::External,
+        1 => Linkage::Internal,
+        2 => Linkage::Weak,
+        _ => return Err(DecodeError::InvalidTag { what: "global-attrs", tag: u32::from(b) }),
+    };
+    if b & !0b1111 != 0 {
+        return Err(DecodeError::InvalidTag { what: "global-attrs", tag: u32::from(b) });
+    }
+    Ok(GlobalAttrs { linkage, constant: b & 4 != 0, detached: b & 8 != 0 })
 }
 
 fn write_function(w: &mut Writer, f: &Function, names: &StrInterner, t: &Tables) {
@@ -865,7 +917,7 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
         return Err(DecodeError::BadMagic);
     }
     let version = r.uvarint()?;
-    if version != u64::from(VERSION) {
+    if !(u64::from(MIN_VERSION)..=u64::from(VERSION)).contains(&version) {
         return Err(DecodeError::UnsupportedVersion(version.try_into().unwrap_or(u32::MAX)));
     }
 
@@ -900,7 +952,8 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
             1 => Some(consts[checked(r.uindex()?, consts.len(), "const")?]),
             t => return Err(DecodeError::InvalidTag { what: "global-init", tag: u32::from(t) }),
         };
-        module.add_global(Global { name, ty, init });
+        let attrs = if version >= 2 { attrs_from_bits(r.u8()?)? } else { GlobalAttrs::DEFAULT };
+        module.define_global(Global { name, ty, init }, attrs);
     }
 
     // --- functions ---
@@ -908,6 +961,21 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
     for _ in 0..nfuncs {
         let f = read_function(&mut r, names, &types, &consts, nglobals, nfuncs)?;
         module.functions.push(f);
+    }
+
+    // Address constants name globals/functions by module index; those counts are
+    // only known now, so range-check them after the fact.
+    for &c in &consts {
+        if let Const::Addr { target, .. } = module.consts().get(c) {
+            match *target {
+                AddrTarget::Global(g) => {
+                    checked(g.index(), nglobals, "global")?;
+                }
+                AddrTarget::Func(f) => {
+                    checked(f.index(), nfuncs, "function")?;
+                }
+            }
+        }
     }
 
     if r.remaining() != 0 {
@@ -985,6 +1053,20 @@ fn read_const(
                 elems.push(consts[checked(r.uindex()?, consts.len(), "const")?]);
             }
             Const::Aggregate { ty, elems }
+        }
+        5 => {
+            let ty = ty(r)?;
+            let kind = r.u8()?;
+            // Ids are `u32`; the exact range is checked once the counts are known.
+            let index = checked(r.uindex()?, u32::MAX as usize, "symbol")?;
+            let target = match kind {
+                0 => AddrTarget::Global(GlobalId::from_index(index)),
+                1 => AddrTarget::Func(FuncId::from_index(index)),
+                t => return Err(DecodeError::InvalidTag { what: "addr-target", tag: u32::from(t) }),
+            };
+            let z = r.uvarint()?;
+            let offset = ((z >> 1) as i64) ^ -((z & 1) as i64);
+            Const::Addr { ty, target, offset }
         }
         t => return Err(DecodeError::InvalidTag { what: "const", tag: u32::from(t) }),
     })
@@ -1211,8 +1293,8 @@ mod tests {
     use super::{DecodeError, MAGIC, VERSION, decode, encode};
     use crate::ir::inst::{BinOp, CastOp, FastMath, Flags, FloatPred, IntPred};
     use crate::ir::types::FloatKind;
-    use crate::ir::value::{Const, FloatBits};
-    use crate::ir::{Global, Module};
+    use crate::ir::value::{AddrTarget, Const, FloatBits};
+    use crate::ir::{Global, GlobalAttrs, GlobalId, Linkage, Module};
     use crate::support::StrInterner;
     use puremp::Int;
 
@@ -1528,5 +1610,74 @@ mod tests {
         bytes.push(VERSION as u8);
         bytes.extend_from_slice(&[0xff; 32]);
         let _ = decode(&bytes, &mut interner); // must not panic
+    }
+
+    /// Global attributes and address constants (to a later global, a function,
+    /// with positive and negative offsets) survive encode → decode.
+    #[test]
+    fn global_attrs_and_address_constants_round_trip() {
+        let src = "module \"gd\"\n\
+                   global internal constant @tab : [2 x ptr] = [2 x ptr] (ptr @x + 16, ptr @f)\n\
+                   global weak @x : [4 x i64] = [4 x i64] poison\n\
+                   global constant detached @d : ptr = ptr @tab - 8\n\
+                   func @f() -> void {\nentry ^0:\n  ret\n}\n";
+        let mut interner = StrInterner::new();
+        let file = crate::support::diagnostics::FileId::new(0);
+        let m = crate::ir::text::parse_module(src, file, &mut interner).expect("parse");
+        let bytes = encode(&m, &interner);
+        let m2 = decode(&bytes, &mut interner).expect("decode");
+        assert_eq!(encode(&m2, &interner), bytes, "re-encode is byte-identical");
+        assert_eq!(
+            crate::ir::text::print_module(&m2, &interner),
+            crate::ir::text::print_module(&m, &interner),
+            "decoded module prints identically"
+        );
+        assert_eq!(
+            m2.global_attrs(GlobalId::from_index(0)),
+            GlobalAttrs { linkage: Linkage::Internal, constant: true, detached: false }
+        );
+    }
+
+    /// A version-1 stream (no per-global attribute byte) still decodes; its
+    /// globals get the default attributes.
+    #[test]
+    fn version_1_stream_decodes_with_default_attrs() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("v1");
+        let i32t = m.types_mut().int(32);
+        let c = m.intern_const(Const::Int { ty: i32t, value: Int::from_i64(9) });
+        let g = Global { name: interner.intern("g"), ty: i32t, init: Some(c) };
+        m.define_global(g, GlobalAttrs::DEFAULT);
+        let mut bytes = encode(&m, &interner);
+        // With no functions the stream ends `<attrs byte> <nfuncs = 0>`; drop the
+        // attribute byte and relabel the version to reconstruct the v1 layout.
+        assert_eq!(bytes[4], VERSION as u8);
+        let n = bytes.len();
+        assert_eq!(&bytes[n - 2..], &[0, 0]);
+        bytes.remove(n - 2);
+        bytes[4] = 1;
+        let m2 = decode(&bytes, &mut interner).expect("v1 decodes");
+        assert_eq!(m2.global_count(), 1);
+        let g2 = m2.global(GlobalId::from_index(0));
+        assert_eq!(m2.global_attrs(GlobalId::from_index(0)), GlobalAttrs::DEFAULT);
+        let init = m2.consts().get(g2.init.expect("initializer kept"));
+        assert_eq!(init, &Const::Int { ty: g2.ty, value: Int::from_i64(9) });
+    }
+
+    /// An address constant naming a nonexistent global is a decode error.
+    #[test]
+    fn address_constant_out_of_range_is_rejected() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("bad");
+        let ptr = m.types_mut().ptr();
+        let target = AddrTarget::Global(GlobalId::from_index(5));
+        let c = m.intern_const(Const::Addr { ty: ptr, target, offset: 0 });
+        let g = Global { name: interner.intern("p"), ty: ptr, init: Some(c) };
+        m.define_global(g, GlobalAttrs::DEFAULT);
+        let bytes = encode(&m, &interner);
+        assert!(matches!(
+            decode(&bytes, &mut interner),
+            Err(DecodeError::IndexOutOfRange { what: "global", index: 5 })
+        ));
     }
 }

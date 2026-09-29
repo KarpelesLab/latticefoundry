@@ -17,11 +17,15 @@
 //!   traits, so the framework can be exercised end to end without a real ISA;
 //! - [`regalloc`] — a correct linear-scan register allocator with spilling;
 //! - [`interp`] — a small MIR interpreter over the virtual target, the
-//!   executable semantics isel + regalloc are validated against.
+//!   executable semantics isel + regalloc are validated against;
+//! - [`data`] — the target-independent emission of global data (initializer
+//!   serialization, `.rodata`/`.data`/`.bss` placement, data relocations) that
+//!   each backend's `compile_module` calls with its absolute-pointer reloc kind.
 //!
 //! Real ISAs (x86-64, AArch64, RISC-V) and instruction *encoding* are Phases
 //! 6–7; this phase produces MIR, not bytes.
 
+pub mod data;
 pub mod interp;
 pub mod isel;
 pub mod mir;

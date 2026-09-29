@@ -111,7 +111,7 @@ impl AbstractDomain for ConstLattice {
         match c {
             // Aggregates are not modeled by the scalar constant lattice; a sound
             // over-approximation is ⊤.
-            Const::Aggregate { .. } => ConstLattice::Top,
+            Const::Aggregate { .. } | Const::Addr { .. } => ConstLattice::Top,
             _ => ConstLattice::Const(c.clone()),
         }
     }

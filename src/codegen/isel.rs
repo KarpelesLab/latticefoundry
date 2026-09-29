@@ -364,6 +364,9 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
                 // Aggregates are out of the scalar subset; a zero placeholder
                 // keeps the MIR well-formed (never executed in tests).
                 Const::Aggregate { .. } => target.li(d, Int::ZERO),
+                // Address constants are global-initializer-only (the verifier
+                // rejects them as operands); a zero placeholder likewise.
+                Const::Addr { .. } => target.li(d, Int::ZERO),
             },
             ValueDef::Global(g) => target.global_addr(d, g.index() as u32),
             // A function used as a plain value (not a direct call target): a zero

@@ -26,10 +26,11 @@
 //!   within the mapping (that call is a `Plt32` relocation against a local
 //!   definition). A relocation to an **undefined external symbol** cannot be
 //!   resolved and yields [`JitError::UnresolvedSymbol`].
-//! - All sections share one `R-X` mapping. For the integer subset the backend
-//!   emits only `.text`, so this is exactly the code. Were writable `.data` to
-//!   appear it would be mapped read-only; that is a documented limitation, not a
-//!   correctness hazard for the supported subset.
+//! - All sections share one `R-X` mapping. A module that defines globals also
+//!   gets `.rodata`/`.data`/`.bss` sections (their relocations, including data
+//!   pointers, are applied like any other); they are readable in place, but
+//!   `.data`/`.bss` are mapped read-only too, so a *store* to a global faults.
+//!   Giving writable data its own `RW` mapping is a documented follow-up.
 //!
 //! # Safety
 //!
