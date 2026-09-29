@@ -16,13 +16,19 @@ machine-code / object-file layer, pluggable targets, and a linker core.
   concepts (SSA, dominator trees, register allocation) are fair game; another
   project's implementation is not. Where we must interoperate with a published
   standard (ELF, DWARF, an ISA manual, IEEE-754), we implement it from the spec.
-- **Only our own crates.** The dependency graph contains only our own focused,
-  clean-room library crates. Nothing third-party, no `-sys` crates, no C.
-  Currently:
-  - [`z3rs`](https://github.com/KarpelesLab/z3rs) — pure-Rust SMT solver, used
+- **Only our own crates.** Every direct dependency is one of our own focused,
+  pure-Rust library crates. There are no `-sys` crates and no C. Third-party
+  crates appear only transitively: qld uses rayon, hashbrown and memmap2.
+  The direct dependencies are:
+  - [`z3rs`](https://github.com/KarpelesLab/z3rs), a pure-Rust SMT solver used
     by the verifier.
-  - [`puremp`](https://github.com/KarpelesLab/puremp) — arbitrary-precision
-    numeric core, used for wide IR constants (and `z3rs`'s own dependency).
+  - [`puremp`](https://github.com/KarpelesLab/puremp), the arbitrary-precision
+    numeric core used for wide IR constants (and a dependency of `z3rs`).
+  - [`rsasm`](https://github.com/KarpelesLab/rsasm), a multi-architecture
+    assembler. It turns assembly text into ELF objects (`mc::asm`, `lf-as`).
+  - [`qld`](https://github.com/KarpelesLab/qld), a GNU-ld-compatible linker. It
+    links ELF objects, archives and shared libraries, including against the
+    host libc (`link::gnu`, `lf-ld`).
 - **Pure, safe Rust.** `unsafe` is a `warn`-level lint, used only where an
   invariant genuinely cannot be expressed in the type system.
 
@@ -53,14 +59,16 @@ latticefoundry/
 │   │                    e-graph equality saturation, superoptimizer, -O pipeline
 │   ├── codegen/         machine IR, instruction selection, register allocation,
 │   │                    MIR interpreter
-│   ├── mc/              encoding + fixups, ELF64 objects, `.lfo`, DWARF
+│   ├── mc/              encoding + fixups, ELF64 objects, `.lfo`, DWARF,
+│   │                    assembly text → objects (rsasm)
 │   ├── target/          x86_64/, aarch64/, riscv/
-│   ├── link/            static linker core (ELF64 executables)
+│   ├── link/            static linker core (ELF64 executables); bridge onto
+│   │                    qld for ELF objects, archives and libc
 │   ├── jit/             in-process JIT (the only `unsafe` in the tree)
 │   └── bin/
 │       ├── lf.rs        compiler driver (`lf build`)
-│       ├── lf-ld.rs     linker
-│       ├── lf-as.rs     assembler
+│       ├── lf-ld.rs     linker (own core for `.lfo`, qld for everything else)
+│       ├── lf-as.rs     assembler (rsasm)
 │       ├── lf-opt.rs    IR optimizer driver
 │       └── lf-dis.rs    disassembler
 ├── lf-cc/               C frontend (separate crate, not a workspace member)
@@ -98,6 +106,13 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
   optimizer (B4), a z3rs superoptimizer (B5), one lattice engine for all
   analyses (B8) and a cost model (B9).
 - An in-process JIT runs the same code without writing an executable.
+- `lf-as` assembles GNU-syntax assembly for x86-64, AArch64 and RISC-V using
+  rsasm.
+- `lf-ld` has two modes. With only `.lfo` inputs it uses our own static linker
+  core. For anything else it accepts a full GNU `ld` command line and links
+  with qld: ELF objects, archives, shared libraries, dynamic executables.
+- `link::gnu::host_c_link_args` links backend output against the host C
+  library directly, without calling a system compiler or linker.
 
 | Target  | Coverage | Validation |
 | ------- | -------- | ---------- |
@@ -105,7 +120,8 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
 | AArch64 | Integer, scalar FP, AAPCS64 struct-by-value | Encodings checked against `llvm-mc`; A64-MIR interpreter |
 | RISC-V  | RV64IM integer | Encodings checked against `llvm-mc`; interpreter |
 
-Not done yet: dynamic (shared-object) linking, sanitizers, RISC-V FP and
+Not done yet: shared-library *output* from our own pipeline, a disassembler
+(`lf-dis`), sanitizers, RISC-V FP and
 relocations, dynamic `alloca` on AArch64/RISC-V, and the deferred bets (B6
 region form, B7 full content-addressing, B10 provenance types, B11 verified
 lowering).
@@ -151,7 +167,8 @@ cargo test
 cargo clippy --all-targets
 ```
 
-Requires a Rust toolchain supporting the 2024 edition (1.88+, per `z3rs`).
+Requires a Rust toolchain supporting the 2024 edition (1.89+, per `rsasm` and
+`qld`).
 
 ## License
 

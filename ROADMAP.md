@@ -160,7 +160,7 @@ binaries: lf (umbrella)   lf-opt   lf-as   lf-dis   lf-ld
 | `codegen`                 | target-independent lowering to machine IR               |
 | `mc`                      | machine-code encoding, object emission, DWARF           |
 | `target`                  | target registry; `x86_64`, `aarch64`, `riscv`           |
-| `link`                    | linker core                                             |
+| `link`                    | static linker core; `link::gnu` bridge onto `qld`       |
 | `jit`                     | in-process execution of compiled code                   |
 
 ### Binaries (`src/bin/`)
@@ -182,6 +182,13 @@ ecosystem. It does **not** reinvent them:
 | -------------------------------------------------------- | ---------------------------------------------------------- |
 | [`puremp`](https://github.com/KarpelesLab/puremp)        | arbitrary-precision integers/rationals/floats for IR constants and codegen constant math |
 | [`z3rs`](https://github.com/KarpelesLab/z3rs)            | SMT solving for the verifier and correctness-guarded rewrites (Phase 9) |
+| [`rsasm`](https://github.com/KarpelesLab/rsasm)          | assembling textual assembly into ELF objects (`mc::asm`, `lf-as`); only the x86, AArch64 and RISC-V backends are enabled |
+| [`qld`](https://github.com/KarpelesLab/qld)              | GNU-ld-compatible linking of ELF objects, archives and shared libraries (`link::gnu`, `lf-ld`), including against the host libc |
+
+Every **direct** dependency is one of our own crates. Third-party crates may
+appear **transitively**: qld uses rayon, hashbrown and memmap2 (which pulls in
+`libc`). Its `plugin` feature, qld's only FFI (`dlopen` of an LTO plugin), is
+disabled.
 
 Additional own-crates may be adopted as later phases need them, e.g.
 [`compcol`](https://github.com/KarpelesLab/compcol) for compressing binary IR /
@@ -314,7 +321,7 @@ Lower optimized IR toward machine instructions.
 
 *Exit:* MIR for a target verifies and, once Phase 6/7 land, assembles and runs.
 
-### **Phase 6 — Machine-code layer**  ✅
+### **Phase 6 — Machine-code layer**  🔶
 
 Turn instructions into bytes and objects.
 
@@ -326,6 +333,10 @@ Turn instructions into bytes and objects.
 
 *Exit:* `lf-as` assembles to `.lfo`/ELF; `lf-dis` round-trips encode∘decode on
 a fuzzed instruction corpus; objects are consumable by Phase 8.
+
+*Progress:* the encoder, `.lfo` and the ELF writer are done. `lf-as` assembles
+real GNU-syntax assembly into ELF through our own `rsasm`. Still open: `lf-dis`
+(no disassembler yet).
 
 ### **Phase 7 — Targets**
 
@@ -355,6 +366,11 @@ Produce a runnable program.
   that runs and returns the expected result.**
 
 *Exit:* end-to-end tests compile → link → execute across the Phase 7 targets.
+
+*Progress:* the static linker core is done for `.lfo` and in-memory objects.
+ELF objects, archives, shared libraries and hosted (libc) executables are linked
+by our own `qld` through `link::gnu`; `lf-ld` sends each input to the right
+linker.
 
 ### Phase 9 — Certified tier: proof-carrying IR  *(is bet B3)*  ✅
 
