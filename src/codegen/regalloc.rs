@@ -400,7 +400,8 @@ pub fn allocate(mf: &mut MachineFunction, target: &dyn MachineTarget) -> Allocat
                         }
                     }
                 }
-                let slot = mf.frame_mut().add_slot(8, 8);
+                let (size, align) = target.spill_slot(class);
+                let slot = mf.frame_mut().add_slot(size, align);
                 spills += 1;
                 match victim {
                     Some((a_end, i)) if a_end > end => {

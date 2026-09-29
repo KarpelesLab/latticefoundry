@@ -43,6 +43,7 @@
 use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, RegClass, StackSlot};
 use crate::codegen::options::{CodegenOptions, CompiledModule};
 use crate::codegen::stack::{STACK_PROBE_INTERVAL, StackReport, StackUsage, scan_calls};
+use crate::codegen::legalize::legalized;
 use crate::codegen::regalloc;
 use crate::ir::Module;
 use crate::mc::emit::{Emitted, Emitter, Ref};
@@ -51,7 +52,7 @@ use crate::mc::object::{
 };
 use crate::support::StrInterner;
 
-use super::isel::{X86Op, X86_64Target};
+use super::isel::{Sse2Legality, X86Op, X86_64Target};
 use super::regs::{self, RBP, RSP};
 
 // ===========================================================================
@@ -412,6 +413,46 @@ fn fxor(e: &mut Emitter, is_f64: bool, d: u8, a: u8, b: u8) {
     sse_rr(e, xor_pfx, false, 0x57, d, b); // xorpd/xorps d, b
 }
 
+/// `movaps d, s` (`0F 28 /r`): a full 128-bit xmm copy.
+pub(crate) fn movaps(e: &mut Emitter, d: u8, s: u8) {
+    sse_rr(e, 0x00, false, 0x28, d, s);
+}
+
+/// A scratch xmm (`xmm13..15`, never allocated) distinct from every register
+/// in `avoid`. Scratch registers only carry a reload into the one instruction
+/// that uses it, so one this instruction does not name is free here.
+fn free_xmm_scratch(avoid: &[u8]) -> u8 {
+    [15u8, 14, 13].into_iter().find(|r| !avoid.contains(r)).expect("three scratch xmms")
+}
+
+/// Expand [`X86Op::VOp`] `d = a OP b` into two-address SSE form (see
+/// `vector::VEnc` for the packed immediate).
+fn encode_vop(e: &mut Emitter, ops: &[MachineOperand]) {
+    let (d, a, b) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+    let (prefix, opcode, comm, imm8) = super::isel::vector::VEnc::decode(uimm(&ops[3]));
+    let op = |e: &mut Emitter, reg: u8, rm: u8| {
+        sse_rr(e, prefix, false, opcode, reg, rm);
+        if let Some(i) = imm8 {
+            e.u8(i);
+        }
+    };
+    if d == a {
+        op(e, d, b);
+    } else if comm && d == b {
+        op(e, d, a);
+    } else if d == b {
+        // Non-commutative with the destination aliasing the second source:
+        // save it first.
+        let t = free_xmm_scratch(&[d, a]);
+        movaps(e, t, b);
+        movaps(e, d, a);
+        op(e, d, t);
+    } else {
+        movaps(e, d, a);
+        op(e, d, b);
+    }
+}
+
 /// Emit `and r64/r32, imm8` (sign-extended immediate) — `83 /4 ib`.
 fn and_ri8(e: &mut Emitter, reg: u8, imm8: i8, w: bool) {
     if w || reg >= 8 {
@@ -646,14 +687,17 @@ pub fn layout_frame_with(
         .collect();
 
     // Slot offsets grow downward from just below the callee-saved region (the
-    // pushed GPRs, then any xmm save slots).
+    // pushed GPRs, then any xmm save slots). The alignment is taken relative
+    // to `rbp`, which the prologue leaves 16-byte aligned (`push rbp` right
+    // after the call's return address), so a slot of alignment up to 16 (a
+    // vector) is really aligned whatever the number of callee-saved pushes.
     let mut off = 16 * xmm_saves.len() as i64;
     let mut slot_off = vec![0i32; mf.frame().len()];
     for (i, off_slot) in slot_off.iter_mut().enumerate() {
         let info = mf.frame().slot(StackSlot::from_index(i));
-        off += info.size as i64;
-        off = align_up(off, (info.align.max(1)) as i64);
-        *off_slot = -((cs_bytes as i64) + off) as i32;
+        let below_rbp = align_up(cs_bytes as i64 + off + info.size as i64, (info.align.max(1)) as i64);
+        off = below_rbp - cs_bytes as i64;
+        *off_slot = -below_rbp as i32;
     }
     let locals = off;
     // The outgoing stack-argument area sits at the very bottom of the frame
@@ -674,6 +718,11 @@ pub fn layout_frame_with(
 fn hidden_clobbers(inst: &MachineInst) -> Vec<crate::codegen::mir::PReg> {
     let flag = |i: usize| inst.operands.get(i).map_or(0, uimm);
     match X86Op::decode(inst.opcode) {
+        // A vector op may borrow a free scratch xmm (the first of xmm15, xmm14,
+        // xmm13 it does not name): a non-commutative op whose destination is
+        // its second source, and a constant with a nonzero high half. (These
+        // are callee-saved on Win64.)
+        X86Op::VOp | X86Op::LoadVConst => vec![regs::xmm(13), regs::xmm(14), regs::xmm(15)],
         X86Op::CvtSi2f if flag(3) & 0b100 != 0 => {
             vec![regs::gpr(regs::RBX), regs::gpr(regs::R10), regs::gpr(regs::R11)]
         }
@@ -877,8 +926,12 @@ fn encode_load(e: &mut Emitter, ops: &[MachineOperand]) {
     let ptr = rnum(&ops[1]);
     let size = uimm(&ops[2]);
     if rclass(&ops[0]) == RegClass::Fp {
-        // movss (4-byte) / movsd (8-byte) load into an xmm register.
-        sse_mem(e, scalar_prefix(size != 4), 0x10, d, ptr, 0);
+        // movss (4-byte) / movsd (8-byte) / movdqu (16-byte vector) load.
+        if size == 16 {
+            sse_mem(e, 0xF3, 0x6F, d, ptr, 0);
+        } else {
+            sse_mem(e, scalar_prefix(size != 4), 0x10, d, ptr, 0);
+        }
         return;
     }
     match size {
@@ -894,8 +947,13 @@ fn encode_store(e: &mut Emitter, ops: &[MachineOperand]) {
     let val = rnum(&ops[1]);
     let size = uimm(&ops[2]);
     if rclass(&ops[1]) == RegClass::Fp {
-        // movss / movsd store from an xmm register (store opcode 0x11).
-        sse_mem(e, scalar_prefix(size != 4), 0x11, val, ptr, 0);
+        // movss / movsd store from an xmm register (store opcode 0x11), or a
+        // 16-byte vector with movdqu.
+        if size == 16 {
+            sse_mem(e, 0xF3, 0x7F, val, ptr, 0);
+        } else {
+            sse_mem(e, scalar_prefix(size != 4), 0x11, val, ptr, 0);
+        }
         return;
     }
     match size {
@@ -1023,9 +1081,9 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             } else if d == s {
                 // A self-move is a no-op regardless of class.
             } else if dc == RegClass::Fp {
-                // xmm↔xmm copy via `movsd` (copies the low 64 bits, which holds
-                // both f32 and f64 values exactly).
-                sse_rr(e, 0xF2, false, 0x10, d, s);
+                // xmm↔xmm copy of all 128 bits via `movaps` (an xmm may hold a
+                // vector; a scalar float lives in the low lane).
+                movaps(e, d, s);
             } else {
                 mov_rr(e, d, s, true);
             }
@@ -1104,7 +1162,8 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let slot = slot_index(&ops[1]);
             let off = ctx.layout.slot_off[slot];
             if rclass(&ops[0]) == RegClass::Fp {
-                sse_mem(e, 0xF2, 0x11, src, RBP as u8, off); // movsd [rbp+off], xmm
+                // The whole register (a vector or a scalar float).
+                sse_mem(e, 0xF3, 0x7F, src, RBP as u8, off); // movdqu [rbp+off], xmm
             } else {
                 mem(e, &[0x89], src, RBP as u8, off, true, false);
             }
@@ -1114,7 +1173,7 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let slot = slot_index(&ops[1]);
             let off = ctx.layout.slot_off[slot];
             if rclass(&ops[0]) == RegClass::Fp {
-                sse_mem(e, 0xF2, 0x10, dst, RBP as u8, off); // movsd xmm, [rbp+off]
+                sse_mem(e, 0xF3, 0x6F, dst, RBP as u8, off); // movdqu xmm, [rbp+off]
             } else {
                 mem(e, &[0x8B], dst, RBP as u8, off, true, false);
             }
@@ -1389,6 +1448,66 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             }
             movzx_byte(e, d);
         }
+        // --- SSE2 vectors ---------------------------------------------------
+        X86Op::VOp => encode_vop(e, ops),
+        X86Op::VUnary => {
+            let (prefix, opcode, _, imm8) = super::isel::vector::VEnc::decode(uimm(&ops[2]));
+            sse_rr(e, prefix, false, opcode, rnum(&ops[0]), rnum(&ops[1]));
+            if let Some(i) = imm8 {
+                e.u8(i);
+            }
+        }
+        X86Op::VShiftI => {
+            let (d, a) = (rnum(&ops[0]), rnum(&ops[1]));
+            let enc = uimm(&ops[2]);
+            if d != a {
+                movaps(e, d, a);
+            }
+            // 66 0F 71/72/73 /ext ib: the extension in ModRM.reg, d in rm.
+            sse_rr(e, 0x66, false, enc as u8, (enc >> 8) as u8, d);
+            e.u8((enc >> 16) as u8);
+        }
+        X86Op::VLoad => {
+            let pfx = if uimm(&ops[2]) != 0 { 0x66 } else { 0xF3 }; // movdqa / movdqu
+            sse_mem(e, pfx, 0x6F, rnum(&ops[0]), rnum(&ops[1]), 0);
+        }
+        X86Op::VStore => {
+            let pfx = if uimm(&ops[2]) != 0 { 0x66 } else { 0xF3 };
+            sse_mem(e, pfx, 0x7F, rnum(&ops[1]), rnum(&ops[0]), 0);
+        }
+        X86Op::LoadVConst => {
+            let d = rnum(&ops[0]);
+            let (lo, hi) = (uimm(&ops[1]), uimm(&ops[2]));
+            if lo == 0 && hi == 0 {
+                sse_rr(e, 0x66, false, 0xEF, d, d); // pxor d, d
+            } else if lo == u64::MAX && hi == u64::MAX {
+                sse_rr(e, 0x66, false, 0x76, d, d); // pcmpeqd d, d
+            } else {
+                let tmp = regs::R11 as u8;
+                mov_ri(e, tmp, lo);
+                sse_rr(e, 0x66, true, 0x6E, d, tmp); // movq d, r11 (zeroes the top)
+                if hi != 0 {
+                    let t = free_xmm_scratch(&[d]);
+                    mov_ri(e, tmp, hi);
+                    sse_rr(e, 0x66, true, 0x6E, t, tmp); // movq t, r11
+                    sse_rr(e, 0x66, false, 0x6C, d, t); // punpcklqdq d, t
+                }
+            }
+        }
+        X86Op::MovGprToX => sse_rr(e, 0x66, uimm(&ops[2]) != 0, 0x6E, rnum(&ops[0]), rnum(&ops[1])),
+        X86Op::MovXToGpr => sse_rr(e, 0x66, uimm(&ops[2]) != 0, 0x7E, rnum(&ops[1]), rnum(&ops[0])),
+        X86Op::Pinsrw => {
+            let (d, v, g) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+            if d != v {
+                movaps(e, d, v);
+            }
+            sse_rr(e, 0x66, false, 0xC4, d, g); // pinsrw d, g32, idx
+            e.u8(uimm(&ops[3]) as u8);
+        }
+        X86Op::Pextrw => {
+            sse_rr(e, 0x66, false, 0xC5, rnum(&ops[0]), rnum(&ops[1])); // pextrw g32, v, idx
+            e.u8(uimm(&ops[2]) as u8);
+        }
         X86Op::Cvtsd2ss => sse_rr(e, 0xF2, false, 0x5A, rnum(&ops[0]), rnum(&ops[1])),
         X86Op::Cvtss2sd => sse_rr(e, 0xF3, false, 0x5A, rnum(&ops[0]), rnum(&ops[1])),
         X86Op::CvtF2si => {
@@ -1607,7 +1726,8 @@ fn compile_function_full(
 /// Compile one function of `module` to its encoded bytes and relocations. Runs
 /// isel → register allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
-    compile_function_full(module, func, syms, &CodegenOptions::default(), false).emitted
+    let legal = legalized(module, &Sse2Legality);
+    compile_function_full(&legal, func, syms, &CodegenOptions::default(), false).emitted
 }
 
 /// Compile every defined function of `module` into a relocatable
@@ -1639,7 +1759,8 @@ pub fn compile_function_lines(
     func: crate::ir::FuncId,
     syms: &StrInterner,
 ) -> (Emitted, Vec<(u64, u32)>) {
-    let out = compile_function_full(module, func, syms, &CodegenOptions::default(), true);
+    let legal = legalized(module, &Sse2Legality);
+    let out = compile_function_full(&legal, func, syms, &CodegenOptions::default(), true);
     (out.emitted, out.rows)
 }
 
@@ -1686,6 +1807,10 @@ fn build_module(
     debug: Option<&DebugSource>,
 ) -> CompiledModule {
     use crate::mc::dwarf::{DebugUnit, FuncDebug};
+
+    // Vector code the SSE2 baseline cannot hold or select is scalarized first.
+    let legal = legalized(module, &Sse2Legality);
+    let module: &Module = &legal;
 
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));

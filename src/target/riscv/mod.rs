@@ -42,6 +42,8 @@ mod tests;
 mod stack_tests;
 #[cfg(test)]
 mod runtime_tests;
+#[cfg(test)]
+mod vector_tests;
 
 pub use encode::{compile_function, compile_module, compile_module_with};
 pub use isel::{RiscvTarget, RvOp};

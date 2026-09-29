@@ -88,7 +88,7 @@ id_newtype!(
 /// [`Module`] beside the global (see [`Module::define_global`] /
 /// [`Module::global_attrs`]) so that this struct keeps its three public fields
 /// and existing builder-API callers (`Global { name, ty, init }`) stay valid.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Global {
     /// The interned symbol name of the global.
     pub name: Sym,
@@ -282,7 +282,7 @@ impl FuncAttrs {
 /// [`DataLayout`] (inside its [`TypeContext`]; LP64 unless set), which every
 /// size, alignment and pointer-width question about its types follows
 /// (`docs/ir-design.md` §3a).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Module {
     /// Human-readable module identifier (typically the source file name).
     pub name: String,
@@ -573,7 +573,7 @@ impl Module {
 /// least one block is a definition whose entry block holds the function's
 /// parameters. The function owns the flat arenas its ids address: the value
 /// table, the instruction arena, the block list, and the per-value use lists.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Function {
     /// The interned symbol name of the function.
     pub name: Sym,
@@ -714,7 +714,7 @@ impl Function {
 /// The parameters are the block's SSA arguments — the block-argument encoding
 /// that replaces φ-nodes. Predecessors supply matching argument lists on their
 /// terminators.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Block {
     params: Vec<ValueId>,
     insts: Vec<InstId>,
@@ -751,3 +751,5 @@ impl Block {
 pub(crate) mod tests;
 #[cfg(test)]
 mod vector_tests;
+#[cfg(test)]
+pub(crate) mod refexec;

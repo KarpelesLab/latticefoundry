@@ -92,4 +92,12 @@ pub trait MachineTarget: std::fmt::Debug {
 
     /// Build a reload: load stack `slot` into register `dst`.
     fn emit_reload(&self, dst: PReg, slot: StackSlot) -> MachineInst;
+
+    /// The `(size, alignment)` in bytes of a spill slot for a register of
+    /// `class`. The default is one 8-byte word; a target whose registers of a
+    /// class can be wider (x86-64 xmm registers holding 128-bit vectors)
+    /// overrides it.
+    fn spill_slot(&self, _class: RegClass) -> (u64, u64) {
+        (8, 8)
+    }
 }

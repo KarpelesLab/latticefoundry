@@ -172,7 +172,7 @@ impl Const {
 ///
 /// Structurally equal constants share one [`ConstId`]. This is what lets pure
 /// value nodes be hash-consed later (bets B6/B7) without reworking the core.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ConstPool {
     consts: Vec<Const>,
     dedup: HashMap<Const, ConstId>,

@@ -1349,7 +1349,8 @@ fn compile_function_full(
 /// Compile one function of `module` to its encoded bytes and relocations. Runs
 /// isel → register allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
-    compile_function_full(module, func, syms, &CodegenOptions::default()).0
+    let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
+    compile_function_full(&legal, func, syms, &CodegenOptions::default()).0
 }
 
 /// Compile every defined function of `module` into a relocatable
@@ -1378,6 +1379,10 @@ pub fn compile_module_with(
     if let Err(e) = crate::target::check_options(crate::target::TargetArch::AArch64, opts) {
         panic!("{e}");
     }
+    // Vectors are scalarized for this target (no SIMD lowering yet; the
+    // generic legalizer keeps any vector code correct).
+    let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
+    let module: &Module = &legal;
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
     let mut stack = StackReport::new();

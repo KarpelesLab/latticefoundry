@@ -795,17 +795,24 @@ impl TargetIsel for RiscvTarget {
                 ));
             }
             InstKind::Select => {
-                // Branchless (a mask blend), so a secret condition is
-                // constant-time (§6d).
-                debug_assert!(!RvOp::Select.may_branch_on_data(&[]));
+                // Branchless `d = f ^ ((t ^ f) & -c)` with `c` in {0, 1}, so a
+                // secret condition is constant-time (§6d); and every step names
+                // at most three registers, so it stays allocatable when all of
+                // them spill (a four-register `Select` needs one more spill
+                // scratch than the three the target reserves).
                 let d = lo.result_reg(inst);
                 let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = lo.reg(inst.operands()[1]);
                 let f = lo.reg(inst.operands()[2]);
-                lo.emit(MachineInst::new(
-                    RvOp::Select.opcode(),
-                    vec![def_v(d), use_v(c), use_v(t), use_v(f)],
-                ));
+                let zero = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(self.li(zero, Int::ZERO));
+                let mask = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(MachineInst::new(RvOp::Sub.opcode(), vec![def_v(mask), use_v(zero), use_v(c), imm(64)]));
+                let diff = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(MachineInst::new(RvOp::Xor.opcode(), vec![def_v(diff), use_v(t), use_v(f), imm(64)]));
+                let pick = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(MachineInst::new(RvOp::And.opcode(), vec![def_v(pick), use_v(diff), use_v(mask), imm(64)]));
+                lo.emit(MachineInst::new(RvOp::Xor.opcode(), vec![def_v(d), use_v(f), use_v(pick), imm(64)]));
             }
             InstKind::Freeze | InstKind::Declassify => {
                 let d = lo.result_reg(inst);

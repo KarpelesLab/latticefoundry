@@ -84,6 +84,15 @@ pub trait TargetIsel: MachineTarget + Sized {
     fn float_const(&self, dst: VReg, bits: u64, _width: u32) -> MachineInst {
         self.li(dst, Int::from_u64(bits))
     }
+
+    /// Build "materialize the vector constant `c` into the vector register
+    /// `dst`": a [`Const::Aggregate`] of vector type (lane constants, poison
+    /// lanes allowed) or a whole-vector `poison`/`null`. Only targets that keep
+    /// vector types legal (see [`crate::codegen::legalize`]) receive one; the
+    /// default is a zero placeholder for targets that never do.
+    fn vector_const(&self, dst: VReg, _types: &TypeContext, _consts: &crate::ir::ConstPool, _c: &Const) -> MachineInst {
+        self.li(dst, Int::ZERO)
+    }
 }
 
 /// A resolved operand source during edge lowering: either a register value or an
@@ -133,10 +142,11 @@ pub struct Lower<'a, T: TargetIsel> {
     va_overflow_off: Option<u64>,
 }
 
-/// Map an IR type to the register class that holds it.
+/// Map an IR type to the register class that holds it. A (legal) vector lives
+/// in the floating-point/SIMD file.
 fn class_of(types: &TypeContext, ty: TypeId) -> RegClass {
     match types.get(ty) {
-        Type::Float(_) => RegClass::Fp,
+        Type::Float(_) | Type::Vector(..) => RegClass::Fp,
         _ => RegClass::Gpr,
     }
 }
@@ -385,6 +395,17 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
         let inst = match self.func.value(v).def.clone() {
             ValueDef::Const(c) => match self.module.consts().get(c).clone() {
                 Const::Int { value, .. } => target.li(d, value),
+                // A vector constant (lanes or whole-vector poison) in a vector
+                // register.
+                k @ (Const::Aggregate { .. } | Const::Null(_) | Const::Poison(_))
+                    if self.types().is_vector(ty) =>
+                {
+                    target.vector_const(d, self.module.types(), self.module.consts(), &k)
+                }
+                // A poison float is any float: zero, loaded into the fp register.
+                Const::Null(_) | Const::Poison(_) if cls == RegClass::Fp => {
+                    target.float_const(d, 0, self.types().bit_width(ty).unwrap_or(64))
+                }
                 Const::Null(_) | Const::Poison(_) => target.li(d, Int::ZERO),
                 // A float constant loads its exact IEEE bit pattern into the fp
                 // register `d` (whose class is `Fp`, since the value is float-typed).
@@ -417,7 +438,11 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
     /// Resolve an IR value to an edge-copy source: an immediate for a constant,
     /// otherwise its register.
     fn src(&mut self, v: ValueId) -> Src {
-        if let ValueDef::Const(c) = self.func.value(v).def {
+        // Only a general-register value can be an immediate edge copy; a float
+        // or vector constant is materialized into its own register class.
+        if let ValueDef::Const(c) = self.func.value(v).def
+            && class_of(self.types(), self.func.value_type(v)) == RegClass::Gpr
+        {
             match self.module.consts().get(c) {
                 Const::Int { value, .. } => return Src::Imm(value.clone()),
                 Const::Null(_) | Const::Poison(_) => return Src::Imm(Int::ZERO),

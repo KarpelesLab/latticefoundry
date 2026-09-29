@@ -104,6 +104,9 @@ use crate::target::{CallConvKind, TargetOs, Triple};
 
 mod win64;
 
+pub(crate) mod vector;
+pub use vector::Sse2Legality;
+
 /// The x86-64 MIR opcode vocabulary. Operand layouts are documented per variant;
 /// `Def`/`Use` are register operands, the rest are immediates, frame slots,
 /// branch labels, or symbol references.
@@ -291,6 +294,38 @@ pub enum X86Op {
     /// `[Def xmm, Imm off]` — `movups xmm, [rbp + off]`: restore it in the
     /// epilogue.
     RestoreXmm = 62,
+
+    // --- SSE2 128-bit vectors (see `vector` for the lowering) ---------------
+    /// `[Def d, Use a, Use b, Imm enc]` — a two-address packed SSE op
+    /// `d = a OP b` (`movaps d, a; OP d, b`). `enc` packs the mandatory prefix
+    /// (bits 0..8, `0` for none), the opcode after `0F` (bits 8..16), whether
+    /// the op is commutative (bit 16), whether an `imm8` follows (bit 17), and
+    /// that immediate (bits 24..32). (See `vector::VEnc`.)
+    VOp = 63,
+    /// `[Def d, Use s, Imm enc]` — a non-destructive packed op `OP d, s`
+    /// (`pshufd`/`pshuflw`/`cvtdq2ps`/`cvttps2dq`), `enc` as for [`X86Op::VOp`].
+    VUnary = 64,
+    /// `[Def d, Use a, Imm enc]` — an immediate packed shift
+    /// (`movaps d, a; psll/psrl/psra d, imm8`): `enc` bits 0..8 the opcode
+    /// (`71`/`72`/`73`), 8..16 the `ModRM.reg` extension, 16..24 the count.
+    VShiftI = 65,
+    /// `[Def d, Use ptr, Imm aligned]` — 16-byte load (`movdqa` if `aligned`,
+    /// else `movdqu`).
+    VLoad = 66,
+    /// `[Use ptr, Use v, Imm aligned]` — 16-byte store (`movdqa`/`movdqu`).
+    VStore = 67,
+    /// `[Def d, Imm lo, Imm hi]` — materialize a 128-bit constant (`pxor` for
+    /// zero, `pcmpeqd` for all-ones, else two `movq` through `r11` joined by
+    /// `punpcklqdq` with a free scratch xmm).
+    LoadVConst = 68,
+    /// `[Def x, Use g, Imm is64]` — `movd`/`movq xmm, r` (zero-extends).
+    MovGprToX = 69,
+    /// `[Def g, Use x, Imm is64]` — `movd`/`movq r, xmm` (the low lane).
+    MovXToGpr = 70,
+    /// `[Def d, Use v, Use g, Imm idx]` — `movaps d, v; pinsrw d, g, idx`.
+    Pinsrw = 71,
+    /// `[Def g, Use v, Imm idx]` — `pextrw g, v, idx` (zero-extended word).
+    Pextrw = 72,
 }
 
 impl X86Op {
@@ -320,6 +355,18 @@ impl X86Op {
             X86Op::BrCond | X86Op::Switch | X86Op::RmwLoop | X86Op::DynAlloca => true,
             X86Op::CvtSi2f => flags(3) & 0b100 != 0,
             X86Op::CvtF2si => flags(3) & 0b10 != 0,
+            // The SSE2 vector ops are straight-line data movement and
+            // arithmetic (blends, not branches, implement `select`).
+            X86Op::VOp
+            | X86Op::VUnary
+            | X86Op::VShiftI
+            | X86Op::VLoad
+            | X86Op::VStore
+            | X86Op::LoadVConst
+            | X86Op::MovGprToX
+            | X86Op::MovXToGpr
+            | X86Op::Pinsrw
+            | X86Op::Pextrw => false,
             _ => false,
         }
     }
@@ -327,13 +374,14 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 63] = [
+        const TABLE: [X86Op; 73] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
             StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
-            Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm,
+            Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm, VOp,
+            VUnary, VShiftI, VLoad, VStore, LoadVConst, MovGprToX, MovXToGpr, Pinsrw, Pextrw,
         ];
         TABLE[op.0 as usize]
     }
@@ -919,6 +967,13 @@ impl X86_64Target {
                 X86Op::Movzx.opcode(),
                 vec![def_v(d), use_v(s), imm(u64::from(src_w)), imm(u64::from(dst_w))],
             )),
+            // A bitcast between an integer and a float crosses register files:
+            // `movd`/`movq` carries the bits.
+            CastOp::Bitcast if lo.mf().vreg_class(d) != lo.mf().vreg_class(s) => {
+                let is64 = u64::from(dst_w.max(src_w) > 32);
+                let op = if lo.mf().vreg_class(d) == RegClass::Fp { X86Op::MovGprToX } else { X86Op::MovXToGpr };
+                lo.emit(MachineInst::new(op.opcode(), vec![def_v(d), use_v(s), imm(is64)]));
+            }
             // Truncation drops high bits, and ptr↔int / same-class bitcast preserve
             // the bit pattern: a plain register copy is correct (consumers operate
             // at the result's width).
@@ -1119,10 +1174,14 @@ impl X86_64Target {
                     };
                     reg_moves.push((a, v));
                 } else {
+                    // A 16-byte vector takes a 16-aligned 16-byte slot.
                     let sz = lo.byte_size(ty);
+                    if sz == 16 {
+                        stack_off = align_up_u64(stack_off, 16);
+                    }
                     let dp = self.lea_rsp(lo, stack_off);
                     lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(sz)]));
-                    stack_off += 8;
+                    stack_off += sz.max(8);
                 }
             }
         }
@@ -1146,7 +1205,7 @@ impl X86_64Target {
 
         // The primary return register (`rax`/`xmm0`); struct results reclaim their
         // eightbytes from `rax`/`rdx`/`xmm0`/`xmm1`, all covered by the clobber set.
-        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float());
+        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float() || lo.types().is_vector(t));
         let ret_reg = if ret_is_fp { cc.fp_ret_reg } else { cc.ret_reg };
 
         let mut operands = Vec::new();
@@ -1459,9 +1518,12 @@ impl X86_64Target {
                     lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(pv), use_p(a)]));
                 } else {
                     let sz = lo.byte_size(ty);
+                    if sz == 16 {
+                        stack_in = align_up_u64(stack_in, 16);
+                    }
                     let p = self.lea_rbp(lo, stack_in);
                     lo.emit(MachineInst::new(X86Op::Load.opcode(), vec![def_v(pv), use_v(p), imm(sz)]));
-                    stack_in += 8;
+                    stack_in += sz.max(8);
                 }
             }
         }
@@ -1584,6 +1646,15 @@ impl MachineTarget for X86_64Target {
         MachineInst::new(X86Op::StoreFrame.opcode(), vec![use_p(src), MachineOperand::Frame(slot)])
     }
 
+    /// An xmm register may hold a whole 128-bit vector, so its spill slot is
+    /// 16 bytes (spilled with `movdqu`).
+    fn spill_slot(&self, class: RegClass) -> (u64, u64) {
+        match class {
+            RegClass::Gpr => (8, 8),
+            RegClass::Fp => (16, 8),
+        }
+    }
+
     fn emit_reload(&self, dst: PReg, slot: StackSlot) -> MachineInst {
         MachineInst::new(X86Op::LoadFrame.opcode(), vec![def(dst), MachineOperand::Frame(slot)])
     }
@@ -1613,6 +1684,11 @@ impl TargetIsel for X86_64Target {
         )
     }
 
+    fn vector_const(&self, dst: VReg, types: &TypeContext, consts: &crate::ir::ConstPool, c: &Const) -> MachineInst {
+        let (lo64, hi64) = vector::const_bits(types, consts, c);
+        MachineInst::new(X86Op::LoadVConst.opcode(), vec![def_v(dst), imm(lo64), imm(hi64)])
+    }
+
     fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
         if self.win64 {
             self.lower_prologue_win64(lo);
@@ -1622,6 +1698,10 @@ impl TargetIsel for X86_64Target {
     }
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        // SSE2 vector code (legalized for `Sse2Legality` beforehand).
+        if self.lower_vector(lo, inst) {
+            return;
+        }
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
             InstKind::ICmp(pred) => {

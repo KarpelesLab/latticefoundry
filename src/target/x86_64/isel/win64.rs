@@ -17,6 +17,10 @@
 //!   is passed by reference: the caller copies it into a 16-byte-aligned
 //!   temporary and passes its address. A return of any other size uses a
 //!   hidden pointer in `rcx`, which the callee also returns in `rax`.
+//! - **Vectors** (`__m128`-class, `docs/ir-design.md` §6e) are passed by
+//!   reference like a large aggregate — the caller stores the vector into a
+//!   16-byte-aligned temporary and passes its address in the argument's GPR or
+//!   stack slot — and returned by value in `xmm0`.
 //! - **Variadic calls.** A float argument among the first four is passed in
 //!   *both* its `xmm` register and the matching GPR (the callee cannot know
 //!   which one to read). A variadic callee spills `rcx, rdx, r8, r9` into its
@@ -121,6 +125,14 @@ impl X86_64Target {
                     self.emit_memcpy(lo, dst, ptr, size);
                     (dst, false, 8)
                 }
+            } else if lo.types().is_vector(ty) {
+                // By reference: a caller-owned, 16-byte-aligned copy.
+                let v = self.oper(lo, arg);
+                let copy = lo.new_slot(16, 16);
+                let dst = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(self.frame_addr(dst, copy));
+                lo.emit(MachineInst::new(X86Op::VStore.opcode(), vec![use_v(dst), use_v(v), imm(1)]));
+                (dst, false, 8)
             } else {
                 let v = self.oper(lo, arg);
                 let is_fp = lo.mf().vreg_class(v) == RegClass::Fp;
@@ -152,7 +164,8 @@ impl X86_64Target {
             lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(areg), use_v(r)]));
         }
 
-        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float());
+        // A float or vector comes back in xmm0.
+        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float() || lo.types().is_vector(t));
         let ret_reg = if ret_is_fp { cc.fp_ret_reg } else { cc.ret_reg };
         let mut operands = Vec::new();
         match lo.callee_func(callee) {
@@ -225,7 +238,9 @@ impl X86_64Target {
             if k >= cc.arg_regs.len() {
                 break;
             }
-            let is_fp = !is_aggregate(lo.types(), sig_params[i]) && lo.mf().vreg_class(pv) == RegClass::Fp;
+            // A vector arrives by reference, as a pointer in the GPR.
+            let by_ref = is_aggregate(lo.types(), sig_params[i]) || lo.types().is_vector(sig_params[i]);
+            let is_fp = !by_ref && lo.mf().vreg_class(pv) == RegClass::Fp;
             reg_param[i] = Some(match (is_fp, captured[k]) {
                 (false, Some(v)) => v,
                 (false, None) => capture(lo, cc.arg_regs[k], RegClass::Gpr),
@@ -278,6 +293,19 @@ impl X86_64Target {
                         }
                     }
                 }
+            } else if lo.types().is_vector(ty) {
+                // By reference: load the vector through the incoming pointer
+                // (unaligned, whoever the caller is).
+                let ptr = match in_reg {
+                    Some(v) => v,
+                    None => {
+                        let p = self.lea_rbp(lo, incoming_slot(k));
+                        let d = lo.fresh_vreg(RegClass::Gpr);
+                        lo.emit(MachineInst::new(X86Op::Load.opcode(), vec![def_v(d), use_v(p), imm(8)]));
+                        d
+                    }
+                };
+                lo.emit(MachineInst::new(X86Op::VLoad.opcode(), vec![def_v(pv), use_v(ptr), imm(0)]));
             } else {
                 match in_reg {
                     Some(v) => lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(pv), use_v(v)])),

@@ -379,6 +379,14 @@ impl<'a> FunctionBuilder<'a> {
         self.func.sig = sig;
     }
 
+    /// The constant a value of the function under construction is, if any.
+    pub fn const_of(&self, v: ValueId) -> Option<ConstId> {
+        match self.func.value(v).def {
+            ValueDef::Const(c) => Some(c),
+            _ => None,
+        }
+    }
+
     // --- memory ------------------------------------------------------------
 
     /// Allocate stack storage for one value of `elem_ty`; result is a pointer.

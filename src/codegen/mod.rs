@@ -41,6 +41,7 @@
 pub mod data;
 pub mod interp;
 pub mod isel;
+pub mod legalize;
 pub mod legalize_int;
 pub mod linkage;
 pub mod mir;

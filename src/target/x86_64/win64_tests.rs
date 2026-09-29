@@ -453,3 +453,51 @@ fn win64_reads_the_first_argument_from_rcx() {
     // mov rax, rcx (48 89 c8) somewhere after the prologue.
     assert!(text.windows(3).any(|w| w == [0x48, 0x89, 0xc8]), "{text:02x?}");
 }
+
+#[test]
+fn win64_m128_goes_by_reference_and_returns_in_xmm0() {
+    // `__m128`-class vectors: passed by reference, returned in xmm0; gcc's
+    // ms_abi is the reference on both sides of the calls. Seven vector
+    // arguments put some by-reference pointers in stack slots, and a vector
+    // live across a call exercises the (Win64 callee-saved) xmm handling.
+    let (m, syms) = parse(
+        r#"module "v"
+func @c_mix(<4 x i32>, <4 x i32>, <2 x f64>) -> <4 x i32>
+func @lf_vadd(<4 x i32>, <4 x i32>, i64, <4 x i32>, <4 x i32>, <4 x i32>, <4 x i32>) -> <4 x i32> {
+entry ^0(%a: <4 x i32>, %b: <4 x i32>, %k: i64, %c: <4 x i32>, %d: <4 x i32>, %e: <4 x i32>, %f: <4 x i32>):
+  %zero = bitcast <2 x i64> (i64 0, i64 0) : <2 x f64>
+  %cd = add %c, %d : <4 x i32>
+  %s = call @c_mix(%a, %b, %zero) : <4 x i32>
+  %k32 = trunc %k : i32
+  %ks = splat %k32 : <4 x i32>
+  %r = mul %s, %ks : <4 x i32>
+  %ef = sub %e, %f : <4 x i32>
+  %x = add %cd, %ef : <4 x i32>
+  %o = add %r, %x : <4 x i32>
+  ret %o
+}
+"#,
+    );
+    crate::verify::verify_module(&m).expect("verifies");
+    let c = r#"
+        #include <emmintrin.h>
+        #include <stdint.h>
+        __attribute__((ms_abi)) __m128i c_mix(__m128i a, __m128i b, __m128d f) {
+            return _mm_xor_si128(_mm_add_epi32(a, b), _mm_castpd_si128(_mm_mul_pd(f, f)));
+        }
+        __attribute__((ms_abi)) __m128i lf_vadd(__m128i, __m128i, long long, __m128i, __m128i, __m128i, __m128i);
+        int main(void) {
+            __m128i a = _mm_set_epi32(4, 3, 2, 1), b = _mm_set_epi32(40, 30, 20, 10);
+            __m128i c = _mm_set1_epi32(100), d = _mm_set1_epi32(7), e = _mm_set1_epi32(50), f = _mm_set1_epi32(5);
+            __m128i r = lf_vadd(a, b, 3, c, d, e, f);
+            int32_t o[4];
+            _mm_storeu_si128((__m128i *)o, r);
+            /* (a + b) * 3 + (c + d) + (e - f) = 33k + 152 for lane k+1 */
+            return (o[0] == 33 + 152 && o[1] == 66 + 152 && o[2] == 99 + 152 && o[3] == 132 + 152) ? 0 : 1;
+        }
+    "#;
+    match run_with_c(&m, &syms, "m128", c) {
+        Some(code) => assert_eq!(code, 0, "Win64 __m128 interop with gcc ms_abi failed"),
+        None => eprintln!("skipping: no C compiler"),
+    }
+}

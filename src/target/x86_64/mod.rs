@@ -54,9 +54,11 @@ mod atomic_tests;
 mod runtime_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod win64_tests;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod vector_tests;
 
 pub use encode::{
     DebugSource, compile_function, compile_module, compile_module_debug, compile_module_debug_with,
     compile_module_with, compile_to_elf,
 };
-pub use isel::{X86Op, X86_64Target};
+pub use isel::{Sse2Legality, X86Op, X86_64Target};

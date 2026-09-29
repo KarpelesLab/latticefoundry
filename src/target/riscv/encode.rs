@@ -1179,7 +1179,8 @@ fn compile_function_full(
 /// allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId) -> Emitted {
     let name = |idx: u32| format!("f{idx}");
-    compile_function_full(module, func, &CodegenOptions::default(), &name).0
+    let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
+    compile_function_full(&legal, func, &CodegenOptions::default(), &name).0
 }
 
 /// Compile every defined function of `module` into a relocatable
@@ -1209,6 +1210,10 @@ pub fn compile_module_with(
     if let Err(e) = crate::target::check_options(crate::target::TargetArch::Riscv64, opts) {
         panic!("{e}");
     }
+    // Vectors are scalarized for this target (no SIMD lowering yet; the
+    // generic legalizer keeps any vector code correct).
+    let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
+    let module: &Module = &legal;
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
     let mut stack = StackReport::new();

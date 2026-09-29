@@ -36,6 +36,8 @@ pub mod yield_points;
 pub(crate) mod ct_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vector_tests;
 
 pub use dce::Dce;
 pub use egraph::EqSat;

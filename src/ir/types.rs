@@ -181,7 +181,7 @@ pub struct Layout {
 ///
 /// The context also carries the module's [`DataLayout`] (LP64 by default), which
 /// every size/alignment query follows.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TypeContext {
     types: Vec<Type>,
     dedup: HashMap<Type, TypeId>,
