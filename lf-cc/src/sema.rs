@@ -39,6 +39,11 @@ pub struct Program {
     pub toplevel_asm: Vec<String>,
 }
 
+/// The diagnostic for a thread-local object: the backends have no TLS
+/// relocations or thread-pointer addressing yet.
+const THREAD_LOCAL_UNSUPPORTED: &str =
+    "thread-local storage (_Thread_local / __thread) is not supported";
+
 /// The plain `char` type on this target (signed 8-bit), used for string data.
 pub fn char_ty() -> CType {
     CType::Int(IntTy::new(8, true))
@@ -661,6 +666,18 @@ impl Checker {
             self.error(g.span, "global cannot have type 'void'");
             return;
         }
+        if g.thread_local {
+            self.error(g.span, THREAD_LOCAL_UNSUPPORTED);
+            return;
+        }
+        // An object of a type whose values cannot be computed with may be
+        // declared `extern`, but not given storage here.
+        if g.storage != Storage::Extern
+            && let Some(name) = g.ty.unsupported_value()
+        {
+            self.error(g.span, format!("objects of type '{name}' are not supported"));
+            return;
+        }
         // Classify this file-scope declaration by its storage class and whether it
         // carries an initializer (C11 6.9.2):
         //   - `extern T x;` (no init)        -> a *declaration* only (references a
@@ -1025,6 +1042,15 @@ impl Checker {
     }
 
     fn check_func(&mut self, f: &crate::ast::FuncDef) {
+        for ty in f.params.iter().map(|p| &p.ty).chain(std::iter::once(&f.ret)) {
+            if let Some(name) = ty.unsupported_value() {
+                self.error(
+                    f.span,
+                    format!("function '{}' passes or returns a '{name}', which is not supported", f.name),
+                );
+                return;
+            }
+        }
         let sig_index = self.sig_index[&f.name];
         let ret = f.ret.clone();
         // Collect every label in the function up front so `goto` may reference a
@@ -1333,6 +1359,14 @@ impl Checker {
         for d in decls {
             if matches!(d.ty, CType::Void) {
                 self.error(d.span, "variable cannot have type 'void'");
+                continue;
+            }
+            if d.thread_local {
+                self.error(d.span, THREAD_LOCAL_UNSUPPORTED);
+                continue;
+            }
+            if let Some(name) = d.ty.unsupported_value() {
+                self.error(d.span, format!("objects of type '{name}' are not supported"));
                 continue;
             }
             // Deduce an incomplete array length from its initializer.
@@ -2493,6 +2527,10 @@ impl Checker {
         let mut targs = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let ta = self.check_rvalue(ctx, a)?;
+            if let Some(name) = ft.params.get(i).and_then(CType::unsupported_value) {
+                self.error(a.span, format!("passing a '{name}' argument is not supported"));
+                return None;
+            }
             let conv = if i < ft.params.len() {
                 self.convert(ta, &ft.params[i])
             } else {
@@ -2540,7 +2578,73 @@ impl Checker {
             }
             // `__builtin_constant_p(x)`: conservatively 0 (not a constant).
             "constant_p" => return Some(TExpr::new(TExprKind::Const(0), CType::int(), span)),
+            "expect_with_probability" => {
+                let e = self.check_rvalue(ctx, args.first()?)?;
+                return Some(self.convert(e, &CType::long()));
+            }
+            // `__builtin_unreachable()`: no code; `__builtin_trap()` aborts.
+            "unreachable" => {
+                let zero = TExpr::new(TExprKind::Const(0), CType::int(), span);
+                return Some(TExpr::new(TExprKind::Convert(Box::new(zero)), CType::Void, span));
+            }
+            "trap" => {
+                if !self.sig_index.contains_key("abort") {
+                    self.register_sig("abort", CType::Void, Vec::new(), false, false, false, None, callee_span);
+                }
+                let callee = Expr { kind: ExprKind::Ident("abort".to_owned()), span: callee_span };
+                return self.check_call(ctx, &callee, &[], span);
+            }
+            // `__builtin_object_size(p, type)`: the size is never known here —
+            // "unknown" is (size_t)-1 for types 0/1 and 0 for types 2/3. The
+            // pointer operand is not evaluated.
+            "object_size" | "dynamic_object_size" => {
+                let kind = args.get(1).and_then(|a| self.const_eval(a)).unwrap_or(0);
+                let v = if kind & 2 != 0 { 0 } else { i128::from(u64::MAX) };
+                return Some(TExpr::new(TExprKind::Const(v), size_t(), span));
+            }
+            // `__builtin_prefetch(addr, ...)`: a hint; evaluate the operands only.
+            "prefetch" => {
+                let mut acc = TExpr::new(TExprKind::Const(0), CType::int(), span);
+                for a in args {
+                    let t = self.check_rvalue(ctx, a)?;
+                    let ty = t.ty.clone();
+                    acc = TExpr::new(TExprKind::Comma(Box::new(acc), Box::new(t)), ty, span);
+                }
+                return Some(TExpr::new(TExprKind::Convert(Box::new(acc)), CType::Void, span));
+            }
+            "assume_aligned" => return self.check_rvalue(ctx, args.first()?),
+            "bswap16" => return self.builtin_bswap(ctx, args, 16, span),
+            "bswap32" => return self.builtin_bswap(ctx, args, 32, span),
+            "bswap64" => return self.builtin_bswap(ctx, args, 64, span),
+            "isnan" | "isinf" | "isinf_sign" | "isfinite" | "finite" | "isnormal" | "signbit"
+            | "signbitf" | "signbitl" | "fpclassify" | "isgreater" | "isgreaterequal"
+            | "isless" | "islessequal" | "islessgreater" | "isunordered" => {
+                return self.builtin_float_classify(ctx, base, args, span);
+            }
+            "va_arg_pack" | "va_arg_pack_len" => {
+                self.error(
+                    span,
+                    format!("'{name}' is only meaningful in always-inline functions and is not supported"),
+                );
+                return None;
+            }
             _ => {}
+        }
+        if let Some((v, ty)) = float_builtin_const_typed(name) {
+            // The argument of `__builtin_nan("")` (a payload string) is ignored.
+            return Some(TExpr::new(TExprKind::FConst(v), ty, span));
+        }
+        // Math library aliases get their true prototype (a variadic implicit
+        // declaration would pass a `float` argument promoted to `double`).
+        // `long double` is `double` in this subset, so the `l` forms call the
+        // `double` functions.
+        if let Some((func, fty, nparams)) = math_builtin(base) {
+            if !self.sig_index.contains_key(func) {
+                let params = vec![fty.clone(); nparams];
+                self.register_sig(func, fty, params, false, false, false, None, callee_span);
+            }
+            let new_callee = Expr { kind: ExprKind::Ident(func.to_owned()), span: callee_span };
+            return self.check_call(ctx, &new_callee, args, span);
         }
         // Library-alias builtins: call the libc function `base`, declaring it
         // implicitly if no prototype is in scope. Pointer-returning functions get
@@ -2570,6 +2674,224 @@ impl Checker {
         }
         let new_callee = Expr { kind: ExprKind::Ident(base.to_owned()), span: callee_span };
         self.check_call(ctx, &new_callee, args, span)
+    }
+
+    /// Bind `value` to a fresh unnamed local, returning its initialization and
+    /// an lvalue naming it (for builtins that use an operand more than once).
+    fn bind_temp(&mut self, ctx: &mut FnCtx, value: TExpr) -> (TStmt, TExpr) {
+        let ty = value.ty.clone();
+        let span = value.span;
+        let id = ctx.add_object("", ty.clone());
+        (TStmt::InitLocal(id, value), TExpr::new(TExprKind::Obj(id), ty, span))
+    }
+
+    /// `__builtin_bswapN(x)`: reverse the bytes of an `N`-bit unsigned value,
+    /// built from shifts and masks.
+    fn builtin_bswap(
+        &mut self,
+        ctx: &mut FnCtx,
+        args: &[Expr],
+        bits: u16,
+        span: Span,
+    ) -> Option<TExpr> {
+        let [arg] = args else {
+            self.error(span, "__builtin_bswap takes exactly one argument");
+            return None;
+        };
+        let ret_ty = CType::Int(IntTy::new(bits, false));
+        // Compute in at least 32 bits (the promoted width).
+        let work = CType::Int(IntTy::new(bits.max(32), false));
+        let v = self.check_rvalue(ctx, arg)?;
+        if !v.ty.is_integer() {
+            self.error(arg.span, "__builtin_bswap requires an integer argument");
+            return None;
+        }
+        let v = self.convert(v, &ret_ty);
+        let v = self.convert(v, &work);
+        let (init, t) = self.bind_temp(ctx, v);
+        let c = |v: i128, ty: &CType| TExpr::new(TExprKind::Const(v), ty.clone(), span);
+        let int = CType::int();
+        let nbytes = i128::from(bits / 8);
+        let mut acc: Option<TExpr> = None;
+        for i in 0..nbytes {
+            // byte i (from the bottom) moves to position nbytes-1-i.
+            let shifted = TExpr::new(
+                TExprKind::Shift(BinaryOp::Shr, Box::new(t.clone()), Box::new(c(8 * i, &int))),
+                work.clone(),
+                span,
+            );
+            let byte = TExpr::new(
+                TExprKind::Arith(BinaryOp::BitAnd, Box::new(shifted), Box::new(c(0xff, &work))),
+                work.clone(),
+                span,
+            );
+            let placed = TExpr::new(
+                TExprKind::Shift(
+                    BinaryOp::Shl,
+                    Box::new(byte),
+                    Box::new(c(8 * (nbytes - 1 - i), &int)),
+                ),
+                work.clone(),
+                span,
+            );
+            acc = Some(match acc {
+                None => placed,
+                Some(a) => TExpr::new(
+                    TExprKind::Arith(BinaryOp::BitOr, Box::new(a), Box::new(placed)),
+                    work.clone(),
+                    span,
+                ),
+            });
+        }
+        let result = self.convert(acc?, &ret_ty);
+        Some(TExpr::new(TExprKind::StmtExpr(vec![init], Some(Box::new(result))), ret_ty, span))
+    }
+
+    /// The floating-point classification builtins behind `<math.h>`'s
+    /// `isnan`/`isinf`/`isfinite`/`isnormal`/`signbit`/`fpclassify` and the quiet
+    /// comparisons (`isgreater`, ..., `isunordered`), expanded inline.
+    fn builtin_float_classify(
+        &mut self,
+        ctx: &mut FnCtx,
+        base: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<TExpr> {
+        let int = CType::int();
+        let ci = |v: i128| TExpr::new(TExprKind::Const(v), CType::int(), span);
+        let cmp = |op: BinaryOp, a: &TExpr, b: TExpr| {
+            TExpr::new(TExprKind::Cmp(op, Box::new(a.clone()), Box::new(b)), CType::int(), span)
+        };
+        let two = matches!(
+            base,
+            "isgreater" | "isgreaterequal" | "isless" | "islessequal" | "islessgreater"
+                | "isunordered"
+        );
+        let (value_args, lead): (&[Expr], &[Expr]) = if base == "fpclassify" {
+            if args.len() != 6 {
+                self.error(span, "__builtin_fpclassify takes six arguments");
+                return None;
+            }
+            (&args[5..], &args[..5])
+        } else {
+            (args, &[])
+        };
+        if value_args.len() != if two { 2 } else { 1 } {
+            self.error(span, format!("wrong number of arguments to __builtin_{base}"));
+            return None;
+        }
+        let mut inits = Vec::new();
+        let mut temps = Vec::new();
+        let mut vals = Vec::new();
+        for a in value_args {
+            let v = self.check_rvalue(ctx, a)?;
+            if !v.ty.is_arithmetic() {
+                self.error(a.span, format!("__builtin_{base} requires a floating-point argument"));
+                return None;
+            }
+            vals.push(v);
+        }
+        // A two-operand comparison works in the operands' common type; an
+        // integer operand of a one-operand test is taken as `double`.
+        let common = if two {
+            let c = usual_arith(&vals[0].ty, &vals[1].ty);
+            if c.is_float() { c } else { CType::double() }
+        } else if vals[0].ty.is_float() {
+            vals[0].ty.clone()
+        } else {
+            CType::double()
+        };
+        for v in vals {
+            let v = self.convert(v, &common);
+            let (init, t) = self.bind_temp(ctx, v);
+            inits.push(init);
+            temps.push(t);
+        }
+        let fc = |v: f64| TExpr::new(TExprKind::FConst(v), common.clone(), span);
+        let t = temps[0].clone();
+        let isnan = |t: &TExpr| cmp(BinaryOp::Ne, t, t.clone());
+        let isinf_pos = cmp(BinaryOp::Eq, &t, fc(f64::INFINITY));
+        let isinf_neg = cmp(BinaryOp::Eq, &t, fc(f64::NEG_INFINITY));
+        let isinf = TExpr::new(
+            TExprKind::LogOr(Box::new(isinf_pos.clone()), Box::new(isinf_neg.clone())),
+            int.clone(),
+            span,
+        );
+        // x - x is 0 for a finite x and NaN for an infinity or a NaN.
+        let diff =
+            TExpr::new(TExprKind::Arith(BinaryOp::Sub, Box::new(t.clone()), Box::new(t.clone())), common.clone(), span);
+        let isfinite = cmp(BinaryOp::Eq, &diff, fc(0.0));
+        let min = if common.float_ty() == Some(crate::ast::FloatTy::F32) {
+            f64::from(f32::MIN_POSITIVE)
+        } else {
+            f64::MIN_POSITIVE
+        };
+        let big = TExpr::new(
+            TExprKind::LogOr(
+                Box::new(cmp(BinaryOp::Ge, &t, fc(min))),
+                Box::new(cmp(BinaryOp::Le, &t, fc(-min))),
+            ),
+            int.clone(),
+            span,
+        );
+        let isnormal =
+            TExpr::new(TExprKind::LogAnd(Box::new(isfinite.clone()), Box::new(big)), int.clone(), span);
+        let cond = |c: TExpr, a: TExpr, b: TExpr| {
+            TExpr::new(TExprKind::Cond(Box::new(c), Box::new(a), Box::new(b)), CType::int(), span)
+        };
+        let result = match base {
+            "isnan" => isnan(&t),
+            "isinf" => isinf,
+            "isinf_sign" => cond(isinf_pos, ci(1), cond(isinf_neg, ci(-1), ci(0))),
+            "isfinite" | "finite" => isfinite,
+            "isnormal" => isnormal,
+            "signbit" | "signbitf" | "signbitl" => {
+                // Read the sign bit through the object representation.
+                let bits = if common.float_ty() == Some(crate::ast::FloatTy::F32) { 32 } else { 64 };
+                let ity = CType::Int(IntTy::new(bits, true));
+                let addr = TExpr::new(TExprKind::AddrOf(Box::new(t.clone())), CType::ptr_to(common.clone()), span);
+                let iaddr = TExpr::new(TExprKind::Convert(Box::new(addr)), CType::ptr_to(ity.clone()), span);
+                let word = TExpr::new(TExprKind::Deref(Box::new(iaddr)), ity.clone(), span);
+                cmp(BinaryOp::Lt, &word, TExpr::new(TExprKind::Const(0), ity, span))
+            }
+            "fpclassify" => {
+                let mut k = Vec::new();
+                for a in lead {
+                    let v = self.check_rvalue(ctx, a)?;
+                    k.push(self.convert(v, &int));
+                }
+                let zero = cmp(BinaryOp::Eq, &t, fc(0.0));
+                cond(
+                    isnan(&t),
+                    k[0].clone(),
+                    cond(isinf, k[1].clone(), cond(isnormal, k[2].clone(), cond(zero, k[4].clone(), k[3].clone()))),
+                )
+            }
+            _ => {
+                let u = temps[1].clone();
+                let unordered = TExpr::new(
+                    TExprKind::LogOr(Box::new(isnan(&t)), Box::new(isnan(&u))),
+                    int.clone(),
+                    span,
+                );
+                match base {
+                    "isgreater" => cmp(BinaryOp::Gt, &t, u),
+                    "isgreaterequal" => cmp(BinaryOp::Ge, &t, u),
+                    "isless" => cmp(BinaryOp::Lt, &t, u),
+                    "islessequal" => cmp(BinaryOp::Le, &t, u),
+                    "islessgreater" => TExpr::new(
+                        TExprKind::LogOr(
+                            Box::new(cmp(BinaryOp::Lt, &t, u.clone())),
+                            Box::new(cmp(BinaryOp::Gt, &t, u)),
+                        ),
+                        int.clone(),
+                        span,
+                    ),
+                    _ => unordered,
+                }
+            }
+        };
+        Some(TExpr::new(TExprKind::StmtExpr(inits, Some(Box::new(result))), int, span))
     }
 
     fn check_cast(
@@ -2929,8 +3251,74 @@ fn const_eval_float(e: &Expr, enums: &HashMap<String, i128>) -> Option<f64> {
                 None => Some(v.trunc()),
             }
         }
+        // `HUGE_VAL`, `INFINITY` and `NAN` expand to these builtin calls.
+        ExprKind::Call(callee, _) => match &callee.kind {
+            ExprKind::Ident(n) => float_builtin_const(n),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// The value of a constant-valued floating builtin (`__builtin_huge_val`,
+/// `__builtin_inff`, `__builtin_nan("")`, ...) and its type, or `None`.
+fn float_builtin_const_typed(name: &str) -> Option<(f64, CType)> {
+    let base = name.strip_prefix("__builtin_")?;
+    let (stem, ty) = match base.strip_suffix('f') {
+        Some(s) if matches!(s, "huge_val" | "inf" | "nan" | "nans") => (s, CType::float()),
+        _ => (base.strip_suffix('l').filter(|s| matches!(*s, "huge_val" | "inf" | "nan" | "nans")).unwrap_or(base), CType::double()),
+    };
+    let v = match stem {
+        "huge_val" | "inf" => f64::INFINITY,
+        "nan" | "nans" => f64::NAN,
+        _ => return None,
+    };
+    Some((v, ty))
+}
+
+/// For a `__builtin_<base>` that aliases a `<math.h>` function, the library
+/// function to call, its floating type, and its parameter count. The `...f`
+/// forms are `float`; the `...l` forms call the `double` function, since
+/// `long double` is `double` in this subset.
+fn math_builtin(base: &str) -> Option<(&str, CType, usize)> {
+    const UNARY: &[&str] = &[
+        "fabs", "sqrt", "floor", "ceil", "trunc", "round", "rint", "nearbyint", "exp", "exp2",
+        "expm1", "log", "log2", "log10", "log1p", "sin", "cos", "tan", "asin", "acos", "atan",
+        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "cbrt", "erf", "erfc", "tgamma",
+        "lgamma", "logb",
+    ];
+    const BINARY: &[&str] = &[
+        "copysign", "fmod", "pow", "atan2", "fmin", "fmax", "hypot", "fdim", "nextafter",
+        "remainder",
+    ];
+    let arity = |f: &str| {
+        if UNARY.contains(&f) {
+            Some(1)
+        } else if BINARY.contains(&f) {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    if let Some(n) = arity(base) {
+        return Some((base, CType::double(), n));
+    }
+    if let Some(stem) = base.strip_suffix('f')
+        && let Some(n) = arity(stem)
+    {
+        return Some((base, CType::float(), n));
+    }
+    if let Some(stem) = base.strip_suffix('l')
+        && let Some(n) = arity(stem)
+    {
+        return Some((stem, CType::double(), n));
+    }
+    None
+}
+
+/// [`float_builtin_const_typed`] without the type.
+fn float_builtin_const(name: &str) -> Option<f64> {
+    float_builtin_const_typed(name).map(|(v, _)| v)
 }
 
 /// Write a floating-point value into `bytes` at `off` as its little-endian IEEE

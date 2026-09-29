@@ -46,6 +46,7 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         va_list_record: None,
         cur_func: None,
         in_params: 0,
+        transparent_params: Vec::new(),
     };
     match parser.parse_unit() {
         Ok(items) => Ok(TranslationUnit {
@@ -119,6 +120,9 @@ struct Parser {
     /// Nesting depth of parameter lists being parsed (a parameter array bound
     /// need not be constant).
     in_params: u32,
+    /// The transparent-union parameters (index, union type) of the parameter
+    /// list parsed last.
+    transparent_params: Vec<(usize, CType)>,
 }
 
 /// The GNU `__attribute__((...))` properties lf-cc gives meaning to. Every other
@@ -559,7 +563,8 @@ impl Parser {
                 span: name_span,
             }));
         }
-        let (params, variadic) = self.parse_param_list()?;
+        let (mut params, variadic) = self.parse_param_list()?;
+        let prologue = self.rebuild_transparent_params(&mut params);
         for p in &params {
             if let Some(n) = &p.name {
                 self.declare_ordinary(n, Some(p.ty.clone()));
@@ -577,7 +582,8 @@ impl Parser {
             variadic,
         }));
         if self.is_punct(Punct::LBrace) {
-            let body = self.parse_block_stmts()?;
+            let mut body = prologue;
+            body.extend(self.parse_block_stmts()?);
             self.pop_scope();
             self.declare_ordinary(&name, Some(fty));
             let gnu_inline = attrs.gnu_inline || !self.std.is_c99();
@@ -1116,6 +1122,8 @@ impl Parser {
         self.expect_punct(Punct::LParen, "'('")?;
         let mut params = Vec::new();
         let mut variadic = false;
+        let mut transparent: Vec<(usize, CType)> = Vec::new();
+        self.transparent_params = Vec::new();
         // Empty parentheses `()` declare a function whose parameters are
         // *unspecified* (an old-style / K&R declarator), NOT a function taking no
         // arguments. Calls to it are unchecked and the arguments undergo the
@@ -1154,12 +1162,15 @@ impl Parser {
             // A parameter of transparent-union type (GNU) is passed exactly like
             // the union's first member, and accepts an argument of any member
             // type; model it as that first member's type (glibc's
-            // `__SOCKADDR_ARG` and `__CONST_SOCKADDR_ARG` are pointer unions).
+            // `__SOCKADDR_ARG` and `__CONST_SOCKADDR_ARG` are pointer unions). A
+            // function *definition* rebuilds the union from it on entry (see
+            // `transparent_params`).
             let ty = match &ty {
                 CType::Record(id)
                     if self.records.get(*id).transparent
                         && !self.records.get(*id).fields.is_empty() =>
                 {
+                    transparent.push((params.len(), ty.clone()));
                     self.records.get(*id).fields[0].ty.clone()
                 }
                 _ => ty,
@@ -1170,7 +1181,42 @@ impl Parser {
             }
         }
         self.expect_punct(Punct::RParen, "')' to close parameter list")?;
+        self.transparent_params = transparent;
         Ok((params, variadic))
+    }
+
+    /// For a function definition whose parameter list (just parsed) had
+    /// transparent-union parameters: rename each such parameter to a hidden
+    /// name holding the first member, and return the declarations that rebuild
+    /// the union under the parameter's own name at the top of the body.
+    fn rebuild_transparent_params(&mut self, params: &mut [Param]) -> Vec<Stmt> {
+        let mut prologue = Vec::new();
+        for (idx, uty) in std::mem::take(&mut self.transparent_params) {
+            let p = &mut params[idx];
+            let Some(name) = p.name.clone() else { continue };
+            let hidden = format!("{name}.transparent");
+            p.name = Some(hidden.clone());
+            let span = p.span;
+            self.declare_ordinary(&name, Some(uty.clone()));
+            let init = Init::List(vec![InitItem {
+                designators: Vec::new(),
+                init: Init::Expr(Expr { kind: ExprKind::Ident(hidden), span }),
+            }]);
+            prologue.push(Stmt {
+                kind: StmtKind::Decl(vec![VarDecl {
+                    name,
+                    ty: uty,
+                    init: Some(init),
+                    align: None,
+                    storage: Storage::None,
+                    asm_label: None,
+                    thread_local: false,
+                    span,
+                }]),
+                span,
+            });
+        }
+        prologue
     }
 
     /// Whether the `(` at the cursor opens an old-style (K&R) identifier list —
