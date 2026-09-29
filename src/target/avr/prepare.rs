@@ -4,8 +4,9 @@
 //! target-independent-style steps:
 //!
 //! 1. **Data layout.** A module that still has the default LP64 layout is given
-//!    the AVR layout ([`super::data_layout`]); one with another layout must
-//!    already agree with it on the pointer widths.
+//!    the AVR layout with functions in space 0 ([`super::data_layout_p0`]: its
+//!    function references were typed that way); one with another layout must
+//!    already agree with AVR's on the pointer widths.
 //! 2. **Soft float** ([`super::softfloat`]): `f32`/`f64` become their bit
 //!    patterns and the operations runtime calls.
 //! 3. **Integer legalization** ([`legalize_ints`]) at a part width of 16:
@@ -53,7 +54,7 @@ pub(crate) fn prepare(
     let (mut m, mut s) = copy_module(module, syms)?;
     let avr = super::data_layout();
     if *m.data_layout() == DataLayout::lp64() {
-        m.set_data_layout(avr);
+        m.set_data_layout(super::data_layout_p0());
     } else {
         let dl = m.data_layout();
         if dl.pointer_bits(0) != 16 || dl.pointers().iter().any(|&(_, p)| p.bits != 16) {

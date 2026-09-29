@@ -165,12 +165,12 @@ impl Device {
     pub const ATMEGA328P: Device =
         Device { name: "atmega328p", flash: 32 * 1024, ram_start: 0x100, ram_end: 0x8ff, vectors: 26, has_mul: true, arch: 5 };
 
-    /// The ATtiny85: AVR25 (no multiplier), 8 KiB flash, 512 B SRAM at
-    /// `0x60..=0x25f`, 15 vectors. (Its vectors are 1-word `rjmp`s on real
-    /// hardware; the startup code here uses 2-word `jmp`, which AVR25 lacks, so
-    /// this device serves compiling and testing the no-`mul` path, not flashing.)
-    pub const ATTINY85_NOMUL: Device =
-        Device { name: "attiny85", flash: 8 * 1024, ram_start: 0x60, ram_end: 0x25f, vectors: 15, has_mul: false, arch: 25 };
+    /// A generic AVR3 core: `jmp`/`call` but **no multiplier**
+    /// (ATmega103-class), 64 KiB of flash addressed, 4 KiB SRAM at
+    /// `0x60..=0xfff`, 24 vectors. It exercises the multiply-by-runtime-call
+    /// path (`avr-avr3`).
+    pub const AVR3: Device =
+        Device { name: "avr3", flash: 64 * 1024, ram_start: 0x60, ram_end: 0xfff, vectors: 24, has_mul: false, arch: 3 };
 
     /// The device named by a target triple's components (`avr-atmega328p`);
     /// a bare `avr` (or `avr-none`/`avr-elf`) is the ATmega328P.
@@ -184,7 +184,7 @@ impl Device {
         for p in parts {
             match p {
                 "atmega328p" | "atmega328" | "m328p" => dev = Device::ATMEGA328P,
-                "attiny85" => dev = Device::ATTINY85_NOMUL,
+                "avr3" => dev = Device::AVR3,
                 "none" | "elf" | "unknown" | "" => {}
                 _ => return None,
             }
@@ -196,6 +196,15 @@ impl Device {
 /// The AVR data layout (see the [module docs](self)).
 pub fn data_layout() -> DataLayout {
     DataLayout::parse("e-p:16:8-p1:16:8-i8:8-i16:8-i32:8-i64:8-f16:8-f32:8-f64:8-S8-n8:16-P1")
+        .expect("the AVR layout spec is valid")
+}
+
+/// The AVR layout for a module written without one: as [`data_layout`], but
+/// with functions in address space 0 (a module built under the default LP64
+/// layout typed its function references that way). Flash data still lives in
+/// space 1; a function pointer is still a word address.
+pub fn data_layout_p0() -> DataLayout {
+    DataLayout::parse("e-p:16:8-p1:16:8-i8:8-i16:8-i32:8-i64:8-f16:8-f32:8-f64:8-S8-n8:16")
         .expect("the AVR layout spec is valid")
 }
 

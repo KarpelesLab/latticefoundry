@@ -46,7 +46,7 @@ pub(crate) struct Avr {
     pub pc: u32,
     /// Instructions executed.
     pub steps: u64,
-    /// Whether an instruction touched the stack below `min_sp` (the lowest SP).
+    /// The lowest stack pointer seen (the deepest stack use).
     pub min_sp: u16,
     ram_end: u16,
 }
@@ -538,6 +538,7 @@ impl Avr {
                 return Err(Fault(format!("out of steps at pc {:#x}", self.pc * 2)));
             }
             self.step()?;
+            self.min_sp = self.min_sp.min(self.sp());
             if self.data[1] != 0 && self.pc == stop {
                 return Err(Fault("r1 is not zero on return".into()));
             }

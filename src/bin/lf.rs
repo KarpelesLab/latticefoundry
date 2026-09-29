@@ -193,10 +193,11 @@ fn build(args: &[String]) -> Result<(), String> {
     if opts.target.arch == TargetArch::Wasm32 && *module.data_layout() == latticefoundry::ir::DataLayout::lp64() {
         module.set_data_layout(target::wasm32::data_layout());
     }
-    // An AVR module that declares no layout gets AVR's (16-bit pointers, the
-    // program-memory address space 1) before it is checked.
+    // An AVR module that declares no layout gets AVR's (16-bit pointers,
+    // program memory as address space 1) before it is checked, keeping its
+    // functions in space 0 where the parser put them.
     if opts.target.arch == TargetArch::Avr && *module.data_layout() == latticefoundry::ir::DataLayout::lp64() {
-        module.set_data_layout(target::avr::data_layout());
+        module.set_data_layout(target::avr::data_layout_p0());
     }
 
     // Verify (Structural tier) unless suppressed.

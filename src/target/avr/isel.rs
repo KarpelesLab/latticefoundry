@@ -341,6 +341,8 @@ impl AvrTarget {
     fn parts(&self, lo: &mut Lower<'_, Self>, v: ValueId) -> Vec<VReg> {
         let n = Self::bits(lo, v).div_ceil(16) as usize;
         if let Some(c) = Self::const_of(lo, v) {
+            // Constants may be stored signed: take the two's-complement pattern.
+            let c = c.mod_2k(16 * n as u32);
             return (0..n).map(|k| {
                 let p = c.div_2k_trunc(16 * k as u32).mod_2k(16).to_u64().unwrap_or(0);
                 self.konst(lo, p)
@@ -842,8 +844,10 @@ impl AvrTarget {
     /// that.
     fn wide_switch_index(&self, lo: &mut Lower<'_, Self>, cond: ValueId, values: &[Int]) -> VReg {
         let parts = self.parts(lo, cond);
+        let total = 16 * parts.len() as u32;
         let mut idx = self.konst(lo, 0);
         for (k, v) in values.iter().enumerate() {
+            let v = &v.mod_2k(total);
             let mut all: Option<VReg> = None;
             for (j, &p) in parts.iter().enumerate() {
                 let pv = v.div_2k_trunc(16 * j as u32).mod_2k(16).to_u64().unwrap_or(0);
@@ -938,10 +942,9 @@ impl MachineTarget for AvrTarget {
 
 impl TargetIsel for AvrTarget {
     fn li(&self, dst: VReg, value: Int) -> MachineInst {
+        // Not recorded as a known zero: the framework also uses `li` for the
+        // edge copies into block parameters, which have several definitions.
         let v = value.mod_2k(16).to_u64().unwrap_or(0);
-        if v == 0 {
-            self.side.borrow_mut().zero.insert(dst);
-        }
         inst(AvrOp::Li, vec![def_v(dst), imm(v)])
     }
 
