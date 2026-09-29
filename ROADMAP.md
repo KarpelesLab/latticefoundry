@@ -420,7 +420,7 @@ relocations) and isel (`Lower::mem_addr_space`) follow the layout; and a
 target-independent wide-integer legalization pass (`codegen::legalize_int`) splits
 integers above the native width into parts, with libcalls for mul/div/rem,
 checked against the reference evaluator at 32-, 16- and 8-bit part widths. The
-three backends themselves remain to be written on top.
+three backends are built on top (below).
 
 **SIMD vectors** (`<N x T>`, [ir-design §6e](docs/ir-design.md)) lower on all
 three targets through the target-independent legalizer (`codegen::legalize`):
@@ -461,6 +461,27 @@ control flow, memory, calls, atomics, `i128`), `llvm-objdump` decoding, and
 `wasm-ld` links. Vectors are scalarized by the generic legalizer (the shared
 vector fixtures run under node), and constant-time code stays branch-free
 (`select` is wasm `select`; decoded bodies are scanned).
+
+*AVR* ✅ ([ir-design §6g](docs/ir-design.md), `target::avr`, triples `avr` /
+`avr-atmega328p`): an 8-bit backend for the AVR5 core (ATmega328P). The
+allocator works on register pairs under the avr-gcc convention (`r25`…`r8`,
+even-aligned, then the stack; `Y` the frame pointer; `SP` written with
+interrupts masked); `i8` is native, `i16` and pointers fill a pair, wider
+integers go through `legalize_int` at `W = 16`; flash data in address space 1
+is read with `lpm`; division, multiplies beyond `mul`'s reach and soft float
+(the shared `codegen::softfloat` pass with libgcc names) call a runtime written
+in LF IR (integer helpers and the whole `f32` set); vectors are scalarized.
+ELF32 `EM_AVR` objects with the `R_AVR_*` relocations, a Harvard firmware
+linker with startup code, and `lf build --oformat ihex|binary`. Validated
+against `llvm-mc`/`llvm-objdump` and by running programs on an
+instruction-level AVR interpreter against the reference evaluator (integers at
+every width, casts, IEEE `f32`, calls with stack arguments, flash and function
+pointers, atomics, vectors, whole images from reset); constant-time code is
+branch- and skip-free where it touches a secret: isel consults the
+secret-taint analysis per operation and uses branch-free compares (reading
+`SREG`), a barrel shifter and shift-pair sign extension only there, keeping
+the compact branching forms for public code. Deferred: `f64` runtime helpers, interrupt handlers, flash beyond
+64 KiB (`elpm`), wider atomics; 6502 and Z80.
 
 ### **Phase 8 — Linker & first end-to-end**  ✅
 

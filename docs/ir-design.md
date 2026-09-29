@@ -1106,6 +1106,50 @@ format:
   code size exponentially; a dispatch loop is linear, and irreducible CFGs are
   rare in front-end output.
 
+## 6g. AVR: an 8-bit Harvard target  *(decided)*
+
+`target::avr` targets the AVR5 core (ATmega328P) through the ordinary
+MIR/regalloc pipeline, clean-room from the AVR Instruction Set Manual, the
+published avr-gcc ABI and the ELF/AVR relocation list:
+
+- **Layout.** `e-p:16:8-p1:16:8-i8:8-…-S8-n8:16-P1`: 16-bit pointers into
+  data memory (space 0) and program memory (space 1, the program space);
+  every alignment is one byte. A data pointer into flash is a byte address
+  (`lpm`), a function pointer a word address (§3a). A module without a layout
+  gets the same one with functions in space 0.
+- **Registers are pairs.** One vreg is one register pair: `i8` in its low
+  register (the high one don't-care), `i16`/pointers in the pair; the
+  avr-gcc argument and result registers are all even-aligned, so the ABI maps
+  onto pairs exactly. Integers above 16 bits go through §3b at `W = 16`.
+- **Preparation**, in order: vector legalization (no legal vector type),
+  soft float (`codegen::softfloat` with libgcc names and a 16-bit `int`),
+  integer legalization. Division, and multiplication `mul` cannot do, are
+  runtime calls; the runtime is LF IR compiled by the backend, one object per
+  function so the firmware linker takes only what a program uses.
+- **Constant time, per operation.** Flash is scarce, so the branch-free
+  lowerings are used only where a secret is: isel runs the secret-taint
+  analysis on the prepared function, and an operation with a secret-derived
+  operand gets the constant-time form — the compare's flag read out of
+  `SREG`, a barrel shifter, a shift-pair sign extension — while public ones
+  keep the compact forms (a skip over an `ldi`, a counted loop, `sbrc`).
+  `select` is always a mask blend.
+  Helper calls take public parameters, so a secret wide multiply shows up as a
+  violation in the prepared module; the 8/16-bit multiply helpers (called on
+  a core without `mul`, possibly on secrets) take a fixed number of
+  iterations.
+
+- **Rejected: 8-bit allocation units.** A register per byte would make every
+  pointer and `i16` two vregs, which the one-vreg-per-value isel and the
+  linear-scan allocator do not model; pairs cost an unused register for each
+  live `i8`.
+- **Rejected: always branch-free.** It costs every program flash (the
+  soft-float runtime alone no longer fit an ATmega328P) for the few that
+  handle secrets; the taint analysis already knows which operations those
+  are.
+- **Rejected: word-addressed data in program memory.** `lpm` reads bytes, so
+  flash data pointers are byte addresses; only functions use word addresses,
+  matching avr-gcc's function pointers.
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than
