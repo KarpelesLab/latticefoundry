@@ -2,7 +2,7 @@
 name = "latticefoundry"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["Mark Karpeles <admin@echelle.co.jp>"]
 repository = "https://github.com/KarpelesLab/latticefoundry"
@@ -15,12 +15,19 @@ description = "A clean-room compiler construction framework in pure Rust"
 name = "latticefoundry"
 path = "src/lib.rs"
 
-# Dependencies are only our own focused, clean-room library crates. No foreign
-# or third-party code. `z3rs` is our pure-Rust SMT solver; `puremp` is our
-# arbitrary-precision numeric core (and z3rs's own dependency).
+# Direct dependencies are only our own focused, clean-room library crates.
+# (Third-party crates may appear transitively through them — qld uses rayon,
+# hashbrown and memmap2.) `z3rs` is our pure-Rust SMT solver; `puremp` is our
+# arbitrary-precision numeric core (and z3rs's own dependency); `rsasm` is our
+# multi-architecture assembler (behind `lf-as`); `qld` is our GNU-ld-compatible
+# linker (behind `lf-ld` for ELF objects, archives and shared libraries).
 [dependencies]
 z3rs = "0.0.4"
 puremp = "0.2"
+# Only the backends for the targets LatticeFoundry has.
+rsasm = { version = "0.1.3", default-features = false, features = ["x86", "aarch64", "riscv"] }
+# No `plugin` feature: that is qld's only FFI (dlopen of a GCC/LLVM LTO plugin).
+qld = { version = "0.1.0", default-features = false }
 
 [lints.rust]
 unsafe_code = "warn"

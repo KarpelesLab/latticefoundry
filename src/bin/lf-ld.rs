@@ -1,7 +1,13 @@
 //! `lf-ld` — the LatticeFoundry linker.
 //!
-//! Resolves symbols and relocations across relocatable objects and archives
-//! and writes an executable or shared object. See ROADMAP Phase 8.
+//! Two linkers behind one driver:
+//!
+//! - when every input is one of our own `.lfo` objects, the LatticeFoundry
+//!   static linker core ([`latticefoundry::link`]) produces a self-contained
+//!   static executable;
+//! - otherwise — ELF `.o` objects, `.a` archives, `-l` libraries, shared
+//!   objects, or any other GNU `ld` option — the whole command line goes to
+//!   our GNU-ld-compatible linker `qld` ([`latticefoundry::link::gnu`]).
 
 use std::process::ExitCode;
 
@@ -16,19 +22,24 @@ fn main() -> ExitCode {
         }
         None | Some("--help" | "-h") => {
             println!("lf-ld — LatticeFoundry linker\n");
-            println!("usage: lf-ld [-o output] [-e entry] <inputs...>\n");
-            println!("options:");
+            println!("usage: lf-ld [-o output] [-e entry] <inputs.lfo...>");
+            println!("       lf-ld <GNU ld command line>\n");
+            println!("With only `.lfo` inputs (and -o/-e), links a static ELF64 executable");
+            println!("with the LatticeFoundry linker core:");
             println!("  -o <path>   output executable path (default: a.out)");
             println!("  -e <name>   entry symbol _start calls (default: main)");
-            println!("Inputs are `.lfo` relocatable objects; the result is a static ELF64");
-            println!("executable. See ROADMAP Phase 8.");
+            println!("Anything else (ELF objects, archives, -l, shared libraries, other");
+            println!("options) is linked by qld, which accepts the GNU ld command line.");
             return ExitCode::SUCCESS;
         }
         _ => {}
     }
 
-    let options = parse(&args);
-    match link::link(&options) {
+    let result = match parse(&args) {
+        Some(options) => link::link(&options),
+        None => link::gnu::link_gnu("lf-ld", &args),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("lf-ld: {err}");
@@ -37,7 +48,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse(args: &[String]) -> LinkOptions {
+/// Parse a native (`.lfo`-only) link; `None` means "hand it to qld".
+fn parse(args: &[String]) -> Option<LinkOptions> {
     let mut options =
         LinkOptions { output: "a.out".to_owned(), inputs: Vec::new(), entry: None };
     let mut it = args.iter();
@@ -53,8 +65,9 @@ fn parse(args: &[String]) -> LinkOptions {
                     options.entry = Some(entry.clone());
                 }
             }
-            input => options.inputs.push(input.to_owned()),
+            input if input.ends_with(".lfo") => options.inputs.push(input.to_owned()),
+            _ => return None,
         }
     }
-    options
+    (!options.inputs.is_empty()).then_some(options)
 }

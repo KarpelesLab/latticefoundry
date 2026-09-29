@@ -21,10 +21,12 @@
 //! - [`lfo`] — our versioned, compact, lossless `.lfo` object serialization.
 //! - [`elf`] — an ELF64 `ET_REL` writer for x86-64, implemented from the ELF
 //!   specification.
+//! - [`asm`] — textual assembly → ELF objects, via our own `rsasm` assembler.
 //!
 //! Everything here is deterministic (tenet T5): the same inputs always produce
 //! byte-identical output.
 
+pub mod asm;
 pub mod dwarf;
 pub mod elf;
 pub mod emit;

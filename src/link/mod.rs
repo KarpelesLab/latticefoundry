@@ -8,10 +8,12 @@
 //!
 //! This module wraps it with the file-oriented [`link`] entry point that
 //! `lf-ld` calls: it reads object files (our own `.lfo` format), links them, and
-//! writes an executable to disk with the execute bit set. Reading standard ELF
-//! `.o` inputs is not yet supported (see the note on [`read_object`]); supply
-//! `.lfo` objects, or use the in-memory [`link_executable`] path.
+//! writes an executable to disk with the execute bit set.
+//!
+//! Standard ELF objects, archives and shared libraries are linked by [`gnu`],
+//! a bridge onto our GNU-ld-compatible linker `qld`.
 
+pub mod gnu;
 mod image;
 
 pub use image::{ImageOptions, LinkError, link_executable};
@@ -31,14 +33,14 @@ pub struct LinkOptions {
 ///
 /// Recognizes our own `.lfo` container. A standard ELF relocatable object is
 /// detected and rejected with a clear message: this static linker's file front
-/// end links `.lfo` inputs (the `lf` pipeline links objects in memory, never via
-/// files). Reading ELF `.o` inputs is a documented future extension.
+/// end links `.lfo` inputs; ELF inputs go through [`gnu::link_gnu`] (`lf-ld`
+/// routes them there automatically).
 fn read_object(path: &str) -> Result<crate::mc::object::ObjectModule, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     if bytes.len() >= 4 && bytes[0..4] == [0x7f, b'E', b'L', b'F'] {
         return Err(format!(
-            "{path}: linking standard ELF relocatable objects is not yet supported; \
-             provide a `.lfo` object (see ROADMAP Phase 8)"
+            "{path}: this is an ELF object; link ELF inputs with `link::gnu` \
+             (qld) — `lf-ld` does so automatically"
         ));
     }
     crate::mc::lfo::decode(&bytes).map_err(|e| format!("cannot decode {path}: {e}"))
