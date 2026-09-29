@@ -1,0 +1,166 @@
+name: Release binaries
+
+# Attaches the LatticeFoundry tools (lf, lf-as, lf-ld, lf-opt, lf-dis) and the
+# lf-cc C compiler to a GitHub Release. release-plz creates the release and
+# then dispatches this workflow explicitly (see release-plz.yml), so
+# workflow_dispatch is the sole, deterministic trigger — we do NOT also listen
+# on `release: published`, which would double-fire and race two upload runs
+# against the same release. The manual dispatch also lets a failed asset
+# upload be retried against an existing release without re-tagging.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload to (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  # gh release upload needs to attach assets.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The release tag to upload against, supplied by the workflow_dispatch input.
+  TAG: ${{ inputs.tag }}
+  BINS: lf lf-as lf-ld lf-opt lf-dis
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-aarch64
+            apt_packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            asset_suffix: windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cross compiler (Linux aarch64)
+        if: matrix.apt_packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: |
+            .
+            lf-cc
+
+      - name: Build tools and lf-cc
+        shell: bash
+        env:
+          # Only set the linker env var when the matrix entry asks for one.
+          # GitHub Actions silently drops empty `env:` values, so this is
+          # a no-op for the native targets.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: |
+          cargo build --release --bins --target ${{ matrix.target }}
+          (cd lf-cc && cargo build --release --bin lf-cc --target ${{ matrix.target }})
+
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          mkdir -p staging/bin
+          cp README.md LICENSE staging/
+          ext=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then ext=".exe"; fi
+          for b in $BINS; do
+            cp "target/${{ matrix.target }}/release/$b$ext" staging/bin/
+          done
+          cp "lf-cc/target/${{ matrix.target }}/release/lf-cc$ext" staging/bin/
+          ls -R staging
+
+      - name: Pack archive
+        id: pack
+        shell: bash
+        run: |
+          name="latticefoundry-${TAG}-${{ matrix.asset_suffix }}"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            asset="${name}.zip"
+            (cd staging && 7z a "../${asset}" *)
+          else
+            asset="${name}.tar.gz"
+            tar -C staging -czf "${asset}" .
+          fi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
+  build-macos-universal:
+    name: build macos universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+          workspaces: |
+            .
+            lf-cc
+
+      - name: Build both Apple slices
+        run: |
+          for t in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --bins --target "$t"
+            (cd lf-cc && cargo build --release --bin lf-cc --target "$t")
+          done
+
+      - name: Lipo into universal binaries
+        run: |
+          mkdir -p staging/bin
+          for b in $BINS; do
+            lipo -create -output "staging/bin/$b" \
+              "target/x86_64-apple-darwin/release/$b" \
+              "target/aarch64-apple-darwin/release/$b"
+          done
+          lipo -create -output staging/bin/lf-cc \
+            lf-cc/target/x86_64-apple-darwin/release/lf-cc \
+            lf-cc/target/aarch64-apple-darwin/release/lf-cc
+          cp README.md LICENSE staging/
+          file staging/bin/*
+
+      - name: Pack archive
+        id: pack
+        run: |
+          asset="latticefoundry-${TAG}-macos-universal.tar.gz"
+          tar -C staging -czf "${asset}" .
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber

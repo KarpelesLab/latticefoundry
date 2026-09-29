@@ -7,6 +7,11 @@ license = "MIT"
 authors = ["Mark Karpeles <admin@echelle.co.jp>"]
 repository = "https://github.com/KarpelesLab/latticefoundry"
 description = "A clean-room compiler construction framework in pure Rust"
+readme = "README.md"
+keywords = ["compiler", "ssa", "codegen", "jit", "linker"]
+categories = ["compilers", "development-tools"]
+# lf-cc is a separate crate that lives in-tree for now.
+exclude = ["/.github", "/lf-cc"]
 
 # This is a single package, NOT a Cargo workspace: one library
 # (`src/lib.rs`) plus several binaries auto-discovered from `src/bin/`

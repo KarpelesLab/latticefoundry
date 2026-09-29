@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The repository is not rustfmt-formatted, so there is no `cargo fmt --check`
+# job. The test jobs are Linux x86-64 only: the execution tests run the native
+# ELF executables LatticeFoundry produces, and the JIT targets x86-64 Linux.
+
+jobs:
+  test:
+    name: Test & lint (latticefoundry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  lf-cc:
+    # lf-cc is a separate nested crate (not a workspace member): build it from
+    # its own directory. Its differential tests compare against the runner's gcc
+    # and link against the host glibc through qld.
+    name: Test & lint (lf-cc)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lf-cc
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lf-cc
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  cross-check:
+    # The tools are cross compilers and must build on every common host, even
+    # though the execution tests only run on x86-64 Linux.
+    name: Build check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: |
+            .
+            lf-cc
+
+      - name: cargo check (latticefoundry)
+        run: cargo check --all-targets --target ${{ matrix.target }}
+
+      - name: cargo check (lf-cc)
+        working-directory: lf-cc
+        run: cargo check --all-targets --target ${{ matrix.target }}
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Keep this pin in sync with `rust-version` in both Cargo.toml files
+      # (1.89 is required by rsasm and qld). Compile-only: behavior is covered
+      # by the stable test jobs.
+      - name: Install Rust 1.89 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+          workspaces: |
+            .
+            lf-cc
+
+      - name: cargo check (latticefoundry)
+        run: cargo check --all-targets
+
+      - name: cargo check (lf-cc)
+        working-directory: lf-cc
+        run: cargo check --all-targets
+
+  docs:
+    name: Docs build (warnings denied)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc --no-deps
+        run: cargo doc --no-deps
