@@ -159,16 +159,41 @@ pub enum FloatTy {
     /// declarations (glibc prototypes name it); computing with a value of this
     /// type is rejected by sema, since no backend implements it.
     F128,
+    /// `float _Complex` (two `float`s: 8 bytes, 4-aligned). Declaration-only,
+    /// like [`FloatTy::F128`].
+    C32,
+    /// `double _Complex` (two `double`s: 16 bytes, 8-aligned; `long double
+    /// _Complex` too, as `long double` is `double` here). Declaration-only.
+    C64,
+    /// `_Float128 _Complex` (32 bytes, 16-aligned). Declaration-only.
+    C128,
 }
 
 impl FloatTy {
-    /// The width in bits of this format (32 or 64).
+    /// The storage width in bits of this format (32, 64, 128 or 256; a complex
+    /// type counts both of its parts).
     pub fn bits(self) -> u16 {
         match self {
             FloatTy::F32 => 32,
-            FloatTy::F64 => 64,
-            FloatTy::F128 => 128,
+            FloatTy::F64 | FloatTy::C32 => 64,
+            FloatTy::F128 | FloatTy::C64 => 128,
+            FloatTy::C128 => 256,
         }
+    }
+
+    /// The alignment in bytes: a complex type aligns like its parts.
+    pub fn align(self) -> u64 {
+        match self {
+            FloatTy::C32 => 4,
+            FloatTy::C64 => 8,
+            FloatTy::C128 => 16,
+            other => u64::from(other.bits()) / 8,
+        }
+    }
+
+    /// Whether this is one of the complex types.
+    pub fn is_complex(self) -> bool {
+        matches!(self, FloatTy::C32 | FloatTy::C64 | FloatTy::C128)
     }
 }
 
@@ -387,6 +412,7 @@ impl CType {
         match self {
             CType::Int(i) if i.width > 64 => Some("__int128"),
             CType::Float(FloatTy::F128) => Some("_Float128"),
+            CType::Float(f) if f.is_complex() => Some("_Complex"),
             _ => None,
         }
     }
@@ -433,6 +459,9 @@ impl fmt::Display for CType {
             CType::Float(FloatTy::F32) => write!(f, "float"),
             CType::Float(FloatTy::F64) => write!(f, "double"),
             CType::Float(FloatTy::F128) => write!(f, "_Float128"),
+            CType::Float(FloatTy::C32) => write!(f, "float _Complex"),
+            CType::Float(FloatTy::C64) => write!(f, "double _Complex"),
+            CType::Float(FloatTy::C128) => write!(f, "_Float128 _Complex"),
             CType::Pointer(inner) => write!(f, "{inner} *"),
             CType::Array(elem, n) => write!(f, "{elem}[{n}]"),
             CType::Record(_) => write!(f, "struct/union"),

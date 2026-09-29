@@ -52,7 +52,7 @@ pub fn align_of(recs: &Records, ty: &CType) -> u64 {
     match ty {
         CType::Void | CType::Bool => 1,
         CType::Int(i) => (u64::from(i.width) / 8).clamp(1, 16),
-        CType::Float(f) => u64::from(f.bits()) / 8,
+        CType::Float(f) => f.align(),
         CType::Pointer(_) => 8,
         CType::Array(elem, _) => align_of(recs, elem),
         CType::Record(id) => record_align(recs, *id),
@@ -272,6 +272,18 @@ pub fn ir_type(cx: &mut TypeContext, recs: &Records, ty: &CType) -> TypeId {
         CType::Float(FloatTy::F64) => cx.float(FloatKind::F64),
         // Storage only: sema never lets a `_Float128` value be computed.
         CType::Float(FloatTy::F128) => cx.int(128),
+        CType::Float(FloatTy::C32) => {
+            let f = cx.float(FloatKind::F32);
+            cx.array(f, 2)
+        }
+        CType::Float(FloatTy::C64) => {
+            let f = cx.float(FloatKind::F64);
+            cx.array(f, 2)
+        }
+        CType::Float(FloatTy::C128) => {
+            let q = cx.int(128);
+            cx.array(q, 2)
+        }
         CType::Pointer(_) => cx.ptr(),
         CType::Array(elem, n) => {
             let e = ir_type(cx, recs, elem);

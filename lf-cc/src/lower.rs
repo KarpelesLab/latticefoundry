@@ -60,7 +60,7 @@ impl Tys {
             CType::Int(i) => self.for_int(i.width),
             CType::Float(FloatTy::F32) => self.f32,
             // `_Float128` only appears in unused prototypes (sema rejects values).
-            CType::Float(FloatTy::F64 | FloatTy::F128) => self.f64,
+            CType::Float(_) => self.f64,
             CType::Pointer(_) => self.ptr,
             CType::Array(..) | CType::Record(_) => self.ptr,
             CType::Func(_) => self.ptr,
@@ -272,7 +272,7 @@ fn decode_float_le(fty: FloatTy, bytes: &[u8]) -> FloatBits {
             FloatBits::F32(u32::from_le_bytes(buf))
         }
         // `_Float128` values never reach lowering (sema rejects them).
-        FloatTy::F64 | FloatTy::F128 => {
+        _ => {
             let mut buf = [0u8; 8];
             for (i, b) in bytes.iter().take(8).enumerate() {
                 buf[i] = *b;

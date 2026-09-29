@@ -782,12 +782,15 @@ impl Pp {
         if opts.optimize && STATEMENT_EXPRESSIONS {
             self.define_object("__OPTIMIZE__", "1");
         }
-        // `__NO_INLINE__` is gcc's "no function is inlined" signal. C libraries
-        // key their `extern __inline __attribute__((__gnu_inline__))`
-        // definitions (glibc: `__USE_EXTERN_INLINES`) on its absence; lf-cc
-        // ignores `gnu_inline` and would emit such a body as a strong external
-        // definition, so the headers must never offer them.
-        self.define_object("__NO_INLINE__", "1");
+        // `__NO_INLINE__` is gcc's "no function is inlined" signal, set when not
+        // optimizing (as gcc does). C libraries key their `extern __inline
+        // __attribute__((__gnu_inline__))` definitions (glibc:
+        // `__USE_EXTERN_INLINES`) on its absence; the parser honours
+        // `gnu_inline` (such a body provides no out-of-line definition), so
+        // offering them when optimizing is safe.
+        if !(opts.optimize && STATEMENT_EXPRESSIONS) {
+            self.define_object("__NO_INLINE__", "1");
+        }
 
         if gnu {
             self.define_object("__GNUC__", "4");
@@ -2255,8 +2258,7 @@ impl Pp {
 
     /// Classify an identifier into a keyword/literal token, applying the standard
     /// gating. Returns `None` (dropping the token) when a gating error is
-    /// recorded, and for GNU `__extension__`, which only silences pedantic
-    /// diagnostics and so has no meaning to this compiler.
+    /// recorded.
     fn classify_ident(&mut self, name: &str, span: Span) -> Option<TokenKind> {
         // Base C89 keywords.
         if let Some(kw) = base_keyword(name) {
@@ -2287,7 +2289,10 @@ impl Pp {
             // GNU `asm`: the reserved spellings everywhere, the plain keyword only
             // under the GNU dialects (in ISO modes `asm` is an ordinary identifier).
             "__asm__" | "__asm" => Some(TokenKind::Keyword(Keyword::Asm)),
-            "__extension__" => None,
+            // GNU `__extension__` reaches the parser, which skips it and lifts the
+            // pedantic C-standard gates (`long long` in C89, anonymous members
+            // before C11, ...) for the declaration or expression it marks.
+            "__extension__" => Some(TokenKind::Ident(name.to_owned())),
             "asm" if self.std.is_gnu() => Some(TokenKind::Keyword(Keyword::Asm)),
             "_Noreturn" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Noreturn, span),
             "_Alignof" => self.gate_reserved(name, self.std.static_assert_generic(), "C11", Keyword::Alignof, span),
@@ -3259,31 +3264,69 @@ fn has_builtin(name: &str) -> bool {
             | "__builtin_memcmp"
             | "__builtin_strcmp"
             | "__builtin_strncmp"
+            // Parsed forms (folded at parse time) and sema-expanded builtins.
+            | "__builtin_offsetof"
+            | "__builtin_types_compatible_p"
+            | "__builtin_choose_expr"
+            | "__builtin_expect_with_probability"
+            | "__builtin_bswap16"
+            | "__builtin_bswap32"
+            | "__builtin_bswap64"
+            | "__builtin_object_size"
+            | "__builtin_dynamic_object_size"
+            | "__builtin_unreachable"
+            | "__builtin_trap"
+            | "__builtin_prefetch"
+            | "__builtin_assume_aligned"
+            | "__builtin_isnan"
+            | "__builtin_isinf"
+            | "__builtin_isinf_sign"
+            | "__builtin_isfinite"
+            | "__builtin_isnormal"
+            | "__builtin_signbit"
+            | "__builtin_fpclassify"
+            | "__builtin_isgreater"
+            | "__builtin_isgreaterequal"
+            | "__builtin_isless"
+            | "__builtin_islessequal"
+            | "__builtin_islessgreater"
+            | "__builtin_isunordered"
+            | "__builtin_huge_val"
+            | "__builtin_huge_valf"
+            | "__builtin_inf"
+            | "__builtin_inff"
+            | "__builtin_nan"
+            | "__builtin_nanf"
     ) || (BUILTIN_VA_LIST_TYPE && name == "__builtin_va_list")
 }
 
 /// Whether the parser implements the `__builtin_va_list` type keyword. The
 /// builtin `<stdarg.h>` spells `__gnuc_va_list` with it when available and
 /// otherwise declares the psABI `struct __va_list_tag[1]` itself.
-const BUILTIN_VA_LIST_TYPE: bool = false;
+const BUILTIN_VA_LIST_TYPE: bool = true;
 
 /// Whether the parser accepts GNU statement expressions `({ … })`, which C
 /// library headers use in their `__OPTIMIZE__` macro forms. Until it does,
 /// `-O1`+ does not predefine `__OPTIMIZE__`.
-const STATEMENT_EXPRESSIONS: bool = false;
+const STATEMENT_EXPRESSIONS: bool = true;
 
 /// `__has_attribute(name)` (GNU `__attribute__` names, bare or `__x__`-
-/// decorated): true only for attributes whose meaning lf-cc provides — which,
-/// since attributes are parsed and then ignored, means the attributes that are
+/// decorated): true only for attributes whose meaning lf-cc provides — the
 /// pure diagnostics or optimization hints (ignoring them is a correct
-/// implementation). Attributes that change layout, linkage, or code (`aligned`,
-/// `packed`, `section`, `alias`, `weak`, `cleanup`, `constructor`, `mode`,
-/// `vector_size`, `gnu_inline`, `transparent_union`, …) answer 0.
+/// implementation), and the ones the parser implements (`aligned`, `packed`,
+/// `mode`, `gnu_inline`, `transparent_union`). Other attributes that change
+/// layout, linkage, or code (`section`, `alias`, `weak`, `cleanup`,
+/// `constructor`, `vector_size`, …) answer 0.
 fn has_gnu_attribute(name: &str) -> bool {
     let name = name.strip_prefix("gnu::").unwrap_or(name);
     matches!(
         undecorate(name),
-        "noreturn"
+        "aligned"
+            | "packed"
+            | "mode"
+            | "gnu_inline"
+            | "transparent_union"
+            | "noreturn"
             | "unused"
             | "used"
             | "maybe_unused"

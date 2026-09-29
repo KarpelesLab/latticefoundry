@@ -2562,7 +2562,9 @@ impl Checker {
         let mut targs = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let ta = self.check_rvalue(ctx, a)?;
-            if let Some(name) = ft.params.get(i).and_then(CType::unsupported_value) {
+            if self.unevaluated == 0
+                && let Some(name) = ft.params.get(i).and_then(CType::unsupported_value)
+            {
                 self.error(a.span, format!("passing a '{name}' argument is not supported"));
                 return None;
             }
@@ -3285,7 +3287,7 @@ fn const_eval_float(e: &Expr, enums: &HashMap<String, i128>) -> Option<f64> {
             let v = rec(inner)?;
             match ty.float_ty() {
                 Some(crate::ast::FloatTy::F32) => Some(f64::from(v as f32)),
-                Some(crate::ast::FloatTy::F64 | crate::ast::FloatTy::F128) => Some(v),
+                Some(_) => Some(v),
                 None => Some(v.trunc()),
             }
         }
@@ -3371,7 +3373,7 @@ fn write_float_bytes(bytes: &mut [u8], off: u64, v: f64, fty: crate::ast::FloatT
                 }
             }
         }
-        crate::ast::FloatTy::F64 | crate::ast::FloatTy::F128 => {
+        _ => {
             let le = v.to_le_bytes();
             for (i, &src) in le.iter().enumerate() {
                 if let Some(dst) = bytes.get_mut(off as usize + i) {

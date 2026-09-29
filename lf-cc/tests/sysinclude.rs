@@ -274,16 +274,24 @@ fn has_queries() {
         "__has_c_attribute(nodiscard) == 202003",
         "__has_c_attribute(deprecated) == 201904",
         "__has_c_attribute(gnu::unused)",
-    ];
-    let no = [
-        "__has_include(<nonexistent/nope.h>)",
+        // Implemented by the parser/sema.
         "__has_builtin(__builtin_bswap32)",
-        "__has_builtin(__builtin_add_overflow)",
-        "__has_builtin(__builtin_strlen)",
+        "__has_builtin(__builtin_offsetof)",
+        "__has_builtin(__builtin_isnan)",
+        "__has_builtin(__builtin_va_list)",
         "__has_attribute(aligned)",
         "__has_attribute(__packed__)",
         "__has_attribute(__gnu_inline__)",
         "__has_attribute(__mode__)",
+        "__has_attribute(__transparent_union__)",
+    ];
+    let no = [
+        "__has_include(<nonexistent/nope.h>)",
+        "__has_builtin(__builtin_add_overflow)",
+        "__has_builtin(__builtin_strlen)",
+        "__has_builtin(__builtin_clz)",
+        "__has_attribute(__vector_size__)",
+        "__has_attribute(section)",
         "__has_c_attribute(no_such_attribute)",
         "__has_feature(address_sanitizer)",
     ];
@@ -346,10 +354,12 @@ int main(void) { return 0; }
     assert_eq!(probe(&iso, "linux"), vec![0], "non-reserved names only in GNU modes");
     assert_eq!(probe(&gnu, "linux"), vec![1]);
     let hosted_opt = PpOptions { hosted: true, optimize: true, ..opts() };
-    // `__OPTIMIZE__` waits for statement-expression support (glibc's <ctype.h>
-    // macro forms need it), so optimizing does not yet define it.
+    // Optimizing claims `__OPTIMIZE__` (the parser accepts the statement
+    // expressions of glibc's <ctype.h> macro forms) and drops `__NO_INLINE__`
+    // (it honours `gnu_inline`), like gcc -O.
     assert_eq!(values("__STDC_HOSTED__", &hosted_opt), vec![1]);
-    assert_eq!(probe(&hosted_opt, "__OPTIMIZE__"), vec![0]);
+    assert_eq!(probe(&hosted_opt, "__OPTIMIZE__"), vec![1]);
+    assert_eq!(probe(&hosted_opt, "__NO_INLINE__"), vec![0]);
     // __COUNTER__ and __INCLUDE_LEVEL__.
     assert_eq!(values("__COUNTER__ __COUNTER__ __INCLUDE_LEVEL__", &gnu), vec![0, 1, 0]);
 }

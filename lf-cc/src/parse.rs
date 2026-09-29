@@ -47,6 +47,7 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         cur_func: None,
         in_params: 0,
         transparent_params: Vec::new(),
+        extension: 0,
     };
     match parser.parse_unit() {
         Ok(items) => Ok(TranslationUnit {
@@ -123,6 +124,9 @@ struct Parser {
     /// The transparent-union parameters (index, union type) of the parameter
     /// list parsed last.
     transparent_params: Vec<(usize, CType)>,
+    /// Nonzero while parsing a declaration or expression marked with GNU
+    /// `__extension__`, which lifts the pedantic C-standard gates.
+    extension: u32,
 }
 
 /// The GNU `__attribute__((...))` properties lf-cc gives meaning to. Every other
@@ -408,9 +412,47 @@ impl Parser {
                 items.push(TopLevel::Asm(stmt.template));
                 continue;
             }
-            items.extend(self.parse_top_level()?);
+            // `__extension__ typedef long long ...;` / `__extension__ extern ...`.
+            let ext = self.skip_extension();
+            self.extension += u32::from(ext);
+            let r = self.parse_top_level();
+            self.extension -= u32::from(ext);
+            items.extend(r?);
         }
         Ok(items)
+    }
+
+    /// Whether the cursor is at GNU `__extension__`.
+    fn at_extension(&self) -> bool {
+        matches!(self.peek(), TokenKind::Ident(n) if n == "__extension__")
+    }
+
+    /// Consume any `__extension__` markers at the cursor; true if there were any.
+    fn skip_extension(&mut self) -> bool {
+        let mut any = false;
+        while self.at_extension() {
+            self.bump();
+            any = true;
+        }
+        any
+    }
+
+    /// Whether the cursor is at `__extension__` (possibly repeated) introducing
+    /// a declaration rather than an expression.
+    fn extension_decl_ahead(&self) -> bool {
+        let mut k = 0;
+        while matches!(self.peek_at(k), TokenKind::Ident(n) if n == "__extension__") {
+            k += 1;
+        }
+        k > 0
+            && match self.peek_at(k) {
+                TokenKind::Keyword(kw) => self.keyword_starts_decl(*kw),
+                TokenKind::Ident(n) => {
+                    self.ident_starts_decl(n)
+                        && !matches!(self.peek_at(k + 1), TokenKind::Punct(Punct::Colon))
+                }
+                _ => false,
+            }
     }
 
     /// Parse a `_Static_assert ( const-expr [, "msg"] ) ;` (C11) or
@@ -1101,6 +1143,7 @@ impl Parser {
                 TokenKind::Keyword(Keyword::Static) => storage = Storage::Static,
                 TokenKind::Keyword(Keyword::Inline) => self.spec_inline = true,
                 TokenKind::Keyword(Keyword::Register | Keyword::Auto | Keyword::Noreturn) => {}
+                TokenKind::Ident(n) if n == "__extension__" => {}
                 TokenKind::Ident(n) if n == "_Thread_local" || n == "__thread" => {
                     self.spec_thread = true;
                 }
@@ -1310,8 +1353,20 @@ impl Parser {
     /// specifier keyword, or a typedef-name identifier).
     fn at_type_specifier(&self) -> bool {
         match self.peek() {
-            TokenKind::Keyword(
-                Keyword::Void
+            TokenKind::Keyword(kw) => self.keyword_starts_decl(*kw),
+            // C23 `_BitInt`/`constexpr` are lexed as identifiers; treat them as
+            // declaration starts so a declaration using them is recognized (the
+            // C23 gate is applied in `parse_decl_specs`).
+            TokenKind::Ident(name) => self.ident_starts_decl(name),
+            _ => false,
+        }
+    }
+
+    /// Whether the keyword `kw` begins a declaration.
+    fn keyword_starts_decl(&self, kw: Keyword) -> bool {
+        matches!(
+            kw,
+            Keyword::Void
                 | Keyword::Bool
                 | Keyword::Char
                 | Keyword::Short
@@ -1336,16 +1391,8 @@ impl Parser {
                 | Keyword::Struct
                 | Keyword::Union
                 | Keyword::Enum
-                | Keyword::Typedef,
-            ) => true,
-            // C23 `_BitInt`/`constexpr` are lexed as identifiers; treat them as
-            // declaration starts so a declaration using them is recognized (the
-            // C23 gate is applied in `parse_decl_specs`).
-            TokenKind::Ident(name) => {
-                self.ident_starts_decl(name)
-            }
-            _ => false,
-        }
+                | Keyword::Typedef
+        )
     }
 
     fn parse_decl_specs(&mut self) -> PResult<CType> {
@@ -1395,11 +1442,20 @@ impl Parser {
         let mut bitint_n: Option<u16> = None;
         // GNU `__int128` (combines with `signed`/`unsigned`).
         let mut has_int128 = false;
+        // C99 `_Complex` (combines with `float`/`double`/`long double`).
+        let mut has_complex = false;
+        // An `__extension__` among the specifiers lifts the pedantic gates.
+        let mut marked = false;
 
         loop {
             if self.at_attribute() {
                 let a = self.parse_attributes()?;
                 attrs.merge(a);
+                continue;
+            }
+            if self.at_extension() {
+                self.bump();
+                marked = true;
                 continue;
             }
             let numeric_seen = has_void
@@ -1432,12 +1488,16 @@ impl Parser {
                         continue;
                     }
                     "_Complex" | "__complex__" => {
-                        return Err(Diagnostic::error("complex types (_Complex) are not supported")
-                            .with_span(sp));
+                        self.bump();
+                        has_complex = true;
+                        saw_any = true;
+                        continue;
                     }
                     _ => {}
                 }
-                if explicit.is_none() && !numeric_seen {
+                // A builtin type name that the program (or glibc, below GCC 7) has
+                // `typedef`ed is resolved as that typedef instead.
+                if explicit.is_none() && !numeric_seen && !self.is_typedef_name(&name) {
                     let ty = match name.as_str() {
                         "__int128_t" => Some(CType::Int(IntTy::new(128, true))),
                         "__uint128_t" => Some(CType::Int(IntTy::new(128, false))),
@@ -1639,6 +1699,31 @@ impl Parser {
             }
             return Err(Diagnostic::error("expected a type").with_span(start));
         }
+        // `_Complex float` / `_Complex double` / `_Complex long double` (a bare
+        // `_Complex` is `double _Complex`, as in gcc). Complex values are not
+        // implemented: the types serve declarations (<complex.h> prototypes).
+        if has_complex {
+            let fty = match &explicit {
+                Some(CType::Float(FloatTy::F32)) => Some(FloatTy::C32),
+                Some(CType::Float(FloatTy::F64)) => Some(FloatTy::C64),
+                Some(CType::Float(FloatTy::F128)) => Some(FloatTy::C128),
+                Some(CType::Float(f)) if f.is_complex() => Some(*f),
+                Some(_) => None,
+                None if has_char || has_short || has_int || has_bool || has_void || has_int128
+                    || signed_spec.is_some()
+                    || (longs > 0 && !has_double) =>
+                {
+                    None
+                }
+                None if has_float => Some(FloatTy::C32),
+                None => Some(FloatTy::C64),
+            };
+            return match fty {
+                Some(f) => Ok(CType::Float(f)),
+                None => Err(Diagnostic::error("complex integer types are not supported")
+                    .with_span(start)),
+            };
+        }
         if let Some(ty) = explicit {
             return Ok(ty);
         }
@@ -1671,7 +1756,7 @@ impl Parser {
             }
             return Ok(CType::Int(IntTy::new(128, signed_spec.unwrap_or(true))));
         }
-        if longs >= 2 && !self.std.has_long_long() {
+        if longs >= 2 && !self.std.has_long_long() && self.extension == 0 && !marked {
             return Err(Diagnostic::error(
                 "`long long` is a C99 feature (use -std=c99 or later)",
             )
@@ -2035,76 +2120,87 @@ impl Parser {
                 self.parse_static_assert()?;
                 continue;
             }
-            let base = self.parse_decl_specs()?;
-            let sattrs = self.spec_attrs.clone();
-            let align = max_align(self.last_alignas.take(), sattrs.aligned);
-            // A member declaration with no declarator: an anonymous struct/union
-            // member (an untagged `struct`/`union`, C11), or a nested tagged type
-            // declaration (which declares no member).
-            if self.is_punct(Punct::Semi) {
-                if let CType::Record(rid) = &base
-                    && self.records.get(*rid).tag.is_none()
-                {
-                    if !self.std.anonymous_members() {
-                        return self.err(
-                            "anonymous struct/union members are a C11 feature (use -std=c11 or later)",
-                        );
-                    }
-                    fields.push(Field {
-                        name: String::new(),
-                        ty: base.clone(),
-                        anonymous: true,
-                        align,
-                        bit_width: None,
-                    });
-                }
-                self.bump(); // ';'
-                continue;
-            }
-            // An unnamed bit-field: `type : const-expr ;` (including `: 0`), which
-            // has no declarator, only a colon and a width.
-            if self.is_punct(Punct::Colon) {
-                let bit_width = self.parse_bitfield_width(&base)?;
-                self.skip_attributes()?;
-                fields.push(Field {
-                    name: String::new(),
-                    ty: base.clone(),
-                    anonymous: false,
-                    align,
-                    bit_width: Some(bit_width),
-                });
-                self.expect_punct(Punct::Semi, "';' after bit-field")?;
-                continue;
-            }
-            loop {
-                let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
-                // Attributes may sit before the bit-field width and after it.
-                let (_label, ty, mut attrs) = self.finish_declarator(ty, name_span, &sattrs)?;
-                let bit_width = if self.is_punct(Punct::Colon) {
-                    let w = self.parse_bitfield_width(&ty)?;
-                    // A named bit-field of width 0 is a constraint violation.
-                    if w == 0 {
-                        return Err(Diagnostic::error(
-                            "named bit-field cannot have zero width",
-                        )
-                        .with_span(name_span));
-                    }
-                    attrs.merge(self.parse_attributes()?);
-                    Some(w)
-                } else {
-                    None
-                };
-                let align = max_align(align, attrs.aligned);
-                fields.push(Field { name, ty, anonymous: false, align, bit_width });
-                if !self.eat_punct(Punct::Comma) {
-                    break;
-                }
-            }
-            self.expect_punct(Punct::Semi, "';' after struct/union member")?;
+            // `__extension__ union { ... };` (glibc) lifts the pedantic gates for
+            // this member declaration.
+            let ext = u32::from(self.skip_extension());
+            self.extension += ext;
+            let r = self.parse_member_decl(&mut fields);
+            self.extension -= ext;
+            r?;
         }
         self.expect_punct(Punct::RBrace, "'}' to close struct/union body")?;
         self.records.defs[id].fields = fields;
         self.records.defs[id].complete = true;
+        Ok(())
+    }
+
+    /// Parse one member declaration of a struct/union body (through its `;`),
+    /// appending the members it declares to `fields`.
+    fn parse_member_decl(&mut self, fields: &mut Vec<Field>) -> PResult<()> {
+        let base = self.parse_decl_specs()?;
+        let sattrs = self.spec_attrs.clone();
+        let align = max_align(self.last_alignas.take(), sattrs.aligned);
+        // A member declaration with no declarator: an anonymous struct/union
+        // member (an untagged `struct`/`union`, C11), or a nested tagged type
+        // declaration (which declares no member).
+        if self.is_punct(Punct::Semi) {
+            if let CType::Record(rid) = &base
+                && self.records.get(*rid).tag.is_none()
+            {
+                if !self.std.anonymous_members() && self.extension == 0 {
+                    return self.err(
+                        "anonymous struct/union members are a C11 feature (use -std=c11 or later)",
+                    );
+                }
+                fields.push(Field {
+                    name: String::new(),
+                    ty: base.clone(),
+                    anonymous: true,
+                    align,
+                    bit_width: None,
+                });
+            }
+            self.bump(); // ';'
+            return Ok(());
+        }
+        // An unnamed bit-field: `type : const-expr ;` (including `: 0`), which
+        // has no declarator, only a colon and a width.
+        if self.is_punct(Punct::Colon) {
+            let bit_width = self.parse_bitfield_width(&base)?;
+            self.skip_attributes()?;
+            fields.push(Field {
+                name: String::new(),
+                ty: base.clone(),
+                anonymous: false,
+                align,
+                bit_width: Some(bit_width),
+            });
+            self.expect_punct(Punct::Semi, "';' after bit-field")?;
+            return Ok(());
+        }
+        loop {
+            let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
+            // Attributes may sit before the bit-field width and after it.
+            let (_label, ty, mut attrs) = self.finish_declarator(ty, name_span, &sattrs)?;
+            let bit_width = if self.is_punct(Punct::Colon) {
+                let w = self.parse_bitfield_width(&ty)?;
+                // A named bit-field of width 0 is a constraint violation.
+                if w == 0 {
+                    return Err(Diagnostic::error("named bit-field cannot have zero width")
+                        .with_span(name_span));
+                }
+                attrs.merge(self.parse_attributes()?);
+                Some(w)
+            } else {
+                None
+            };
+            let align = max_align(align, attrs.aligned);
+            fields.push(Field { name, ty, anonymous: false, align, bit_width });
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::Semi, "';' after struct/union member")?;
         Ok(())
     }
 
@@ -2341,7 +2437,7 @@ impl Parser {
             }
             // A label (`ident :`) is a statement even when its name is a
             // typedef-name, so it must not be mistaken for a declaration.
-            let is_decl = self.at_type_specifier() && !self.label_ahead();
+            let is_decl = (self.at_type_specifier() || self.extension_decl_ahead()) && !self.label_ahead();
             if is_decl && seen_stmt && !self.std.mixed_declarations() {
                 self.pop_scope();
                 return self.err(
@@ -2369,6 +2465,14 @@ impl Parser {
         // `[[fallthrough]];`, `[[maybe_unused]] int x;`).
         self.skip_attributes()?;
         let start = self.peek_span();
+        // `__extension__ long long x;` — a marked block-scope declaration.
+        if self.extension_decl_ahead() {
+            self.skip_extension();
+            self.extension += 1;
+            let r = self.parse_local_decl();
+            self.extension -= 1;
+            return r;
+        }
         // A named label `ident :` (its own namespace; may shadow a typedef name).
         if self.label_ahead() {
             let TokenKind::Ident(name) = self.peek().clone() else { unreachable!() };
@@ -2764,6 +2868,14 @@ impl Parser {
 
     fn parse_unary(&mut self) -> PResult<Expr> {
         let start = self.peek_span();
+        // GNU `__extension__` as a unary prefix: `__extension__ ({ ... })`.
+        if self.at_extension() {
+            self.skip_extension();
+            self.extension += 1;
+            let r = self.parse_cast();
+            self.extension -= 1;
+            return r;
+        }
         // GNU labels as values: `&&label`.
         if self.is_punct(Punct::AmpAmp)
             && let TokenKind::Ident(name) = self.peek_at(1).clone()

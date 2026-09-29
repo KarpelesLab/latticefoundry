@@ -5,9 +5,10 @@
 //!
 //! Two front-end paths are exercised:
 //!
-//! - lf-cc's own preprocessor over `/usr/include` (with gcc's freestanding
-//!   header directory ahead of it when one is installed; otherwise lf-cc's
-//!   builtin `<stdarg.h>`/`<stddef.h>`/... are used);
+//! - lf-cc as a user runs it: its own preprocessor, its builtin freestanding
+//!   headers, and the default `/usr/include` search — at -O0, and at -O2
+//!   (which predefines `__OPTIMIZE__`, turning on glibc's `extern __inline`
+//!   definitions and <ctype.h>'s statement-expression macros);
 //! - when gcc is available, `gcc -E` as a preprocessing *oracle*, so the
 //!   parser/sema/lowering are tested on exactly the text gcc itself compiles
 //!   (also in the `-O2 -D_GNU_SOURCE` configuration, which turns on glibc's
@@ -23,15 +24,13 @@ use latticefoundry::link::gnu::HostCrt;
 
 const LF_CC: &str = env!("CARGO_BIN_EXE_lf-cc");
 
-/// One program: its source, the expected stdout, stderr, and exit status, and
-/// whether lf-cc's own preprocessor handles every header it includes yet.
+/// One program: its source, and the expected stdout, stderr, and exit status.
 struct Prog {
     name: &'static str,
     src: &'static str,
     stdout: &'static str,
     stderr: &'static str,
     exit: i32,
-    own_pp: bool,
 }
 
 fn programs() -> Vec<Prog> {
@@ -87,7 +86,6 @@ int main(void) {
                      !\n",
             stderr: "to stderr 7\n",
             exit: 3,
-            own_pp: true,
         },
         Prog {
             name: "stdlib_services",
@@ -149,7 +147,6 @@ int main(void) {
                      calloc=0000\n",
             stderr: "",
             exit: 0,
-            own_pp: true,
         },
         Prog {
             name: "string_and_ctype",
@@ -195,7 +192,6 @@ int main(void) {
                      alpha=10 digit=3 upper=2 space=3 mIxEd 1\n",
             stderr: "",
             exit: 0,
-            own_pp: true,
         },
         Prog {
             name: "errno_and_math",
@@ -235,7 +231,6 @@ int main(void) {
                      isgreater=1 isunordered=1\n",
             stderr: "",
             exit: 0,
-            own_pp: true,
         },
         Prog {
             name: "posix_services",
@@ -320,8 +315,6 @@ int main(void) {
                      stat=0 isdir=1\n",
             stderr: "",
             exit: 0,
-            // Needs `#include_next <limits.h>` and more preprocessor work.
-            own_pp: false,
         },
     ]
 }
@@ -329,35 +322,6 @@ int main(void) {
 fn which(prog: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|d| d.join(prog)).find(|c| c.is_file())
-}
-
-/// gcc's freestanding header directory (`<stdarg.h>`, `<stddef.h>`, ...), if
-/// one is installed: the newest `/usr/lib*/gcc/<triple>/<ver>/include`.
-fn gcc_freestanding_include() -> Option<PathBuf> {
-    let mut best: Option<(u32, PathBuf)> = None;
-    for root in ["/usr/lib/gcc", "/usr/lib64/gcc"] {
-        let Ok(triples) = std::fs::read_dir(root) else { continue };
-        for t in triples.flatten() {
-            let Ok(vers) = std::fs::read_dir(t.path()) else { continue };
-            for v in vers.flatten() {
-                let inc = v.path().join("include");
-                if !inc.join("stdarg.h").is_file() {
-                    continue;
-                }
-                let major = v
-                    .file_name()
-                    .to_string_lossy()
-                    .split('.')
-                    .next()
-                    .and_then(|m| m.parse::<u32>().ok())
-                    .unwrap_or(0);
-                if best.as_ref().is_none_or(|(b, _)| major > *b) {
-                    best = Some((major, inc));
-                }
-            }
-        }
-    }
-    best.map(|(_, p)| p)
 }
 
 fn prerequisites() -> bool {
@@ -430,28 +394,18 @@ fn real_header_programs_with_own_preprocessor() {
         return;
     }
     let s = Scratch::new("own");
-    let mut include: Vec<String> = Vec::new();
-    if let Some(inc) = gcc_freestanding_include() {
-        include.push("-nostdinc".to_owned());
-        include.push(format!("-I{}", inc.display()));
-    } else {
-        // glibc's <stdio.h> takes `__gnuc_va_list` from <stdarg.h> (via
-        // `__need___va_list`), which lf-cc's builtin <stdarg.h> does not
-        // provide yet — preprocessor/builtin-header work, not front-end work.
-        eprintln!("skipping: no gcc freestanding headers, and lf-cc's builtin <stdarg.h> lacks __gnuc_va_list");
-        return;
-    }
-    include.push("-I/usr/include".to_owned());
     let mut failures = Vec::new();
-    for p in programs().iter().filter(|p| p.own_pp) {
+    for p in programs() {
         let src = format!("{}.c", p.name);
         std::fs::write(s.0.join(&src), p.src).expect("write source");
-        for opt in ["-O0", "-O2"] {
-            let exe = format!("{}{opt}", p.name);
-            let mut args: Vec<&str> = include.iter().map(String::as_str).collect();
-            args.extend([opt, src.as_str(), "-o", exe.as_str(), "-lm"]);
-            if lf_cc(&s.0, &args, &format!("{} {opt}", p.name), &mut failures) {
-                check(p, &format!("lf-cc {opt}"), &run(&s.0.join(&exe)), &mut failures);
+        for (tag, flags) in
+            [("O0", &["-O0"][..]), ("O2", &["-O2"][..]), ("O2-gnu", &["-O2", "-D_GNU_SOURCE"][..])]
+        {
+            let exe = format!("{}.{tag}", p.name);
+            let mut args: Vec<&str> = flags.to_vec();
+            args.extend([src.as_str(), "-o", exe.as_str(), "-lm"]);
+            if lf_cc(&s.0, &args, &format!("{} ({tag})", p.name), &mut failures) {
+                check(&p, &format!("lf-cc {tag}"), &run(&s.0.join(&exe)), &mut failures);
             }
         }
     }
@@ -507,8 +461,58 @@ fn real_header_programs_with_gcc_preprocessing() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Every M9 target header, `#include`d alone in its gcc-preprocessed form
-/// (plain and `-O2 -D_GNU_SOURCE`), compiles and links.
+/// The M9 target headers, and more of the C library's public headers.
+const HEADERS: &[&str] = &[
+    "stdio.h", "stdlib.h", "string.h", "unistd.h", "errno.h", "ctype.h", "fcntl.h", "signal.h",
+    "sys/stat.h", "sys/types.h", "time.h", "stdarg.h", "stddef.h", "limits.h", "setjmp.h",
+    "dirent.h", "math.h", "utime.h", "locale.h", "wchar.h", "stdint.h", "inttypes.h", "assert.h",
+    "sys/wait.h", "sys/time.h", "pwd.h", "grp.h", "termios.h", "strings.h", "sys/socket.h",
+    "netinet/in.h", "arpa/inet.h", "netdb.h", "sys/mman.h", "sys/ioctl.h", "poll.h",
+    "sys/select.h", "pthread.h", "sched.h", "regex.h", "glob.h", "fnmatch.h", "getopt.h",
+    "libgen.h", "search.h", "iconv.h", "langinfo.h", "wctype.h", "fenv.h", "complex.h",
+    "sys/resource.h", "sys/utsname.h", "sys/uio.h", "sys/un.h", "sys/param.h", "endian.h",
+    "byteswap.h", "err.h", "ftw.h", "dlfcn.h", "stdbool.h", "float.h", "alloca.h", "malloc.h",
+    "syslog.h", "semaphore.h", "spawn.h",
+];
+
+/// Write `#include <h>` + an empty `main` for header `h`; returns the file stem.
+fn header_probe(dir: &Path, h: &str) -> String {
+    let stem = h.replace(['/', '.'], "_");
+    std::fs::write(
+        dir.join(format!("{stem}.c")),
+        format!("#include <{h}>\nint main(void) {{ return 0; }}\n"),
+    )
+    .expect("write source");
+    stem
+}
+
+/// Every header, `#include`d alone, compiles and links through lf-cc's own
+/// preprocessor (plain, and `-O2 -D_GNU_SOURCE`).
+#[test]
+fn every_target_header_compiles_with_own_preprocessor() {
+    if !prerequisites() {
+        return;
+    }
+    let s = Scratch::new("own-headers");
+    let mut failures = Vec::new();
+    for h in HEADERS {
+        if !Path::new("/usr/include").join(h).is_file() {
+            continue;
+        }
+        let stem = header_probe(&s.0, h);
+        let src = format!("{stem}.c");
+        for (tag, flags) in [("plain", &[][..]), ("O2-gnu", &["-O2", "-D_GNU_SOURCE"][..])] {
+            let exe = format!("{stem}.{tag}");
+            let mut args: Vec<&str> = flags.to_vec();
+            args.extend([src.as_str(), "-o", exe.as_str()]);
+            lf_cc(&s.0, &args, &format!("<{h}> ({tag})"), &mut failures);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Every header, `#include`d alone in its gcc-preprocessed form (plain and
+/// `-O2 -D_GNU_SOURCE`), compiles and links.
 #[test]
 fn every_target_header_compiles_in_gcc_preprocessed_form() {
     if !prerequisites() {
@@ -518,28 +522,14 @@ fn every_target_header_compiles_in_gcc_preprocessed_form() {
         eprintln!("skipping: gcc (the preprocessing oracle) is not installed");
         return;
     };
-    const HEADERS: &[&str] = &[
-        "stdio.h", "stdlib.h", "string.h", "unistd.h", "errno.h", "ctype.h", "fcntl.h",
-        "signal.h", "sys/stat.h", "sys/types.h", "time.h", "stdarg.h", "stddef.h", "limits.h",
-        "setjmp.h", "dirent.h", "math.h", "utime.h", "locale.h", "wchar.h", "stdint.h",
-        "inttypes.h", "assert.h", "sys/wait.h", "sys/time.h", "pwd.h", "grp.h", "termios.h",
-        "strings.h", "sys/socket.h", "netinet/in.h", "arpa/inet.h", "netdb.h", "sys/mman.h",
-        "sys/ioctl.h", "poll.h", "sys/select.h", "pthread.h", "sched.h", "regex.h", "glob.h",
-        "fnmatch.h", "getopt.h", "libgen.h", "search.h", "iconv.h", "langinfo.h", "wctype.h",
-        "fenv.h", "sys/resource.h", "sys/utsname.h", "sys/uio.h", "sys/un.h", "sys/param.h",
-        "endian.h", "byteswap.h", "err.h", "ftw.h", "dlfcn.h", "stdbool.h", "float.h",
-        "alloca.h", "malloc.h", "syslog.h", "semaphore.h", "spawn.h",
-    ];
     let s = Scratch::new("headers");
     let mut failures = Vec::new();
     for h in HEADERS {
         if !Path::new("/usr/include").join(h).is_file() {
             continue;
         }
-        let stem = h.replace(['/', '.'], "_");
+        let stem = header_probe(&s.0, h);
         let src = format!("{stem}.c");
-        std::fs::write(s.0.join(&src), format!("#include <{h}>\nint main(void) {{ return 0; }}\n"))
-            .expect("write source");
         for (tag, flags) in [("plain", &[][..]), ("O2-gnu", &["-O2", "-D_GNU_SOURCE"][..])] {
             let pre = format!("{stem}.{tag}.i.c");
             let out = Command::new(&gcc)

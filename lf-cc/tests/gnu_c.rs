@@ -364,7 +364,9 @@ fn unsupported_constructs_are_rejected_clearly() {
         ("typedef float v4 __attribute__((vector_size(16))); int main(void){return 0;}", "vector"),
         ("__thread int t; int main(void) { return 0; }", "thread-local"),
         ("int main(void) { static _Thread_local int t; return t; }", "thread-local"),
-        ("_Complex double z; int main(void) { return 0; }", "complex"),
+        ("_Complex double z; int main(void) { return 0; }", "_Complex"),
+        ("double _Complex csqrt(double _Complex); int main(void) { csqrt(1.0); return 0; }", "_Complex"),
+        ("int main(void) { _Complex int ci; return 0; }", "complex integer"),
         ("typedef int bad __attribute__((mode(V4SI))); int main(void){return 0;}", "machine mode"),
         (
             "static inline int u(void) { __asm__(\"nop\"); return 0; } int main(void) { return u(); }",
@@ -386,10 +388,36 @@ fn declaration_only_uses_are_accepted() {
     for src in [
         "extern __int128 v; int main(void) { return (int)sizeof v; }",
         "typedef _Float128 q; q *p; int main(void) { return p == 0; }",
+        "float _Complex cf(float _Complex); extern _Complex long double cl; extern double _Complex cd; int main(void) { return sizeof(cf(0)) + sizeof cd != 24; }",
+        "typedef float _Float32; typedef double _Float64; _Float32 f = 1.5f; int main(void) { return f != 1.5f; }",
+        "struct s { __extension__ union { int a; long b; }; }; __extension__ typedef long long ll; int main(void) { __extension__ long long x = __extension__ 1LL; struct s v; v.a = 0; return (int)x - 1 + v.a; }",
         "static inline int u(void) { __asm__(\"nop\"); return 0; } int main(void) { return 0; }",
     ] {
         let errs = check_errors(src);
         assert!(errs.is_empty(), "unexpected errors for:\n{src}\n{errs}");
+    }
+}
+
+/// GNU `__extension__` lifts the pedantic C-standard gates for the declaration
+/// or expression it marks (glibc marks `long long` typedefs and C11 anonymous
+/// unions with it), while the unmarked forms stay rejected under C89.
+#[test]
+fn extension_lifts_pedantic_gates() {
+    let c89 = lf_cc::PpOptions { std: lf_cc::CStd::parse("c89").unwrap(), ..Default::default() };
+    let marked = "__extension__ typedef long long ll;\n\
+                  struct t { int a; __extension__ union { int b; float c; }; };\n\
+                  int main(void) {\n\
+                      __extension__ long long x = __extension__ 5LL;\n\
+                      struct t v;\n\
+                      v.b = 2;\n\
+                      return (int)x + v.b + (int)sizeof(ll);\n\
+                  }\n";
+    lf_cc::check_source_with(marked, &c89).unwrap_or_else(|e| panic!("marked forms: {e:?}"));
+    for unmarked in [
+        "typedef long long ll; int main(void) { return 0; }",
+        "struct t { int a; union { int b; float c; }; }; int main(void) { return 0; }",
+    ] {
+        assert!(lf_cc::check_source_with(unmarked, &c89).is_err(), "C89 must reject:\n{unmarked}");
     }
 }
 
