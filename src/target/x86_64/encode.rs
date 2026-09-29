@@ -279,6 +279,30 @@ pub(crate) fn pop_r(e: &mut Emitter, r: u8) {
     e.u8(0x58 + (r & 7));
 }
 
+/// Emit `cmp a, b` at the operands' integer `width`. Values narrower than 32
+/// bits live in wider host registers whose upper bits are not kept clean (an
+/// `i8` add of 200 + 100 leaves 300 in the register), so an 8- or 16-bit
+/// comparison must use the 8- or 16-bit form of `cmp` (`38 /r`, `66 39 /r`)
+/// rather than comparing the whole 32-bit register.
+pub(crate) fn cmp_rr_width(e: &mut Emitter, a: u8, b: u8, width: u32) {
+    match width {
+        0..=8 => {
+            // Any REX prefix makes registers 4..7 name spl/bpl/sil/dil instead of
+            // ah/ch/dh/bh, so emit one whenever such a register is involved.
+            if a >= 4 || b >= 4 {
+                e.u8(rex(false, b >= 8, false, a >= 8));
+            }
+            e.u8(0x38);
+            e.u8(modrm(3, b, a));
+        }
+        9..=16 => {
+            e.u8(0x66);
+            alu_rr(e, 0x39, a, b, false);
+        }
+        _ => alu_rr(e, 0x39, a, b, width > 32),
+    }
+}
+
 /// Emit `cmp r, imm32` (`REX.W 81 /7 id`).
 fn cmp_ri(e: &mut Emitter, reg: u8, value: i32, w: bool) {
     if w || reg >= 8 {
@@ -769,8 +793,7 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let a = rnum(&ops[1]);
             let b = rnum(&ops[2]);
             let cc = uimm(&ops[3]) as u8;
-            let w = iimm(&ops[4]) == 64;
-            alu_rr(e, 0x39, a, b, w); // cmp a, b
+            cmp_rr_width(e, a, b, iimm(&ops[4]) as u32); // cmp a, b
             setcc(e, cc, d);
             movzx_byte(e, d);
         }

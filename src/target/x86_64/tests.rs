@@ -105,6 +105,18 @@ fn golden_setcc_and_cmp() {
 }
 
 #[test]
+fn golden_narrow_cmp() {
+    // cmp al, bl = 38 d8 ; cmp sil, dil = 40 38 fe ; cmp r8b, al = 41 38 c0
+    assert_eq!(enc(|e| cmp_rr_width(e, 0, 3, 8)), vec![0x38, 0xd8]);
+    assert_eq!(enc(|e| cmp_rr_width(e, 6, 7, 8)), vec![0x40, 0x38, 0xfe]);
+    assert_eq!(enc(|e| cmp_rr_width(e, 8, 0, 8)), vec![0x41, 0x38, 0xc0]);
+    // cmp ax, bx = 66 39 d8 ; cmp eax, ebx = 39 d8 ; cmp rax, rbx = 48 39 d8
+    assert_eq!(enc(|e| cmp_rr_width(e, 0, 3, 16)), vec![0x66, 0x39, 0xd8]);
+    assert_eq!(enc(|e| cmp_rr_width(e, 0, 3, 32)), vec![0x39, 0xd8]);
+    assert_eq!(enc(|e| cmp_rr_width(e, 0, 3, 64)), vec![0x48, 0x39, 0xd8]);
+}
+
+#[test]
 fn golden_movsx_movzx() {
     // movsxd rax, ecx = 48 63 c1  (32->64 sign-extend)
     assert_eq!(enc(|e| movsx_rr(e, 0, 1, 32, 64)), vec![0x48, 0x63, 0xc1]);

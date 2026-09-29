@@ -273,6 +273,53 @@ entry ^0:
     }
 
     #[test]
+    fn native_narrow_icmp_ignores_upper_register_bits() {
+        // An i8/i16 add can leave carries above the value's width in the host
+        // register (200 + 100 is 300 in a 32-bit register, but 44 as an i8).
+        // Comparisons must look at the value's own width only. Each function
+        // returns 1 when the comparison sees the wrapped value.
+        let src = "\
+module \"k\"
+func @ult8(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %c = icmp ult %s, %a : i1
+  %r = zext %c : i64
+  ret %r
+}
+func @slt8(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %c = icmp slt %s, i8 0 : i1
+  %r = zext %c : i64
+  ret %r
+}
+func @eq16(i16, i16) -> i64 {
+entry ^0(%a: i16, %b: i16):
+  %s = add %a, %b : i16
+  %c = icmp eq %s, i16 4 : i1
+  %r = zext %c : i64
+  ret %r
+}
+func @main() -> i64 {
+entry ^0:
+  %x = call @ult8(i8 -56, i8 100) : i64
+  %y = call @slt8(i8 100, i8 100) : i64
+  %z = call @eq16(i16 -2, i16 6) : i64
+  %xy = shl %y, i64 1 : i64
+  %xz = shl %z, i64 2 : i64
+  %t = or %x, %xy : i64
+  %u = or %t, %xz : i64
+  ret %u
+}
+";
+        let mut syms = StrInterner::new();
+        let module = crate::ir::text::parse_module(src, FileId::new(0), &mut syms)
+            .expect("parse .lf");
+        assert_eq!(build_and_run(&module, &syms, "narrow_icmp"), 0b111);
+    }
+
+    #[test]
     fn lfo_file_link_runs() {
         // Exercise the same file-based path `lf-ld` uses: encode a real object
         // to `.lfo`, link it from disk with `link()`, then run the executable.
