@@ -352,8 +352,12 @@ a fuzzed instruction corpus; objects are consumable by Phase 8.
 object writers from their specifications, selected by `mc::write_object` from
 a `target::Triple`. They are checked with `llvm-readobj`/`llvm-objdump`/GNU
 `objdump` and linked by qld into PE and Mach-O executables. `lf-as` assembles
-real GNU-syntax assembly into ELF through our own `rsasm`. Still open: `lf-dis`
-(no disassembler yet).
+real GNU-syntax assembly into ELF through our own `rsasm`. The ELF writer is
+generic over an `ElfTarget` (ELF32 or ELF64, either byte order, `REL` or
+`RELA`, the machine's relocation numbering), so the 32-bit targets get ELF32
+relocatable objects (validated with `readelf`); relocation kinds include
+`Abs16`, and DWARF can use 4- or 2-byte addresses. Still open: `lf-dis` (no
+disassembler yet).
 
 ### **Phase 7 — Targets**
 
@@ -393,6 +397,20 @@ functions take `internal`/`weak` linkage. AArch64 and RISC-V reject the PIC
 models with a clear error (`target::compile_module_for`); they need GOT
 sequences (`adrp`+`ldr` `R_AARCH64_ADR_GOT_PAGE`/`LD64_GOT_LO12_NC`, `auipc`+`ld`
 `R_RISCV_GOT_HI20`).
+
+*Non-64-bit foundation* ✅ (for wasm32, Arm Cortex-M and AVR; see
+[ir-design §3a/§3b](docs/ir-design.md)): modules carry a per-target
+`DataLayout` (pointer size/alignment per address space, scalar alignments,
+endianness, stack alignment, native integer widths, program address space;
+LP64 by default) and an optional target name, both in the `.lf` header and the
+`.lfb` v4 header; `ptr addrspace(N)` pointers and globals placed in an address
+space, with verifier rules and no `addrspacecast`; sizes, offsets, the reference
+evaluator, global-data emission (4- and 2-byte pointer fields, per-space
+relocations) and isel (`Lower::mem_addr_space`) follow the layout; and a
+target-independent wide-integer legalization pass (`codegen::legalize_int`) splits
+integers above the native width into parts, with libcalls for mul/div/rem,
+checked against the reference evaluator at 32-, 16- and 8-bit part widths. The
+three backends themselves remain to be written on top.
 
 ### **Phase 8 — Linker & first end-to-end**  ✅
 

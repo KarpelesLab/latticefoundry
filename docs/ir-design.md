@@ -56,8 +56,8 @@ parameters passed on the branch.
 - `Float(F16 | F32 | F64)` at first; wider/exotic formats added only when a
   target needs them (values via `puremp`'s float support so constant-folding is
   exact and host-independent).
-- `Ptr` — **opaque** (no pointee type), address spaces added lazily as
-  `Ptr(addrspace)` only when a target requires them.
+- `Ptr` — **opaque** (no pointee type), in an **address space**: `ptr` is the
+  default space 0, `ptr addrspace(N)` space `N` (§3a).
 - Aggregates: `Array(T, n)`, `Struct(fields)`; vectors (`Vector(T, n)`) added
   with SIMD targets; scalable vectors deferred until a scalable-vector target
   (SVE/RVV) is real.
@@ -69,6 +69,135 @@ type level is on from day one (T5).
 **Rejected:** typed pointers (`i32*`). Opaque pointers are where LLVM arrived
 after years of pain; we start there. The *accessed* type lives on the memory
 operation (§6), which is where it is actually needed.
+
+## 3a. Data layout and address spaces  *(decided)*
+
+The IR is target-independent but target-*aware*: every module carries a
+**data layout** (`ir::DataLayout`) that pins down how its types map onto bytes,
+and may name its **target**. Both are module-level declarations in the text
+form, and part of the `.lfb` header from version 4:
+
+```text
+module "blink"
+target "avr"
+datalayout "e-p:16:8-p1:16:8-i8:8-i16:8-i32:8-i64:8-f16:8-f32:8-f64:8-S8-n8-P1"
+```
+
+The layout records:
+
+| item | spec | meaning |
+|---|---|---|
+| byte order | `e` / `E` | little / big endian |
+| pointers | `p[AS]:SIZE:ALIGN` | size and ABI alignment of a pointer into address space `AS` (default 0); every space a module uses must be declared |
+| integers | `iW:ALIGN` | alignment of an integer whose store size rounds up to `W` bits (a wider integer takes the widest entry's) |
+| floats | `f16`/`f32`/`f64:ALIGN` | float alignments |
+| stack | `S:ALIGN` | stack alignment |
+| native ints | `nW:W:…` | integer widths the target computes with (the input to legalization, §3b) |
+| program space | `PAS` | the address space functions live in |
+
+All numbers are in bits. Items left out keep their **LP64** value, and LP64 —
+`e-p:64:64-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-S128-n8:16:32:64` —
+is the default, so a module that never declares a layout means exactly what it
+meant before layouts existed (x86-64, AArch64 and RISC-V 64 all use it). The
+printer writes `datalayout` only for a non-default layout and `target` only when
+set; the parser accepts both optional lines right after `module`.
+
+**Where it lives.** The layout sits in the module's `TypeContext`, so every
+size, alignment and offset query (`size_of`, `align_of`, `stride`,
+`field_offset`) follows it — and with them the builder's `struct_field` /
+`array_elem` helpers (whose offsets are integers of the base pointer's width),
+the verifier (a pointer's bit size for `bitcast`, atomics' natural alignment),
+the reference evaluator (addresses wrap at their space's pointer width), global
+data emission (field sizes, byte order, per-width relocations), and isel
+(`Lower::int_width` of a pointer). A backend declares its layout through
+`MachineTarget::data_layout`. Modules with different layouts or targets do not
+link (`MergeError::DataLayoutMismatch`).
+
+**Address spaces.** A pointer type names its space: `Type::Ptr` is space 0 and
+`Type::PtrIn(n)` (`ptr addrspace(n)`, `n ≥ 1`) any other; `PtrIn(0)` interns to
+`Ptr`, so each space has one type, and code written before address spaces keeps
+compiling. Each space has its own pointer width in the layout — AVR, for
+instance, has 16-bit data pointers in space 0 and program memory in space 1.
+The rules:
+
+- A **global** lives in an address space (`global constant addrspace(1) @tbl :
+  …`, default 0); a reference to it — `@tbl` as an operand, `ptr addrspace(1)
+  @tbl` in an initializer — is a pointer into that space. A **function**
+  reference is a pointer into the layout's program space, and an indirect call
+  goes through such a pointer.
+- `alloca` / `dyn_alloca` produce space-0 pointers (the stack is data memory);
+  `ptr_add` stays in its base's space; only a space-0 `ptr` is interchangeable
+  with an aggregate value (§6).
+- Pointers of different spaces are different types: they never unify at a
+  call, return, block argument, `select` or `icmp`.
+- A `load`/`store`/atomic accesses the space of its address operand. Nothing
+  more is recorded on the instruction: isel reads it from the operand's type
+  (`Lower::mem_addr_space`), which is how a backend picks, say, AVR's `lpm` for
+  program memory and `ld` for data memory.
+
+**No `addrspacecast`.** Converting a pointer from one space to another is
+rejected (`bitcast` between pointer types is invalid).
+
+- **Rejected:** an LLVM-style `addrspacecast`. Its meaning is target-defined —
+  on the targets we are building for (AVR flash vs. SRAM) the spaces are
+  disjoint memories, not views of one memory, so a "cast" has no meaning the IR
+  could state or the verifier check. Code that really wants to reuse an address
+  numerically across spaces says so with `ptrtoint` + `inttoptr`, which are
+  explicit about going through an integer (and whose integer widths follow each
+  space's pointer width). A target where spaces alias (a GPU's generic space) can
+  add a checked cast later.
+
+**Binary form.** `.lfb` version 4 adds, after the module name, the target (a
+presence byte and a string) and the layout spec (empty for LP64), and a
+per-global address space (bit 6 of the global's attribute byte, whose bits 4–5
+hold the version-3 visibility, announces a varint after the byte). `ptr
+addrspace(N)` is type tag 7 with a varint space. Version 1, 2 and 3 streams
+still decode, as LP64 modules with no target and every global in space 0.
+
+## 3b. Integers a target cannot compute with: legalization  *(decided)*
+
+The IR has arbitrary-width integers (§3); a machine does not. The layout's
+native widths (`n…`) say what a target computes with, and
+`codegen::legalize_int::legalize_ints` — a target-independent IR-to-IR pass run
+before isel — rewrites every integer wider than a *part width* `W` (by default
+the widest native width) as `N` parts of type `iW`, least significant first:
+
+- `and`/`or`/`xor`/`select`/`freeze` per part; `add`/`sub` with an `icmp ult`
+  carry/borrow chain; shifts by a constant as part moves plus funnel shifts;
+  shifts by a variable as funnel shifts by `s mod W` (each done as two shifts so
+  no shift amount reaches `W`) and a `select` ladder on `s / W`;
+- `icmp eq`/`ne` as an `or` of per-part `xor`s; ordered compares
+  lexicographically from the top part (signed there, unsigned below);
+- `trunc`/`zext`/`sext` as part selection and zero/sign fill;
+- non-volatile `load`/`store` as one access per part in the layout's byte order;
+- block parameters and branch arguments as one per part;
+- `mul`, `udiv`, `sdiv`, `urem`, `srem` as **libcalls** `T f(T, T)`, named after
+  libgcc (`__muldi3`, `__udivdi3`, `__divdi3`, `__umoddi3`, `__moddi3`, and the
+  `si`/`ti` forms) unless the caller supplies other names; missing helpers are
+  declared. AVR has no hardware multiplier at all, so this is the right default.
+
+Flags are dropped (the expansion refines: flags only add poison). wasm32 needs
+none of this (`i64` is native); Thumb uses `W = 32`; AVR `W = 8` or `16`.
+
+**The ABI boundary stays wide.** The pass keeps function signatures: a wide
+entry parameter, call argument or result, return value, and the operands and
+results of the operations only a backend can split (`ptrtoint`/`inttoptr`,
+`bitcast` and float conversions, `syscall`, a `switch` condition, a `ptr_add`
+offset, `dyn_alloca`, volatile and atomic accesses) stay whole, joined from and
+split into parts with a fixed shape (`zext`/`shl k·W`/`or` and
+`lshr k·W`/`trunc`). `illegal_int_ops` checks that nothing else touches a wide
+integer. A backend lowers those points in its ABI seam, where a wide value lives
+in a register group.
+
+- **Rejected:** rewriting signatures (an `i64` parameter becoming two `i32`s).
+  The IR has single-result instructions and returns, so a wide return would
+  need an invented multi-value convention, and how a wide value is passed (which
+  registers, what order, split between registers and stack) is exactly what
+  each target's ABI decides. The boundary shape leaves that decision to it.
+- **Rejected:** legalizing inside isel (a value mapped to several virtual
+  registers). It would couple every backend's isel to the expansion; as an IR
+  pass it is target-independent, verifiable with the ordinary verifier, and
+  testable against the reference evaluator.
 
 ## 4. Value & constant model  *(decided)*
 
@@ -117,11 +246,11 @@ carries both from version 2 (version-1 streams still decode, with default
 attributes).
 
 **Emission** (`codegen::data`, shared by every backend; each target supplies
-only its absolute-pointer relocation): every defined, non-detached global is
-serialized per the data layout, little-endian — integers two's-complement at
-their store size, floats as IEEE bits, `null`/`poison` as zeros (zero refines
-poison), arrays at the element stride, structs at natural field offsets with
-zero padding — and placed at its type's alignment in
+only its absolute-pointer relocations): every defined, non-detached global is
+serialized per the data layout (§3a), in its byte order — integers
+two's-complement at their store size, floats as IEEE bits, `null`/`poison` as
+zeros (zero refines poison), arrays at the element stride, structs at the
+layout's field offsets with zero padding — and placed at its type's alignment in
 
 | global | section |
 |---|---|
@@ -130,8 +259,10 @@ zero padding — and placed at its type's alignment in
 | mutable, all zero / poison | `.bss` (`NOBITS`, `WA`) |
 
 with an `STT_OBJECT` symbol of the global's size. An address field becomes a
-pointer-sized zero plus an absolute relocation `S + offset` (`R_X86_64_64` on
-x86-64). The static linker maps `.rodata` into an `R` segment and `.data`+`.bss`
+zero field of its pointer type's size plus an absolute relocation
+`S + offset` of that width — `Abs64`, `Abs32` or `Abs16` (`R_X86_64_64` on
+x86-64); `emit_globals_with` lets a target pick the relocation per address
+space. The static linker maps `.rodata` into an `R` segment and `.data`+`.bss`
 into one `RW` segment whose `memsz` exceeds its `filesz` by the zero-filled
 `.bss`.
 
@@ -528,8 +659,8 @@ break structural sharing or parallel processing (tenets T5/T6).
 - **Vector poison granularity.** Per-lane poison vs. whole-value poison. Per-lane
   is more precise but complicates the refinement relation; decide with the first
   SIMD target.
-- **Address-space semantics.** Deferred until a target needs more than one; the
-  `Ptr` representation reserves room.
+- **Address-space semantics.** *(decided, §3a: per-space pointer widths, no
+  `addrspacecast`.)*
 
 Each open question is resolved *before* the opcode or feature it governs is
 frozen, and its resolution is added above with the same option/rejected/why
