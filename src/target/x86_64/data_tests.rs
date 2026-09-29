@@ -359,3 +359,182 @@ fn lfo_round_trips_data_object() {
         link_executable(vec![back], &ImageOptions::default()).expect("decoded object links");
     }
 }
+
+/// One `PT_LOAD` program header of a linked image.
+#[derive(Debug)]
+struct Load {
+    flags: u32,
+    offset: u64,
+    vaddr: u64,
+    filesz: u64,
+    memsz: u64,
+}
+
+/// The `PT_LOAD` program headers of an ELF64 executable image.
+fn loads(image: &[u8]) -> Vec<Load> {
+    let u16_at = |o: usize| u16::from_le_bytes(image[o..o + 2].try_into().unwrap());
+    let u32_at = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
+    let (phoff, phentsize, phnum) = (u64_at(32) as usize, u16_at(54) as usize, u16_at(56) as usize);
+    (0..phnum)
+        .map(|i| phoff + i * phentsize)
+        .filter(|&o| u32_at(o) == 1)
+        .map(|o| Load {
+            flags: u32_at(o + 4),
+            offset: u64_at(o + 8),
+            vaddr: u64_at(o + 16),
+            filesz: u64_at(o + 32),
+            memsz: u64_at(o + 40),
+        })
+        .collect()
+}
+
+const PAGE: u64 = 0x1000;
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+/// Segments are packed in the file (no page of padding per segment), but each
+/// still starts on its own page in memory at the file's in-page offset, and the
+/// segments come in the given flag order without sharing a memory page.
+fn assert_packed_layout(image: &[u8], expect_flags: &[u32]) {
+    let segs = loads(image);
+    assert_eq!(segs.iter().map(|s| s.flags).collect::<Vec<_>>(), expect_flags, "{segs:?}");
+    for (i, s) in segs.iter().enumerate() {
+        assert_eq!(s.offset % PAGE, s.vaddr % PAGE, "segment {i} breaks p_offset ≡ p_vaddr");
+        assert!(s.memsz >= s.filesz && s.offset + s.filesz <= image.len() as u64);
+        if i > 0 {
+            let prev = &segs[i - 1];
+            // Packed in the file: at most a section alignment of padding.
+            assert!(s.offset >= prev.offset + prev.filesz, "segments overlap in the file");
+            assert!(s.offset - (prev.offset + prev.filesz) < 64, "file padding between segments");
+            // A fresh page in memory, past the previous segment's last page.
+            let prev_last_page = (prev.vaddr + prev.memsz - 1) & !(PAGE - 1);
+            assert!(s.vaddr & !(PAGE - 1) > prev_last_page, "segments {} and {i} share a page", i - 1);
+        }
+    }
+}
+
+/// A hello world with its string in `.rodata` is a few hundred bytes: the
+/// `.rodata` segment is packed right after `.text` in the file instead of being
+/// pushed to the next page boundary (issue #2).
+#[test]
+fn hello_world_image_is_small() {
+    const HELLO: &str = r#"
+module "hello"
+global constant @msg : [12 x i8] = [12 x i8] "Hello world\n"
+
+func @main() -> i64 {
+entry ^0:
+  %n = syscall i64 1, i64 1, @msg, i64 12 : i64
+  %rc = sub %n, i64 12 : i64
+  ret %rc
+}
+"#;
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let (out, status, image_len) = build_and_run(HELLO, level, "small");
+        assert_eq!(out, b"Hello world\n", "stdout at {level:?}");
+        assert_eq!(status.code(), Some(0), "exit status at {level:?}");
+        assert!(image_len < 2048, "hello world is {image_len} bytes at {level:?}");
+    }
+    let (m, syms) = prepare(HELLO, OptLevel::O2);
+    let image = link_executable(vec![super::compile_module(&m, &syms)], &ImageOptions::default())
+        .expect("link should succeed");
+    assert_packed_layout(&image, &[PF_R | PF_X, PF_R]);
+}
+
+/// `.bss` that shares a memory page with the end of `.data` reads as zero even
+/// though the file bytes past `.data` on that page are not zero: the loader
+/// clears the rest of the page past `p_filesz`. With `-g` the page's tail is
+/// DWARF, which is exactly that case. Also checks the `R+X`/`R`/`R+W` flags;
+/// [`store_to_constant_global_faults`] checks `.rodata` stays unwritable now
+/// that it shares a file page with `.text`.
+#[test]
+fn bss_after_packed_data_reads_zero() {
+    const SRC: &str = r#"
+module "bss_after_data"
+global constant @k : [5 x i8] = [5 x i8] "rodat"
+global @d : [13 x i8] = [13 x i8] "ABCDEFGHIJKLM"
+global @z : [64 x i64] = [64 x i64] poison
+
+func @main() -> i64 {
+entry ^0:
+  br ^1(i64 0, i64 0)
+^1(%i: i64, %s: i64):
+  %off = mul %i, i64 8 : i64
+  %p = ptr_add @z, %off : ptr
+  %v = load %p align 8 : i64
+  %s1 = or %s, %v : i64
+  %i1 = add %i, i64 1 : i64
+  %done = icmp eq %i1, i64 64 : i1
+  cond_br %done, ^2(%s1), ^1(%i1, %s1)
+^2(%acc: i64):
+  %dp = ptr_add @d, i64 12 : ptr
+  %db = load %dp align 1 : i8
+  %kb = load @k align 1 : i8
+  %db64 = zext %db : i64
+  %kb64 = zext %kb : i64
+  %ok1 = icmp eq %acc, i64 0 : i1
+  %ok2 = icmp eq %db64, i64 77 : i1
+  %ok3 = icmp eq %kb64, i64 114 : i1
+  %ok12 = and %ok1, %ok2 : i1
+  %ok = and %ok12, %ok3 : i1
+  %r = select %ok, i64 42, i64 1 : i64
+  ret %r
+}
+"#;
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let (m, syms) = prepare(SRC, level);
+        let source = super::DebugSource { file_name: "t.lf".to_owned(), comp_dir: "/tmp".to_owned() };
+        for debug in [false, true] {
+            let obj = if debug {
+                super::compile_module_debug(&m, &syms, &source)
+            } else {
+                super::compile_module(&m, &syms)
+            };
+            let opts = ImageOptions { debug, ..ImageOptions::default() };
+            let image = link_executable(vec![obj], &opts).expect("link should succeed");
+            assert_packed_layout(&image, &[PF_R | PF_X, PF_R, PF_R | PF_W]);
+            let data = loads(&image).pop().unwrap();
+            assert!(data.memsz > data.filesz, "no .bss tail");
+            // .bss starts mid-page, on the page holding the end of .data.
+            let file_end = data.offset + data.filesz;
+            assert_ne!(file_end % PAGE, 0);
+            if debug {
+                // The rest of that file page is non-zero (debug data), so a
+                // zero .bss really depends on the loader clearing it.
+                let page_end = (file_end | (PAGE - 1)) + 1;
+                let tail = &image[file_end as usize..(page_end as usize).min(image.len())];
+                assert!(tail.iter().any(|&b| b != 0), "file tail past .data is all zero");
+            }
+            let path = temp_path("bsstail");
+            write_executable(path.to_str().unwrap(), &image).expect("write executable");
+            let (_, status) = run(&path);
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(status.code(), Some(42), "exit status at {level:?}, debug={debug}");
+        }
+    }
+}
+
+/// `readelf -lW` accepts the packed program headers without complaint.
+#[test]
+fn readelf_accepts_packed_segments() {
+    if !tool_available("readelf") {
+        eprintln!("skipping: readelf not installed");
+        return;
+    }
+    let (m, syms) = prepare(TABLE, OptLevel::O0);
+    let image = link_executable(vec![super::compile_module(&m, &syms)], &ImageOptions::default())
+        .expect("link should succeed");
+    let path = temp_path("readelf_l");
+    std::fs::write(&path, &image).unwrap();
+    let out = std::process::Command::new("readelf").args(["-lW"]).arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && err.trim().is_empty(), "readelf -lW complained:\n{err}");
+    assert_eq!(text.matches("LOAD").count(), 3, "readelf output:\n{text}");
+    for flags in ["R E", "R  ", "RW "] {
+        assert!(text.contains(flags), "readelf lacks a `{flags}` segment:\n{text}");
+    }
+}

@@ -13,8 +13,12 @@
 //! 2. **Section layout**: same-kind sections (`.text`/`.rodata`/`.data`/`.bss`)
 //!    are concatenated across objects with alignment, assigned virtual
 //!    addresses, and grouped into `PT_LOAD` segments with the right permission
-//!    flags. The image keeps the invariant `vaddr == base + file_offset`, which
-//!    trivially satisfies the ELF rule `p_offset ≡ p_vaddr (mod page)`.
+//!    flags (`R+X` text, `R` rodata, `R+W` data+bss, in that order). Segments
+//!    are packed back to back in the file, so a small program pays no page of
+//!    padding per segment; in memory each segment starts on a fresh page at the
+//!    same in-page offset as in the file, which is all the ELF rule
+//!    `p_offset ≡ p_vaddr (mod p_align)` asks. A file page shared by two
+//!    segments is mapped once per segment, each with its own permissions.
 //! 3. **Relocation processing**: with every address now known, each generic
 //!    [`RelocKind`] is applied in place (`Abs64` = `S+A`, `Pc32`/`Plt32` =
 //!    `S+A-P`, …). In a static link a `Plt32` to a defined symbol reduces to a
@@ -306,6 +310,17 @@ fn symbol_address(
     }
 }
 
+/// The file offset holding the byte at virtual address `vaddr`, which must lie
+/// in the file-backed part of one of `segments` (every relocated field does:
+/// relocations live in `.text`/`.rodata`/`.data`, never in `.bss`).
+fn file_offset_of(segments: &[Segment], vaddr: u64) -> usize {
+    let seg = segments
+        .iter()
+        .find(|s| vaddr >= s.vaddr && vaddr < s.vaddr + s.filesz)
+        .expect("a relocated field lies in a file-backed segment");
+    (seg.offset + (vaddr - seg.vaddr)) as usize
+}
+
 /// Write a little-endian value of `n` bytes into `buf` at `off`.
 fn put(buf: &mut [u8], off: usize, bytes: &[u8]) {
     buf[off..off + bytes.len()].copy_from_slice(bytes);
@@ -351,19 +366,38 @@ pub fn link_executable(
     let mut placement: Placement = DetHashMap::default();
     let mut segments: Vec<Segment> = Vec::new();
 
-    // Place a group of file-backed sections at the current end of `buf`.
-    let place_filebacked = |buf: &mut Vec<u8>, placement: &mut Placement, g: &[(usize, usize)]| {
-        for &(oi, si) in g {
-            let s = &objects[oi].sections()[si];
-            let aligned = align_up(buf.len() as u64, s.align.max(1));
-            buf.resize(aligned as usize, 0);
-            placement.insert((oi, si), base + buf.len() as u64);
-            buf.extend_from_slice(&s.bytes);
-        }
+    // Place a group of file-backed sections at the current end of `buf`. Within
+    // one segment `vaddr - file offset` is the constant `delta`.
+    let place_filebacked =
+        |buf: &mut Vec<u8>, placement: &mut Placement, g: &[(usize, usize)], delta: u64| {
+            for &(oi, si) in g {
+                let s = &objects[oi].sections()[si];
+                let aligned = align_up(buf.len() as u64, s.align.max(1));
+                buf.resize(aligned as usize, 0);
+                placement.insert((oi, si), buf.len() as u64 + delta);
+                buf.extend_from_slice(&s.bytes);
+            }
+        };
+
+    // Where the next segment starts, in the file and in memory. Segments are
+    // packed back to back in the file (the next offset is only rounded up to
+    // the first section's alignment), while each one gets a virtual address on
+    // a fresh page past the previous segment, with the same offset within the
+    // page (`p_offset ≡ p_vaddr (mod p_align)`). A file page holding the end of
+    // one segment and the start of the next is simply mapped twice, once per
+    // segment, each mapping with its own permissions. `align` is the largest
+    // alignment of the segment's file-backed sections: when it exceeds a page,
+    // the vaddr must agree with the file offset modulo it too.
+    let segment_start = |buf: &Vec<u8>, g: &[(usize, usize)], prev_vend: u64| -> (u64, u64) {
+        let first_align = g.first().map_or(1, |&(o, s)| objects[o].sections()[s].align.max(1));
+        let align =
+            g.iter().map(|&(o, s)| objects[o].sections()[s].align.max(1)).fold(PAGE, u64::max);
+        let off = align_up(buf.len() as u64, first_align);
+        (off, align_up(prev_vend, align) + off % align)
     };
 
     // --- TEXT segment (R+X): headers + all .text, starting at file offset 0. ---
-    place_filebacked(&mut buf, &mut placement, &g_text);
+    place_filebacked(&mut buf, &mut placement, &g_text, base);
     let text_end = buf.len() as u64;
     segments.push(Segment {
         offset: 0,
@@ -372,44 +406,55 @@ pub fn link_executable(
         memsz: text_end,
         flags: PF_R | PF_X,
     });
+    let mut vend = base + text_end;
 
-    // --- RODATA segment (R): its own page. ---
+    // --- RODATA segment (R): packed after .text in the file, own page in memory. ---
     if rodata_present {
-        let seg_off = align_up(buf.len() as u64, PAGE);
+        let (seg_off, seg_vaddr) = segment_start(&buf, &g_rodata, vend);
         buf.resize(seg_off as usize, 0);
-        place_filebacked(&mut buf, &mut placement, &g_rodata);
-        let end = buf.len() as u64;
+        place_filebacked(&mut buf, &mut placement, &g_rodata, seg_vaddr - seg_off);
+        let filesz = buf.len() as u64 - seg_off;
         segments.push(Segment {
             offset: seg_off,
-            vaddr: base + seg_off,
-            filesz: end - seg_off,
-            memsz: end - seg_off,
+            vaddr: seg_vaddr,
+            filesz,
+            memsz: filesz,
             flags: PF_R,
         });
+        vend = seg_vaddr + filesz;
     }
 
     // --- DATA segment (R+W): initialized .data (file) then .bss (memory only). ---
+    //
+    // This segment is always the last one, in the file and in memory. That is
+    // what keeps `.bss` zero: the loader maps whole file pages, so the page
+    // holding the end of `.data` may also carry file bytes past `p_filesz`
+    // (with `-g`, the debug sections that follow). Linux clears the rest of
+    // that page from `p_vaddr + p_filesz` on (`padzero`, writing through this
+    // segment's private writable mapping, so the file is untouched) and maps
+    // anonymous zero pages for the remainder of `p_memsz`. No other segment
+    // maps memory at or past this segment's pages, so nothing refills them.
     if data_present {
-        let seg_off = align_up(buf.len() as u64, PAGE);
+        let (seg_off, seg_vaddr) = segment_start(&buf, &g_data, vend);
         buf.resize(seg_off as usize, 0);
-        place_filebacked(&mut buf, &mut placement, &g_data);
-        let file_end = buf.len() as u64;
+        place_filebacked(&mut buf, &mut placement, &g_data, seg_vaddr - seg_off);
+        let filesz = buf.len() as u64 - seg_off;
 
         // `.bss` extends the memory image past the file image; assign each a
-        // vaddr (== base + running memory offset) but emit no file bytes.
-        let mut mem_cursor = file_end;
+        // vaddr past the end of `.data` but emit no file bytes.
+        let mut mem_cursor = seg_vaddr + filesz;
         for &(oi, si) in &g_bss {
             let s = &objects[oi].sections()[si];
             mem_cursor = align_up(mem_cursor, s.align.max(1));
-            placement.insert((oi, si), base + mem_cursor);
+            placement.insert((oi, si), mem_cursor);
             mem_cursor += s.bss_size;
         }
 
         segments.push(Segment {
             offset: seg_off,
-            vaddr: base + seg_off,
-            filesz: file_end - seg_off,
-            memsz: mem_cursor - seg_off,
+            vaddr: seg_vaddr,
+            filesz,
+            memsz: mem_cursor - seg_vaddr,
             flags: PF_R | PF_W,
         });
     }
@@ -424,7 +469,7 @@ pub fn link_executable(
             }
             let sec_vaddr = placement[&(oi, r.section.index())];
             let p = sec_vaddr + r.offset;
-            let file_off = (p - base) as usize;
+            let file_off = file_offset_of(&segments, p);
             let s = symbol_address(&objects, &placement, &globals, oi, r.symbol)?;
             let a = r.addend;
             let name = || obj.symbol(r.symbol).name.clone();
@@ -582,7 +627,7 @@ fn emit_debug_and_sections(
                 size: seg.filesz,
                 link: 0,
                 info: 0,
-                align: PAGE,
+                align: shdr_align(seg.vaddr),
                 entsize: 0,
             });
             text_shndx = idx;
@@ -597,7 +642,7 @@ fn emit_debug_and_sections(
                 size: seg.filesz,
                 link: 0,
                 info: 0,
-                align: PAGE,
+                align: shdr_align(seg.vaddr),
                 entsize: 0,
             });
             data_shndx = idx;
@@ -629,7 +674,7 @@ fn emit_debug_and_sections(
                 size: seg.filesz,
                 link: 0,
                 info: 0,
-                align: PAGE,
+                align: shdr_align(seg.vaddr),
                 entsize: 0,
             });
             rodata_shndx = idx;
@@ -806,6 +851,13 @@ fn emit_debug_and_sections(
     }
 
     Ok(SectionTable { shoff, shnum: (1 + shdrs.len()) as u16, shstrndx: shstrndx as u16 })
+}
+
+/// The `sh_addralign` of a section header covering a whole segment: the largest
+/// power of two (capped at a page) that its address is a multiple of. Packed
+/// segments no longer start on a page boundary, so a page is not always true.
+fn shdr_align(vaddr: u64) -> u64 {
+    1 << vaddr.trailing_zeros().min(PAGE.trailing_zeros())
 }
 
 /// Write one `Elf64_Sym` (24 bytes).
@@ -1064,8 +1116,10 @@ mod tests {
         let text_foff = align_up(headers, 16);
         assert_eq!(text_foff, headers);
         let text_end = text_foff + 14;
-        let ro_foff = align_up(text_end, PAGE);
-        let target_addr = BASE_DEFAULT + ro_foff;
+        // .rodata (align 1) is packed right after .text in the file, and mapped
+        // on the next page at the same in-page offset.
+        let ro_foff = text_end;
+        let target_addr = BASE_DEFAULT + PAGE + ro_foff;
 
         // Program headers agree with the computed rodata placement.
         let ro_ph = EHDR_SIZE as usize + PHDR_SIZE as usize;

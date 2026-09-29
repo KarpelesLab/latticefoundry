@@ -377,7 +377,10 @@ ELF objects, archives, shared libraries and hosted (libc) executables are linked
 by our own `qld` through `link::gnu`; `lf-ld` sends each input to the right
 linker. Programs with static data link and run: `.rodata` maps into an `R`
 segment, `.data`+`.bss` into one `RW` segment (`.bss` zero-filled through
-`memsz > filesz`), and data relocations are applied in place; execution tests
+`memsz > filesz`), and data relocations are applied in place. Segments are
+packed back to back in the file and each starts on a fresh page in memory at
+the same in-page offset, so a hello world is 258 bytes rather than 4 KB of
+mostly padding; execution tests
 cover a `.rodata` string written by `syscall`, a `.data` counter, a 512 KiB
 `.bss` array, and a pointer table driving an indirect call, plus `lf build`
 end to end and the same objects linked by `qld`.
