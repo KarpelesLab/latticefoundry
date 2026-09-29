@@ -78,6 +78,7 @@ const R_X86_64_GOTPCREL: u32 = 9;
 const R_X86_64_32: u32 = 10;
 const R_X86_64_32S: u32 = 11;
 const R_X86_64_PC64: u32 = 24;
+const R_X86_64_16: u32 = 12;
 
 /// The size in bytes of an `Elf64_Ehdr`.
 const EHDR_SIZE: u64 = 64;
@@ -93,6 +94,7 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
     match kind {
         RelocKind::Abs64 => R_X86_64_64,
         RelocKind::Abs32 => R_X86_64_32,
+        RelocKind::Abs16 => R_X86_64_16,
         RelocKind::Abs32S => R_X86_64_32S,
         RelocKind::Pc32 => R_X86_64_PC32,
         RelocKind::Pc64 => R_X86_64_PC64,

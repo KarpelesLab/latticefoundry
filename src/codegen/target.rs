@@ -46,6 +46,15 @@ pub trait MachineTarget: std::fmt::Debug {
     /// A short human-readable target name.
     fn name(&self) -> &str;
 
+    /// The target's data layout: pointer widths per address space, scalar
+    /// alignments, stack alignment and native integer widths. A module compiled
+    /// for this target should carry the same layout
+    /// ([`Module::set_data_layout`](crate::ir::Module::set_data_layout)); the
+    /// default is the LP64 layout of the 64-bit targets.
+    fn data_layout(&self) -> crate::ir::DataLayout {
+        crate::ir::DataLayout::lp64()
+    }
+
     /// The register classes this target exposes.
     fn reg_classes(&self) -> &[RegClass];
 

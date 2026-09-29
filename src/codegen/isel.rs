@@ -219,14 +219,49 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
         &self.mf
     }
 
-    /// The bit width of a value's integer type, treating pointers as 64-bit.
+    /// The bit width of a value's scalar type; a pointer counts at its address
+    /// space's width in the module's data layout (64 under LP64), and anything
+    /// else (an aggregate address) at the default space's pointer width.
     pub fn int_width(&self, v: ValueId) -> u32 {
-        self.types().bit_width(self.func.value_type(v)).unwrap_or(64)
+        let ty = self.func.value_type(v);
+        let types = self.types();
+        types
+            .bit_width(ty)
+            .or_else(|| types.pointer_bits(ty))
+            .unwrap_or_else(|| types.data_layout().pointer_bits(0))
     }
 
-    /// The byte size of a value's type under the default data layout.
+    /// The byte size of a value's type under the module's data layout.
     pub fn byte_size(&self, ty: TypeId) -> u64 {
         self.types().size_of(ty)
+    }
+
+    /// The address space of a pointer-typed value (`0` for an aggregate value,
+    /// which denotes a space-0 address), or `None` for a non-address.
+    pub fn addr_space(&self, v: ValueId) -> Option<u32> {
+        let ty = self.func.value_type(v);
+        match self.types().get(ty) {
+            Type::Struct(_) | Type::Array(..) => Some(0),
+            t => t.addr_space(),
+        }
+    }
+
+    /// The address space a memory instruction accesses: that of its address
+    /// operand (operand 0 of `load`, `store`, the atomics). A target picks its
+    /// access instructions by it — e.g. AVR reads program memory (space 1)
+    /// with `lpm` and data memory with `ld`. `None` for a non-memory
+    /// instruction.
+    pub fn mem_addr_space(&self, inst: &InstData) -> Option<u32> {
+        use crate::ir::InstKind;
+        match inst.kind {
+            InstKind::Load { .. }
+            | InstKind::Store { .. }
+            | InstKind::AtomicLoad { .. }
+            | InstKind::AtomicStore { .. }
+            | InstKind::AtomicRmw { .. }
+            | InstKind::CmpXchg { .. } => inst.operands().first().and_then(|&p| self.addr_space(p)),
+            _ => None,
+        }
     }
 
     /// If `v` is a direct reference to a function, its index; else `None`.

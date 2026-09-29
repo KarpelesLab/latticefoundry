@@ -489,6 +489,12 @@ pub fn link_executable(
                     }
                     put(&mut buf, file_off, &(v as u32).to_le_bytes());
                 }
+                RelocKind::Abs16 => {
+                    let v = (s as i64).wrapping_add(a);
+                    if !crate::mc::object::write_field(&mut buf, file_off, 2, v, crate::ir::Endian::Little) {
+                        return Err(LinkError::RelocOverflow { symbol: name(), at: p });
+                    }
+                }
                 RelocKind::Pc32 | RelocKind::Plt32 => {
                     // A PLT call in a static link is just a PC-relative reference.
                     let v = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
@@ -577,6 +583,12 @@ fn emit_debug_and_sections(
                         return Err(LinkError::RelocOverflow { symbol: name(), at: field });
                     }
                     put(buf, field as usize, &(v as u32).to_le_bytes());
+                }
+                RelocKind::Abs16 => {
+                    let v = (s as i64).wrapping_add(a);
+                    if !crate::mc::object::write_field(buf, field as usize, 2, v, crate::ir::Endian::Little) {
+                        return Err(LinkError::RelocOverflow { symbol: name(), at: field });
+                    }
                 }
                 other => return Err(LinkError::UnsupportedReloc(other)),
             }

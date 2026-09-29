@@ -69,9 +69,11 @@ pub enum VOp {
     Select = 16,
     /// `[Def d, Use s, Imm castcode, Imm srcw, Imm dstw]` — integer conversion.
     Cast = 17,
-    /// `[Def d, Use ptr, Imm size]` — load `size` bytes.
+    /// `[Def d, Use ptr, Imm size, Imm space]` — load `size` bytes from address
+    /// space `space` (the machine has one flat memory; the operand shows how a
+    /// real target sees the space of an access, [`Lower::mem_addr_space`]).
     Load = 18,
-    /// `[Use ptr, Use val, Imm size]` — store `size` bytes.
+    /// `[Use ptr, Use val, Imm size, Imm space]` — store `size` bytes.
     Store = 19,
     /// `[Def d, Frame slot]` — `d = address of slot`.
     FrameAddr = 20,
@@ -421,7 +423,7 @@ impl TargetIsel for VirtualTarget {
                 let d = lo.result_reg(inst);
                 let s = lo.reg(inst.operands()[0]);
                 let srcw = lo.int_width(inst.operands()[0]);
-                let dstw = lo.types().bit_width(inst.ty).unwrap_or(64);
+                let dstw = lo.types().int_or_ptr_bits(inst.ty).unwrap_or(64);
                 lo.emit(MachineInst::new(
                     VOp::Cast.opcode(),
                     vec![
@@ -459,12 +461,14 @@ impl TargetIsel for VirtualTarget {
                 let d = lo.result_reg(inst);
                 let ptr = lo.reg(inst.operands()[0]);
                 let size = lo.byte_size(*ty);
+                let space = lo.mem_addr_space(inst).unwrap_or(0);
                 lo.emit(MachineInst::new(
                     VOp::Load.opcode(),
                     vec![
                         MachineOperand::Def(Reg::Virtual(d)),
                         MachineOperand::Use(Reg::Virtual(ptr)),
                         MachineOperand::Imm(Int::from_u64(size)),
+                        MachineOperand::Imm(Int::from_u64(u64::from(space))),
                     ],
                 ));
             }
@@ -472,20 +476,24 @@ impl TargetIsel for VirtualTarget {
                 let ptr = lo.reg(inst.operands()[0]);
                 let val = lo.reg(inst.operands()[1]);
                 let size = lo.byte_size(*ty);
+                let space = lo.mem_addr_space(inst).unwrap_or(0);
                 lo.emit(MachineInst::new(
                     VOp::Store.opcode(),
                     vec![
                         MachineOperand::Use(Reg::Virtual(ptr)),
                         MachineOperand::Use(Reg::Virtual(val)),
                         MachineOperand::Imm(Int::from_u64(size)),
+                        MachineOperand::Imm(Int::from_u64(u64::from(space))),
                     ],
                 ));
             }
             InstKind::PtrAdd { .. } => {
+                // Address arithmetic wraps at the pointer width of the space.
                 let d = lo.result_reg(inst);
                 let base = lo.reg(inst.operands()[0]);
                 let off = lo.reg(inst.operands()[1]);
-                lo.emit(arith(VOp::Add, d, base, off, 64));
+                let width = lo.int_width(inst.result().expect("ptr_add has a result"));
+                lo.emit(arith(VOp::Add, d, base, off, width));
             }
             InstKind::Select => {
                 let d = lo.result_reg(inst);

@@ -304,24 +304,13 @@ impl Emitter {
 /// Patch a little-endian field of `width` bytes at `at` with `value`, checking
 /// that it fits.
 fn patch(buf: &mut [u8], at: u64, width: usize, value: i64) -> Result<(), EmitError> {
-    let start = at as usize;
-    match width {
-        8 => {
-            let bytes = value.to_le_bytes();
-            buf[start..start + 8].copy_from_slice(&bytes);
-        }
-        4 => {
-            // Accept anything representable in either i32 or u32 (the field is
-            // reinterpreted per the relocation's signedness downstream).
-            if value < i32::MIN as i64 || value > u32::MAX as i64 {
-                return Err(EmitError::FieldOverflow { offset: at, value });
-            }
-            let bytes = (value as u32).to_le_bytes();
-            buf[start..start + 4].copy_from_slice(&bytes);
-        }
-        _ => unreachable!("relocation field widths are 4 or 8"),
+    // Accept anything representable in either the signed or the unsigned
+    // field (it is reinterpreted per the relocation's signedness downstream).
+    if crate::mc::object::write_field(buf, at as usize, width, value, crate::ir::Endian::Little) {
+        Ok(())
+    } else {
+        Err(EmitError::FieldOverflow { offset: at, value })
     }
-    Ok(())
 }
 
 #[cfg(test)]

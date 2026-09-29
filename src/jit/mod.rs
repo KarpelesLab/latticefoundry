@@ -213,6 +213,15 @@ impl CompiledModule {
                         }
                         mem[field_off..field_off + 4].copy_from_slice(&(v as u32).to_le_bytes());
                     }
+                    RelocKind::Abs16 => {
+                        let v = (s as i64).wrapping_add(a);
+                        if !crate::mc::object::write_field(mem, field_off, 2, v, crate::ir::Endian::Little) {
+                            return Err(JitError::RelocOverflow {
+                                symbol: obj.symbol(r.symbol).name.clone(),
+                                at: p,
+                            });
+                        }
+                    }
                     RelocKind::Pc32 | RelocKind::Plt32 => {
                         // A local PLT call resolves to a plain PC-relative ref.
                         let v = (s as i64).wrapping_add(a).wrapping_sub(p as i64);

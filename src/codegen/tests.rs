@@ -583,3 +583,53 @@ fn register_file_shape() {
     assert_eq!(target.callee_saved().len(), 5);
     assert_eq!(target.call_conv().arg_regs.len(), 4);
 }
+
+// --- data layout and address spaces reach isel ------------------------------
+
+/// Under a 16-bit layout with a program-memory space 1: a load through a
+/// `ptr addrspace(1)` reaches the target with its space (the virtual target
+/// records it as the access's last immediate), a store through a stack
+/// `ptr` with space 0, and pointer arithmetic wraps at 16 bits.
+#[test]
+fn address_spaces_and_pointer_width_reach_isel() {
+    use crate::codegen::mir::MachineOperand;
+    use crate::ir::{DataLayout, Global, GlobalAttrs};
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("avr");
+    m.set_data_layout(DataLayout::parse("p:16:8-p1:16:8-i16:8-n8:16").unwrap());
+    let i8t = m.types_mut().int(8);
+    let i16t = m.types_mut().int(16);
+    let tbl = m.define_global(Global { name: syms.intern("tbl"), ty: i8t, init: None }, GlobalAttrs::DEFAULT);
+    m.set_global_addr_space(tbl, 1);
+    let sig = m.types_mut().func(vec![i16t], i8t, false);
+    let f = m.declare_function(syms.intern("rd"), sig);
+    {
+        let mut b = m.build(f);
+        let e = b.create_entry_block();
+        let i = b.param(e, 0);
+        let g = b.global_ref(tbl);
+        let p = b.ptr_add(g, i, false);
+        let v = b.load(i8t, p, 1);
+        let slot = b.alloca(i8t);
+        b.store(i8t, slot, v, 1);
+        b.ret(Some(v));
+    }
+    crate::verify::verify_module(&m).expect("verifies");
+    let target = VirtualTarget::new();
+    let mf = target.select(&m, f);
+    let insts: Vec<_> = mf.block_ids().flat_map(|b| mf.block(b).insts.clone()).collect();
+    let space_of = |op: VOp| -> Vec<Int> {
+        insts
+            .iter()
+            .filter(|i| VOp::decode(i.opcode) == op)
+            .map(|i| match i.operands.last() {
+                Some(MachineOperand::Imm(s)) => s.clone(),
+                other => panic!("no space immediate: {other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(space_of(VOp::Load), [Int::from_u64(1)]);
+    assert_eq!(space_of(VOp::Store), [Int::ZERO]);
+    let add = insts.iter().find(|i| VOp::decode(i.opcode) == VOp::Add).expect("ptr_add lowers to add");
+    assert!(matches!(add.operands.last(), Some(MachineOperand::Imm(w)) if *w == Int::from_u64(16)));
+}

@@ -20,6 +20,9 @@
 //! [`Abs64`](crate::mc::object::RelocKind::Abs64) relocation against the
 //! function's symbol, so the linker fills the real address. High-pc values are
 //! emitted as constant offsets (`DW_FORM_data8`), which need no relocation.
+//! A target with narrower code addresses calls [`build_with_address_size`]
+//! instead: the unit header's `address_size` and every address field then use
+//! 4 (`Abs32`) or 2 (`Abs16`) bytes.
 //!
 //! The format is implemented from the published DWARF specification (tenet T1);
 //! nothing here is copied from another toolchain. Output is deterministic.
@@ -60,7 +63,6 @@ const DW_LNE_END_SEQUENCE: u8 = 1;
 const DW_LNE_SET_ADDRESS: u8 = 2;
 
 const DWARF_VERSION: u16 = 4;
-const ADDRESS_SIZE: u8 = 8;
 
 /// Per-function debug facts the emitter needs.
 #[derive(Clone, Debug)]
@@ -176,8 +178,22 @@ impl DebugStr {
 
 // ---- Emitter -----------------------------------------------------------------
 
-/// Build the four DWARF sections for `unit`.
+/// Build the four DWARF sections for `unit`, with 8-byte addresses.
 pub fn build(unit: &DebugUnit) -> DwarfSections {
+    build_with_address_size(unit, 8)
+}
+
+/// Build the four DWARF sections for `unit` for a target whose code addresses
+/// are `address_size` bytes wide (8, 4 or 2): the compile unit's
+/// `address_size` and every `DW_FORM_addr` / `DW_LNE_set_address` field use
+/// that width, relocated by the matching [`RelocKind::abs_for_width`] kind.
+///
+/// # Panics
+///
+/// If `address_size` is not 8, 4 or 2.
+pub fn build_with_address_size(unit: &DebugUnit, address_size: u8) -> DwarfSections {
+    let addr = RelocKind::abs_for_width(u64::from(address_size))
+        .unwrap_or_else(|| panic!("unsupported DWARF address size {address_size}"));
     let mut strs = DebugStr::default();
     let producer_off = strs.add(&unit.producer);
     let name_off = strs.add(&unit.file_name);
@@ -185,8 +201,8 @@ pub fn build(unit: &DebugUnit) -> DwarfSections {
     let func_name_off: Vec<u32> = unit.funcs.iter().map(|f| strs.add(&f.name)).collect();
 
     let abbrev = build_abbrev();
-    let info = build_info(unit, producer_off, name_off, comp_dir_off, &func_name_off);
-    let line = build_line(unit);
+    let info = build_info(unit, addr, producer_off, name_off, comp_dir_off, &func_name_off);
+    let line = build_line(unit, addr);
 
     DwarfSections { abbrev, str: strs.buf, info, line }
 }
@@ -239,9 +255,11 @@ fn build_abbrev() -> Vec<u8> {
 }
 
 /// The compile-unit + subprogram DIEs of `.debug_info`. Address fields become
-/// `Abs64` relocations against the corresponding function symbols.
+/// `addr` relocations (`Abs64` by default) against the corresponding function
+/// symbols.
 fn build_info(
     unit: &DebugUnit,
+    addr: RelocKind,
     producer_off: u32,
     name_off: u32,
     comp_dir_off: u32,
@@ -253,7 +271,7 @@ fn build_info(
     e.u32(0); // unit_length, patched at the end.
     e.u16(DWARF_VERSION);
     e.u32(0); // debug_abbrev_offset (this unit's abbrevs start at 0).
-    e.u8(ADDRESS_SIZE);
+    e.u8(addr.field_width() as u8); // address_size
 
     // Compile-unit DIE (abbrev 1).
     uleb_e(&mut e, 1);
@@ -263,9 +281,9 @@ fn build_info(
     e.u32(0); // DW_AT_stmt_list, sec_offset (single line program at 0)
     // DW_AT_low_pc = address of the first function (relocated).
     if let Some(first) = unit.funcs.first() {
-        e.reference(RelocKind::Abs64, Ref::Symbol(first.name.clone()), 0);
+        e.reference(addr, Ref::Symbol(first.name.clone()), 0);
     } else {
-        e.u64(0);
+        e.bytes(&vec![0; addr.field_width()]);
     }
     e.u64(unit.text_size); // DW_AT_high_pc, data8 (offset from low_pc)
 
@@ -276,7 +294,7 @@ fn build_info(
         e.u32(noff); // DW_AT_name, strp
         uleb_e(&mut e, 1); // DW_AT_decl_file, udata (file index 1)
         uleb_e(&mut e, u64::from(f.decl_line)); // DW_AT_decl_line, udata
-        e.reference(RelocKind::Abs64, Ref::Symbol(f.name.clone()), 0); // low_pc (reloc)
+        e.reference(addr, Ref::Symbol(f.name.clone()), 0); // low_pc (reloc)
         e.u64(f.size); // DW_AT_high_pc, data8
     }
 
@@ -290,8 +308,8 @@ fn build_info(
 }
 
 /// The `.debug_line` line-number program. Each `DW_LNE_set_address` operand is an
-/// `Abs64` relocation against the function's symbol.
-fn build_line(unit: &DebugUnit) -> Emitted {
+/// `addr` relocation (`Abs64` by default) against the function's symbol.
+fn build_line(unit: &DebugUnit, addr: RelocKind) -> Emitted {
     let mut e = Emitter::new();
 
     e.u32(0); // unit_length placeholder (patched last)
@@ -326,9 +344,9 @@ fn build_line(unit: &DebugUnit) -> Emitted {
     for f in &unit.funcs {
         // DW_LNE_set_address <low_pc>  (extended opcode).
         e.u8(0); // extended opcode marker
-        uleb_e(&mut e, 1 + ADDRESS_SIZE as u64); // length = sub-opcode + address
+        uleb_e(&mut e, 1 + addr.field_width() as u64); // length = sub-opcode + address
         e.u8(DW_LNE_SET_ADDRESS);
-        e.reference(RelocKind::Abs64, Ref::Symbol(f.name.clone()), 0);
+        e.reference(addr, Ref::Symbol(f.name.clone()), 0);
 
         let mut cur_off: u64 = 0;
         let mut cur_line: i64 = 1;
@@ -428,13 +446,29 @@ mod tests {
         // unit_length excludes its own 4 bytes.
         assert_eq!(read_u32(info, 0) as usize, info.len() - 4);
         assert_eq!(u16::from_le_bytes([info[4], info[5]]), DWARF_VERSION);
-        assert_eq!(info[10], ADDRESS_SIZE); // after abbrev offset u32
+        assert_eq!(info[10], 8); // address_size, after the abbrev offset u32
         // Address fields relocate against the function symbols: CU low_pc + one
         // per subprogram = 3 relocations, all Abs64.
         assert_eq!(s.info.relocations.len(), 3);
         assert!(s.info.relocations.iter().all(|r| r.kind == RelocKind::Abs64));
         let names: Vec<&str> = s.info.relocations.iter().map(|r| r.symbol.as_str()).collect();
         assert_eq!(names, vec!["main", "main", "helper"]);
+    }
+
+    /// A 32-bit (and a 16-bit) target: 4- (2-)byte addresses, `Abs32`
+    /// (`Abs16`) relocations, and the sections shrink by the saved bytes.
+    #[test]
+    fn narrow_address_sizes() {
+        let wide = build(&sample_unit());
+        for (size, kind) in [(4u8, RelocKind::Abs32), (2, RelocKind::Abs16)] {
+            let s = build_with_address_size(&sample_unit(), size);
+            assert_eq!(s.info.bytes[10], size);
+            assert!(s.info.relocations.iter().chain(&s.line.relocations).all(|r| r.kind == kind));
+            let saved = 8 - usize::from(size);
+            assert_eq!(s.info.bytes.len(), wide.info.bytes.len() - 3 * saved);
+            assert_eq!(s.line.bytes.len(), wide.line.bytes.len() - 2 * saved);
+            assert_eq!(read_u32(&s.info.bytes, 0) as usize, s.info.bytes.len() - 4);
+        }
     }
 
     #[test]

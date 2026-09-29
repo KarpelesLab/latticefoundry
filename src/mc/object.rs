@@ -263,13 +263,18 @@ impl Symbol {
 /// its format's numeric codes (see [`crate::mc::elf`] for the x86-64 mapping).
 /// The set is deliberately extensible; it currently covers what x86-64 and
 /// AArch64 relocatable code need for calls, data references, and PC-relative
-/// addressing.
+/// addressing, plus the absolute data kinds of every pointer width a
+/// [`DataLayout`](crate::ir::DataLayout) allows a whole-byte relocation for
+/// (`Abs64`, `Abs32`, `Abs16`; see [`RelocKind::abs_for_width`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RelocKind {
     /// Absolute 64-bit: field = S + A.
     Abs64,
     /// Absolute 32-bit, zero-extended: field = S + A.
     Abs32,
+    /// Absolute 16-bit: field = S + A, which must fit 16 bits (signed or
+    /// unsigned). The pointer relocation of 16-bit address spaces (AVR).
+    Abs16,
     /// Absolute 32-bit, sign-extended: field = S + A.
     Abs32S,
     /// PC-relative 32-bit: field = S + A - P.
@@ -298,6 +303,7 @@ impl RelocKind {
     pub fn field_width(self) -> usize {
         match self {
             RelocKind::Abs64 | RelocKind::Pc64 => 8,
+            RelocKind::Abs16 => 2,
             RelocKind::Abs32
             | RelocKind::Abs32S
             | RelocKind::Pc32
@@ -307,6 +313,18 @@ impl RelocKind {
             | RelocKind::Aarch64Call26
             | RelocKind::Aarch64AdrPrelPgHi21
             | RelocKind::Aarch64AddAbsLo12Nc => 4,
+        }
+    }
+
+    /// The generic absolute data relocation for a pointer field of `bytes`
+    /// bytes: [`Abs64`](RelocKind::Abs64) for 8, [`Abs32`](RelocKind::Abs32)
+    /// for 4, [`Abs16`](RelocKind::Abs16) for 2, `None` for any other width.
+    pub fn abs_for_width(bytes: u64) -> Option<RelocKind> {
+        match bytes {
+            8 => Some(RelocKind::Abs64),
+            4 => Some(RelocKind::Abs32),
+            2 => Some(RelocKind::Abs16),
+            _ => None,
         }
     }
 
@@ -324,6 +342,33 @@ impl RelocKind {
                 | RelocKind::Aarch64AdrPrelPgHi21
         )
     }
+}
+
+/// Store `value` into the `width`-byte field at `buf[at..]` in `endian` byte
+/// order, as a width-generic absolute (or PC-relative) relocation result.
+/// Returns `false`, leaving `buf` untouched, if `value` fits the field neither
+/// as a signed nor as an unsigned `width`-byte integer (an 8-byte field always
+/// fits). The shared patching rule of the emitter, the JIT and the linker.
+pub fn write_field(buf: &mut [u8], at: usize, width: usize, value: i64, endian: crate::ir::Endian) -> bool {
+    debug_assert!((1..=8).contains(&width), "field width {width}");
+    if width < 8 {
+        let bits = 8 * width as u32;
+        let (min, umax) = (-(1i64 << (bits - 1)), (1i64 << bits) - 1);
+        if value < min || value > umax {
+            return false;
+        }
+    }
+    let le = value.to_le_bytes();
+    let field = &mut buf[at..at + width];
+    match endian {
+        crate::ir::Endian::Little => field.copy_from_slice(&le[..width]),
+        crate::ir::Endian::Big => {
+            for (i, b) in field.iter_mut().enumerate() {
+                *b = le[width - 1 - i];
+            }
+        }
+    }
+    true
 }
 
 /// A patch to apply to a section's bytes once the target symbol's address is
@@ -537,6 +582,17 @@ mod tests {
     #[test]
     fn reloc_kind_widths() {
         assert_eq!(RelocKind::Abs64.field_width(), 8);
+        assert_eq!(RelocKind::Abs16.field_width(), 2);
+        assert_eq!(RelocKind::abs_for_width(2), Some(RelocKind::Abs16));
+        assert_eq!(RelocKind::abs_for_width(4), Some(RelocKind::Abs32));
+        assert_eq!(RelocKind::abs_for_width(3), None);
+        let mut buf = [0u8; 4];
+        assert!(write_field(&mut buf, 1, 2, 0xbeef, crate::ir::Endian::Little));
+        assert_eq!(buf, [0, 0xef, 0xbe, 0]);
+        assert!(write_field(&mut buf, 0, 2, -2, crate::ir::Endian::Big));
+        assert_eq!(buf[..2], [0xff, 0xfe]);
+        assert!(!write_field(&mut buf, 0, 2, 0x1_0000, crate::ir::Endian::Little));
+        assert!(!write_field(&mut buf, 0, 2, -0x8001, crate::ir::Endian::Little));
         assert_eq!(RelocKind::Pc32.field_width(), 4);
         assert!(RelocKind::Plt32.is_pcrel());
         assert!(!RelocKind::Abs64.is_pcrel());

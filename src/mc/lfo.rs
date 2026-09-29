@@ -335,6 +335,7 @@ fn reloc_kind_code(k: RelocKind) -> u8 {
         RelocKind::Aarch64Call26 => 7,
         RelocKind::Aarch64AdrPrelPgHi21 => 8,
         RelocKind::Aarch64AddAbsLo12Nc => 9,
+        RelocKind::Abs16 => 10,
     }
 }
 
@@ -350,6 +351,7 @@ fn reloc_kind_from(c: u8) -> Result<RelocKind, DecodeError> {
         7 => RelocKind::Aarch64Call26,
         8 => RelocKind::Aarch64AdrPrelPgHi21,
         9 => RelocKind::Aarch64AddAbsLo12Nc,
+        10 => RelocKind::Abs16,
         _ => return Err(DecodeError::InvalidTag { what: "reloc-kind", tag: u32::from(c) }),
     })
 }
