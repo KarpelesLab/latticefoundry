@@ -41,11 +41,12 @@ use super::regs::{FP, LR, SP, XZR};
 // 32-bit instruction-word builders (bitfields from the ARM A64 encodings)
 // ===========================================================================
 
-/// The `sf` bit (bit 31) selects the 64-bit (`X`) form; a `width` of 64 is
-/// 64-bit, anything narrower uses the 32-bit (`W`) form.
+/// The `sf` bit (bit 31) selects the 64-bit (`X`) form: a `width` of 32 or less
+/// uses the 32-bit (`W`) form, anything wider (including odd widths such as
+/// `i48`, which need the upper word) the 64-bit form.
 #[inline]
-fn sf_of(width: u32) -> u32 {
-    u32::from(width >= 64)
+pub(crate) fn sf_of(width: u32) -> u32 {
+    u32::from(width > 32)
 }
 
 /// A data-processing (shifted register) form `op Rd, Rn, Rm` (shift=LSL #0):
@@ -147,6 +148,17 @@ pub(crate) fn msub(sf: u32, rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
 fn bfm(base: u32, sf: u32, rd: u32, rn: u32, immr: u32, imms: u32) -> u32 {
     // The `N` bit (bit 22) always equals `sf` for the 32-/64-bit forms.
     base | (sf << 31) | (sf << 22) | ((immr & 0x3F) << 16) | ((imms & 0x3F) << 10) | (rn << 5) | rd
+}
+/// `sbfx Rd, Rn, #0, #width` (`SBFM Rd, Rn, #0, #(width-1)`): sign-extend the
+/// low `width` bits. With `sf = 1` and a `width` of 8/16/32 this is `sxtb`/
+/// `sxth`/`sxtw Xd, Wn`.
+pub(crate) fn sbfx0(sf: u32, rd: u32, rn: u32, width: u32) -> u32 {
+    bfm(0x1300_0000, sf, rd, rn, 0, width - 1)
+}
+/// `ubfx Rd, Rn, #0, #width` (`UBFM Rd, Rn, #0, #(width-1)`): zero-extend the
+/// low `width` bits.
+pub(crate) fn ubfx0(sf: u32, rd: u32, rn: u32, width: u32) -> u32 {
+    bfm(0x5300_0000, sf, rd, rn, 0, width - 1)
 }
 /// `lsl Rd, Rn, #shift` (`UBFM Rd, Rn, #(-shift MOD w), #(w-1-shift)`).
 pub(crate) fn lsl_imm(sf: u32, rd: u32, rn: u32, shift: u32) -> u32 {
@@ -795,6 +807,8 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         }
         A64Op::Unreachable => b.word(brk(1)),
         A64Op::Svc => b.word(svc(0)),
+        A64Op::Sbfx => b.word(sbfx0(1, rnum(&ops[0]), rnum(&ops[1]), uimm(&ops[2]) as u32)),
+        A64Op::Ubfx => b.word(ubfx0(1, rnum(&ops[0]), rnum(&ops[1]), uimm(&ops[2]) as u32)),
         A64Op::StpFpLr => b.word(stp_pre(FP.into(), LR.into(), SP.into(), -2)),
         A64Op::LdpFpLr => b.word(ldp_post(FP.into(), LR.into(), SP.into(), 2)),
         A64Op::MovFpSp => b.word(add_imm(1, FP.into(), SP.into(), 0)),

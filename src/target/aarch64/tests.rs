@@ -71,6 +71,28 @@ fn golden_div_and_shift() {
 }
 
 #[test]
+fn golden_bitfield_extend() {
+    // sxtb x0, w1 = sbfm x0, x1, #0, #7 = 20 1c 40 93
+    assert_eq!(sbfx0(1, 0, 1, 8).to_le_bytes(), [0x20, 0x1c, 0x40, 0x93]);
+    // sxtw x0, w1 = sbfm x0, x1, #0, #31 = 20 7c 40 93
+    assert_eq!(sbfx0(1, 0, 1, 32).to_le_bytes(), [0x20, 0x7c, 0x40, 0x93]);
+    // ubfx x0, x1, #0, #8 = ubfm x0, x1, #0, #7 = 20 1c 40 d3
+    assert_eq!(ubfx0(1, 0, 1, 8).to_le_bytes(), [0x20, 0x1c, 0x40, 0xd3]);
+    // ubfx x0, x1, #0, #1 = ubfm x0, x1, #0, #0 = 20 00 40 d3
+    assert_eq!(ubfx0(1, 0, 1, 1).to_le_bytes(), [0x20, 0x00, 0x40, 0xd3]);
+}
+
+#[test]
+fn odd_widths_above_32_use_the_x_form() {
+    // An i33..i64 op needs the upper word: only widths up to 32 use `W`.
+    assert_eq!(sf_of(1), 0);
+    assert_eq!(sf_of(32), 0);
+    assert_eq!(sf_of(33), 1);
+    assert_eq!(sf_of(48), 1);
+    assert_eq!(sf_of(64), 1);
+}
+
+#[test]
 fn golden_cmp_cset_csel() {
     // cmp x1, x2 = subs xzr, x1, x2 = 3f 00 02 eb
     assert_eq!(subs_reg(1, 31, 1, 2).to_le_bytes(), [0x3f, 0x00, 0x02, 0xeb]);
@@ -175,6 +197,22 @@ fn differential_encoding_matches_llvm_mc() {
         (asr_imm(1, 0, 1, 3), "asr x0, x1, #3"),
         (lsl_imm(0, 0, 1, 5), "lsl w0, w1, #5"),
         (lslv(1, 0, 1, 2), "lslv x0, x1, x2"),
+        // bitfield extracts (A64Op::Sbfx / Ubfx: extend a narrow value to 64 bits)
+        (sbfx0(1, 0, 1, 8), "sxtb x0, w1"),
+        (sbfx0(1, 0, 1, 16), "sxth x0, w1"),
+        (sbfx0(1, 0, 1, 32), "sxtw x0, w1"),
+        (sbfx0(1, 3, 4, 1), "sbfx x3, x4, #0, #1"),
+        (sbfx0(1, 3, 4, 24), "sbfx x3, x4, #0, #24"),
+        (sbfx0(1, 3, 4, 48), "sbfx x3, x4, #0, #48"),
+        (sbfx0(1, 5, 6, 63), "sbfx x5, x6, #0, #63"),
+        (ubfx0(1, 0, 1, 1), "ubfx x0, x1, #0, #1"),
+        (ubfx0(1, 0, 1, 8), "ubfx x0, x1, #0, #8"),
+        (ubfx0(1, 0, 1, 16), "ubfx x0, x1, #0, #16"),
+        (ubfx0(1, 0, 1, 32), "ubfx x0, x1, #0, #32"),
+        (ubfx0(1, 7, 8, 48), "ubfx x7, x8, #0, #48"),
+        (ubfx0(1, 9, 10, 63), "ubfx x9, x10, #0, #63"),
+        (sbfx0(0, 0, 1, 8), "sxtb w0, w1"),
+        (ubfx0(0, 0, 1, 8), "uxtb w0, w1"),
         (lsrv(1, 0, 1, 2), "lsrv x0, x1, x2"),
         (asrv(1, 0, 1, 2), "asrv x0, x1, x2"),
         // compare / conditional set / select
@@ -461,7 +499,8 @@ fn interp_max() {
     let (m, f) = build_max();
     assert_eq!(eval2(&m, f, 3, 4), i(4));
     assert_eq!(eval2(&m, f, 9, 2), i(9));
-    assert_eq!(eval2(&m, f, -1, -5), i(-1));
+    // Registers hold 64-bit patterns: -1 comes back as all-ones.
+    assert_eq!(eval2(&m, f, -1, -5), i(-1).mod_2k(64));
     assert_eq!(eval2(&m, f, 7, 7), i(7));
 }
 
@@ -1421,4 +1460,469 @@ fn syscall_encodes_svc_0() {
         code.bytes.chunks(4).any(|w| w == 0xD400_0001u32.to_le_bytes()),
         "the encoded body contains `svc #0`"
     );
+}
+
+// ===========================================================================
+// Narrow values with dirty upper register bits
+// ===========================================================================
+//
+// i1/i8/i16 and odd-width (`_BitInt`) values live in wider registers whose bits
+// above the value's width are not kept clean: an `i8` add of 200 + 100 leaves
+// 300 in the register, a `trunc` to `i1` keeps the source's other bits, and a
+// negative constant is materialized sign-extended. Every op whose result
+// depends on those bits must extend first. These are the x86-64 execution
+// probes (`src/link/mod.rs`) run on the MIR interpreter, which models the
+// register width faithfully. Each checking function returns 0 when correct;
+// `main` ORs a distinct bit per failing check.
+
+/// Parse `src`, lower every function, and run its `main` on the interpreter.
+/// Every function also goes through the whole encoding pipeline (register
+/// allocation, frame layout, encoding) to keep the new extension ops covered.
+fn run_lf_main(src: &str) -> u64 {
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(src, crate::support::diagnostics::FileId::new(0), &mut syms)
+        .expect("parse .lf");
+    for k in 0..m.functions().count() {
+        assert!(!compile_function(&m, FuncId::from_index(k), &syms).bytes.is_empty());
+    }
+    let main = m
+        .functions()
+        .position(|f| syms.resolve(f.name) == "main")
+        .expect("a `main` function");
+    let (target, funcs) = lower_all(&m);
+    let v = interp::run(&target, &funcs, main, &[])
+        .expect("interpretation succeeds")
+        .expect("main returns a value");
+    v.to_u64().expect("a 64-bit pattern")
+}
+
+/// The names of the checks whose bit is set in `code`.
+fn failing_checks<'a>(code: u64, names: &[&'a str]) -> Vec<&'a str> {
+    names.iter().enumerate().filter(|(i, _)| code & (1 << i) != 0).map(|(_, n)| *n).collect()
+}
+
+#[test]
+fn narrow_icmp_ignores_upper_register_bits() {
+    // Each function returns 1 when the comparison sees the wrapped value.
+    let src = "\
+module \"k\"
+func @ult8(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %c = icmp ult %s, %a : i1
+  %r = zext %c : i64
+  ret %r
+}
+func @slt8(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %c = icmp slt %s, i8 0 : i1
+  %r = zext %c : i64
+  ret %r
+}
+func @eq16(i16, i16) -> i64 {
+entry ^0(%a: i16, %b: i16):
+  %s = add %a, %b : i16
+  %c = icmp eq %s, i16 4 : i1
+  %r = zext %c : i64
+  ret %r
+}
+func @main() -> i64 {
+entry ^0:
+  %x = call @ult8(i8 -56, i8 100) : i64
+  %y = call @slt8(i8 100, i8 100) : i64
+  %z = call @eq16(i16 -2, i16 6) : i64
+  %xy = shl %y, i64 1 : i64
+  %xz = shl %z, i64 2 : i64
+  %t = or %x, %xy : i64
+  %u = or %t, %xz : i64
+  ret %u
+}
+";
+    let code = run_lf_main(src);
+    let failing = failing_checks(!code & 0b111, &["ult i8", "slt i8", "eq i16"]);
+    assert!(failing.is_empty(), "narrow icmp saw dirty upper bits: {failing:?} (got {code:#b})");
+}
+
+#[test]
+fn narrow_ops_ignore_upper_register_bits() {
+    // 200 + 100 is 44 as an i8 (300 in the register), and 100 + 100 is -56 as
+    // an i8 (200 in the register).
+    let src = "\
+module \"k\"
+func @lshr(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = lshr %s, i8 1 : i8
+  %c = icmp ne %r, i8 22 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @ashr(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = ashr %s, i8 1 : i8
+  %c = icmp ne %r, i8 -28 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @udiv(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = udiv %s, i8 2 : i8
+  %c = icmp ne %r, i8 22 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @urem(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = urem %s, i8 3 : i8
+  %c = icmp ne %r, i8 2 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @sdiv(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = sdiv %s, i8 2 : i8
+  %c = icmp ne %r, i8 -28 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @srem(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %r = srem %s, i8 3 : i8
+  %c = icmp ne %r, i8 -2 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @switch(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  switch %s, ^1 [44: ^2]
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @condbr(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i1
+  cond_br %t, ^1, ^2
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @sitofp(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %f = sitofp %s : f64
+  %i = fptosi %f : i64
+  %c = icmp ne %i, i64 -56 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @uitofp(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %f = uitofp %s : f64
+  %i = fptosi %f : i64
+  %c = icmp ne %i, i64 44 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @main() -> i64 {
+entry ^0:
+  %v0 = call @lshr(i8 -56, i8 100) : i64
+  %v1 = call @ashr(i8 100, i8 100) : i64
+  %v2 = call @udiv(i8 -56, i8 100) : i64
+  %v3 = call @urem(i8 -56, i8 100) : i64
+  %v4 = call @sdiv(i8 100, i8 100) : i64
+  %v5 = call @srem(i8 100, i8 100) : i64
+  %v6 = call @switch(i8 -56, i8 100) : i64
+  %v7 = call @condbr(i32 2) : i64
+  %v8 = call @sitofp(i8 100, i8 100) : i64
+  %v9 = call @uitofp(i8 -56, i8 100) : i64
+  %s1 = shl %v1, i64 1 : i64
+  %s2 = shl %v2, i64 2 : i64
+  %s3 = shl %v3, i64 3 : i64
+  %s4 = shl %v4, i64 4 : i64
+  %s5 = shl %v5, i64 5 : i64
+  %s6 = shl %v6, i64 6 : i64
+  %s7 = shl %v7, i64 7 : i64
+  %s8 = shl %v8, i64 8 : i64
+  %s9 = shl %v9, i64 9 : i64
+  %o1 = or %v0, %s1 : i64
+  %o2 = or %o1, %s2 : i64
+  %o3 = or %o2, %s3 : i64
+  %o4 = or %o3, %s4 : i64
+  %o5 = or %o4, %s5 : i64
+  %o6 = or %o5, %s6 : i64
+  %o7 = or %o6, %s7 : i64
+  %o8 = or %o7, %s8 : i64
+  %o9 = or %o8, %s9 : i64
+  ret %o9
+}
+";
+    let names = ["lshr", "ashr", "udiv", "urem", "sdiv", "srem", "switch", "cond_br", "sitofp", "uitofp"];
+    let code = run_lf_main(src);
+    let failing = failing_checks(code, &names);
+    assert!(failing.is_empty(), "narrow ops saw dirty upper bits: {failing:?} ({code:#b})");
+}
+
+#[test]
+fn narrow_values_dirty_above_width() {
+    // `0 - 1` as an i8 is 255 unsigned but all-ones in the register; a `trunc`
+    // to i1 keeps the source's other bits; odd widths (i24) have no compare of
+    // their own; a switch compares full registers, and case values may not fit
+    // an immediate.
+    let src = "\
+module \"k\"
+func @ushr(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = sub %a, %b : i8
+  %r = lshr %s, i8 1 : i8
+  %c = icmp ne %r, i8 127 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @udiv(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = sub %a, %b : i8
+  %r = udiv %s, i8 2 : i8
+  %c = icmp ne %r, i8 127 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @uitofp(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = sub %a, %b : i8
+  %f = uitofp %s : f64
+  %i = fptosi %f : i64
+  %c = icmp ne %i, i64 255 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @zext1(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i1
+  %z = zext %t : i64
+  ret %z
+}
+func @select1(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i1
+  %r = select %t, i64 1, i64 0 : i64
+  ret %r
+}
+func @cmp24(i32) -> i64 {
+entry ^0(%a: i32):
+  %t = trunc %a : i24
+  %c = icmp ne %t, i24 5 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @switch32(i32, i32) -> i64 {
+entry ^0(%a: i32, %b: i32):
+  %s = sub %a, %b : i32
+  switch %s, ^1 [-1: ^2]
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @switch64(i64) -> i64 {
+entry ^0(%a: i64):
+  switch %a, ^1 [4294967296: ^2]
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+}
+func @main() -> i64 {
+entry ^0:
+  %v0 = call @ushr(i8 0, i8 1) : i64
+  %v1 = call @udiv(i8 0, i8 1) : i64
+  %v2 = call @uitofp(i8 0, i8 1) : i64
+  %v3 = call @zext1(i32 2) : i64
+  %v4 = call @select1(i32 2) : i64
+  %v5 = call @cmp24(i32 16777221) : i64
+  %v6 = call @switch32(i32 0, i32 1) : i64
+  %v7 = call @switch64(i64 4294967296) : i64
+  %s1 = shl %v1, i64 1 : i64
+  %s2 = shl %v2, i64 2 : i64
+  %s3 = shl %v3, i64 3 : i64
+  %s4 = shl %v4, i64 4 : i64
+  %s5 = shl %v5, i64 5 : i64
+  %s6 = shl %v6, i64 6 : i64
+  %s7 = shl %v7, i64 7 : i64
+  %o1 = or %v0, %s1 : i64
+  %o2 = or %o1, %s2 : i64
+  %o3 = or %o2, %s3 : i64
+  %o4 = or %o3, %s4 : i64
+  %o5 = or %o4, %s5 : i64
+  %o6 = or %o5, %s6 : i64
+  %o7 = or %o6, %s7 : i64
+  ret %o7
+}
+";
+    let names = ["lshr", "udiv", "uitofp", "zext i1", "select i1", "icmp i24", "switch i32", "switch imm64"];
+    let code = run_lf_main(src);
+    let failing = failing_checks(code, &names);
+    assert!(failing.is_empty(), "narrow values mishandled: {failing:?} ({code:#b})");
+}
+
+#[test]
+fn narrow_casts_and_wide_odd_widths() {
+    // Integer casts and odd widths above 32 bits: `sext`/`zext` must extend
+    // from the source's own width (its register may hold anything above it),
+    // an i48 op must run on the full 64-bit register, and a signed compare of
+    // i1s sees `true` as -1.
+    let src = "\
+module \"k\"
+func @sext8(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %x = sext %s : i64
+  %c = icmp ne %x, i64 -56 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @zext8(i8, i8) -> i64 {
+entry ^0(%a: i8, %b: i8):
+  %s = add %a, %b : i8
+  %x = zext %s : i64
+  %c = icmp ne %x, i64 44 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @zext32(i64) -> i64 {
+entry ^0(%a: i64):
+  %t = trunc %a : i32
+  %x = zext %t : i64
+  %c = icmp ne %x, i64 5 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @sext32(i64) -> i64 {
+entry ^0(%a: i64):
+  %t = trunc %a : i32
+  %x = sext %t : i64
+  %c = icmp ne %x, i64 -1 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @sext1(i64) -> i64 {
+entry ^0(%a: i64):
+  %t = icmp eq %a, %a : i1
+  %x = sext %t : i64
+  %c = icmp ne %x, i64 -1 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @add48(i64) -> i64 {
+entry ^0(%a: i64):
+  %t = trunc %a : i48
+  %s = add %t, i48 1 : i48
+  %x = zext %s : i64
+  %c = icmp ne %x, i64 140737488355328 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @ashr48(i64) -> i64 {
+entry ^0(%a: i64):
+  %t = trunc %a : i48
+  %r = ashr %t, i48 4 : i48
+  %x = sext %r : i64
+  %c = icmp ne %x, i64 -1 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @sge1(i64) -> i64 {
+entry ^0(%a: i64):
+  %t = icmp eq %a, %a : i1
+  %f = icmp ne %a, %a : i1
+  %c = icmp sge %t, %f : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @main() -> i64 {
+entry ^0:
+  %v0 = call @sext8(i8 100, i8 100) : i64
+  %v1 = call @zext8(i8 -56, i8 100) : i64
+  %v2 = call @zext32(i64 4294967301) : i64
+  %v3 = call @sext32(i64 4294967295) : i64
+  %v4 = call @sext1(i64 7) : i64
+  %v5 = call @add48(i64 140737488355327) : i64
+  %v6 = call @ashr48(i64 -1) : i64
+  %v7 = call @sge1(i64 7) : i64
+  %s1 = shl %v1, i64 1 : i64
+  %s2 = shl %v2, i64 2 : i64
+  %s3 = shl %v3, i64 3 : i64
+  %s4 = shl %v4, i64 4 : i64
+  %s5 = shl %v5, i64 5 : i64
+  %s6 = shl %v6, i64 6 : i64
+  %s7 = shl %v7, i64 7 : i64
+  %o1 = or %v0, %s1 : i64
+  %o2 = or %o1, %s2 : i64
+  %o3 = or %o2, %s3 : i64
+  %o4 = or %o3, %s4 : i64
+  %o5 = or %o4, %s5 : i64
+  %o6 = or %o5, %s6 : i64
+  %o7 = or %o6, %s7 : i64
+  ret %o7
+}
+";
+    let names = ["sext i8", "zext i8", "zext i32", "sext i32", "sext i1", "add i48", "ashr i48", "sge i1"];
+    let code = run_lf_main(src);
+    let failing = failing_checks(code, &names);
+    assert!(failing.is_empty(), "narrow casts / odd widths mishandled: {failing:?} ({code:#b})");
+}
+
+#[test]
+fn narrow_shift_count_and_ptr_offset() {
+    // A variable shift takes its count from the low 5/6 bits of the count
+    // register, which an `i4` count doesn't own; and a `ptr_add` offset is a
+    // signed value of its own width (an i32 -8 held as 2^32 - 8 is still -8).
+    let src = "\
+module \"k\"
+func @shl4(i8) -> i64 {
+entry ^0(%a: i8):
+  %c = trunc %a : i4
+  %r = shl i4 3, %c : i4
+  %z = zext %r : i64
+  %k = icmp ne %z, i64 6 : i1
+  %o = zext %k : i64
+  ret %o
+}
+func @poff(i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64):
+  %p = alloca [4 x i64] : ptr
+  %e = ptr_add %p, i64 8 : ptr
+  store i64 7, %e align 8 : i64
+  %q = ptr_add %p, i64 16 : ptr
+  %ta = trunc %a : i32
+  %tb = trunc %b : i32
+  %off = sub %ta, %tb : i32
+  %r = ptr_add %q, %off : ptr
+  %v = load %r align 8 : i64
+  %k = icmp ne %v, i64 7 : i1
+  %o = zext %k : i64
+  ret %o
+}
+func @main() -> i64 {
+entry ^0:
+  %v0 = call @shl4(i8 17) : i64
+  %v1 = call @poff(i64 4294967296, i64 8) : i64
+  %s1 = shl %v1, i64 1 : i64
+  %o1 = or %v0, %s1 : i64
+  ret %o1
+}
+";
+    let code = run_lf_main(src);
+    let failing = failing_checks(code, &["shl i4 count", "ptr_add i32 offset"]);
+    assert!(failing.is_empty(), "narrow shift count / offset mishandled: {failing:?} ({code:#b})");
 }

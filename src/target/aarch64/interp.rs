@@ -11,6 +11,16 @@
 //! evaluated as compare-then-set, `MovRI` as a load-immediate) rather than the
 //! encoder's multi-word expansion.
 //!
+//! ## Register width
+//!
+//! Every general register is modeled as the 64-bit pattern the hardware holds,
+//! and each op runs at the width its encoding selects (the `W` form for a
+//! `width` of 32 or less, else the `X` form): a `W`-form result is truncated to
+//! 32 bits and zero-extends into the upper half, exactly as on hardware. The
+//! IR-level width is *not* applied, so a narrow value keeps whatever bits its
+//! computation left above its width (an `i8` add of 200 + 100 holds 300), and an
+//! isel that forgets to extend before an op that reads those bits is caught.
+//!
 //! ## The aggregate ABI model
 //!
 //! To validate by-value struct passing/returning ([`super::isel::classify_aggregate`])
@@ -139,6 +149,12 @@ struct CallOut {
     regs: Vec<(PReg, Int)>,
 }
 
+/// The register width an op of IR width `width` runs at: 32 for the `W` form,
+/// 64 for the `X` form (the encoder's `sf` bit).
+fn reg_width(width: u32) -> u32 {
+    if super::encode::sf_of(width) == 1 { 64 } else { 32 }
+}
+
 fn mask(v: &Int, width: u32) -> Int {
     if width == 0 { Int::ZERO } else { v.mod_2k(width) }
 }
@@ -227,7 +243,7 @@ impl Machine<'_> {
         match op {
             A64Op::MovRI => {
                 let d = def(ops, 0)?;
-                fr.regs.insert(d, imm(ops, 1)?.clone());
+                fr.regs.insert(d, mask(imm(ops, 1)?, 64));
             }
             A64Op::MovRR => {
                 let d = def(ops, 0)?;
@@ -242,7 +258,7 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let bb = self.rd(fr, use_reg(ops, 2)?);
-                let w = imm_u32(ops, 3)?;
+                let w = reg_width(imm_u32(ops, 3)?);
                 let res = match op {
                     A64Op::Add => a.add(&bb),
                     A64Op::Sub => a.sub(&bb),
@@ -258,7 +274,7 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let k = imm(ops, 2)?.clone();
-                let w = imm_u32(ops, 3)?;
+                let w = reg_width(imm_u32(ops, 3)?);
                 let res = if op == A64Op::AddI { a.add(&k) } else { a.sub(&k) };
                 fr.regs.insert(d, mask(&res, w));
             }
@@ -266,7 +282,7 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let bb = self.rd(fr, use_reg(ops, 2)?);
-                let w = imm_u32(ops, 3)?;
+                let w = reg_width(imm_u32(ops, 3)?);
                 fr.regs.insert(d, self.div(op, &a, &bb, w)?);
             }
             A64Op::Msub => {
@@ -274,22 +290,23 @@ impl Machine<'_> {
                 let m = self.rd(fr, use_reg(ops, 1)?);
                 let n = self.rd(fr, use_reg(ops, 2)?);
                 let a = self.rd(fr, use_reg(ops, 3)?);
-                let w = imm_u32(ops, 4)?;
+                let w = reg_width(imm_u32(ops, 4)?);
                 fr.regs.insert(d, mask(&a.sub(&m.mul(&n)), w));
             }
             A64Op::LslI | A64Op::LsrI | A64Op::AsrI => {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let k = imm(ops, 2)?.to_u64().unwrap_or(0) as u32;
-                let w = imm_u32(ops, 3)?;
+                let w = reg_width(imm_u32(ops, 3)?);
                 fr.regs.insert(d, shift(op, &a, k, w));
             }
             A64Op::LslV | A64Op::LsrV | A64Op::AsrV => {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let bb = self.rd(fr, use_reg(ops, 2)?);
-                let w = imm_u32(ops, 3)?;
-                let k = (bb.to_u64().unwrap_or(0) % u64::from(w.max(1))) as u32;
+                // The count is taken modulo the register width.
+                let w = reg_width(imm_u32(ops, 3)?);
+                let k = (bb.to_u64().unwrap_or(0) % u64::from(w)) as u32;
                 fr.regs.insert(d, shift(op, &a, k, w));
             }
             A64Op::CmpCset => {
@@ -297,7 +314,7 @@ impl Machine<'_> {
                 let a = self.rd(fr, use_reg(ops, 1)?);
                 let bb = self.rd(fr, use_reg(ops, 2)?);
                 let cc = imm(ops, 3)?.to_u64().unwrap_or(0) as u8;
-                let w = imm_u32(ops, 4)?;
+                let w = reg_width(imm_u32(ops, 4)?);
                 let r = eval_cond(cc, &a, &bb, w);
                 fr.regs.insert(d, if r { Int::ONE } else { Int::ZERO });
             }
@@ -306,7 +323,18 @@ impl Machine<'_> {
                 let c = self.rd(fr, use_reg(ops, 1)?);
                 let t = self.rd(fr, use_reg(ops, 2)?);
                 let f = self.rd(fr, use_reg(ops, 3)?);
+                // `cmp cond, xzr` looks at all 64 bits of the condition.
                 fr.regs.insert(d, if c.is_zero() { f } else { t });
+            }
+            A64Op::Sbfx | A64Op::Ubfx => {
+                // `sbfm`/`ubfm Xd, Xn, #0, #(width-1)`: extend the low `width`
+                // bits to all 64.
+                let d = def(ops, 0)?;
+                let s = self.rd(fr, use_reg(ops, 1)?);
+                let w = imm_u32(ops, 2)?;
+                let low = mask(&s, w);
+                let v = if op == A64Op::Sbfx { mask(&signed(&low, w), 64) } else { low };
+                fr.regs.insert(d, v);
             }
             A64Op::Load => {
                 let d = def(ops, 0)?;
@@ -369,12 +397,14 @@ impl Machine<'_> {
                 return Ok(Flow::Goto(target));
             }
             A64Op::Switch => {
+                // Each case value is materialized as a 64-bit pattern and compared
+                // with all 64 bits of the scrutinee (`cmp x, x9`).
                 let c = self.rd(fr, use_reg(ops, 0)?);
                 let mut target = label(ops, 1)?;
                 let mut i = 2;
                 while i + 1 < ops.len() {
                     if let (MachineOperand::Imm(v), MachineOperand::Label(b)) = (&ops[i], &ops[i + 1])
-                        && *v == c
+                        && mask(v, 64) == c
                     {
                         target = *b;
                         break;
@@ -438,11 +468,14 @@ impl Machine<'_> {
                 let s = self.rd(fr, use_reg(ops, 1)?);
                 let dst_int_w = imm_u32(ops, 2)?;
                 let src_flt_w = imm_u32(ops, 3)?;
+                // The conversion saturates at the register width (`W` for a
+                // destination of 32 bits or less); a `W` result zero-extends.
                 let x = fval(&s, src_flt_w).trunc();
-                let v = if op == A64Op::Fcvtzs {
-                    mask(&Int::from_i64(x as i64), dst_int_w)
-                } else {
-                    mask(&Int::from_u64(x as u64), dst_int_w)
+                let v = match (op == A64Op::Fcvtzs, reg_width(dst_int_w)) {
+                    (true, 64) => mask(&Int::from_i64(x as i64), 64),
+                    (true, _) => mask(&Int::from_i64(i64::from(x as i32)), 32),
+                    (false, 64) => Int::from_u64(x as u64),
+                    (false, _) => Int::from_u64(u64::from(x as u32)),
                 };
                 fr.regs.insert(d, v);
             }
@@ -450,7 +483,9 @@ impl Machine<'_> {
                 let d = def(ops, 0)?;
                 let s = self.rd(fr, use_reg(ops, 1)?);
                 let dst_flt_w = imm_u32(ops, 2)?;
-                let src_int_w = imm_u32(ops, 3)?;
+                // The source register is read at its form's width (`sf`), so any
+                // bits between the IR width and 32/64 take part.
+                let src_int_w = reg_width(imm_u32(ops, 3)?);
                 let bits = mask(&s, src_int_w);
                 let x = if op == A64Op::Scvtf {
                     signed(&bits, src_int_w).to_i64().unwrap_or(0) as f64
@@ -499,7 +534,10 @@ impl Machine<'_> {
         Ok(Flow::Next)
     }
 
+    /// `sdiv`/`udiv` at register width `w` (32 or 64): only the low `w` bits
+    /// of each operand take part.
     fn div(&self, op: A64Op, a: &Int, b: &Int, w: u32) -> Result<Int, String> {
+        let (a, b) = (&mask(a, w), &mask(b, w));
         match op {
             A64Op::Udiv => {
                 if b.is_zero() {
@@ -520,8 +558,10 @@ impl Machine<'_> {
         }
     }
 
+    /// A register's 64-bit pattern (inputs handed in as negative `Int`s are
+    /// normalized to their two's-complement bits).
     fn rd(&self, fr: &Frame, r: Reg) -> Int {
-        fr.regs.get(&r).cloned().unwrap_or(Int::ZERO)
+        fr.regs.get(&r).map(|v| mask(v, 64)).unwrap_or(Int::ZERO)
     }
 }
 

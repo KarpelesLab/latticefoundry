@@ -172,6 +172,12 @@ pub enum A64Op {
     /// isel as one consecutive run right before); the kernel returns in `x0` and
     /// preserves every other register, so `x0` is the only def.
     Svc = 54,
+    /// `[Def d, Use s, Imm width]` — `sbfx Xd, Xs, #0, #width` (`sbfm`):
+    /// sign-extend the low `width` bits (1..=63) of `s` to all 64 bits.
+    Sbfx = 55,
+    /// `[Def d, Use s, Imm width]` — `ubfx Xd, Xs, #0, #width` (`ubfm`):
+    /// zero-extend the low `width` bits (1..=63) of `s` to all 64 bits.
+    Ubfx = 56,
 }
 
 impl A64Op {
@@ -184,15 +190,26 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 55] = [
+        const TABLE: [A64Op; 57] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
             AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
-            Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc,
+            Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc, Sbfx, Ubfx,
         ];
         TABLE[op.0 as usize]
     }
+}
+
+/// A switch case value sign-extended from the scrutinee's `width` to 64 bits,
+/// matching the sign-extended scrutinee it is compared against.
+fn sext_case(value: &Int, width: u32) -> Int {
+    if width >= 64 {
+        return value.clone();
+    }
+    let raw = value.to_i64().map(|v| v as u64).or_else(|| value.to_u64()).unwrap_or(0);
+    let shift = 64 - width;
+    Int::from_i64(((raw << shift) as i64) >> shift)
 }
 
 /// Encode an [`IntPred`] as the A64 condition-code nibble used by `b.cond`/`cset`
@@ -442,6 +459,52 @@ impl AArch64Target {
         None
     }
 
+    /// Whether `v` is a compare result, whose register holds exactly 0 or 1
+    /// (`cset` writes the whole register).
+    fn is_compare(lo: &Lower<'_, Self>, v: ValueId) -> bool {
+        matches!(lo.func().value(v).def, ValueDef::Inst(id)
+            if matches!(lo.func().inst(id).kind, InstKind::ICmp(_) | InstKind::FCmp(_)))
+    }
+
+    /// `v` sign- or zero-extended from its width to all 64 bits of a register
+    /// (`sbfx`/`ubfx Xd, Xn, #0, #width`). Narrow values live in wider registers
+    /// whose upper bits are not kept clean (an `i8` add of 200 + 100 leaves 300
+    /// in the register), so anything that reads those bits extends first. A
+    /// 64-bit value, and a compare result being zero-extended, are already
+    /// clean.
+    fn extend64(&self, lo: &mut Lower<'_, Self>, v: ValueId, signed: bool) -> VReg {
+        let r = lo.reg(v);
+        let width = lo.int_width(v);
+        if width >= 64 || (!signed && Self::is_compare(lo, v)) {
+            return r;
+        }
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        let op = if signed { A64Op::Sbfx } else { A64Op::Ubfx };
+        lo.emit(MachineInst::new(op.opcode(), vec![def_v(d), use_v(r), imm(u64::from(width))]));
+        d
+    }
+
+    /// An integer operand ready for an operation whose result depends on the
+    /// bits above the value's width (right shifts, division, int→float,
+    /// compares). A 32-/64-bit value is used as is by the matching `W`/`X` form,
+    /// which reads exactly its width; any other width is extended (see
+    /// [`Self::extend64`]). Returns the register and the width to operate at
+    /// (32 for a value that fits a `W` register, else 64).
+    fn extended(&self, lo: &mut Lower<'_, Self>, v: ValueId, signed: bool) -> (VReg, u32) {
+        let width = lo.int_width(v);
+        if width == 32 || width >= 64 {
+            return (lo.reg(v), width.min(64));
+        }
+        (self.extend64(lo, v, signed), if width < 32 { 32 } else { 64 })
+    }
+
+    /// An `i1` branch/select condition as a register holding exactly 0 or 1
+    /// (`cbnz`/`cmp` test all 64 bits). A compare's result already is; anything
+    /// else (e.g. a `trunc` to `i1`) may carry garbage above bit 0.
+    fn clean_cond(&self, lo: &mut Lower<'_, Self>, v: ValueId) -> VReg {
+        self.extend64(lo, v, false)
+    }
+
     fn lower_bin(&self, lo: &mut Lower<'_, Self>, op: BinOp, inst: &InstData) {
         let d = lo.result_reg(inst);
         let width = lo.int_width(inst.operands()[0]);
@@ -501,10 +564,10 @@ impl AArch64Target {
             BinOp::Shl => self.lower_shift(lo, A64Op::LslI, A64Op::LslV, d, inst, width),
             BinOp::LShr => self.lower_shift(lo, A64Op::LsrI, A64Op::LsrV, d, inst, width),
             BinOp::AShr => self.lower_shift(lo, A64Op::AsrI, A64Op::AsrV, d, inst, width),
-            BinOp::UDiv => self.lower_div(lo, A64Op::Udiv, false, d, inst, width),
-            BinOp::URem => self.lower_div(lo, A64Op::Udiv, true, d, inst, width),
-            BinOp::SDiv => self.lower_div(lo, A64Op::Sdiv, false, d, inst, width),
-            BinOp::SRem => self.lower_div(lo, A64Op::Sdiv, true, d, inst, width),
+            BinOp::UDiv => self.lower_div(lo, A64Op::Udiv, false, d, inst),
+            BinOp::URem => self.lower_div(lo, A64Op::Udiv, true, d, inst),
+            BinOp::SDiv => self.lower_div(lo, A64Op::Sdiv, false, d, inst),
+            BinOp::SRem => self.lower_div(lo, A64Op::Sdiv, true, d, inst),
             // `frem` has no direct A64 form (it is an `fmod` libcall); a documented
             // follow-up. `d` is an fp register, so keep the MIR well-formed with a
             // zero float constant (never executed in tests).
@@ -552,27 +615,53 @@ impl AArch64Target {
     }
 
     /// Conversions. Float↔float and int↔float go through the A64 `fcvt`/`fcvtz*`/
-    /// `scvtf`/`ucvtf` forms; every other cast (integer width change, ptr↔int,
-    /// bitcast within a class) is a low-bits-preserving copy, as before.
+    /// `scvtf`/`ucvtf` forms; `zext`/`sext` (and `inttoptr` from a narrower
+    /// integer) extend from the source's width; every other cast (truncation,
+    /// ptr→int, bitcast within a class) is a low-bits-preserving copy.
     fn lower_cast(&self, lo: &mut Lower<'_, Self>, op: CastOp, inst: &InstData) {
         let d = lo.result_reg(inst);
-        let s = lo.reg(inst.operands()[0]);
-        let src_w = lo.int_width(inst.operands()[0]);
+        let src = inst.operands()[0];
+        let src_w = lo.int_width(src);
         let dst_w = lo.types().bit_width(inst.ty).unwrap_or(64);
-        let emit3 = |lo: &mut Lower<'_, Self>, o: A64Op, a: u32, b: u32| {
+        let emit3 = |lo: &mut Lower<'_, Self>, o: A64Op, s: VReg, a: u32, b: u32| {
             lo.emit(MachineInst::new(
                 o.opcode(),
                 vec![def_v(d), use_v(s), imm(u64::from(a)), imm(u64::from(b))],
             ));
         };
         match op {
-            CastOp::FpTrunc | CastOp::FpExt => emit3(lo, A64Op::Fcvt, dst_w, src_w),
-            CastOp::FpToSi => emit3(lo, A64Op::Fcvtzs, dst_w, src_w),
-            CastOp::FpToUi => emit3(lo, A64Op::Fcvtzu, dst_w, src_w),
-            CastOp::SiToFp => emit3(lo, A64Op::Scvtf, dst_w, src_w),
-            CastOp::UiToFp => emit3(lo, A64Op::Ucvtf, dst_w, src_w),
-            // Integer↔integer / ptr↔int / same-class bitcast: preserve low bits.
-            _ => lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)])),
+            CastOp::FpTrunc | CastOp::FpExt => {
+                let s = lo.reg(src);
+                emit3(lo, A64Op::Fcvt, s, dst_w, src_w);
+            }
+            CastOp::FpToSi => {
+                let s = lo.reg(src);
+                emit3(lo, A64Op::Fcvtzs, s, dst_w, src_w);
+            }
+            CastOp::FpToUi => {
+                let s = lo.reg(src);
+                emit3(lo, A64Op::Fcvtzu, s, dst_w, src_w);
+            }
+            // The conversion reads the whole `W`/`X` source register: a narrow
+            // source is extended first, and converted at the extended width.
+            CastOp::SiToFp => {
+                let (s, w) = self.extended(lo, src, true);
+                emit3(lo, A64Op::Scvtf, s, dst_w, w);
+            }
+            CastOp::UiToFp => {
+                let (s, w) = self.extended(lo, src, false);
+                emit3(lo, A64Op::Ucvtf, s, dst_w, w);
+            }
+            // The source register's bits above its width are not clean.
+            CastOp::ZExt | CastOp::SExt | CastOp::IntToPtr => {
+                let s = self.extend64(lo, src, op == CastOp::SExt);
+                lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
+            }
+            // Truncation / ptr→int / same-class bitcast: preserve low bits.
+            _ => {
+                let s = lo.reg(src);
+                lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
+            }
         }
     }
 
@@ -585,19 +674,31 @@ impl AArch64Target {
         inst: &InstData,
         width: u32,
     ) {
-        let a = lo.reg(inst.operands()[0]);
+        // A right shift brings the bits above the width down into the result:
+        // extend first and shift at the extended width.
+        let (a, op_w) = match imm_op {
+            A64Op::LsrI => self.extended(lo, inst.operands()[0], false),
+            A64Op::AsrI => self.extended(lo, inst.operands()[0], true),
+            _ => (lo.reg(inst.operands()[0]), width),
+        };
         if let Some(c) = Self::const_of(lo, inst.operands()[1]) {
             let shmask = if width >= 64 { 63 } else { u64::from(width) - 1 };
             let count = c.to_u64().unwrap_or(0) & shmask;
             lo.emit(MachineInst::new(
                 imm_op.opcode(),
-                vec![def_v(d), use_v(a), imm(count), imm(u64::from(width))],
+                vec![def_v(d), use_v(a), imm(count), imm(u64::from(op_w))],
             ));
         } else {
-            let b = lo.reg(inst.operands()[1]);
+            // The hardware takes the count modulo the register width (its low 5
+            // or 6 bits); a count narrower than that may carry garbage there.
+            let b = if lo.int_width(inst.operands()[1]) < 6 {
+                self.extend64(lo, inst.operands()[1], false)
+            } else {
+                lo.reg(inst.operands()[1])
+            };
             lo.emit(MachineInst::new(
                 var_op.opcode(),
-                vec![def_v(d), use_v(a), use_v(b), imm(u64::from(width))],
+                vec![def_v(d), use_v(a), use_v(b), imm(u64::from(op_w))],
             ));
         }
     }
@@ -609,10 +710,12 @@ impl AArch64Target {
         want_rem: bool,
         d: VReg,
         inst: &InstData,
-        width: u32,
     ) {
-        let a = lo.reg(inst.operands()[0]);
-        let b = lo.reg(inst.operands()[1]);
+        // Division sees every bit of both operands (at the `W`/`X` width): extend
+        // them by the division's signedness and divide at the extended width.
+        let signed = div_op == A64Op::Sdiv;
+        let (a, _) = self.extended(lo, inst.operands()[0], signed);
+        let (b, width) = self.extended(lo, inst.operands()[1], signed);
         if !want_rem {
             lo.emit(MachineInst::new(
                 div_op.opcode(),
@@ -1183,9 +1286,13 @@ impl TargetIsel for AArch64Target {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
             InstKind::ICmp(pred) => {
                 let d = lo.result_reg(inst);
-                let a = lo.reg(inst.operands()[0]);
-                let b = lo.reg(inst.operands()[1]);
-                let width = lo.int_width(inst.operands()[0]);
+                // `cmp` reads the whole `W`/`X` register: a 32-/64-bit compare
+                // uses the matching form, any other width is extended (by the
+                // predicate's signedness) first.
+                let signed =
+                    matches!(pred, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
+                let (a, _) = self.extended(lo, inst.operands()[0], signed);
+                let (b, width) = self.extended(lo, inst.operands()[1], signed);
                 lo.emit(MachineInst::new(
                     A64Op::CmpCset.opcode(),
                     vec![
@@ -1232,7 +1339,8 @@ impl TargetIsel for AArch64Target {
             InstKind::PtrAdd { .. } => {
                 let d = lo.result_reg(inst);
                 let base = lo.reg(inst.operands()[0]);
-                let off = lo.reg(inst.operands()[1]);
+                // The byte offset is signed; a narrow one is sign-extended.
+                let off = self.extend64(lo, inst.operands()[1], true);
                 lo.emit(MachineInst::new(
                     A64Op::Add.opcode(),
                     vec![def_v(d), use_v(base), use_v(off), imm(64)],
@@ -1240,7 +1348,7 @@ impl TargetIsel for AArch64Target {
             }
             InstKind::Select => {
                 let d = lo.result_reg(inst);
-                let c = lo.reg(inst.operands()[0]);
+                let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = lo.reg(inst.operands()[1]);
                 let f = lo.reg(inst.operands()[2]);
                 lo.emit(MachineInst::new(
@@ -1354,7 +1462,7 @@ impl TargetIsel for AArch64Target {
                 lo.emit(self.jump(e));
             }
             InstKind::CondBr { if_true, if_false, true_args, false_args } => {
-                let cond = lo.reg(inst.operands()[0]);
+                let cond = self.clean_cond(lo, inst.operands()[0]);
                 let ops = inst.operands();
                 let tb = 1 + *true_args as usize;
                 let fb = tb + *false_args as usize;
@@ -1368,7 +1476,10 @@ impl TargetIsel for AArch64Target {
                 ));
             }
             InstKind::Switch(data) => {
-                let cond = lo.reg(inst.operands()[0]);
+                // Cases are compared as 64-bit values: sign-extend the scrutinee
+                // and each case value from the scrutinee's width.
+                let width = lo.int_width(inst.operands()[0]);
+                let cond = self.extend64(lo, inst.operands()[0], true);
                 let ops = inst.operands();
                 let mut idx = 1usize;
                 let dcount = data.default_args as usize;
@@ -1382,7 +1493,7 @@ impl TargetIsel for AArch64Target {
                     let cvals: Vec<_> = ops[idx..idx + n].to_vec();
                     idx += n;
                     let ce = lo.edge_to(case.target, &cvals);
-                    operands.push(MachineOperand::Imm(case.value.clone()));
+                    operands.push(MachineOperand::Imm(sext_case(&case.value, width)));
                     operands.push(MachineOperand::Label(ce));
                 }
                 lo.emit(MachineInst::new(A64Op::Switch.opcode(), operands));
