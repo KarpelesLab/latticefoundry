@@ -28,7 +28,9 @@
 //! WebAssembly (`wasm32`, `wasm32-unknown-unknown`) has no operating system in
 //! this sense: its OS is [`TargetOs::None`], its object format
 //! [`ObjectFormat::Wasm`] whatever the OS, and its calling convention
-//! [`CallConvKind::Wasm32`].
+//! [`CallConvKind::Wasm32`]. `avr` is always bare metal too; its later
+//! components name the device (`avr-atmega328p`, see
+//! [`crate::target::avr::Device::from_triple`]).
 
 use std::fmt;
 

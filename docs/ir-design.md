@@ -135,6 +135,17 @@ The rules:
   (`Lower::mem_addr_space`), which is how a backend picks, say, AVR's `lpm` for
   program memory and `ld` for data memory.
 
+**AVR's program space** (the `avr` backend, `P1`): a pointer into space 1 is
+16 bits and means one of two things by what it points to. The address of
+*data* in flash (a `global addrspace(1)`) is a **byte** address, which `lpm`
+reads; the address of a *function* is its **word** address (byte address / 2),
+what `icall` takes and what avr-gcc's function pointers hold. Loads through the
+first work and pointer arithmetic on them is byte arithmetic; the second are
+only called. The IR does not distinguish the two kinds of pointer, and nothing
+converts between them — a program never needs to, since it cannot read code as
+data portably anyway. 16 bits reach 64 KiB of flash; larger devices would need
+a 24-bit space-1 pointer and `elpm`.
+
 **No `addrspacecast`.** Converting a pointer from one space to another is
 rejected (`bitcast` between pointer types is invalid).
 
