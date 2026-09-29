@@ -349,23 +349,23 @@ the same payload as tags 6/7, and the atomics use tags 21–25, so existing
 Clean-room from each ISA's memory model. Volatile accesses are one ordinary
 load/store of exactly the declared width on every target. Atomics:
 
-| IR | x86-64 (TSO) | AArch64 (ARMv8.0) |
-|---|---|---|
-| `atomic_load relaxed` | `mov` | `ldr` |
-| `atomic_load acquire`/`seq_cst` | `mov` | `ldar` |
-| `atomic_store relaxed` | `mov` | `str` |
-| `atomic_store release` | `mov` | `stlr` |
-| `atomic_store seq_cst` | `xchg` | `stlr` |
-| `atomic_rmw xchg` | `xchg` | `ld{a}xr`/`st{l}xr` loop |
-| `atomic_rmw add`/`sub` | `lock xadd` (`sub` negates first) | `ld{a}xr`/`st{l}xr` loop |
-| other `atomic_rmw` | `lock cmpxchg` loop | `ld{a}xr`/`st{l}xr` loop |
-| `cmpxchg` | `lock cmpxchg` (`rax`) | `ld{a}xr`/`cmp`/`b.ne`/`st{l}xr` loop |
-| `fence seq_cst` | `mfence` | `dmb ish` |
-| `fence acq_rel`/`release` | nothing | `dmb ish` |
-| `fence acquire` | nothing | `dmb ishld` |
-
-The RISC-V backend does not lower atomics yet (it stops with a clear "not yet
-supported" error).
+| IR | x86-64 (TSO) | AArch64 (ARMv8.0) | RISC-V (RV64IMA, RVWMO) |
+|---|---|---|---|
+| `atomic_load relaxed` | `mov` | `ldr` | `l*` |
+| `atomic_load acquire` | `mov` | `ldar` | `l*; fence r,rw` |
+| `atomic_load seq_cst` | `mov` | `ldar` | `fence rw,rw; l*; fence r,rw` |
+| `atomic_store relaxed` | `mov` | `str` | `s*` |
+| `atomic_store release` | `mov` | `stlr` | `fence rw,w; s*` |
+| `atomic_store seq_cst` | `xchg` | `stlr` | `fence rw,w; s*` |
+| `atomic_rmw xchg` | `xchg` | `ld{a}xr`/`st{l}xr` loop | `amoswap` (8/16-bit: LR/SC loop) |
+| `atomic_rmw add`/`sub` | `lock xadd` (`sub` negates first) | `ld{a}xr`/`st{l}xr` loop | `amoadd` (`sub` negates first; 8/16-bit: LR/SC loop) |
+| `atomic_rmw and`/`or`/`xor`/`max`/`min`/`umax`/`umin` | `lock cmpxchg` loop | `ld{a}xr`/`st{l}xr` loop | `amo<op>` (8/16-bit: LR/SC loop) |
+| `atomic_rmw nand` | `lock cmpxchg` loop | `ld{a}xr`/`st{l}xr` loop | LR/SC loop |
+| `cmpxchg` | `lock cmpxchg` (`rax`) | `ld{a}xr`/`cmp`/`b.ne`/`st{l}xr` loop | LR/SC loop |
+| `fence seq_cst` | `mfence` | `dmb ish` | `fence rw,rw` |
+| `fence acq_rel` | nothing | `dmb ish` | `fence.tso` |
+| `fence release` | nothing | `dmb ish` | `fence rw,w` |
+| `fence acquire` | nothing | `dmb ishld` | `fence r,rw` |
 
 On x86-64 every `lock`ed instruction and `xchg` with memory is a full barrier,
 so the orderings of rmw/cmpxchg need nothing more; loads are never reordered with
@@ -389,6 +389,18 @@ releases. Its result, address and operands are ordinary allocated registers
 the store status use `x16`/`x17` (IP0/IP1), which are never allocated. A
 narrow compare (`cmpxchg`, `max`/`min`) extends at the access width, so
 garbage above a narrow value never causes a spurious mismatch.
+
+RISC-V follows the RVWMO mapping of the ISA manual's memory-model appendix.
+Code with atomics needs the A extension (RV64IMA); code without stays RV64IM.
+An AMO carries `.aq` for an acquiring ordering and `.rl` for a releasing one;
+an LR/SC loop puts `.aq` (and for `seq_cst` also `.rl`) on the `lr` and `.rl`
+on the `sc`. The A extension has no byte or halfword AMOs or LR/SC, so 8/16-bit
+rmw and `cmpxchg` run an LR/SC loop on the naturally aligned 32-bit word that
+contains the lane (natural alignment guarantees the lane never straddles two
+words), inserting the new lane with shifts rather than a mask register. The
+loops use the encoder's never-allocated scratch registers `t0`/`t1`/`t2`/`t6`,
+plus the destination as the `sc` status, since the old value is recomputed
+from the loaded word after the loop.
 
 ## 7. Instruction flags: one unified model  *(decided)*
 

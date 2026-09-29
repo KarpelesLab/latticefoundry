@@ -209,6 +209,32 @@ fn differential_li_materialization() {
     }
 }
 
+/// Wide `li` materializations evaluate to their value, including near
+/// `i64::MAX`, where the high part's computation must wrap (it used to
+/// overflow). Evaluated by a tiny model of the five instruction forms `li`
+/// emits (`lui`, `addi` from `x0` or `rd`, `addiw`, `slli`).
+#[test]
+fn wide_li_sequences_evaluate_to_their_value() {
+    fn eval(bytes: &[u8]) -> i64 {
+        let mut r: i64 = 0;
+        for w in bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())) {
+            let imm12 = i64::from((w as i32) >> 20);
+            let rs1_is_zero = (w >> 15) & 0x1F == 0;
+            r = match (w & 0x7F, (w >> 12) & 7) {
+                (0x37, _) => i64::from((w & 0xFFFF_F000) as i32),
+                (0x13, 0) => if rs1_is_zero { imm12 } else { r.wrapping_add(imm12) },
+                (0x13, 1) => r << ((w >> 20) & 0x3F),
+                (0x1B, 0) => i64::from(r.wrapping_add(imm12) as i32),
+                other => panic!("unexpected li word {w:#010x} {other:?}"),
+            };
+        }
+        r
+    }
+    for val in [i64::MAX, i64::MAX - 1, i64::MIN, i64::MIN + 1, 0x7FFF_FFFF_FFFF_F800, 0x1234_5678_9ABC_DEF0, -2, 0x8000_0000] {
+        assert_eq!(eval(&emit_li_bytes(10, val)), val, "li {val:#x}");
+    }
+}
+
 // ===========================================================================
 // IR fixtures + RV64-MIR interpretation (isel correctness without execution)
 // ===========================================================================
@@ -1205,4 +1231,240 @@ entry ^0(%a: i64):
     // The callee also extends its own return, so the i32 case holds even for a
     // direct entry into `@id32` with a dirty register.
     assert_eq!(run(0, 0x1_FFFF_FFFF), u64::MAX);
+}
+
+// ===========================================================================
+// Atomics: the A extension (AMOs, LR/SC loops, fences)
+// ===========================================================================
+
+/// Assemble RV64IMA code with `llvm-mc` (labels `1:`/`2:` with references
+/// `1b`/`2f`, resolved here to numeric branch offsets since `--show-encoding`
+/// leaves label fixups unresolved), returning all its bytes; `None` when
+/// `llvm-mc` is unavailable or rejects the input.
+fn llvm_mc_rva(asm: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut labels: Vec<(String, i64)> = Vec::new();
+    let mut insns: Vec<&str> = Vec::new();
+    for line in asm.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match line.strip_suffix(':') {
+            Some(l) => labels.push((l.to_string(), insns.len() as i64)),
+            None => insns.push(line),
+        }
+    }
+    let at = |name: &str| labels.iter().find(|(l, _)| l == name).map(|&(_, i)| i).unwrap_or(0);
+    let resolved: Vec<String> = insns
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let i = i as i64;
+            l.replace("1b", &(4 * (at("1") - i)).to_string()).replace("2f", &(4 * (at("2") - i)).to_string())
+        })
+        .collect();
+    let mut child = std::process::Command::new("llvm-mc")
+        .args(["--triple=riscv64", "-mattr=+m,+a", "--show-encoding"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(resolved.join("\n").as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut bytes = Vec::new();
+    for line in text.lines() {
+        let Some(pos) = line.find("encoding: [") else { continue };
+        let start = pos + "encoding: [".len();
+        let end = line[start..].find(']')? + start;
+        for tok in line[start..end].split(',') {
+            bytes.push(u8::from_str_radix(tok.trim().trim_start_matches("0x"), 16).ok()?);
+        }
+    }
+    Some(bytes)
+}
+
+#[test]
+fn atomics_run_their_sequential_meaning_in_the_interpreter() {
+    use crate::target::atomic_fixtures::{CMPXCHG_SLOTS, rmw_cases, rmw_slot_program};
+    for bytes in [1, 2, 4, 8] {
+        let cases = rmw_cases(bytes);
+        let code = run_lf_main(&rmw_slot_program(&cases));
+        assert_eq!(code, 0, "i{}: case {:?}", 8 * bytes, cases.get((code as usize).wrapping_sub(1)));
+    }
+    assert_eq!(run_lf_main(CMPXCHG_SLOTS), 0);
+}
+
+#[test]
+fn atomics_select_fences_amos_and_loops() {
+    use super::isel::RvOp;
+    use crate::codegen::mir::MachineOperand;
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(
+        crate::target::atomic_fixtures::ALL_FORMS,
+        crate::support::diagnostics::FileId::new(0),
+        &mut syms,
+    )
+    .expect("parse");
+    crate::verify::verify_module(&m).expect("verify");
+    let (_, funcs) = lower_all(&m);
+    let insts: Vec<_> = funcs[0].block_ids().flat_map(|b| funcs[0].block(b).insts.clone()).collect();
+    let imm = |o: &MachineOperand| match o {
+        MachineOperand::Imm(v) => v.to_u64().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    // The memory-ordering skeleton: every fence (fm, pred, succ) and access in
+    // order, per the RVWMO mapping.
+    let skeleton: Vec<String> = insts
+        .iter()
+        .filter_map(|i| match RvOp::decode(i.opcode) {
+            RvOp::Fence => Some(format!(
+                "fence{}.{:04b}.{:04b}",
+                if imm(&i.operands[0]) == 8 { ".tso" } else { "" },
+                imm(&i.operands[1]),
+                imm(&i.operands[2])
+            )),
+            RvOp::Load => Some(format!("l{}", imm(&i.operands[2]))),
+            RvOp::Store => Some(format!("s{}", imm(&i.operands[2]))),
+            RvOp::AtomicRmw => Some(format!("rmw{}.{:03b}", imm(&i.operands[3]), imm(&i.operands[5]))),
+            RvOp::CmpXchg => Some(format!("cas{}.{:03b}", imm(&i.operands[4]), imm(&i.operands[5]))),
+            _ => None,
+        })
+        .collect();
+    let want = [
+        "l8",                                          // relaxed load
+        "l8", "fence.0010.0011",                       // acquire: l; fence r,rw
+        "fence.0011.0011", "l8", "fence.0010.0011",    // seq_cst: fence rw,rw; l; fence r,rw
+        "s8",                                          // relaxed store
+        "fence.0011.0001", "s8",                       // release: fence rw,w; s
+        "fence.0011.0001", "s8",                       // seq_cst: fence rw,w; s
+        "fence.0010.0011",                             // fence acquire
+        "fence.0011.0001",                             // fence release
+        "fence.tso.0011.0011",                         // fence acq_rel
+        "fence.0011.0011",                             // fence seq_cst
+        "rmw8.000", "rmw8.001", "rmw8.100", "rmw8.101", "rmw8.111", "rmw1.111",
+        "cas8.111", "cas2.001",
+        "l1", "s1",                                    // the volatile byte access
+    ];
+    assert_eq!(skeleton, want);
+    assert!(!compile_function(&m, FuncId::from_index(0)).bytes.is_empty());
+}
+
+#[test]
+fn a_extension_encodings_match_llvm_mc() {
+    let cases: Vec<(u32, &str)> = vec![
+        (lr(4, false, false, 5, 31), "lr.w t0, (t6)"),
+        (lr(8, true, true, 10, 11), "lr.d.aqrl a0, (a1)"),
+        (sc(4, false, true, 10, 6, 31), "sc.w.rl a0, t1, (t6)"),
+        (sc(8, false, false, 5, 12, 13), "sc.d t0, a2, (a3)"),
+        (amo(0b00001, true, true, 10, 11, 12, 8), "amoswap.d.aqrl a0, a1, (a2)"),
+        (amo(0b00000, true, false, 10, 11, 12, 4), "amoadd.w.aq a0, a1, (a2)"),
+        (amo(0b00100, false, true, 13, 14, 15, 8), "amoxor.d.rl a3, a4, (a5)"),
+        (amo(0b01100, false, false, 8, 9, 18, 4), "amoand.w s0, s1, (s2)"),
+        (amo(0b01000, false, false, 8, 9, 18, 8), "amoor.d s0, s1, (s2)"),
+        (amo(0b10000, false, false, 8, 9, 18, 4), "amomin.w s0, s1, (s2)"),
+        (amo(0b10100, false, false, 8, 9, 18, 8), "amomax.d s0, s1, (s2)"),
+        (amo(0b11000, false, false, 8, 9, 18, 4), "amominu.w s0, s1, (s2)"),
+        (amo(0b11100, true, true, 8, 9, 18, 8), "amomaxu.d.aqrl s0, s1, (s2)"),
+        (fence(0, 0b0011, 0b0011), "fence rw, rw"),
+        (fence(0, 0b0010, 0b0011), "fence r, rw"),
+        (fence(0, 0b0011, 0b0001), "fence rw, w"),
+        (fence(0b1000, 0b0011, 0b0011), "fence.tso"),
+        (bcmp(5, 6, 10, 8), "bge t1, a0, 8"),
+        (bcmp(7, 10, 6, 8), "bgeu a0, t1, 8"),
+    ];
+    let mut checked = 0;
+    for (word, asm) in cases {
+        match llvm_mc_rva(asm) {
+            Some(bytes) => {
+                assert_eq!(word.to_le_bytes().to_vec(), bytes, "`{asm}`");
+                checked += 1;
+            }
+            None => eprintln!("skipping llvm-mc cross-check of `{asm}`"),
+        }
+    }
+    eprintln!("checked {checked} RISC-V A-extension encodings against llvm-mc");
+}
+
+#[test]
+fn atomic_sequences_match_llvm_mc() {
+    use super::isel::RvOp;
+    use super::regs::gpr;
+    use crate::codegen::mir::{MachineInst, MachineOperand, Reg};
+    use crate::ir::RmwOp;
+    let d = |n: u16| MachineOperand::Def(Reg::Physical(gpr(n)));
+    let u = |n: u16| MachineOperand::Use(Reg::Physical(gpr(n)));
+    let k = |v: u64| MachineOperand::Imm(Int::from_u64(v));
+    // d = a0 (x10), ptr = a1 (x11), val / expected = a2 (x12), new = a3 (x13).
+    let rmw = |size: u64, op: RmwOp, aqrl: u64| {
+        MachineInst::new(
+            RvOp::AtomicRmw.opcode(),
+            vec![d(10), u(11), u(12), k(size), k(u64::from(op.code())), k(aqrl)],
+        )
+    };
+    let cas = |size: u64, aqrl: u64| {
+        MachineInst::new(RvOp::CmpXchg.opcode(), vec![d(10), u(11), u(12), u(13), k(size), k(aqrl)])
+    };
+    let lane = "andi t6, a1, -4\nandi t2, a1, 3\nslli t2, t2, 3\n";
+    let merge = |top: u32| {
+        format!("sll t1, t1, t2\nxor t1, t1, t0\nsrl t1, t1, t2\nslli t1, t1, {top}\nsrli t1, t1, {top}\nsll t1, t1, t2\nxor t1, t1, t0\n")
+    };
+    let cases: Vec<(MachineInst, String)> = vec![
+        (rmw(8, RmwOp::Add, 0b101), "amoadd.d.aqrl a0, a2, (a1)".into()),
+        (rmw(4, RmwOp::Sub, 0b001), "neg t0, a2\namoadd.w.aq a0, t0, (a1)".into()),
+        (rmw(4, RmwOp::UMax, 0b100), "amomaxu.w.rl a0, a2, (a1)".into()),
+        (
+            rmw(8, RmwOp::Nand, 0b111),
+            "1:\nlr.d.aqrl a0, (a1)\nand t0, a0, a2\nnot t0, t0\nsc.d.rl t1, t0, (a1)\nbnez t1, 1b".into(),
+        ),
+        (
+            rmw(1, RmwOp::Add, 0b111),
+            format!(
+                "{lane}1:\nlr.w.aqrl t0, (t6)\nsrl t1, t0, t2\nadd t1, t1, a2\n{}sc.w.rl a0, t1, (t6)\nbnez a0, 1b\nsrl a0, t0, t2",
+                merge(56)
+            ),
+        ),
+        (
+            rmw(2, RmwOp::Max, 0b001),
+            format!(
+                "{lane}1:\nlr.w.aq t0, (t6)\nsrl t1, t0, t2\nslli t1, t1, 48\nslli a0, a2, 48\nbge t1, a0, 8\nmv t1, a0\nsrli t1, t1, 48\n{}sc.w a0, t1, (t6)\nbnez a0, 1b\nsrl a0, t0, t2",
+                merge(48)
+            ),
+        ),
+        (
+            rmw(1, RmwOp::UMin, 0b000),
+            format!(
+                "{lane}1:\nlr.w t0, (t6)\nsrl t1, t0, t2\nslli t1, t1, 56\nslli a0, a2, 56\nbgeu a0, t1, 8\nmv t1, a0\nsrli t1, t1, 56\n{}sc.w a0, t1, (t6)\nbnez a0, 1b\nsrl a0, t0, t2",
+                merge(56)
+            ),
+        ),
+        (
+            cas(8, 0b111),
+            "1:\nlr.d.aqrl a0, (a1)\nbne a0, a2, 2f\nsc.d.rl t0, a3, (a1)\nbnez t0, 1b\n2:".into(),
+        ),
+        (
+            cas(4, 0b001),
+            "sext.w t1, a2\n1:\nlr.w.aq a0, (a1)\nbne a0, t1, 2f\nsc.w t0, a3, (a1)\nbnez t0, 1b\n2:".into(),
+        ),
+        (
+            cas(2, 0b100),
+            format!(
+                "{lane}1:\nlr.w t0, (t6)\nsrl t1, t0, t2\nslli t1, t1, 48\nslli a0, a2, 48\nbne t1, a0, 2f\nmv t1, a3\n{}sc.w.rl a0, t1, (t6)\nbnez a0, 1b\n2:\nsrl a0, t0, t2",
+                merge(48)
+            ),
+        ),
+    ];
+    let mut checked = 0;
+    for (inst, asm) in &cases {
+        let ours = encode_atomic_for_test(inst);
+        match llvm_mc_rva(asm) {
+            Some(want) => {
+                assert_eq!(ours, want, "\n{asm}");
+                checked += 1;
+            }
+            None => eprintln!("skipping llvm-mc cross-check of\n{asm}"),
+        }
+    }
+    eprintln!("checked {checked} RISC-V atomic sequences against llvm-mc");
 }

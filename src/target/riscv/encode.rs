@@ -326,7 +326,10 @@ fn li_steps(val: i64) -> Vec<LiStep> {
         return steps;
     }
     let lo12 = sext12(val);
-    let hi = (val - i64::from(lo12)) >> 12;
+    // Wrapping: near `i64::MAX` a negative `lo12` pushes the difference past
+    // the top, and the register arithmetic of the emitted sequence wraps the
+    // same way (e.g. `i64::MAX` = `(i64::MIN >> 12) << 12` + -1).
+    let hi = val.wrapping_sub(i64::from(lo12)) >> 12;
     let mut steps = li_steps(hi);
     steps.push(LiStep::Slli(12));
     if lo12 != 0 {
@@ -828,7 +831,243 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         RvOp::Unreachable => b.word(ebreak()),
         RvOp::Ecall => b.word(ecall()),
         RvOp::SextW => b.word(addiw(rnum(&ops[0]), rnum(&ops[1]), 0)),
+        RvOp::Fence => {
+            b.word(fence(simm(&ops[0]) as u32, simm(&ops[1]) as u32, simm(&ops[2]) as u32));
+        }
+        RvOp::AtomicRmw => encode_atomic_rmw(b, ops),
+        RvOp::CmpXchg => encode_cmpxchg(b, ops),
     }
+}
+
+// ===========================================================================
+// The A extension: AMOs, LR/SC loops, fences
+// ===========================================================================
+
+/// An A-extension (`AMO` major opcode `0101111`) word: `funct5 | aq | rl | rs2 |
+/// rs1 | funct3 | rd`, with `funct3` = 2 (`.w`) for a 4-byte and 3 (`.d`) for
+/// an 8-byte access.
+pub(crate) fn amo(funct5: u32, aq: bool, rl: bool, rd: u32, rs2: u32, rs1: u32, size: u64) -> u32 {
+    let funct3 = if size == 8 { 3 } else { 2 };
+    r_type((funct5 << 2) | (u32::from(aq) << 1) | u32::from(rl), rs2, rs1, funct3, rd, 0x2F)
+}
+/// `lr.{w,d}{.aq}{.rl} rd, (rs1)`.
+pub(crate) fn lr(size: u64, aq: bool, rl: bool, rd: u32, rs1: u32) -> u32 {
+    amo(0b00010, aq, rl, rd, 0, rs1, size)
+}
+/// `sc.{w,d}{.aq}{.rl} rd, rs2, (rs1)` (`rd` = 0 on success).
+pub(crate) fn sc(size: u64, aq: bool, rl: bool, rd: u32, rs2: u32, rs1: u32) -> u32 {
+    amo(0b00011, aq, rl, rd, rs2, rs1, size)
+}
+/// `fence pred, succ` (`fm` = 8 with `rw, rw` is `fence.tso`); `pred`/`succ`
+/// are the 4-bit `iorw` sets.
+pub(crate) fn fence(fm: u32, pred: u32, succ: u32) -> u32 {
+    (fm << 28) | ((pred & 0xF) << 24) | ((succ & 0xF) << 20) | 0x0F
+}
+/// `blt`/`bge`/`bltu`/`bgeu rs1, rs2, imm` by `funct3` (4/5/6/7).
+pub(crate) fn bcmp(funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+    b_type(imm, rs2, rs1, funct3, 0x63)
+}
+
+/// The `amo<op>` `funct5` of an rmw operation, when a single AMO implements it
+/// (every op but `sub`, which negates into an `amoadd`, and `nand`).
+fn amo_funct5(op: crate::ir::inst::RmwOp) -> Option<u32> {
+    use crate::ir::inst::RmwOp::*;
+    Some(match op {
+        Xchg => 0b00001,
+        Add | Sub => 0b00000,
+        Xor => 0b00100,
+        And => 0b01100,
+        Or => 0b01000,
+        Min => 0b10000,
+        Max => 0b10100,
+        UMin => 0b11000,
+        UMax => 0b11100,
+        Nand => return None,
+    })
+}
+
+/// A backward branch displacement from the current offset to `top`.
+fn back_to(b: &RvBuf, top: u64) -> i32 {
+    (top as i64 - b.offset() as i64) as i32
+}
+
+/// The shift that aligns a narrow lane to the top of a 64-bit register.
+fn lane_top(bytes: u64) -> u32 {
+    64 - 8 * bytes as u32
+}
+
+/// The masked-lane prologue of a narrow (1/2-byte) LR/SC loop: `t6` = the
+/// aligned 4-byte word holding the lane, `t2` = the lane's bit offset in it.
+/// Natural alignment guarantees the lane never straddles two words.
+fn lane_setup(b: &mut RvBuf, ptr: u32) {
+    b.word(andi(T6.into(), ptr, -4));
+    b.word(andi(T2.into(), ptr, 3));
+    b.word(slli(T2.into(), T2.into(), 3));
+}
+
+/// Merge the new lane value in `t1` (garbage above the lane width allowed)
+/// into the loaded word `t0` at bit offset `t2`, leaving the new word in `t1`:
+/// `t1 = t0 ^ (((t1 << t2) ^ t0) & lane_mask)`, masking with shifts so no
+/// extra register is needed.
+fn lane_merge(b: &mut RvBuf, bytes: u64) {
+    let (t0, t1, t2) = (T0.into(), T1.into(), T2.into());
+    b.word(sll(t1, t1, t2));
+    b.word(xor(t1, t1, t0));
+    b.word(srl(t1, t1, t2));
+    b.word(slli(t1, t1, lane_top(bytes)));
+    b.word(srli(t1, t1, lane_top(bytes)));
+    b.word(sll(t1, t1, t2));
+    b.word(xor(t1, t1, t0));
+}
+
+/// Expand [`RvOp::AtomicRmw`] (see its docs): one AMO when the width and the
+/// operation allow, else an LR/SC loop.
+///
+/// The narrow loop keeps the aligned address in `t6`, the lane offset in `t2`,
+/// the loaded word in `t0` and the lane arithmetic in `t1`; the destination
+/// `d` doubles as a temporary (for `max`/`min`) and as the `sc` status, and is
+/// set to the old lane (`t0 >> t2`) after the loop:
+///
+/// ```text
+///     andi t6, ptr, -4 ; andi t2, ptr, 3 ; slli t2, t2, 3
+/// L:  lr.w t0, (t6)
+///     srl  t1, t0, t2              ; old lane (garbage above)
+///     <t1 = op(t1, val)>
+///     <merge t1 into t0 at t2>     ; see lane_merge
+///     sc.w d, t1, (t6)
+///     bnez d, L
+///     srl  d, t0, t2               ; the old value
+/// ```
+fn encode_atomic_rmw(b: &mut RvBuf, ops: &[MachineOperand]) {
+    use crate::ir::inst::RmwOp;
+    let (d, ptr, val) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+    let bytes = simm(&ops[3]) as u64;
+    let op = RmwOp::from_code(simm(&ops[4]) as u64).expect("AtomicRmw carries a valid rmw code");
+    let aqrl = simm(&ops[5]);
+    let (acq, lr_rl, rel) = (aqrl & 1 != 0, aqrl & 2 != 0, aqrl & 4 != 0);
+    let (t0, t1, t6) = (T0.into(), T1.into(), T6.into());
+    let zero = ZERO.into();
+    if bytes >= 4 {
+        if let Some(f5) = amo_funct5(op) {
+            let src = if op == RmwOp::Sub {
+                b.word(sub(t0, zero, val));
+                t0
+            } else {
+                val
+            };
+            b.word(amo(f5, acq, rel, d, src, ptr, bytes));
+            return;
+        }
+        // nand: L: lr d, (ptr); and t0, d, val; not t0; sc t1, t0, (ptr); bnez t1, L
+        let top = b.offset();
+        b.word(lr(bytes, acq, lr_rl, d, ptr));
+        b.word(and(t0, d, val));
+        b.word(xori(t0, t0, -1));
+        b.word(sc(bytes, false, rel, t1, t0, ptr));
+        let back = back_to(b, top);
+        b.word(bne(t1, zero, back));
+        return;
+    }
+    lane_setup(b, ptr);
+    let top = b.offset();
+    b.word(lr(4, acq, lr_rl, t0, t6));
+    b.word(srl(t1, t0, T2.into()));
+    match op {
+        RmwOp::Xchg => b.word(mv(t1, val)),
+        RmwOp::Add => b.word(add(t1, t1, val)),
+        RmwOp::Sub => b.word(sub(t1, t1, val)),
+        RmwOp::And => b.word(and(t1, t1, val)),
+        RmwOp::Nand => {
+            b.word(and(t1, t1, val));
+            b.word(xori(t1, t1, -1));
+        }
+        RmwOp::Or => b.word(or(t1, t1, val)),
+        RmwOp::Xor => b.word(xor(t1, t1, val)),
+        RmwOp::Max | RmwOp::Min | RmwOp::UMax | RmwOp::UMin => {
+            // Compare the lanes at the top of the register (sign bit = the
+            // lane's sign bit), keep `old` when it wins, else take `val`.
+            let top_shift = lane_top(bytes);
+            b.word(slli(t1, t1, top_shift));
+            b.word(slli(d, val, top_shift));
+            let (funct3, keep_lhs) = match op {
+                RmwOp::Max => (5, true),   // bge old, val
+                RmwOp::Min => (5, false),  // bge val, old
+                RmwOp::UMax => (7, true),  // bgeu old, val
+                _ => (7, false),           // bgeu val, old
+            };
+            let (x, y) = if keep_lhs { (t1, d) } else { (d, t1) };
+            b.word(bcmp(funct3, x, y, 8)); // skip the mv
+            b.word(mv(t1, d));
+            b.word(srli(t1, t1, top_shift));
+        }
+    }
+    lane_merge(b, bytes);
+    b.word(sc(4, false, rel, d, t1, t6));
+    let back = back_to(b, top);
+    b.word(bne(d, zero, back));
+    b.word(srl(d, t0, T2.into()));
+}
+
+/// Expand [`RvOp::CmpXchg`] into a strong LR/SC compare-and-exchange loop:
+///
+/// ```text
+/// 64-bit:  L: lr.d d, (ptr); bne d, exp, done; sc.d t0, new, (ptr); bnez t0, L
+/// 32-bit:  sext.w t1, exp  (lr.w sign-extends; `exp` may carry garbage)
+///          L: lr.w d, (ptr); bne d, t1, done; sc.w t0, new, (ptr); bnez t0, L
+/// narrow:  lane setup; L: lr.w t0, (t6); srl t1, t0, t2; slli t1, t1, top;
+///          slli d, exp, top; bne t1, d, done; mv t1, new; <merge>;
+///          sc.w d, t1, (t6); bnez d, L; done: srl d, t0, t2
+/// ```
+fn encode_cmpxchg(b: &mut RvBuf, ops: &[MachineOperand]) {
+    let (d, ptr, expected, new) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), rnum(&ops[3]));
+    let bytes = simm(&ops[4]) as u64;
+    let aqrl = simm(&ops[5]);
+    let (acq, lr_rl, rel) = (aqrl & 1 != 0, aqrl & 2 != 0, aqrl & 4 != 0);
+    let (t0, t1, t6) = (T0.into(), T1.into(), T6.into());
+    let zero = ZERO.into();
+    if bytes >= 4 {
+        let exp = if bytes == 4 {
+            b.word(addiw(t1, expected, 0));
+            t1
+        } else {
+            expected
+        };
+        let top = b.offset();
+        b.word(lr(bytes, acq, lr_rl, d, ptr));
+        b.word(bne(d, exp, 12)); // over the bne, sc and bnez
+        b.word(sc(bytes, false, rel, t0, new, ptr));
+        let back = back_to(b, top);
+        b.word(bne(t0, zero, back));
+        return;
+    }
+    lane_setup(b, ptr);
+    let top = b.offset();
+    let top_shift = lane_top(bytes);
+    b.word(lr(4, acq, lr_rl, t0, t6));
+    b.word(srl(t1, t0, T2.into()));
+    b.word(slli(t1, t1, top_shift));
+    b.word(slli(d, expected, top_shift));
+    // bne over: bne, mv, the 7-word merge, sc, bnez.
+    b.word(bne(t1, d, 4 * 11));
+    b.word(mv(t1, new));
+    lane_merge(b, bytes);
+    b.word(sc(4, false, rel, d, t1, t6));
+    let back = back_to(b, top);
+    b.word(bne(d, zero, back));
+    b.word(srl(d, t0, T2.into()));
+}
+
+/// Test hook: the encoding of one allocated [`RvOp::AtomicRmw`] or
+/// [`RvOp::CmpXchg`].
+#[cfg(test)]
+pub(crate) fn encode_atomic_for_test(inst: &MachineInst) -> Vec<u8> {
+    let mut b = RvBuf::new();
+    match RvOp::decode(inst.opcode) {
+        RvOp::AtomicRmw => encode_atomic_rmw(&mut b, &inst.operands),
+        RvOp::CmpXchg => encode_cmpxchg(&mut b, &inst.operands),
+        other => panic!("not an atomic pseudo: {other:?}"),
+    }
+    b.bytes
 }
 
 /// Encode a `SetCmp` (`[Def d, Use a, Use b, Imm pred, Imm width]`) into a

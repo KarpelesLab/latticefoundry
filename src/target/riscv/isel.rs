@@ -1,4 +1,4 @@
-//! The RISC-V RV64IM machine opcode set ([`RvOp`]) and the integer
+//! The RISC-V RV64IM(A) machine opcode set ([`RvOp`]) and the integer
 //! instruction-selection rules.
 //!
 //! [`RvOp`] is this target's [`Opcode`] vocabulary: a *post-isel, pre-encoding*
@@ -37,10 +37,15 @@
 //! honored: an `i32` argument/return is sign-extended (`sext.w`) and an `i1`
 //! zero-extended, so foreign callees see ABI-conformant registers.
 //!
+//! ## Atomics (the A extension)
+//!
+//! Atomics use the A extension (`lr`/`sc`, `amo*`) and `fence`, so code that
+//! contains them needs an RV64IMA core; code without them stays RV64IM. See
+//! `RiscvTarget::lower_atomic` for the mapping.
+//!
 //! Deferred (noted for a follow-up): the RV64 word forms (`addw`/`divw`/
 //! `sraw`/...) as a cheaper `i32` lowering; scalar floating-point (F/D), the
-//! compressed (C) and atomic (A) extensions; and `> 8` integer arguments passed
-//! on the stack.
+//! compressed (C) extension; and `> 8` integer arguments passed on the stack.
 
 use crate::codegen::isel::{Lower, TargetIsel};
 use crate::codegen::mir::{
@@ -153,6 +158,25 @@ pub enum RvOp {
     /// `[Def d, Use s]` — `sext.w d, s` (`addiw d, s, 0`): sign-extend the low
     /// 32 bits of `s` to 64.
     SextW = 41,
+
+    // --- the A extension (atomics; see `lower_atomic` for the mapping) ------
+    /// `[Imm fm, Imm pred, Imm succ]` — `fence pred, succ` (`fm` = 8 with
+    /// `rw, rw` is `fence.tso`). `pred`/`succ` are the 4-bit `iorw` sets.
+    Fence = 42,
+    /// `[Def d, Use ptr, Use val, Imm size, Imm op, Imm aqrl]` — an atomic
+    /// read-modify-write ([`RmwOp::code`](crate::ir::RmwOp::code) `op`), `d` =
+    /// the old value. A 4/8-byte op with an AMO is one `amo<op>.{w,d}` (`sub`
+    /// negates into `t0` first); `nand` and every 1/2-byte op expand at encode
+    /// time into an LR/SC retry loop (the narrow ones on the aligned word, with
+    /// the lane masked by shifts). `aqrl` bit 0 = acquire (`.aq` on the AMO /
+    /// `lr`), bit 1 = `.rl` on the AMO / `lr` (`seq_cst`), bit 2 = `.rl` on
+    /// `sc`. Clobbers `t0`, `t1`, `t2`, `t6` (never allocated).
+    AtomicRmw = 43,
+    /// `[Def d, Use ptr, Use expected, Use new, Imm size, Imm aqrl]` — a strong
+    /// compare-and-exchange LR/SC loop (narrow sizes on the aligned word); `d` =
+    /// the old value. `aqrl` as for [`RvOp::AtomicRmw`]. Clobbers `t0`, `t1`,
+    /// `t2`, `t6`.
+    CmpXchg = 44,
 }
 
 impl RvOp {
@@ -165,11 +189,11 @@ impl RvOp {
     /// Decode a MIR [`Opcode`] back to an [`RvOp`].
     pub fn decode(op: Opcode) -> RvOp {
         use RvOp::*;
-        const TABLE: [RvOp; 42] = [
+        const TABLE: [RvOp; 45] = [
             Mv, Li, Add, Sub, And, Or, Xor, Mul, Mulh, Addi, Andi, Ori, Xori, Div, Divu, Rem, Remu,
             Slli, Srli, Srai, Sll, Srl, Sra, SetCmp, Select, Load, Store, FrameAddr, GlobalAddr,
             Call, Ret, J, BrCond, Switch, Unreachable, StoreFrame, LoadFrame, AddiSp, SaveReg,
-            RestoreReg, Ecall, SextW,
+            RestoreReg, Ecall, SextW, Fence, AtomicRmw, CmpXchg,
         ];
         TABLE[op.0 as usize]
     }
@@ -319,6 +343,108 @@ impl RiscvTarget {
             32 if is_int => self.extend64(lo, v, true),
             1 if is_int => self.extend64(lo, v, false),
             _ => lo.reg(v),
+        }
+    }
+
+    /// Lower an atomic memory operation or fence with the A extension, following
+    /// the RVWMO mapping of the RISC-V ISA manual (Vol. I, "Memory model"
+    /// appendix, the mapping of C/C++ atomics):
+    ///
+    /// | IR | RISC-V |
+    /// |---|---|
+    /// | `atomic_load relaxed` | `l{b,h,w,d}` |
+    /// | `atomic_load acquire` | `l*; fence r,rw` |
+    /// | `atomic_load seq_cst` | `fence rw,rw; l*; fence r,rw` |
+    /// | `atomic_store relaxed` | `s{b,h,w,d}` |
+    /// | `atomic_store release`/`seq_cst` | `fence rw,w; s*` |
+    /// | `atomic_rmw` (32/64-bit, not `nand`) | `amo<op>.{w,d}{.aq}{.rl}` |
+    /// | `atomic_rmw nand`, any 8/16-bit rmw | LR/SC loop ([`RvOp::AtomicRmw`]) |
+    /// | `cmpxchg` | LR/SC loop ([`RvOp::CmpXchg`]) |
+    /// | `fence acquire` / `release` / `acq_rel` / `seq_cst` | `fence r,rw` / `fence rw,w` / `fence.tso` / `fence rw,rw` |
+    ///
+    /// Acquire orderings set `.aq` (on the AMO or the `lr`), release orderings
+    /// `.rl` (on the AMO or the `sc`), and `seq_cst` both, with `lr.aqrl` in a
+    /// loop.
+    fn lower_atomic(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        use crate::ir::inst::AtomicOrdering;
+        const R: u64 = 0b0010;
+        const W: u64 = 0b0001;
+        const RW: u64 = R | W;
+        let fence = |lo: &mut Lower<'_, Self>, fm: u64, pred: u64, succ: u64| {
+            lo.emit(MachineInst::new(RvOp::Fence.opcode(), vec![imm(fm), imm(pred), imm(succ)]));
+        };
+        // The `aqrl` immediate of the rmw/cmpxchg pseudos.
+        let aqrl = |acq: bool, rel: bool, seq: bool| -> u64 {
+            u64::from(acq) | (u64::from(seq) << 1) | (u64::from(rel) << 2)
+        };
+        let ops = inst.operands();
+        match &inst.kind {
+            InstKind::AtomicLoad { ty, ordering, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(ops[0]);
+                let size = lo.byte_size(*ty);
+                if *ordering == AtomicOrdering::SeqCst {
+                    fence(lo, 0, RW, RW);
+                }
+                lo.emit(MachineInst::new(RvOp::Load.opcode(), vec![def_v(d), use_v(ptr), imm(size)]));
+                if ordering.is_acquire() {
+                    fence(lo, 0, R, RW);
+                }
+            }
+            InstKind::AtomicStore { ty, ordering, .. } => {
+                let ptr = lo.reg(ops[0]);
+                let val = lo.reg(ops[1]);
+                let size = lo.byte_size(*ty);
+                if ordering.is_release() {
+                    fence(lo, 0, RW, W);
+                }
+                lo.emit(MachineInst::new(RvOp::Store.opcode(), vec![use_v(ptr), use_v(val), imm(size)]));
+            }
+            InstKind::AtomicRmw { op, ty, ordering, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(ops[0]);
+                let val = lo.reg(ops[1]);
+                let size = lo.byte_size(*ty);
+                let seq = *ordering == AtomicOrdering::SeqCst;
+                lo.emit(MachineInst::new(
+                    RvOp::AtomicRmw.opcode(),
+                    vec![
+                        def_v(d),
+                        use_v(ptr),
+                        use_v(val),
+                        imm(size),
+                        imm(u64::from(op.code())),
+                        imm(aqrl(ordering.is_acquire(), ordering.is_release(), seq)),
+                    ],
+                ));
+            }
+            InstKind::CmpXchg { ty, success, failure, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(ops[0]);
+                let expected = lo.reg(ops[1]);
+                let new = lo.reg(ops[2]);
+                let size = lo.byte_size(*ty);
+                let acq = success.is_acquire() || failure.is_acquire();
+                let seq = *success == AtomicOrdering::SeqCst;
+                lo.emit(MachineInst::new(
+                    RvOp::CmpXchg.opcode(),
+                    vec![
+                        def_v(d),
+                        use_v(ptr),
+                        use_v(expected),
+                        use_v(new),
+                        imm(size),
+                        imm(aqrl(acq, success.is_release(), seq)),
+                    ],
+                ));
+            }
+            InstKind::Fence(ordering) => match ordering {
+                AtomicOrdering::Acquire => fence(lo, 0, R, RW),
+                AtomicOrdering::Release => fence(lo, 0, RW, W),
+                AtomicOrdering::AcqRel => fence(lo, 0b1000, RW, RW),
+                _ => fence(lo, 0, RW, RW),
+            },
+            other => unreachable!("lower_atomic on {other:?}"),
         }
     }
 
@@ -697,7 +823,7 @@ impl TargetIsel for RiscvTarget {
                 let d = lo.result_reg(inst);
                 lo.emit(MachineInst::new(RvOp::Li.opcode(), vec![def_v(d), imm(0)]));
             }
-            k if k.is_atomic() => panic!("RISC-V backend: atomics are not yet supported: {k:?}"),
+            k if k.is_atomic() => self.lower_atomic(lo, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),
         }
     }
