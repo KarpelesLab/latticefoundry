@@ -405,6 +405,54 @@ fn syscall_result_is_opaque_even_when_identical() {
     assert!(matches!(h.check(), RefinementResult::Unknown(_)));
 }
 
+#[test]
+fn dropping_a_fence_is_never_proved() {
+    // A fence has no result and no value effect, yet dropping one is not a
+    // refinement in a concurrent program. The checker has no memory-model
+    // encoding, so a result-less effect makes the function Unknown (it used to
+    // be skipped silently, which would have "proved" this rewrite).
+    let mut h = unary_int(32);
+    h.set_src(|b, p| {
+        b.fence(crate::ir::AtomicOrdering::SeqCst);
+        p[0]
+    });
+    h.set_tgt(|_, p| p[0]);
+    match h.check() {
+        RefinementResult::Unknown(reason) => assert!(reason.contains("fence"), "reason was {reason:?}"),
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+#[test]
+fn atomics_and_volatile_are_never_proved() {
+    use crate::ir::{AtomicOrdering, RmwOp};
+    // Identical on both sides, and still Unknown: the checker models neither
+    // memory nor inter-thread ordering, so it never claims anything about them.
+    type Body = fn(&mut FunctionBuilder, ValueId, ValueId) -> ValueId;
+    let bodies: [Body; 4] = [
+        |b, x, a| b.atomic_rmw(RmwOp::Add, a, x, AtomicOrdering::SeqCst),
+        |b, x, a| b.cmpxchg(a, x, x, AtomicOrdering::SeqCst, AtomicOrdering::Relaxed),
+        |b, x, a| {
+            let i64t = b.value_type(x);
+            b.atomic_load(i64t, a, AtomicOrdering::Acquire)
+        },
+        |b, x, a| {
+            let i64t = b.value_type(x);
+            b.load_volatile(i64t, a, 8)
+        },
+    ];
+    for body in bodies {
+        let mut h = Harness::signature(|m| {
+            let i64t = m.types_mut().int(64);
+            let ptr = m.types_mut().ptr();
+            (vec![i64t, ptr], i64t)
+        });
+        h.set_src(|b, p| body(b, p[0], p[1]));
+        h.set_tgt(|b, p| body(b, p[0], p[1]));
+        assert!(matches!(h.check(), RefinementResult::Unknown(_)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cross-checks against the concrete reference evaluator.
 // ---------------------------------------------------------------------------

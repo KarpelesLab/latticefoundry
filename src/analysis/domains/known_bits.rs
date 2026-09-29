@@ -306,7 +306,7 @@ impl AbstractDomain for KnownBits {
                 | InstKind::Load { .. }
                 | InstKind::Call
                 | InstKind::Syscall
-        ) {
+        ) || inst.kind.is_atomic() {
             return KnownBits::Top;
         }
         // An undetermined operand keeps the result undetermined (SCCP optimism).

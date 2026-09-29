@@ -459,6 +459,12 @@ impl Enc<'_> {
                 if let Some(res) = inst.result() {
                     let sym = self.encode_inst(func, prefix, inst, res, &mut map, &mut ub, &reach)?;
                     map.insert(res, sym);
+                } else if inst.kind.has_side_effect() {
+                    // A result-less effect (a store, a void call, an atomic store,
+                    // a fence) changes state the encoding does not model; skipping
+                    // it silently could "prove" a rewrite that drops or reorders
+                    // it, so the whole function is Unknown instead.
+                    return Err(unsupported("result-less memory effect (store / void call / fence)"));
                 }
             }
 
@@ -743,6 +749,13 @@ impl Enc<'_> {
             | InstKind::Load { .. }
             | InstKind::Store { .. }
             | InstKind::Call => return Err(unsupported("memory / call op")),
+            // Atomics and fences: memory state plus inter-thread ordering, which
+            // the checker does not model; skipped (Unknown), never proved.
+            InstKind::AtomicLoad { .. }
+            | InstKind::AtomicStore { .. }
+            | InstKind::AtomicRmw { .. }
+            | InstKind::CmpXchg { .. }
+            | InstKind::Fence(_) => return Err(unsupported("atomic memory op / fence")),
             // An opaque effect on the outside world: the checker has no model of
             // the kernel, so a function containing one is skipped, never proved.
             InstKind::Syscall => return Err(unsupported("syscall (opaque external effect)")),

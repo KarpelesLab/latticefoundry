@@ -819,6 +819,100 @@ fn encode_store(e: &mut Emitter, ops: &[MachineOperand]) {
     }
 }
 
+/// Emit a (optionally `lock`-prefixed) `op [base], reg` with the operand size
+/// `size` bytes: the byte form uses `op8`, the others `op`, with a `66` prefix
+/// for 16 bits and `REX.W` for 64. The byte form forces a `REX` when `reg` is
+/// 4..7 so it names `spl`/`bpl`/`sil`/`dil` rather than `ah`..`bh`. The legacy
+/// prefixes (`66`, `F0`; any order is legal, we use the assemblers' `66 F0`)
+/// precede the `REX` byte, as the encoding requires.
+fn atomic_mem_rr(e: &mut Emitter, lock: bool, op8: &[u8], op: &[u8], reg: u8, base: u8, size: u64) {
+    if size == 2 {
+        e.u8(0x66);
+    }
+    if lock {
+        e.u8(0xF0);
+    }
+    match size {
+        1 => mem(e, op8, reg, base, 0, false, reg >= 4),
+        2 => mem(e, op, reg, base, 0, false, false),
+        4 => mem(e, op, reg, base, 0, false, false),
+        _ => mem(e, op, reg, base, 0, true, false),
+    }
+}
+
+/// Test hook: [`atomic_mem_rr`] for the three atomic opcode families, named by
+/// the byte of their full-width form (`0xB1` cmpxchg, `0xC1` xadd, `0x87`
+/// xchg).
+#[cfg(test)]
+pub(crate) fn atomic_mem_rr_for_test(e: &mut Emitter, lock: bool, op: u8, reg: u8, base: u8, size: u64) {
+    let (op8, opw): (&[u8], &[u8]) = match op {
+        0xB1 => (&[0x0F, 0xB0], &[0x0F, 0xB1]),
+        0xC1 => (&[0x0F, 0xC0], &[0x0F, 0xC1]),
+        _ => (&[0x86], &[0x87]),
+    };
+    atomic_mem_rr(e, lock, op8, opw, reg, base, size);
+}
+
+/// Expand [`X86Op::RmwLoop`] — `[Def rax, Def tmp, Use ptr, Use val, Imm size,
+/// Imm op]` — into a `lock cmpxchg` retry loop:
+///
+/// ```text
+///     mov{zx} eax/rax, [ptr]        ; old
+/// L:  mov tmp, rax
+///     <tmp = op(tmp, val)>          ; and/or/xor, and+not, or cmp+cmov
+///     lock cmpxchg [ptr], tmp       ; if [ptr] == old: [ptr] = tmp, else rax = [ptr]
+///     jne L
+/// ```
+///
+/// On exit `rax` holds the value the successful exchange replaced (the old
+/// value). Registers narrower than 64 bits carry garbage above the width; every
+/// step only consumes the low `8 * size` bits (the sized `cmp` and `cmpxchg`),
+/// so that is harmless.
+fn encode_rmw_loop(e: &mut Emitter, ops: &[MachineOperand]) {
+    use crate::ir::inst::RmwOp;
+    let rax = regs::RAX as u8;
+    let tmp = rnum(&ops[1]);
+    let ptr = rnum(&ops[2]);
+    let val = rnum(&ops[3]);
+    let size = uimm(&ops[4]);
+    let op = RmwOp::from_code(uimm(&ops[5])).expect("RmwLoop carries a valid rmw code");
+    let width = (8 * size) as u32;
+    encode_load(e, &[ops[0].clone(), ops[2].clone(), MachineOperand::Imm(puremp::Int::from_u64(size))]);
+    let top = e.create_label();
+    e.bind_label(top);
+    mov_rr(e, tmp, rax, true);
+    match op {
+        RmwOp::And => alu_rr(e, 0x21, tmp, val, true),
+        RmwOp::Or => alu_rr(e, 0x09, tmp, val, true),
+        RmwOp::Xor => alu_rr(e, 0x31, tmp, val, true),
+        RmwOp::Nand => {
+            alu_rr(e, 0x21, tmp, val, true);
+            // not tmp (F7 /2)
+            e.u8(rex(true, false, false, tmp >= 8));
+            e.u8(0xF7);
+            e.u8(modrm(3, 2, tmp));
+        }
+        RmwOp::Max | RmwOp::Min | RmwOp::UMax | RmwOp::UMin => {
+            // cmp old, val at the access width; take `val` when it wins.
+            cmp_rr_width(e, rax, val, width);
+            let cc = match op {
+                RmwOp::Max => 0xC,  // old <  val (signed)   -> val
+                RmwOp::Min => 0xF,  // old >  val (signed)   -> val
+                RmwOp::UMax => 0x2, // old <  val (unsigned) -> val
+                _ => 0x7,           // old >  val (unsigned) -> val
+            };
+            cmov_rr(e, cc, tmp, val, true);
+        }
+        RmwOp::Xchg | RmwOp::Add | RmwOp::Sub => {
+            unreachable!("xchg/add/sub lower to xchg / lock xadd, not a loop")
+        }
+    }
+    atomic_mem_rr(e, true, &[0x0F, 0xB0], &[0x0F, 0xB1], tmp, ptr, size);
+    e.u8(0x0F);
+    e.u8(0x85); // jne top
+    e.pcrel32(Ref::Label(top), 0);
+}
+
 /// Encode one machine instruction into `e`.
 fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
     let ops = &inst.operands;
@@ -1032,6 +1126,32 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             e.u8(0x0F);
             e.u8(0x05); // syscall
         }
+        X86Op::Mfence => e.bytes(&[0x0F, 0xAE, 0xF0]),
+        X86Op::Xchg => {
+            // mov d, val; xchg [ptr], d  (xchg with memory is implicitly locked)
+            let (d, ptr, val, size) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), uimm(&ops[3]));
+            if d != val {
+                mov_rr(e, d, val, true);
+            }
+            atomic_mem_rr(e, false, &[0x86], &[0x87], d, ptr, size);
+        }
+        X86Op::LockXadd => {
+            // mov d, val; [neg d;] lock xadd [ptr], d
+            let (d, ptr, val, size) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), uimm(&ops[3]));
+            if d != val {
+                mov_rr(e, d, val, true);
+            }
+            if uimm(&ops[4]) != 0 {
+                neg_r(e, d, true);
+            }
+            atomic_mem_rr(e, true, &[0x0F, 0xC0], &[0x0F, 0xC1], d, ptr, size);
+        }
+        X86Op::LockCmpxchg => {
+            // lock cmpxchg [ptr], new   (expected/old in rax)
+            let (ptr, new, size) = (rnum(&ops[2]), rnum(&ops[3]), uimm(&ops[4]));
+            atomic_mem_rr(e, true, &[0x0F, 0xB0], &[0x0F, 0xB1], new, ptr, size);
+        }
+        X86Op::RmwLoop => encode_rmw_loop(e, ops),
         X86Op::Push => push_r(e, rnum(&ops[0])),
         X86Op::Pop => pop_r(e, rnum(&ops[0])),
         X86Op::MovRbpRsp => mov_rr(e, RBP as u8, RSP as u8, true),

@@ -224,7 +224,7 @@ impl AbstractDomain for Range {
                 | InstKind::Load { .. }
                 | InstKind::Call
                 | InstKind::Syscall
-        ) {
+        ) || inst.kind.is_atomic() {
             return Range::Top;
         }
         // SCCP optimism: an undetermined operand keeps the result undetermined.

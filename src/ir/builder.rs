@@ -13,8 +13,8 @@
 //! data layout and lower to `ptr_add` (`docs/ir-design.md` §6).
 
 use crate::ir::inst::{
-    BinOp, CastOp, Flags, FloatPred, InstData, InstId, InstKind, IntPred, SwitchCase, SwitchData,
-    UnaryOp, Use,
+    AtomicOrdering, BinOp, CastOp, Flags, FloatPred, InstData, InstId, InstKind, IntPred, RmwOp,
+    SwitchCase, SwitchData, UnaryOp, Use,
 };
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ConstId, ConstPool, FloatBits, ValueDef, ValueId};
@@ -284,13 +284,99 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Load a value of `ty` from `ptr` with the given alignment.
     pub fn load(&mut self, ty: TypeId, ptr: ValueId, align: u32) -> ValueId {
-        self.emit(InstKind::Load { ty, align }, vec![ptr], Flags::NONE, Some(ty))
+        self.emit(InstKind::Load { ty, align, volatile: false }, vec![ptr], Flags::NONE, Some(ty))
             .expect("load has a result")
     }
 
     /// Store `val` (of `ty`) to `ptr` with the given alignment.
     pub fn store(&mut self, ty: TypeId, ptr: ValueId, val: ValueId, align: u32) {
-        self.emit(InstKind::Store { ty, align }, vec![ptr, val], Flags::NONE, None);
+        self.emit(InstKind::Store { ty, align, volatile: false }, vec![ptr, val], Flags::NONE, None);
+    }
+
+    /// A **volatile** load of `ty` from `ptr` (memory-mapped I/O): performed
+    /// exactly once, at exactly `ty`'s width, in program order with every other
+    /// volatile access; never removed, merged, or forwarded (see
+    /// [`InstKind::Load`]).
+    pub fn load_volatile(&mut self, ty: TypeId, ptr: ValueId, align: u32) -> ValueId {
+        self.emit(InstKind::Load { ty, align, volatile: true }, vec![ptr], Flags::NONE, Some(ty))
+            .expect("load has a result")
+    }
+
+    /// A **volatile** store of `val` (of `ty`) to `ptr`; see
+    /// [`FunctionBuilder::load_volatile`].
+    pub fn store_volatile(&mut self, ty: TypeId, ptr: ValueId, val: ValueId, align: u32) {
+        self.emit(InstKind::Store { ty, align, volatile: true }, vec![ptr, val], Flags::NONE, None);
+    }
+
+    /// The natural alignment of an atomic access of `ty`: its size in bytes.
+    fn atomic_align(&self, ty: TypeId) -> u32 {
+        self.types.size_of(ty).max(1) as u32
+    }
+
+    /// An atomic load of `ty` (`i8`..`i64` or `ptr`) from a naturally aligned
+    /// `ptr` with `ordering` (`relaxed`, `acquire` or `seq_cst`).
+    pub fn atomic_load(&mut self, ty: TypeId, ptr: ValueId, ordering: AtomicOrdering) -> ValueId {
+        let align = self.atomic_align(ty);
+        self.emit(InstKind::AtomicLoad { ty, align, ordering }, vec![ptr], Flags::NONE, Some(ty))
+            .expect("atomic_load has a result")
+    }
+
+    /// An atomic store of `val` (of `ty`) to a naturally aligned `ptr` with
+    /// `ordering` (`relaxed`, `release` or `seq_cst`).
+    pub fn atomic_store(&mut self, ty: TypeId, ptr: ValueId, val: ValueId, ordering: AtomicOrdering) {
+        let align = self.atomic_align(ty);
+        self.emit(InstKind::AtomicStore { ty, align, ordering }, vec![ptr, val], Flags::NONE, None);
+    }
+
+    /// An atomic read-modify-write: indivisibly replace `*ptr` with
+    /// `op(*ptr, val)` and return the old value. The accessed type is `val`'s.
+    pub fn atomic_rmw(
+        &mut self,
+        op: RmwOp,
+        ptr: ValueId,
+        val: ValueId,
+        ordering: AtomicOrdering,
+    ) -> ValueId {
+        let ty = self.func.value_type(val);
+        let align = self.atomic_align(ty);
+        self.emit(InstKind::AtomicRmw { op, ty, align, ordering }, vec![ptr, val], Flags::NONE, Some(ty))
+            .expect("atomic_rmw has a result")
+    }
+
+    /// A strong atomic compare-and-exchange: if `*ptr == expected` store `new`.
+    /// Returns the old value; the exchange happened iff it equals `expected`
+    /// (see [`FunctionBuilder::cmpxchg_success`]). The accessed type is
+    /// `expected`'s.
+    pub fn cmpxchg(
+        &mut self,
+        ptr: ValueId,
+        expected: ValueId,
+        new: ValueId,
+        success: AtomicOrdering,
+        failure: AtomicOrdering,
+    ) -> ValueId {
+        let ty = self.func.value_type(expected);
+        let align = self.atomic_align(ty);
+        self.emit(
+            InstKind::CmpXchg { ty, align, success, failure },
+            vec![ptr, expected, new],
+            Flags::NONE,
+            Some(ty),
+        )
+        .expect("cmpxchg has a result")
+    }
+
+    /// The `i1` success flag of a [`cmpxchg`](FunctionBuilder::cmpxchg) that
+    /// returned `old` for `expected`: `icmp eq old, expected` (exact, since the
+    /// exchange is strong).
+    pub fn cmpxchg_success(&mut self, old: ValueId, expected: ValueId) -> ValueId {
+        self.icmp(IntPred::Eq, old, expected)
+    }
+
+    /// A memory fence with `ordering` (`acquire`, `release`, `acq_rel` or
+    /// `seq_cst`).
+    pub fn fence(&mut self, ordering: AtomicOrdering) {
+        self.emit(InstKind::Fence(ordering), Vec::new(), Flags::NONE, None);
     }
 
     /// Displace a pointer by a byte offset; result is a pointer.

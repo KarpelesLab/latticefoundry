@@ -357,6 +357,54 @@ fn lower_call_runs() {
 }
 
 #[test]
+fn atomics_and_volatile_lower_and_run_sequentially() {
+    // The virtual machine is single-threaded: each atomic runs its sequential
+    // meaning, a fence is a no-op marker, and a volatile access is a plain one.
+    let src = "module \"t\"
+func @f(i64) -> i64 {
+entry ^0(%x: i64):
+  %s = alloca i64 : ptr
+  store volatile %x, %s align 8 : i64
+  %o1 = atomic_rmw add seq_cst %s, i64 5 align 8 : i64
+  %e = add %x, i64 5 : i64
+  %o2 = cmpxchg seq_cst relaxed %s, %e, i64 100 align 8 : i64
+  %o3 = cmpxchg seq_cst relaxed %s, %e, i64 999 align 8 : i64
+  fence seq_cst
+  %o4 = atomic_rmw umin relaxed %s, i64 64 align 8 : i64
+  %v = atomic_load acquire %s align 8 : i64
+  atomic_store release %v, %s align 8 : i64
+  %w = load volatile %s align 8 : i64
+  %a = add %o1, %o2 : i64
+  %b = add %a, %o3 : i64
+  %c = add %b, %o4 : i64
+  %d = add %c, %w : i64
+  ret %d
+}
+";
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(src, crate::support::diagnostics::FileId::new(0), &mut syms)
+        .expect("parse");
+    let target = VirtualTarget::new();
+    let mut mf = target.select(&m, FuncId::from_index(0));
+    assert_well_formed(&mf, &target);
+    let count = |mf: &MachineFunction, op: VOp| {
+        mf.block_ids().flat_map(|b| mf.block(b).insts.clone()).filter(|i| VOp::decode(i.opcode) == op).count()
+    };
+    assert_eq!(count(&mf, VOp::AtomicRmw), 2);
+    assert_eq!(count(&mf, VOp::CmpXchg), 2);
+    assert_eq!(count(&mf, VOp::Fence), 1);
+    for x in [0i64, 7, 1000] {
+        // o1 = x; o2 = x+5 (exchanged to 100); o3 = 100 (fails); o4 = 100
+        // (then min(100, 64) = 64); w = 64.
+        let want = x + (x + 5) + 100 + 100 + 64;
+        let got = interp::run(&target, std::slice::from_ref(&mf), 0, &[Int::from_i64(x)]).unwrap().unwrap();
+        assert_eq!(got, Int::from_i64(want), "f({x})");
+    }
+    regalloc::allocate(&mut mf, &target);
+    assert_all_physical(&mf);
+}
+
+#[test]
 fn lower_memory_roundtrip_runs() {
     let target = VirtualTarget::new();
     let (m, f) = build_mem();

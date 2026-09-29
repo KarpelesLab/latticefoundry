@@ -53,7 +53,7 @@
 //! [`addr_compatible`]; the base / address sites use [`is_aggregate`] alongside
 //! [`is_ptr`].
 
-use crate::ir::inst::{BinOp, CastOp, InstData, InstId, InstKind, UnaryOp};
+use crate::ir::inst::{AtomicOrdering, BinOp, CastOp, InstData, InstId, InstKind, RmwOp, UnaryOp};
 use crate::ir::types::{FloatKind, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, Module};
@@ -444,7 +444,7 @@ impl<'a> Ctx<'a> {
                     ));
                 }
             }
-            InstKind::Load { ty: acc, align } => {
+            InstKind::Load { ty: acc, align, .. } => {
                 self.check_align(inst, "load", *align);
                 if !self.arity(inst, ops, 1) {
                     return;
@@ -461,7 +461,7 @@ impl<'a> Ctx<'a> {
                     self.type_mismatch(inst, "load result vs. accessed type", ty, *acc);
                 }
             }
-            InstKind::Store { ty: acc, align } => {
+            InstKind::Store { ty: acc, align, .. } => {
                 self.check_align(inst, "store", *align);
                 if !self.arity(inst, ops, 2) {
                     return;
@@ -478,6 +478,74 @@ impl<'a> Ctx<'a> {
                 if v != *acc {
                     self.type_mismatch(inst, "stored value vs. accessed type", v, *acc);
                 }
+            }
+            InstKind::AtomicLoad { ty: acc, align, ordering } => {
+                self.check_atomic_type(inst, "atomic_load", *acc, *align, true);
+                if !ordering.valid_for_load() {
+                    self.bad_ordering(inst, "atomic_load", *ordering, "relaxed, acquire or seq_cst");
+                }
+                if !self.arity(inst, ops, 1) {
+                    return;
+                }
+                self.check_atomic_addr(inst, "atomic_load", ops[0]);
+                if *acc != ty {
+                    self.type_mismatch(inst, "atomic_load result vs. accessed type", ty, *acc);
+                }
+            }
+            InstKind::AtomicStore { ty: acc, align, ordering } => {
+                self.check_atomic_type(inst, "atomic_store", *acc, *align, true);
+                if !ordering.valid_for_store() {
+                    self.bad_ordering(inst, "atomic_store", *ordering, "relaxed, release or seq_cst");
+                }
+                if !self.arity(inst, ops, 2) {
+                    return;
+                }
+                self.check_atomic_addr(inst, "atomic_store", ops[0]);
+                let v = func.value_type(ops[1]);
+                if v != *acc {
+                    self.type_mismatch(inst, "atomic_store value vs. accessed type", v, *acc);
+                }
+            }
+            InstKind::AtomicRmw { op, ty: acc, align, .. } => {
+                // Only `xchg` moves a pointer; the arithmetic ops are integer-only.
+                let allow_ptr = *op == RmwOp::Xchg;
+                self.check_atomic_type(inst, "atomic_rmw", *acc, *align, allow_ptr);
+                if !self.arity(inst, ops, 2) {
+                    return;
+                }
+                self.check_atomic_addr(inst, "atomic_rmw", ops[0]);
+                let v = func.value_type(ops[1]);
+                if v != *acc {
+                    self.type_mismatch(inst, "atomic_rmw operand vs. accessed type", v, *acc);
+                }
+                if *acc != ty {
+                    self.type_mismatch(inst, "atomic_rmw result vs. accessed type", ty, *acc);
+                }
+            }
+            InstKind::CmpXchg { ty: acc, align, failure, .. } => {
+                self.check_atomic_type(inst, "cmpxchg", *acc, *align, true);
+                if !failure.valid_for_load() {
+                    self.bad_ordering(inst, "cmpxchg failure", *failure, "relaxed, acquire or seq_cst");
+                }
+                if !self.arity(inst, ops, 3) {
+                    return;
+                }
+                self.check_atomic_addr(inst, "cmpxchg", ops[0]);
+                for (what, &o) in [("expected", &ops[1]), ("new", &ops[2])] {
+                    let v = func.value_type(o);
+                    if v != *acc {
+                        self.type_mismatch(inst, &format!("cmpxchg {what} vs. accessed type"), v, *acc);
+                    }
+                }
+                if *acc != ty {
+                    self.type_mismatch(inst, "cmpxchg result vs. accessed type", ty, *acc);
+                }
+            }
+            InstKind::Fence(ordering) => {
+                if !ordering.valid_for_fence() {
+                    self.bad_ordering(inst, "fence", *ordering, "acquire, release, acq_rel or seq_cst");
+                }
+                self.arity(inst, ops, 0);
             }
             InstKind::PtrAdd { .. } => {
                 if !self.arity(inst, ops, 2) {
@@ -1101,6 +1169,52 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// An atomic access type must be `i8`/`i16`/`i32`/`i64` (or `ptr` where
+    /// `allow_ptr`), with an alignment that is a power of two and at least the
+    /// type's size (natural alignment).
+    fn check_atomic_type(&mut self, inst: InstId, op: &str, acc: TypeId, align: u32, allow_ptr: bool) {
+        let m = self.module;
+        let ok_int = matches!(m.types().get(acc), Type::Int(8 | 16 | 32 | 64));
+        if !(ok_int || (allow_ptr && is_ptr(m, acc))) {
+            let allowed = if allow_ptr { "i8, i16, i32, i64 or ptr" } else { "i8, i16, i32 or i64" };
+            self.err(format!(
+                "instruction #{}: {op} accesses {}, but atomics support only {allowed}",
+                inst.index(),
+                render_type(m, acc),
+            ));
+            return;
+        }
+        self.check_align(inst, op, align);
+        let size = m.types().size_of(acc);
+        if u64::from(align) < size {
+            self.err(format!(
+                "instruction #{}: {op} alignment {align} is below the natural alignment {size} of {}",
+                inst.index(),
+                render_type(m, acc),
+            ));
+        }
+    }
+
+    /// An atomic's address operand must be a `ptr`.
+    fn check_atomic_addr(&mut self, inst: InstId, op: &str, addr: ValueId) {
+        let p = self.func.value_type(addr);
+        if !is_ptr(self.module, p) {
+            self.err(format!(
+                "instruction #{}: {op} address operand must be a pointer, found {}",
+                inst.index(),
+                render_type(self.module, p),
+            ));
+        }
+    }
+
+    fn bad_ordering(&mut self, inst: InstId, op: &str, o: AtomicOrdering, allowed: &str) {
+        self.err(format!(
+            "instruction #{}: {op} ordering `{}` is invalid (allowed: {allowed})",
+            inst.index(),
+            o.name(),
+        ));
+    }
+
     fn type_mismatch(&mut self, inst: InstId, what: &str, a: TypeId, b: TypeId) {
         let (x, y) = (render_type(self.module, a), render_type(self.module, b));
         self.err(format!("instruction #{}: {what}: {x} vs. {y}", inst.index()));
@@ -1569,5 +1683,124 @@ mod syscall_tests {
             b.cast(CastOp::PtrToInt, r, i64t)
         });
         assert!(diags.iter().any(|d| d.contains("syscall result must be i64, found ptr")), "{diags:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for volatile accesses, atomics and fences.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod atomic_tests {
+    use crate::support::StrInterner;
+    use crate::support::diagnostics::FileId;
+    use crate::verify::verify_module;
+
+    /// Parse a one-block function `f(ptr %p, i32 %v, i64 %w) -> void` whose
+    /// body is `body` and return the verifier's messages (empty when valid).
+    /// Parsing must succeed: these are type/ordering errors only the verifier
+    /// catches.
+    fn check(body: &str) -> Vec<String> {
+        let src = format!(
+            "module \"t\"\nfunc @f(ptr, i32, i64) -> void {{\nentry ^0(%p: ptr, %v: i32, %w: i64):\n{body}\n  ret\n}}\n"
+        );
+        let mut syms = StrInterner::new();
+        let m = crate::ir::text::parse_module(&src, FileId::new(0), &mut syms)
+            .unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+        match verify_module(&m) {
+            Ok(()) => Vec::new(),
+            Err(diags) => diags.into_iter().map(|d| d.message).collect(),
+        }
+    }
+
+    fn assert_rejects(body: &str, needle: &str) {
+        let diags = check(body);
+        assert!(diags.iter().any(|d| d.contains(needle)), "`{body}`: expected `{needle}` in {diags:?}");
+    }
+
+    #[test]
+    fn valid_forms_verify() {
+        let mut syms = StrInterner::new();
+        let m = crate::ir::tests::atomics_module(&mut syms);
+        assert!(verify_module(&m).is_ok());
+        let diags = check(
+            "  %a = load volatile %p align 1 : i32\n  store volatile %v, %p align 2 : i32\n  %b = atomic_load acquire %p align 4 : i32\n  %c = atomic_rmw umax relaxed %p, %v align 8 : i32\n  %d = cmpxchg release seq_cst %p, %w, %w align 8 : i64\n  fence release",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn load_cannot_release_and_store_cannot_acquire() {
+        assert_rejects("  %a = atomic_load release %p align 4 : i32", "atomic_load ordering `release` is invalid");
+        assert_rejects("  %a = atomic_load acq_rel %p align 4 : i32", "atomic_load ordering `acq_rel` is invalid");
+        assert_rejects("  atomic_store acquire %v, %p align 4 : i32", "atomic_store ordering `acquire` is invalid");
+        assert_rejects("  atomic_store acq_rel %v, %p align 4 : i32", "atomic_store ordering `acq_rel` is invalid");
+    }
+
+    #[test]
+    fn cmpxchg_failure_must_be_a_load_ordering_and_fence_not_relaxed() {
+        assert_rejects(
+            "  %a = cmpxchg seq_cst release %p, %v, %v align 4 : i32",
+            "cmpxchg failure ordering `release` is invalid",
+        );
+        assert_rejects(
+            "  %a = cmpxchg seq_cst acq_rel %p, %v, %v align 4 : i32",
+            "cmpxchg failure ordering `acq_rel` is invalid",
+        );
+        assert_rejects("  fence relaxed", "fence ordering `relaxed` is invalid");
+    }
+
+    #[test]
+    fn under_aligned_atomics_are_rejected() {
+        assert_rejects(
+            "  %a = atomic_load seq_cst %p align 2 : i32",
+            "atomic_load alignment 2 is below the natural alignment 4 of i32",
+        );
+        assert_rejects(
+            "  atomic_store relaxed %w, %p align 4 : i64",
+            "atomic_store alignment 4 is below the natural alignment 8 of i64",
+        );
+        assert_rejects("  %a = atomic_rmw add relaxed %p, %v align 3 : i32", "must be a nonzero power of two");
+        assert_rejects(
+            "  %a = cmpxchg seq_cst seq_cst %p, %w, %w align 1 : i64",
+            "cmpxchg alignment 1 is below the natural alignment 8 of i64",
+        );
+    }
+
+    #[test]
+    fn unsupported_atomic_types_are_rejected() {
+        assert_rejects(
+            "  %a = atomic_load relaxed %p align 16 : i128",
+            "atomic_load accesses i128, but atomics support only i8, i16, i32, i64 or ptr",
+        );
+        assert_rejects(
+            "  %a = atomic_load relaxed %p align 1 : i1",
+            "atomics support only i8, i16, i32, i64 or ptr",
+        );
+        assert_rejects(
+            "  %a = atomic_load relaxed %p align 8 : f64",
+            "atomic_load accesses f64",
+        );
+        // Arithmetic rmw on a pointer: only xchg moves pointers.
+        assert_rejects(
+            "  %a = atomic_rmw add relaxed %p, %p align 8 : ptr",
+            "atomic_rmw accesses ptr, but atomics support only i8, i16, i32 or i64",
+        );
+        assert!(check("  %a = atomic_rmw xchg relaxed %p, %p align 8 : ptr").is_empty());
+    }
+
+    #[test]
+    fn operand_types_must_match_the_access() {
+        assert_rejects("  atomic_store relaxed %w, %p align 8 : i32", "atomic_store value vs. accessed type");
+        assert_rejects("  %a = atomic_rmw add relaxed %p, %w align 8 : i32", "atomic_rmw operand vs. accessed type");
+        assert_rejects(
+            "  %a = cmpxchg seq_cst relaxed %p, %v, %w align 8 : i64",
+            "cmpxchg expected vs. accessed type",
+        );
+        assert_rejects(
+            "  %a = cmpxchg seq_cst relaxed %p, %w, %v align 8 : i64",
+            "cmpxchg new vs. accessed type",
+        );
+        // The address must be a pointer (not an aggregate, unlike plain load).
+        assert_rejects("  %a = atomic_load relaxed %w align 8 : i64", "atomic_load address operand must be a pointer");
     }
 }

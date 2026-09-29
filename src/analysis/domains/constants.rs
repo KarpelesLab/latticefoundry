@@ -125,7 +125,7 @@ impl AbstractDomain for ConstLattice {
                 | InstKind::Load { .. }
                 | InstKind::Call
                 | InstKind::Syscall
-        ) {
+        ) || inst.kind.is_atomic() {
             return ConstLattice::Top;
         }
 

@@ -3,10 +3,12 @@
 //! An instruction is *dead* when its result is used by nothing that ultimately
 //! contributes to the function's observable behavior, and the instruction itself
 //! has **no side effects**. Per the reference semantics the side-effecting /
-//! always-live opcodes are `store`, `call`, and `alloca` (memory effects) and
-//! every terminator (control flow); everything else — arithmetic, comparisons,
-//! casts, `select`, `freeze`, `ptr_add`, and `load` — is a pure value whose only
-//! reason to exist is its result.
+//! always-live opcodes are `store`, `call`, `syscall`, `alloca`/`dyn_alloca`,
+//! every atomic (`atomic_load`, `atomic_store`, `atomic_rmw`, `cmpxchg`) and
+//! `fence`, a *volatile* `load` (see [`InstKind::has_side_effect`]), and every
+//! terminator (control flow); everything else — arithmetic, comparisons, casts,
+//! `select`, `freeze`, `ptr_add`, and a plain `load` — is a pure value whose
+//! only reason to exist is its result.
 //!
 //! Liveness is a backward reachability fixpoint: seed the live set with the
 //! side-effecting instructions and terminators, then repeatedly mark the
@@ -38,16 +40,10 @@ impl FunctionTransform for Dce {
     }
 }
 
-/// Whether an opcode has a side effect that keeps it live regardless of use.
+/// Whether an opcode has a side effect that keeps it live regardless of use
+/// (stores, calls, syscalls, allocations, atomics, fences, volatile loads).
 fn has_side_effect(kind: &InstKind) -> bool {
-    matches!(
-        kind,
-        InstKind::Alloca { .. }
-            | InstKind::DynAlloca { .. }
-            | InstKind::Store { .. }
-            | InstKind::Call
-            | InstKind::Syscall
-    )
+    kind.has_side_effect()
 }
 
 /// Mark instruction `i` live and enqueue it, if it was not already.

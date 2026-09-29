@@ -254,3 +254,58 @@ entry ^0(%fd: i64):
     assert_eq!(fcntl(-1), -9, "EBADF comes back as a raw -errno");
     assert_eq!(fcntl(1_000_000), -9);
 }
+
+/// JIT-compiled atomics operating on memory owned by Rust: `lfinc(addr, n)`
+/// does `n` seq_cst fetch-adds of 1 on the `u64` at `addr` and returns the last
+/// old value; `lfcas(addr, expected)` exchanges `expected` for `expected + 1`
+/// and returns the old value.
+const JIT_ATOMICS: &str = "module \"t\"
+func @lfinc(i64, i64) -> i64 {
+entry ^0(%a: i64, %n: i64):
+  %p = inttoptr %a : ptr
+  br ^1(i64 0, i64 0)
+^1(%i: i64, %last: i64):
+  %c = icmp slt %i, %n : i1
+  cond_br %c, ^2, ^3
+^2:
+  %o = atomic_rmw add seq_cst %p, i64 1 align 8 : i64
+  %i2 = add %i, i64 1 : i64
+  br ^1(%i2, %o)
+^3:
+  ret %last
+}
+
+func @lfcas(i64, i64) -> i64 {
+entry ^0(%a: i64, %e: i64):
+  %p = inttoptr %a : ptr
+  %n = add %e, i64 1 : i64
+  %o = cmpxchg acq_rel acquire %p, %e, %n align 8 : i64
+  ret %o
+}
+";
+
+#[test]
+fn jit_atomics_on_rust_memory_across_threads() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (m, syms) = parse_lf(JIT_ATOMICS);
+    let cm = Jit::new().compile(&m, &syms).unwrap();
+    let inc = cm.get_fn_i64_i64_i64("lfinc").expect("lfinc is compiled");
+    let cas = cm.get_fn_i64_i64_i64("lfcas").expect("lfcas is compiled");
+    let cell = AtomicU64::new(0);
+    let addr = cell.as_ptr() as i64;
+
+    // Four Rust threads race JIT-compiled fetch-adds on one counter.
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| inc(addr, 100_000));
+        }
+    });
+    assert_eq!(cell.load(Ordering::SeqCst), 400_000, "no increment was lost");
+
+    // Compare-exchange: success returns the expected value and stores +1; a
+    // stale expectation fails, returns the current value, and stores nothing.
+    assert_eq!(cas(addr, 400_000), 400_000);
+    assert_eq!(cell.load(Ordering::SeqCst), 400_001);
+    assert_eq!(cas(addr, 7), 400_001);
+    assert_eq!(cell.load(Ordering::SeqCst), 400_001);
+}

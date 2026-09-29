@@ -46,8 +46,14 @@
 //!               | castop operand ":" type
 //!               | "alloca" type ":" type
 //!               | "dyn_alloca" operand "align" INT ":" type
-//!               | "load" operand "align" INT ":" type
-//!               | "store" operand "," operand "align" INT ":" type
+//!               | "load" [ "volatile" ] operand "align" INT ":" type
+//!               | "store" [ "volatile" ] operand "," operand "align" INT ":" type
+//!               | "atomic_load" ordering operand "align" INT ":" type
+//!               | "atomic_store" ordering operand "," operand "align" INT ":" type
+//!               | "atomic_rmw" rmwop ordering operand "," operand "align" INT ":" type
+//!               | "cmpxchg" ordering ordering operand "," operand "," operand
+//!                 "align" INT ":" type
+//!               | "fence" ordering
 //!               | "ptr_add" [ "inbounds" ] operand "," operand ":" type
 //!               | "select" operand "," operand "," operand ":" type
 //!               | "freeze" operand ":" type
@@ -63,6 +69,9 @@
 //!               | ("urem"|"srem"|"and"|"or"|"xor") operand "," operand ":" type
 //!               | ("fadd"|"fsub"|"fmul"|"fdiv"|"frem") fm operand "," operand ":" type
 //! iflags      ::= { "nsw" | "nuw" | "exact" }
+//! ordering    ::= "relaxed" | "acquire" | "release" | "acq_rel" | "seq_cst"
+//! rmwop       ::= "xchg" | "add" | "sub" | "and" | "nand" | "or" | "xor"
+//!               | "max" | "min" | "umax" | "umin"
 //! fm          ::= { "nnan" | "ninf" | "nsz" | "reassoc" | "contract" | "afn" }
 //! target      ::= "^" INT [ "(" [ operand { "," operand } ] ")" ]
 //! case        ::= INT ":" target
@@ -101,7 +110,10 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::ir::builder::FunctionBuilder;
-use crate::ir::inst::{BinOp, CastOp, FastMath, Flags, FloatPred, InstId, InstKind, IntPred, UnaryOp};
+use crate::ir::inst::{
+    AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstId, InstKind, IntPred, RmwOp,
+    UnaryOp,
+};
 use crate::ir::types::{FloatKind, Type};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, ValueDef, ValueId};
 use crate::ir::{
@@ -340,21 +352,61 @@ fn write_inst<W: fmt::Write>(
             write!(f, " align {align} : ")?;
             write_type(f, module, data.ty)
         }
-        InstKind::Load { ty, align } => {
+        InstKind::Load { ty, align, volatile } => {
             write!(f, "load ")?;
+            if *volatile {
+                write!(f, "volatile ")?;
+            }
             op(f, ops[0])?;
             write!(f, " align {align} : ")?;
             write_type(f, module, *ty)
         }
-        InstKind::Store { ty, align } => {
+        InstKind::Store { ty, align, volatile } => {
             // operands are [ptr, value]; print value first for readability.
             write!(f, "store ")?;
+            if *volatile {
+                write!(f, "volatile ")?;
+            }
             op(f, ops[1])?;
             write!(f, ", ")?;
             op(f, ops[0])?;
             write!(f, " align {align} : ")?;
             write_type(f, module, *ty)
         }
+        InstKind::AtomicLoad { ty, align, ordering } => {
+            write!(f, "atomic_load {} ", ordering.name())?;
+            op(f, ops[0])?;
+            write!(f, " align {align} : ")?;
+            write_type(f, module, *ty)
+        }
+        InstKind::AtomicStore { ty, align, ordering } => {
+            // Like `store`: value first, then the address.
+            write!(f, "atomic_store {} ", ordering.name())?;
+            op(f, ops[1])?;
+            write!(f, ", ")?;
+            op(f, ops[0])?;
+            write!(f, " align {align} : ")?;
+            write_type(f, module, *ty)
+        }
+        InstKind::AtomicRmw { op: rmw, ty, align, ordering } => {
+            write!(f, "atomic_rmw {} {} ", rmw.name(), ordering.name())?;
+            op(f, ops[0])?;
+            write!(f, ", ")?;
+            op(f, ops[1])?;
+            write!(f, " align {align} : ")?;
+            write_type(f, module, *ty)
+        }
+        InstKind::CmpXchg { ty, align, success, failure } => {
+            write!(f, "cmpxchg {} {} ", success.name(), failure.name())?;
+            op(f, ops[0])?;
+            write!(f, ", ")?;
+            op(f, ops[1])?;
+            write!(f, ", ")?;
+            op(f, ops[2])?;
+            write!(f, " align {align} : ")?;
+            write_type(f, module, *ty)
+        }
+        InstKind::Fence(ordering) => write!(f, "fence {}", ordering.name()),
         InstKind::PtrAdd { inbounds } => {
             write!(f, "ptr_add")?;
             if *inbounds {
@@ -1042,8 +1094,13 @@ enum OpAst {
     Alloca(TypeId),
     DynAlloca(u32, Operand),
     Syscall(Vec<Operand>),
-    Load(TypeId, u32, Operand),
-    Store(TypeId, u32, Operand, Operand),
+    Load(TypeId, u32, bool, Operand),
+    Store(TypeId, u32, bool, Operand, Operand),
+    AtomicLoad(TypeId, u32, AtomicOrdering, Operand),
+    AtomicStore(TypeId, u32, AtomicOrdering, Operand, Operand),
+    AtomicRmw(RmwOp, TypeId, u32, AtomicOrdering, Operand, Operand),
+    CmpXchg(TypeId, u32, AtomicOrdering, AtomicOrdering, Operand, Operand, Operand),
+    Fence(AtomicOrdering),
     PtrAdd(bool, Operand, Operand),
     Select(Operand, Operand, Operand),
     Freeze(Operand),
@@ -1167,6 +1224,27 @@ impl Parser {
         } else {
             self.err(self.span(), format!("expected `{s}`"))
         }
+    }
+
+    /// `"align" INT ":" type` — the common tail of the memory operations.
+    fn parse_align_type(&mut self, module: &mut Module) -> PResult<(u32, TypeId)> {
+        self.expect_ident("align")?;
+        let align = self.parse_u32()?;
+        self.expect(&TokKind::Colon, "`:`")?;
+        let ty = self.parse_type(module)?;
+        Ok((align, ty))
+    }
+
+    /// An atomic memory ordering keyword (`relaxed`, `acquire`, `release`,
+    /// `acq_rel`, `seq_cst`).
+    fn parse_ordering(&mut self) -> PResult<AtomicOrdering> {
+        let (name, sp) = self.expect_any_ident()?;
+        AtomicOrdering::from_name(&name).ok_or_else(|| {
+            Diagnostic::error(format!(
+                "expected a memory ordering (relaxed, acquire, release, acq_rel, seq_cst), found `{name}`"
+            ))
+            .with_span(sp)
+        })
     }
 
     fn expect_any_ident(&mut self) -> PResult<(String, Span)> {
@@ -1482,23 +1560,56 @@ impl Parser {
                 Ok(OpAst::DynAlloca(align, n))
             }
             "load" => {
+                let volatile = self.eat_ident("volatile");
                 let ptr = self.parse_operand(module)?;
-                self.expect_ident("align")?;
-                let align = self.parse_u32()?;
-                self.expect(&TokKind::Colon, "`:`")?;
-                let ty = self.parse_type(module)?;
-                Ok(OpAst::Load(ty, align, ptr))
+                let (align, ty) = self.parse_align_type(module)?;
+                Ok(OpAst::Load(ty, align, volatile, ptr))
             }
             "store" => {
+                let volatile = self.eat_ident("volatile");
                 let val = self.parse_operand(module)?;
                 self.expect(&TokKind::Comma, "`,`")?;
                 let ptr = self.parse_operand(module)?;
-                self.expect_ident("align")?;
-                let align = self.parse_u32()?;
-                self.expect(&TokKind::Colon, "`:`")?;
-                let ty = self.parse_type(module)?;
-                Ok(OpAst::Store(ty, align, val, ptr))
+                let (align, ty) = self.parse_align_type(module)?;
+                Ok(OpAst::Store(ty, align, volatile, val, ptr))
             }
+            "atomic_load" => {
+                let ordering = self.parse_ordering()?;
+                let ptr = self.parse_operand(module)?;
+                let (align, ty) = self.parse_align_type(module)?;
+                Ok(OpAst::AtomicLoad(ty, align, ordering, ptr))
+            }
+            "atomic_store" => {
+                let ordering = self.parse_ordering()?;
+                let val = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let ptr = self.parse_operand(module)?;
+                let (align, ty) = self.parse_align_type(module)?;
+                Ok(OpAst::AtomicStore(ty, align, ordering, val, ptr))
+            }
+            "atomic_rmw" => {
+                let (name, sp) = self.expect_any_ident()?;
+                let rmw = RmwOp::from_name(&name)
+                    .ok_or_else(|| Diagnostic::error("unknown atomic_rmw operation").with_span(sp))?;
+                let ordering = self.parse_ordering()?;
+                let ptr = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let val = self.parse_operand(module)?;
+                let (align, ty) = self.parse_align_type(module)?;
+                Ok(OpAst::AtomicRmw(rmw, ty, align, ordering, ptr, val))
+            }
+            "cmpxchg" => {
+                let success = self.parse_ordering()?;
+                let failure = self.parse_ordering()?;
+                let ptr = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let expected = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let new = self.parse_operand(module)?;
+                let (align, ty) = self.parse_align_type(module)?;
+                Ok(OpAst::CmpXchg(ty, align, success, failure, ptr, expected, new))
+            }
+            "fence" => Ok(OpAst::Fence(self.parse_ordering()?)),
             "ptr_add" => {
                 let inbounds = self.eat_ident("inbounds");
                 let base = self.parse_operand(module)?;
@@ -2011,14 +2122,47 @@ fn emit_inst(
             let nv = resolve_operand(b, n, names, func_names, global_names)?;
             Some(b.dyn_alloca(nv, *align))
         }
-        OpAst::Load(ty, align, ptr) => {
+        OpAst::Load(ty, align, volatile, ptr) => {
             let p = resolve_operand(b, ptr, names, func_names, global_names)?;
-            Some(b.load(*ty, p, *align))
+            let kind = InstKind::Load { ty: *ty, align: *align, volatile: *volatile };
+            b.append_inst(kind, vec![p], Flags::NONE, Some(*ty))
         }
-        OpAst::Store(ty, align, val, ptr) => {
+        OpAst::Store(ty, align, volatile, val, ptr) => {
             let v = resolve_operand(b, val, names, func_names, global_names)?;
             let p = resolve_operand(b, ptr, names, func_names, global_names)?;
-            b.store(*ty, p, v, *align);
+            let kind = InstKind::Store { ty: *ty, align: *align, volatile: *volatile };
+            b.append_inst(kind, vec![p, v], Flags::NONE, None)
+        }
+        // The atomics carry an explicit alignment in text, so they are built
+        // from raw parts (the builder helpers always use natural alignment).
+        OpAst::AtomicLoad(ty, align, ordering, ptr) => {
+            let p = resolve_operand(b, ptr, names, func_names, global_names)?;
+            let kind = InstKind::AtomicLoad { ty: *ty, align: *align, ordering: *ordering };
+            b.append_inst(kind, vec![p], Flags::NONE, Some(*ty))
+        }
+        OpAst::AtomicStore(ty, align, ordering, val, ptr) => {
+            let v = resolve_operand(b, val, names, func_names, global_names)?;
+            let p = resolve_operand(b, ptr, names, func_names, global_names)?;
+            let kind = InstKind::AtomicStore { ty: *ty, align: *align, ordering: *ordering };
+            b.append_inst(kind, vec![p, v], Flags::NONE, None)
+        }
+        OpAst::AtomicRmw(rmw, ty, align, ordering, ptr, val) => {
+            let p = resolve_operand(b, ptr, names, func_names, global_names)?;
+            let v = resolve_operand(b, val, names, func_names, global_names)?;
+            let kind =
+                InstKind::AtomicRmw { op: *rmw, ty: *ty, align: *align, ordering: *ordering };
+            b.append_inst(kind, vec![p, v], Flags::NONE, Some(*ty))
+        }
+        OpAst::CmpXchg(ty, align, success, failure, ptr, expected, new) => {
+            let p = resolve_operand(b, ptr, names, func_names, global_names)?;
+            let e = resolve_operand(b, expected, names, func_names, global_names)?;
+            let n = resolve_operand(b, new, names, func_names, global_names)?;
+            let kind =
+                InstKind::CmpXchg { ty: *ty, align: *align, success: *success, failure: *failure };
+            b.append_inst(kind, vec![p, e, n], Flags::NONE, Some(*ty))
+        }
+        OpAst::Fence(ordering) => {
+            b.fence(*ordering);
             None
         }
         OpAst::PtrAdd(inbounds, base, off) => {
@@ -2748,5 +2892,65 @@ entry ^0:
         assert!(text.contains("global detached @g : i32 = i32 3"), "{text}");
         let parsed = round_trip(&m, &mut syms);
         assert_eq!(parsed.global_attrs(GlobalId::from_index(0)), GlobalAttrs::DETACHED);
+    }
+
+    #[test]
+    fn volatile_and_atomics_round_trip() {
+        let mut syms = StrInterner::new();
+        let m = crate::ir::tests::atomics_module(&mut syms);
+        let text = print_module(&m, &syms);
+        for needle in [
+            "= load volatile @g align 4 : i32",
+            "store volatile %",
+            "= atomic_load acquire %0 align 8 : i64",
+            "atomic_store release %",
+            "= atomic_rmw nand acq_rel %0, i64 4 align 8 : i64",
+            "= atomic_rmw umin seq_cst @g, i32 10 align 4 : i32",
+            "= cmpxchg seq_cst relaxed %0, %1, i64 42 align 8 : i64",
+            "= cmpxchg acq_rel acquire @gp, ptr null, %0 align 16 : ptr",
+            "fence acquire\n",
+            "fence seq_cst\n",
+        ] {
+            assert!(text.contains(needle), "missing `{needle}` in\n{text}");
+        }
+        let parsed = round_trip(&m, &mut syms);
+        assert!(crate::verify::verify_module(&parsed).is_ok());
+        // The flags and orderings are structurally preserved, not just printed.
+        let a = m.function(FuncId::from_index(0));
+        let b = parsed.function(FuncId::from_index(0));
+        let kinds = |f: &Function| -> Vec<InstKind> {
+            f.blocks().flat_map(|(_, bl)| bl.insts().iter().map(|&i| f.inst(i).kind.clone())).collect()
+        };
+        assert_eq!(kinds(a), kinds(b));
+    }
+
+    #[test]
+    fn plain_load_and_store_print_as_before() {
+        // A non-volatile access keeps its original spelling.
+        let src = "module \"x\"\nfunc @f(ptr) -> i32 {\nentry ^0(%p: ptr):\n  %v = load %p align 4 : i32\n  store %v, %p align 4 : i32\n  ret %v\n}\n";
+        let mut syms = StrInterner::new();
+        let m = parse_module(src, file(), &mut syms).expect("parse");
+        let text = print_module(&m, &syms);
+        assert!(text.contains("= load %0 align 4 : i32"), "{text}");
+        assert!(text.contains("  store %1, %0 align 4 : i32"), "{text}");
+        assert!(!text.contains("volatile"), "{text}");
+    }
+
+    #[test]
+    fn bad_orderings_and_rmw_ops_are_parse_errors() {
+        let wrap = |body: &str| {
+            format!("module \"x\"\nfunc @f(ptr) -> void {{\nentry ^0(%p: ptr):\n  {body}\n  ret\n}}\n")
+        };
+        for (body, why) in [
+            ("fence monotonic", "not an ordering name"),
+            ("fence", "missing ordering"),
+            ("%x = atomic_rmw frob seq_cst %p, i32 1 align 4 : i32", "unknown rmw op"),
+            ("%x = atomic_load %p align 4 : i32", "missing ordering"),
+            ("%x = cmpxchg seq_cst %p, i32 0, i32 1 align 4 : i32", "missing failure ordering"),
+            ("%x = atomic_load acquire %p : i32", "missing align"),
+        ] {
+            let mut syms = StrInterner::new();
+            assert!(parse_module(&wrap(body), file(), &mut syms).is_err(), "{why}: `{body}` should not parse");
+        }
     }
 }

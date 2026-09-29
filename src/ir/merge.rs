@@ -344,16 +344,31 @@ fn copy_body(
 }
 
 /// Copy an instruction, remapping the result type and any [`TypeId`] carried in
-/// its opcode payload (`alloca`/`load`/`store`). Value operands are local ids and
-/// are preserved as-is.
+/// its opcode payload (`alloca`, `load`/`store` and the atomics). Value operands
+/// are local ids and are preserved as-is.
 fn remap_inst(inst: &InstData, type_map: &[TypeId]) -> InstData {
     let mut new = inst.clone();
     new.ty = type_map[inst.ty.index()];
+    let m = |ty: &TypeId| type_map[ty.index()];
     new.kind = match &inst.kind {
-        InstKind::Alloca { elem_ty } => InstKind::Alloca { elem_ty: type_map[elem_ty.index()] },
-        InstKind::Load { ty, align } => InstKind::Load { ty: type_map[ty.index()], align: *align },
-        InstKind::Store { ty, align } => {
-            InstKind::Store { ty: type_map[ty.index()], align: *align }
+        InstKind::Alloca { elem_ty } => InstKind::Alloca { elem_ty: m(elem_ty) },
+        InstKind::Load { ty, align, volatile } => {
+            InstKind::Load { ty: m(ty), align: *align, volatile: *volatile }
+        }
+        InstKind::Store { ty, align, volatile } => {
+            InstKind::Store { ty: m(ty), align: *align, volatile: *volatile }
+        }
+        InstKind::AtomicLoad { ty, align, ordering } => {
+            InstKind::AtomicLoad { ty: m(ty), align: *align, ordering: *ordering }
+        }
+        InstKind::AtomicStore { ty, align, ordering } => {
+            InstKind::AtomicStore { ty: m(ty), align: *align, ordering: *ordering }
+        }
+        InstKind::AtomicRmw { op, ty, align, ordering } => {
+            InstKind::AtomicRmw { op: *op, ty: m(ty), align: *align, ordering: *ordering }
+        }
+        InstKind::CmpXchg { ty, align, success, failure } => {
+            InstKind::CmpXchg { ty: m(ty), align: *align, success: *success, failure: *failure }
         }
         other => other.clone(),
     };

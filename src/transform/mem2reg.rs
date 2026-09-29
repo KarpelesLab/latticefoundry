@@ -1,9 +1,10 @@
 //! **mem2reg** — promote memory `alloca` slots to SSA values.
 //!
 //! An `alloca` is *promotable* when it is used **only** as the whole-slot address
-//! of `load`/`store` instructions (accessing exactly the allocated type) and its
-//! address never otherwise escapes — it is never a `ptr_add` base, a `call`
-//! argument, a stored *value*, a returned value, or any other operand. Such a
+//! of non-volatile `load`/`store` instructions (accessing exactly the allocated
+//! type) and its address never otherwise escapes — it is never a `ptr_add`
+//! base, a `call` argument, a stored *value*, a returned value, an atomic's
+//! address, or any other operand. Such a
 //! slot behaves exactly like a local variable, so its loads and stores can be
 //! replaced by direct SSA data flow, deleting the memory traffic entirely.
 //!
@@ -78,11 +79,17 @@ struct Plan {
 }
 
 /// Whether the alloca whose result is `av` (of element type `elem_ty`) is
-/// promotable: every use is a whole-slot `load`/`store` of `elem_ty` through the
-/// address operand, never an escaping use.
+/// promotable: every use is a whole-slot, non-volatile `load`/`store` of
+/// `elem_ty` through the address operand, never an escaping use. A volatile
+/// access pins its slot in memory (each access is an observable event that must
+/// happen exactly as written), and an atomic, like any other use, disqualifies
+/// the slot.
 fn is_promotable(old: &Function, av: ValueId, elem_ty: TypeId) -> bool {
     for u in old.uses_of(av) {
         match old.inst(u.inst).kind {
+            InstKind::Load { volatile: true, .. } | InstKind::Store { volatile: true, .. } => {
+                return false;
+            }
             // A load's only operand is the address; must access the slot type.
             InstKind::Load { ty, .. } => {
                 if u.operand != 0 || ty != elem_ty {

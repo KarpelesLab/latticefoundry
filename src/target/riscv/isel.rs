@@ -697,6 +697,7 @@ impl TargetIsel for RiscvTarget {
                 let d = lo.result_reg(inst);
                 lo.emit(MachineInst::new(RvOp::Li.opcode(), vec![def_v(d), imm(0)]));
             }
+            k if k.is_atomic() => panic!("RISC-V backend: atomics are not yet supported: {k:?}"),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),
         }
     }

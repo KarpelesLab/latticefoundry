@@ -243,6 +243,30 @@ pub enum X86Op {
     /// clobbers `rcx` (return `rip`) and `r11` (saved `rflags`). Every other
     /// register is preserved by the kernel, so only those three are defs.
     Syscall = 55,
+
+    // --- atomics (x86-64 is TSO: see `lower_atomic` for the mapping) --------
+    /// `[]` — `mfence` (`0F AE F0`): a full barrier, for `fence seq_cst`.
+    Mfence = 56,
+    /// `[Def d, Use ptr, Use val, Imm size]` — `mov d, val; xchg [ptr], d`
+    /// (`86`/`87 /r`, implicitly locked): atomically swap, leaving the old value
+    /// in `d`. Also the `seq_cst` store (its result is simply unused).
+    Xchg = 57,
+    /// `[Def d, Use ptr, Use val, Imm size, Imm negate]` — `mov d, val;
+    /// [neg d;] lock xadd [ptr], d` (`F0 0F C0`/`C1 /r`): atomic fetch-add
+    /// (fetch-sub with `negate` = 1), the old value left in `d`.
+    LockXadd = 58,
+    /// `[Def rax, Use rax, Use ptr, Use new, Imm size]` — `lock cmpxchg [ptr],
+    /// new` (`F0 0F B0`/`B1 /r`): compares `rax` (the expected value, moved
+    /// there by isel right before) with `[ptr]`, stores `new` if equal, and
+    /// leaves the old memory value in `rax` either way.
+    LockCmpxchg = 59,
+    /// `[Def rax, Def tmp, Use ptr, Use val, Imm size, Imm op]` — an atomic
+    /// read-modify-write with no single x86 instruction returning the old value
+    /// (`and`/`or`/`xor`/`nand`/`max`/`min`/`umax`/`umin`), expanded at encode
+    /// time into a `lock cmpxchg` loop with an internal label:
+    /// `mov rax, [ptr]; L: mov tmp, rax; tmp = op(tmp, val); lock cmpxchg [ptr],
+    /// tmp; jne L`. The old value ends in `rax`; `tmp` is a clobbered scratch.
+    RmwLoop = 60,
 }
 
 impl X86Op {
@@ -255,13 +279,13 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 56] = [
+        const TABLE: [X86Op; 61] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
             StoreFrame, LoadFrame, FAdd, FSub, FMul, FDiv, FXor, LoadFConst, FCmpSet, Cvtsd2ss,
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
-            Syscall,
+            Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop,
         ];
         TABLE[op.0 as usize]
     }
@@ -1157,6 +1181,110 @@ impl X86_64Target {
         lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(rax)]));
     }
 
+    /// Lower an atomic memory operation or fence. x86-64 is TSO (the Intel SDM
+    /// Vol. 3A §9.2 memory-ordering model): ordinary loads are not reordered
+    /// with other loads, stores not with other stores, and a load may pass
+    /// only an *earlier store to a different location*; `lock`-prefixed
+    /// instructions and `xchg` with memory are full barriers. So:
+    ///
+    /// | IR | x86-64 |
+    /// |---|---|
+    /// | `atomic_load` (any ordering) | `mov` |
+    /// | `atomic_store` relaxed/release | `mov` |
+    /// | `atomic_store seq_cst` | `xchg` (a store that is also a full barrier) |
+    /// | `atomic_rmw xchg` | `xchg` |
+    /// | `atomic_rmw add`/`sub` | `lock xadd` (`sub` negates first) |
+    /// | other `atomic_rmw` | `lock cmpxchg` loop ([`X86Op::RmwLoop`]) |
+    /// | `cmpxchg` | `lock cmpxchg` (expected/old in `rax`) |
+    /// | `fence seq_cst` | `mfence` |
+    /// | `fence` acquire/release/acq_rel | nothing (TSO already orders them; the IR-level barrier is what kept the optimizer from moving memory ops across it) |
+    ///
+    /// Every `lock`ed form is a full barrier, so the rmw/cmpxchg orderings need
+    /// nothing extra.
+    fn lower_atomic(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        use crate::ir::inst::{AtomicOrdering, RmwOp};
+        let ops = inst.operands();
+        match &inst.kind {
+            InstKind::AtomicLoad { ty, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = self.oper(lo, ops[0]);
+                let size = lo.byte_size(*ty);
+                lo.emit(MachineInst::new(X86Op::Load.opcode(), vec![def_v(d), use_v(ptr), imm(size)]));
+            }
+            InstKind::AtomicStore { ty, ordering, .. } => {
+                let ptr = self.oper(lo, ops[0]);
+                let val = self.oper(lo, ops[1]);
+                let size = lo.byte_size(*ty);
+                if *ordering == AtomicOrdering::SeqCst {
+                    // `xchg` = store + full barrier; the swapped-out value is
+                    // discarded.
+                    let junk = lo.fresh_vreg(RegClass::Gpr);
+                    lo.emit(MachineInst::new(
+                        X86Op::Xchg.opcode(),
+                        vec![def_v(junk), use_v(ptr), use_v(val), imm(size)],
+                    ));
+                } else {
+                    lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(ptr), use_v(val), imm(size)]));
+                }
+            }
+            InstKind::AtomicRmw { op, ty, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = self.oper(lo, ops[0]);
+                let val = self.oper(lo, ops[1]);
+                let size = lo.byte_size(*ty);
+                match op {
+                    RmwOp::Xchg => lo.emit(MachineInst::new(
+                        X86Op::Xchg.opcode(),
+                        vec![def_v(d), use_v(ptr), use_v(val), imm(size)],
+                    )),
+                    RmwOp::Add | RmwOp::Sub => lo.emit(MachineInst::new(
+                        X86Op::LockXadd.opcode(),
+                        vec![def_v(d), use_v(ptr), use_v(val), imm(size), imm(u64::from(*op == RmwOp::Sub))],
+                    )),
+                    _ => {
+                        let rax = regs::gpr(regs::RAX);
+                        let tmp = lo.fresh_vreg(RegClass::Gpr);
+                        lo.emit(MachineInst::new(
+                            X86Op::RmwLoop.opcode(),
+                            vec![
+                                def(rax),
+                                def_v(tmp),
+                                use_v(ptr),
+                                use_v(val),
+                                imm(size),
+                                imm(u64::from(op.code())),
+                            ],
+                        ));
+                        lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(rax)]));
+                    }
+                }
+            }
+            InstKind::CmpXchg { ty, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = self.oper(lo, ops[0]);
+                let expected = self.oper(lo, ops[1]);
+                let new = self.oper(lo, ops[2]);
+                let size = lo.byte_size(*ty);
+                let rax = regs::gpr(regs::RAX);
+                // The fixed-register window is exactly `mov rax, expected;
+                // lock cmpxchg; mov d, rax`: every operand is materialized
+                // before it, so no other definition can land in rax in between.
+                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(rax), use_v(expected)]));
+                lo.emit(MachineInst::new(
+                    X86Op::LockCmpxchg.opcode(),
+                    vec![def(rax), use_p(rax), use_v(ptr), use_v(new), imm(size)],
+                ));
+                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(rax)]));
+            }
+            InstKind::Fence(ordering) => {
+                if *ordering == AtomicOrdering::SeqCst {
+                    lo.emit(MachineInst::new(X86Op::Mfence.opcode(), Vec::new()));
+                }
+            }
+            other => unreachable!("lower_atomic on {other:?}"),
+        }
+    }
+
     /// Lower the entry prologue with System V aggregate/`sret`/stack-parameter
     /// support. A register-passed struct parameter is stored into a private home
     /// slot (so the body sees it in memory) and its vreg is that slot's address; a
@@ -1464,6 +1592,8 @@ impl TargetIsel for X86_64Target {
                     vec![def_v(d), use_v(n), imm(u64::from(*align))],
                 ));
             }
+            // A volatile access is the same single `mov` at exactly the accessed
+            // width: nothing below isel merges, splits, or removes memory ops.
             InstKind::Load { ty, .. } => {
                 let d = lo.result_reg(inst);
                 let ptr = self.oper(lo, inst.operands()[0]);
@@ -1524,6 +1654,11 @@ impl TargetIsel for X86_64Target {
                 let s = self.oper(lo, inst.operands()[0]);
                 lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
             }
+            InstKind::AtomicLoad { .. }
+            | InstKind::AtomicStore { .. }
+            | InstKind::AtomicRmw { .. }
+            | InstKind::CmpXchg { .. }
+            | InstKind::Fence(_) => self.lower_atomic(lo, inst),
             InstKind::Call => self.lower_call(lo, inst),
             InstKind::Syscall => self.lower_syscall(lo, inst),
             InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),

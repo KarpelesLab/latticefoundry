@@ -1385,6 +1385,7 @@ impl TargetIsel for AArch64Target {
             }
             InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),
             InstKind::FCmp(pred) => self.lower_fcmp(lo, *pred, inst),
+            k if k.is_atomic() => panic!("AArch64 backend: atomics are not yet supported: {k:?}"),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),
         }
     }

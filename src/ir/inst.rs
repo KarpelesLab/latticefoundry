@@ -318,6 +318,215 @@ pub struct SwitchData {
     pub cases: Vec<SwitchCase>,
 }
 
+/// The memory ordering of an atomic operation or fence (`docs/ir-design.md`
+/// §6b). The names and meanings follow the C11/C++11 memory model; the IR has
+/// no weaker "unordered" level, so `relaxed` is the weakest.
+///
+/// Every ordering makes the access itself **atomic** (indivisible: no torn
+/// reads or writes, a single total modification order per location). The
+/// ordering adds *inter-thread* constraints, which in turn bound code motion
+/// (the reference evaluator is single-threaded, so it only sees the sequential
+/// meaning; the constraints below are what optimizations must respect):
+///
+/// - [`Relaxed`](AtomicOrdering::Relaxed) — atomicity only; no ordering with
+///   other memory operations.
+/// - [`Acquire`](AtomicOrdering::Acquire) — (loads, rmw, cmpxchg, fences) no
+///   memory operation that follows in program order may be performed before it.
+/// - [`Release`](AtomicOrdering::Release) — (stores, rmw, cmpxchg, fences) no
+///   memory operation that precedes it in program order may be performed after
+///   it.
+/// - [`AcqRel`](AtomicOrdering::AcqRel) — (rmw, cmpxchg, fences) both.
+/// - [`SeqCst`](AtomicOrdering::SeqCst) — acquire + release, plus a single total
+///   order over all `seq_cst` operations.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum AtomicOrdering {
+    /// `relaxed` — atomic, but unordered with respect to other locations.
+    Relaxed,
+    /// `acquire` — later memory operations stay after it.
+    Acquire,
+    /// `release` — earlier memory operations stay before it.
+    Release,
+    /// `acq_rel` — both acquire and release.
+    AcqRel,
+    /// `seq_cst` — acquire + release + one global order of `seq_cst` ops.
+    SeqCst,
+}
+
+impl AtomicOrdering {
+    /// Every ordering, weakest first (also the binary encoding order).
+    pub const ALL: [AtomicOrdering; 5] = [
+        AtomicOrdering::Relaxed,
+        AtomicOrdering::Acquire,
+        AtomicOrdering::Release,
+        AtomicOrdering::AcqRel,
+        AtomicOrdering::SeqCst,
+    ];
+
+    /// Whether this ordering has acquire semantics (`acquire`, `acq_rel`,
+    /// `seq_cst`): no later memory operation may be moved above it.
+    pub fn is_acquire(self) -> bool {
+        matches!(self, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst)
+    }
+
+    /// Whether this ordering has release semantics (`release`, `acq_rel`,
+    /// `seq_cst`): no earlier memory operation may be moved below it.
+    pub fn is_release(self) -> bool {
+        matches!(self, AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst)
+    }
+
+    /// The textual spelling (`relaxed`, `acquire`, `release`, `acq_rel`,
+    /// `seq_cst`).
+    pub fn name(self) -> &'static str {
+        match self {
+            AtomicOrdering::Relaxed => "relaxed",
+            AtomicOrdering::Acquire => "acquire",
+            AtomicOrdering::Release => "release",
+            AtomicOrdering::AcqRel => "acq_rel",
+            AtomicOrdering::SeqCst => "seq_cst",
+        }
+    }
+
+    /// Parse a textual spelling (see [`AtomicOrdering::name`]).
+    pub fn from_name(s: &str) -> Option<AtomicOrdering> {
+        AtomicOrdering::ALL.into_iter().find(|o| o.name() == s)
+    }
+
+    /// This ordering's position in [`AtomicOrdering::ALL`] (a stable small code).
+    pub fn code(self) -> u8 {
+        AtomicOrdering::ALL.iter().position(|&x| x == self).expect("every ordering is listed") as u8
+    }
+
+    /// The ordering with the given [`AtomicOrdering::code`].
+    pub fn from_code(c: u64) -> Option<AtomicOrdering> {
+        usize::try_from(c).ok().and_then(|i| AtomicOrdering::ALL.get(i).copied())
+    }
+
+    /// Whether this ordering is allowed on an `atomic_load` (a load cannot
+    /// release: `relaxed`, `acquire`, `seq_cst`). Also the set allowed as a
+    /// `cmpxchg` failure ordering (the failure path is a pure load).
+    pub fn valid_for_load(self) -> bool {
+        !matches!(self, AtomicOrdering::Release | AtomicOrdering::AcqRel)
+    }
+
+    /// Whether this ordering is allowed on an `atomic_store` (a store cannot
+    /// acquire: `relaxed`, `release`, `seq_cst`).
+    pub fn valid_for_store(self) -> bool {
+        !matches!(self, AtomicOrdering::Acquire | AtomicOrdering::AcqRel)
+    }
+
+    /// Whether this ordering is allowed on a `fence` (anything but `relaxed`,
+    /// which would order nothing).
+    pub fn valid_for_fence(self) -> bool {
+        self != AtomicOrdering::Relaxed
+    }
+}
+
+/// The read-modify-write operation of an [`atomic_rmw`](InstKind::AtomicRmw).
+/// Each computes the new memory contents from the old value `old` and the
+/// operand `v` (both of the accessed type, arithmetic wrapping); the
+/// instruction returns `old`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RmwOp {
+    /// `v` (exchange / swap). The only op also allowed on `ptr`.
+    Xchg,
+    /// `old + v` (wrapping).
+    Add,
+    /// `old - v` (wrapping).
+    Sub,
+    /// `old & v`.
+    And,
+    /// `!(old & v)`.
+    Nand,
+    /// `old | v`.
+    Or,
+    /// `old ^ v`.
+    Xor,
+    /// Signed maximum of `old` and `v`.
+    Max,
+    /// Signed minimum of `old` and `v`.
+    Min,
+    /// Unsigned maximum of `old` and `v`.
+    UMax,
+    /// Unsigned minimum of `old` and `v`.
+    UMin,
+}
+
+impl RmwOp {
+    /// Every operation (also the binary encoding order).
+    pub const ALL: [RmwOp; 11] = [
+        RmwOp::Xchg,
+        RmwOp::Add,
+        RmwOp::Sub,
+        RmwOp::And,
+        RmwOp::Nand,
+        RmwOp::Or,
+        RmwOp::Xor,
+        RmwOp::Max,
+        RmwOp::Min,
+        RmwOp::UMax,
+        RmwOp::UMin,
+    ];
+
+    /// The textual spelling (`xchg`, `add`, `sub`, `and`, `nand`, `or`, `xor`,
+    /// `max`, `min`, `umax`, `umin`).
+    pub fn name(self) -> &'static str {
+        match self {
+            RmwOp::Xchg => "xchg",
+            RmwOp::Add => "add",
+            RmwOp::Sub => "sub",
+            RmwOp::And => "and",
+            RmwOp::Nand => "nand",
+            RmwOp::Or => "or",
+            RmwOp::Xor => "xor",
+            RmwOp::Max => "max",
+            RmwOp::Min => "min",
+            RmwOp::UMax => "umax",
+            RmwOp::UMin => "umin",
+        }
+    }
+
+    /// Parse a textual spelling (see [`RmwOp::name`]).
+    pub fn from_name(s: &str) -> Option<RmwOp> {
+        RmwOp::ALL.into_iter().find(|o| o.name() == s)
+    }
+
+    /// This operation's position in [`RmwOp::ALL`] (a stable small code, used
+    /// as a machine-instruction immediate by the backends).
+    pub fn code(self) -> u8 {
+        RmwOp::ALL.iter().position(|&x| x == self).expect("every rmw op is listed") as u8
+    }
+
+    /// The operation with the given [`RmwOp::code`].
+    pub fn from_code(c: u64) -> Option<RmwOp> {
+        usize::try_from(c).ok().and_then(|i| RmwOp::ALL.get(i).copied())
+    }
+
+    /// The sequential meaning on `width`-bit two's-complement values given as
+    /// their unsigned bit patterns (`old`, `v` < 2^width, `width` ≤ 64): the
+    /// new memory contents, masked to `width` bits.
+    pub fn apply(self, old: u64, v: u64, width: u32) -> u64 {
+        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let sext = |x: u64| -> i64 {
+            let sh = 64 - width.min(64);
+            ((x << sh) as i64) >> sh
+        };
+        let r = match self {
+            RmwOp::Xchg => v,
+            RmwOp::Add => old.wrapping_add(v),
+            RmwOp::Sub => old.wrapping_sub(v),
+            RmwOp::And => old & v,
+            RmwOp::Nand => !(old & v),
+            RmwOp::Or => old | v,
+            RmwOp::Xor => old ^ v,
+            RmwOp::Max => if sext(old) >= sext(v) { old } else { v },
+            RmwOp::Min => if sext(old) <= sext(v) { old } else { v },
+            RmwOp::UMax => old.max(v),
+            RmwOp::UMin => old.min(v),
+        };
+        r & mask
+    }
+}
+
 /// An opcode together with its immediate/structural data.
 ///
 /// Value operands live in [`InstData::operands`], *not* here; this carries only
@@ -366,20 +575,107 @@ pub enum InstKind {
     /// (this is where opaque pointers put the type back). Loading through a
     /// poison or dangling pointer, or with insufficient alignment, is undefined
     /// behavior; loading uninitialized memory yields poison.
+    ///
+    /// A **volatile** load (`load volatile`) is an observable event in its own
+    /// right (memory-mapped I/O): it is performed exactly once, at exactly the
+    /// accessed type's width, in program order relative to every other volatile
+    /// access, atomic, fence, call and syscall. It is never removed (even
+    /// unused), duplicated, merged, widened or narrowed, hoisted or sunk,
+    /// promoted to a register, or forwarded from a store, and its result is
+    /// unknown to every analysis.
     Load {
         /// The type read from memory (the result type).
         ty: TypeId,
         /// The assumed alignment of the access, in bytes (a power of two).
         align: u32,
+        /// Whether the access is volatile (see above).
+        volatile: bool,
     },
     /// Store a value to memory; operands `[ptr, value]`. No result. Storing
     /// through a poison/dangling pointer or under-aligned is undefined behavior.
+    /// A **volatile** store (`store volatile`) obeys the same rules as a volatile
+    /// load: performed exactly once, at exactly its width, in order, and never
+    /// removed, not even when a later store overwrites it.
     Store {
         /// The type written to memory (the type of the stored value).
         ty: TypeId,
         /// The assumed alignment of the access, in bytes (a power of two).
         align: u32,
+        /// Whether the access is volatile (see [`InstKind::Load`]).
+        volatile: bool,
     },
+    /// Atomic load; operand `[ptr]`, result type = `ty` (`i8`/`i16`/`i32`/`i64`
+    /// or `ptr`). Sequentially it reads `ty` from `ptr` exactly like `load`; the
+    /// access is indivisible and ordered per `ordering` (`relaxed`, `acquire` or
+    /// `seq_cst`; see [`AtomicOrdering`]). `align` must be at least the type's
+    /// size (natural alignment); an address that is not so aligned, poison, or
+    /// dangling is undefined behavior. Never removed, duplicated, or merged;
+    /// its result is unknown to every analysis.
+    AtomicLoad {
+        /// The type read (the result type).
+        ty: TypeId,
+        /// The alignment of the access, in bytes (≥ the type's size).
+        align: u32,
+        /// The memory ordering.
+        ordering: AtomicOrdering,
+    },
+    /// Atomic store; operands `[ptr, value]`, no result. Sequentially a `store`
+    /// of `ty`; indivisible and ordered per `ordering` (`relaxed`, `release` or
+    /// `seq_cst`). Alignment and address rules as for
+    /// [`AtomicLoad`](InstKind::AtomicLoad). Never removed.
+    AtomicStore {
+        /// The type written (the type of the stored value).
+        ty: TypeId,
+        /// The alignment of the access, in bytes (≥ the type's size).
+        align: u32,
+        /// The memory ordering.
+        ordering: AtomicOrdering,
+    },
+    /// Atomic read-modify-write; operands `[ptr, v]`, result type = `ty`.
+    /// Indivisibly reads `old` from `ptr`, writes `op(old, v)` (see [`RmwOp`])
+    /// and returns `old`. `ty` is `i8`/`i16`/`i32`/`i64`, or also `ptr` for
+    /// `xchg`. Any ordering is allowed. A poison `v` stores poison (the result
+    /// is still the loaded `old`). Alignment and address rules as for
+    /// [`AtomicLoad`](InstKind::AtomicLoad). Never removed (even with an unused
+    /// result).
+    AtomicRmw {
+        /// The modification applied.
+        op: RmwOp,
+        /// The accessed type (the type of `v` and of the result).
+        ty: TypeId,
+        /// The alignment of the access, in bytes (≥ the type's size).
+        align: u32,
+        /// The memory ordering.
+        ordering: AtomicOrdering,
+    },
+    /// Atomic compare-and-exchange (strong); operands `[ptr, expected, new]`,
+    /// result type = `ty` (`i8`/`i16`/`i32`/`i64` or `ptr`). Indivisibly reads
+    /// `old` from `ptr`; if `old == expected` (bitwise) it writes `new`. Returns
+    /// `old`. It never fails spuriously, so the exchange happened **iff** the
+    /// result equals `expected`: front ends obtain the success flag as
+    /// `icmp eq %old, %expected` (instructions have a single result; see
+    /// `docs/ir-design.md` §6b). `success` orders the read-modify-write when the
+    /// exchange happens (any ordering); `failure` orders the plain load when it
+    /// does not (`relaxed`, `acquire` or `seq_cst`). A poison `expected` or
+    /// loaded value is undefined behavior (the comparison would branch on
+    /// poison); a poison `new` stores poison. Never removed.
+    CmpXchg {
+        /// The accessed type (of `expected`, `new` and the result).
+        ty: TypeId,
+        /// The alignment of the access, in bytes (≥ the type's size).
+        align: u32,
+        /// The ordering when the exchange happens.
+        success: AtomicOrdering,
+        /// The ordering when it does not (a load ordering).
+        failure: AtomicOrdering,
+    },
+    /// Memory fence; no operands, no result. Establishes its ordering
+    /// (`acquire`, `release`, `acq_rel` or `seq_cst`; `relaxed` is rejected)
+    /// between the memory operations around it without accessing memory
+    /// itself. It has no sequential effect, but it is a code-motion barrier:
+    /// never removed, and no memory operation may cross it in a direction its
+    /// ordering forbids (`seq_cst` and `acq_rel` forbid both).
+    Fence(AtomicOrdering),
     /// Pointer displacement; operands `[base, byte_offset]`, result is a pointer.
     /// Computes `base + byte_offset` as a byte address — this replaces
     /// `getelementptr`; structured addressing is a builder convenience that
@@ -453,6 +749,45 @@ pub enum InstKind {
 }
 
 impl InstKind {
+    /// Whether this opcode is an atomic memory operation or a fence
+    /// (`atomic_load`, `atomic_store`, `atomic_rmw`, `cmpxchg`, `fence`).
+    pub fn is_atomic(&self) -> bool {
+        matches!(
+            self,
+            InstKind::AtomicLoad { .. }
+                | InstKind::AtomicStore { .. }
+                | InstKind::AtomicRmw { .. }
+                | InstKind::CmpXchg { .. }
+                | InstKind::Fence(_)
+        )
+    }
+
+    /// Whether this opcode is a volatile `load` or `store`.
+    pub fn is_volatile(&self) -> bool {
+        matches!(self, InstKind::Load { volatile: true, .. } | InstKind::Store { volatile: true, .. })
+    }
+
+    /// Whether this instruction must be kept even when its result is unused,
+    /// because it does more than produce a value: every store, call, syscall,
+    /// allocation, atomic operation and fence, and a volatile load. Plain loads
+    /// and pure value ops are not included; terminators are kept by their own
+    /// rule. Dead-code elimination and constant propagation consult this.
+    ///
+    /// Every atomic is kept, including an unused `relaxed` `atomic_load`:
+    /// dropping one would be sound under the memory model, but keeping it is
+    /// the simple, obviously-correct choice.
+    pub fn has_side_effect(&self) -> bool {
+        match self {
+            InstKind::Alloca { .. }
+            | InstKind::DynAlloca { .. }
+            | InstKind::Store { .. }
+            | InstKind::Call
+            | InstKind::Syscall => true,
+            InstKind::Load { volatile, .. } => *volatile,
+            k => k.is_atomic(),
+        }
+    }
+
     /// Whether this opcode is a block terminator (ends a basic block).
     pub fn is_terminator(&self) -> bool {
         matches!(

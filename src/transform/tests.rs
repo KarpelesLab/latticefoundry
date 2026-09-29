@@ -701,3 +701,205 @@ fn syscall_result_is_never_a_constant() {
     assert_eq!(n_syscall(m.function(f)), 1);
     assert!(ret_value_const(&m, f).is_top());
 }
+
+// ---------------------------------------------------------------------------
+// Volatile accesses, atomics and fences: kept, in place, in order.
+// ---------------------------------------------------------------------------
+
+/// A local slot accessed only through volatile loads/stores (two identical
+/// back-to-back loads, one unused load of a device register), then a loop whose
+/// body does loop-invariant volatile loads/stores, atomics with unused results,
+/// fences, and a call to a callee that is itself an atomic (inlinable).
+const VOLATILE_ATOMIC_LOOP: &str = r#"
+module "vol"
+global @dev : i32 = i32 0
+global @flag : i32 = i32 0
+
+func @bump(ptr) -> i32 {
+entry ^0(%q: ptr):
+  %o = atomic_rmw add seq_cst %q, i32 1 align 4 : i32
+  ret %o
+}
+
+func @f(i64, ptr) -> i32 {
+entry ^0(%n: i64, %p: ptr):
+  %slot = alloca i32 : ptr
+  store volatile i32 7, %slot align 4 : i32
+  %a = load volatile %slot align 4 : i32
+  %b = load volatile %slot align 4 : i32
+  %dead = load volatile @dev align 4 : i32
+  br ^1(i64 0, %a)
+^1(%i: i64, %acc: i32):
+  %c = icmp slt %i, %n : i1
+  cond_br %c, ^2, ^3
+^2:
+  %v = load volatile @dev align 4 : i32
+  store volatile i32 1, @dev align 4 : i32
+  store volatile i32 1, @dev align 4 : i32
+  %u = atomic_rmw or relaxed %p, i32 4 align 4 : i32
+  fence acquire
+  %l = atomic_load acquire @flag align 4 : i32
+  atomic_store release %l, %p align 4 : i32
+  %x = cmpxchg seq_cst relaxed %p, i32 0, i32 1 align 4 : i32
+  %k = call @bump(%p) : i32
+  fence seq_cst
+  %acc2 = add %acc, %v : i32
+  %i2 = add %i, i64 1 : i64
+  br ^1(%i2, %acc2)
+^3:
+  %r = add %acc, %b : i32
+  ret %r
+}
+"#;
+
+fn parse_fixture(src: &str) -> (Module, FuncId) {
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(src, crate::support::diagnostics::FileId::new(0), &mut syms)
+        .unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    (m, FuncId::from_index(1))
+}
+
+/// The ordered sequence of ordering-relevant events (volatile accesses,
+/// atomics, fences, calls) along each straight-line chain of blocks (a block
+/// followed by the unique-predecessor targets of its unconditional `br`s), as
+/// sorted non-empty lists. Block ids may be renumbered and a straight line may
+/// be split or merged by a pass, but no event may move off its path or reorder.
+fn event_sequences(f: &Function) -> Vec<Vec<String>> {
+    let n = f.block_count();
+    let mut preds = vec![0usize; n];
+    let mut br_target: Vec<Option<usize>> = vec![None; n];
+    for (bid, blk) in f.blocks() {
+        if let Some(t) = blk.terminator() {
+            for s in f.inst(t).successors() {
+                preds[s.index()] += 1;
+            }
+            if let InstKind::Br(t) = f.inst(t).kind {
+                br_target[bid.index()] = Some(t.index());
+            }
+        }
+    }
+    let absorbed: Vec<bool> = (0..n)
+        .map(|b| preds[b] == 1 && br_target.iter().enumerate().any(|(p, &t)| t == Some(b) && p != b))
+        .collect();
+    let events = |b: usize| -> Vec<String> {
+        f.block(crate::ir::BlockId::from_index(b))
+            .insts()
+            .iter()
+            .map(|&i| &f.inst(i).kind)
+            .filter(|k| k.is_volatile() || k.is_atomic() || matches!(k, InstKind::Call))
+            .map(|k| if matches!(k, InstKind::Call) { "call".to_string() } else { format!("{k:?}") })
+            .collect()
+    };
+    let mut seqs: Vec<Vec<String>> = Vec::new();
+    for start in (0..n).filter(|&b| !absorbed[b]) {
+        let mut seq = events(start);
+        let mut cur = start;
+        let mut steps = 0;
+        while let Some(t) = br_target[cur] {
+            if !absorbed[t] || steps > n {
+                break;
+            }
+            seq.extend(events(t));
+            cur = t;
+            steps += 1;
+        }
+        if !seq.is_empty() {
+            seqs.push(seq);
+        }
+    }
+    seqs.sort();
+    seqs
+}
+
+/// The expected sequences once `@bump` is inlined: the call becomes its body's
+/// `atomic_rmw add seq_cst`, at the call's position.
+fn inlined(seqs: &[Vec<String>], m: &Module) -> Vec<Vec<String>> {
+    let bump = m.function(FuncId::from_index(0));
+    let body = event_sequences(bump).concat();
+    let mut out: Vec<Vec<String>> = seqs
+        .iter()
+        .map(|s| s.iter().flat_map(|e| if e == "call" { body.clone() } else { vec![e.clone()] }).collect())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn every_pass_keeps_volatile_and_atomics_in_place_and_in_order() {
+    for name in ["dce", "sccp", "licm", "egraph", "simplify_cfg", "mem2reg", "inline"] {
+        let (mut m, f) = parse_fixture(VOLATILE_ATOMIC_LOOP);
+        let before = event_sequences(m.function(f));
+        assert_eq!(before.iter().map(Vec::len).sum::<usize>(), 14);
+        let expect = if name == "inline" { inlined(&before, &m) } else { before };
+        crate::transform::pipeline::run_passes(
+            &mut m,
+            vec![crate::transform::pipeline::pass_by_name(name).unwrap()],
+        );
+        assert!(verify_module(&m).is_ok(), "{name} keeps the module valid");
+        let func = m.function(f);
+        assert_eq!(event_sequences(func), expect, "{name} must not drop, merge, move or reorder");
+        assert_eq!(n_alloca(func), 1, "{name}: a volatile slot is never promoted");
+    }
+}
+
+#[test]
+fn full_pipeline_keeps_volatile_and_atomics() {
+    use crate::transform::pipeline::{OptLevel, optimize};
+    for level in [OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+        let (mut m, f) = parse_fixture(VOLATILE_ATOMIC_LOOP);
+        let before = event_sequences(m.function(f));
+        let after_inline = inlined(&before, &m);
+        optimize(&mut m, level);
+        assert!(verify_module(&m).is_ok());
+        let func = m.function(f);
+        let got = event_sequences(func);
+        assert!(got == before || got == after_inline, "{level:?} changed the event order:\n{got:#?}");
+        assert_eq!(n_alloca(func), 1, "{level:?}: the volatile slot stays in memory");
+        // The two identical volatile loads of the slot are not merged, the
+        // stored 7 is not forwarded, and nothing volatile-derived is folded.
+        assert!(ret_value_const(&m, f).is_top(), "{level:?}: the result depends on volatile loads");
+    }
+}
+
+#[test]
+fn the_same_code_without_volatile_is_optimized() {
+    // A sanity check that the fixture exercises the passes: drop `volatile`
+    // and mem2reg promotes the slot, and DCE removes the unused device load.
+    let src = VOLATILE_ATOMIC_LOOP.replace(" volatile", "");
+    let (mut m, f) = parse_fixture(&src);
+    crate::transform::pipeline::run_passes(
+        &mut m,
+        vec![
+            crate::transform::pipeline::pass_by_name("mem2reg").unwrap(),
+            crate::transform::pipeline::pass_by_name("dce").unwrap(),
+        ],
+    );
+    let func = m.function(f);
+    assert_eq!(n_alloca(func), 0, "a plain slot is promoted");
+    assert_eq!(n_load(func), 1, "only the loop's (used) load of @dev survives");
+    assert_eq!(n_store(func), 2, "the plain stores to @dev stay (a global)");
+}
+
+#[test]
+fn atomic_results_are_unknown_to_the_analyses() {
+    // Even after storing a constant, an atomic load / rmw / cmpxchg result is ⊤.
+    for op in [
+        "%r = atomic_load seq_cst %p align 4 : i32",
+        "%r = atomic_rmw add seq_cst %p, i32 0 align 4 : i32",
+        "%r = cmpxchg seq_cst seq_cst %p, i32 5, i32 5 align 4 : i32",
+        "%r = load volatile %p align 4 : i32",
+    ] {
+        let src = format!(
+            "module \"t\"\nfunc @f() -> i32 {{\nentry ^0:\n  %p = alloca i32 : ptr\n  store i32 5, %p align 4 : i32\n  {op}\n  ret %r\n}}\n"
+        );
+        let mut syms = StrInterner::new();
+        let mut m = crate::ir::text::parse_module(&src, crate::support::diagnostics::FileId::new(0), &mut syms)
+            .unwrap_or_else(|e| panic!("parse: {e:?}"));
+        let f = FuncId::from_index(0);
+        crate::transform::pipeline::optimize(&mut m, crate::transform::pipeline::OptLevel::O3);
+        assert!(verify_module(&m).is_ok());
+        assert!(ret_value_const(&m, f).is_top(), "`{op}` must not fold at -O3");
+        assert_eq!(n_alloca(m.function(f)), 1, "`{op}`: the slot is not promoted");
+    }
+}

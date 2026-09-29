@@ -47,8 +47,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::ir::inst::{
-    BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred, SwitchCase,
-    SwitchData, UnaryOp, Use,
+    AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred,
+    RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
 use crate::ir::types::{FloatKind, FuncType, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, Value, ValueDef, ValueId};
@@ -277,6 +277,23 @@ fn checked(index: usize, len: usize, what: &'static str) -> Result<usize, Decode
 //
 // These are written by hand rather than relying on `as u8` discriminants so the
 // on-disk codes stay stable even if the in-memory enums are reordered.
+
+fn ordering_code(o: AtomicOrdering) -> u8 {
+    o.code()
+}
+
+fn ordering_from(c: u8) -> Result<AtomicOrdering, DecodeError> {
+    AtomicOrdering::from_code(u64::from(c))
+        .ok_or(DecodeError::InvalidTag { what: "atomic ordering", tag: u32::from(c) })
+}
+
+fn rmw_code(op: RmwOp) -> u8 {
+    op.code()
+}
+
+fn rmw_from(c: u8) -> Result<RmwOp, DecodeError> {
+    RmwOp::from_code(u64::from(c)).ok_or(DecodeError::InvalidTag { what: "atomic rmw op", tag: u32::from(c) })
+}
 
 fn binop_code(op: BinOp) -> u8 {
     use BinOp::*;
@@ -515,7 +532,12 @@ fn collect_tables(module: &Module) -> Tables {
             tstack.push(inst.ty);
             match &inst.kind {
                 InstKind::Alloca { elem_ty } => tstack.push(*elem_ty),
-                InstKind::Load { ty, .. } | InstKind::Store { ty, .. } => tstack.push(*ty),
+                InstKind::Load { ty, .. }
+                | InstKind::Store { ty, .. }
+                | InstKind::AtomicLoad { ty, .. }
+                | InstKind::AtomicStore { ty, .. }
+                | InstKind::AtomicRmw { ty, .. }
+                | InstKind::CmpXchg { ty, .. } => tstack.push(*ty),
                 _ => {}
             }
         }
@@ -853,15 +875,47 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
             w.u8(17);
             w.uvarint(u64::from(*align));
         }
-        InstKind::Load { ty, align } => {
-            w.u8(6);
+        // A volatile access has its own tag (19/20) with the same payload, so
+        // streams without one keep the original bytes (no version bump).
+        InstKind::Load { ty, align, volatile } => {
+            w.u8(if *volatile { 19 } else { 6 });
             w.uvarint(t.ty(*ty));
             w.uvarint(u64::from(*align));
         }
-        InstKind::Store { ty, align } => {
-            w.u8(7);
+        InstKind::Store { ty, align, volatile } => {
+            w.u8(if *volatile { 20 } else { 7 });
             w.uvarint(t.ty(*ty));
             w.uvarint(u64::from(*align));
+        }
+        InstKind::AtomicLoad { ty, align, ordering } => {
+            w.u8(21);
+            w.uvarint(t.ty(*ty));
+            w.uvarint(u64::from(*align));
+            w.u8(ordering_code(*ordering));
+        }
+        InstKind::AtomicStore { ty, align, ordering } => {
+            w.u8(22);
+            w.uvarint(t.ty(*ty));
+            w.uvarint(u64::from(*align));
+            w.u8(ordering_code(*ordering));
+        }
+        InstKind::AtomicRmw { op, ty, align, ordering } => {
+            w.u8(23);
+            w.u8(rmw_code(*op));
+            w.uvarint(t.ty(*ty));
+            w.uvarint(u64::from(*align));
+            w.u8(ordering_code(*ordering));
+        }
+        InstKind::CmpXchg { ty, align, success, failure } => {
+            w.u8(24);
+            w.uvarint(t.ty(*ty));
+            w.uvarint(u64::from(*align));
+            w.u8(ordering_code(*success));
+            w.u8(ordering_code(*failure));
+        }
+        InstKind::Fence(ordering) => {
+            w.u8(25);
+            w.u8(ordering_code(*ordering));
         }
         InstKind::PtrAdd { inbounds } => {
             w.u8(8);
@@ -1217,15 +1271,15 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
         3 => InstKind::FCmp(floatpred_from(r.u8()?)?),
         4 => InstKind::Cast(cast_from(r.u8()?)?),
         5 => InstKind::Alloca { elem_ty: ty(r)? },
-        6 => {
+        tag @ (6 | 19) => {
             let ty = ty(r)?;
             let align = r.u32()?;
-            InstKind::Load { ty, align }
+            InstKind::Load { ty, align, volatile: tag == 19 }
         }
-        7 => {
+        tag @ (7 | 20) => {
             let ty = ty(r)?;
             let align = r.u32()?;
-            InstKind::Store { ty, align }
+            InstKind::Store { ty, align, volatile: tag == 20 }
         }
         8 => InstKind::PtrAdd { inbounds: r.u8()? != 0 },
         9 => InstKind::Select,
@@ -1256,6 +1310,30 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
         16 => InstKind::Unreachable,
         17 => InstKind::DynAlloca { align: r.u32()? },
         18 => InstKind::Syscall,
+        21 => {
+            let ty = ty(r)?;
+            let align = r.u32()?;
+            InstKind::AtomicLoad { ty, align, ordering: ordering_from(r.u8()?)? }
+        }
+        22 => {
+            let ty = ty(r)?;
+            let align = r.u32()?;
+            InstKind::AtomicStore { ty, align, ordering: ordering_from(r.u8()?)? }
+        }
+        23 => {
+            let op = rmw_from(r.u8()?)?;
+            let ty = ty(r)?;
+            let align = r.u32()?;
+            InstKind::AtomicRmw { op, ty, align, ordering: ordering_from(r.u8()?)? }
+        }
+        24 => {
+            let ty = ty(r)?;
+            let align = r.u32()?;
+            let success = ordering_from(r.u8()?)?;
+            let failure = ordering_from(r.u8()?)?;
+            InstKind::CmpXchg { ty, align, success, failure }
+        }
+        25 => InstKind::Fence(ordering_from(r.u8()?)?),
         t => return Err(DecodeError::InvalidTag { what: "opcode", tag: u32::from(t) }),
     })
 }
@@ -1290,7 +1368,8 @@ fn rebuild_value_cache(values: &[Value]) -> HashMap<ValueDef, ValueId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, MAGIC, VERSION, decode, encode};
+    use super::{DecodeError, MAGIC, Tables, VERSION, Writer, decode, encode, write_inst_kind};
+    use crate::support::hash::DetHashMap;
     use crate::ir::inst::{BinOp, CastOp, FastMath, Flags, FloatPred, IntPred};
     use crate::ir::types::FloatKind;
     use crate::ir::value::{AddrTarget, Const, FloatBits};
@@ -1524,6 +1603,85 @@ mod tests {
             .collect();
         assert_eq!(arities, vec![1, 7], "decoded syscalls keep their operands");
         assert!(crate::verify::verify_module(&m2).is_ok());
+    }
+
+    #[test]
+    fn volatile_and_atomics_round_trip() {
+        let mut interner = StrInterner::new();
+        let m = crate::ir::tests::atomics_module(&mut interner);
+        let bytes = encode(&m, &interner);
+        let mut back = StrInterner::new();
+        let m2 = decode(&bytes, &mut back).expect("decode should succeed");
+        assert_eq!(encode(&m2, &back), bytes, "binary form must be stable");
+        assert_eq!(
+            crate::ir::text::print_module(&m, &interner),
+            crate::ir::text::print_module(&m2, &back),
+            "the decoded module is the original"
+        );
+        assert!(crate::verify::verify_module(&m2).is_ok());
+    }
+
+    #[test]
+    fn plain_memory_ops_keep_their_original_tags() {
+        // Backward compatibility: a module with no volatile access encodes a
+        // plain load/store with the original tags 6/7 and the original payload,
+        // so version-2 streams written before volatile existed decode unchanged.
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("plain");
+        let i32t = m.types_mut().int(32);
+        let ptr = m.types_mut().ptr();
+        let sig = m.types_mut().func(vec![ptr], i32t, false);
+        let f = m.declare_function(interner.intern("f"), sig);
+        let (plain, vol) = {
+            let mut b = m.build(f);
+            let e = b.create_entry_block();
+            let p = b.param(e, 0);
+            let v = b.load(i32t, p, 4);
+            b.store(i32t, p, v, 4);
+            b.ret(Some(v));
+            (
+                crate::ir::InstKind::Load { ty: i32t, align: 4, volatile: false },
+                crate::ir::InstKind::Load { ty: i32t, align: 4, volatile: true },
+            )
+        };
+        let mut type_index = DetHashMap::default();
+        type_index.insert(i32t, 0);
+        let t = Tables { types: vec![i32t], type_index, consts: Vec::new(), const_index: DetHashMap::default() };
+        let mut w = Writer::new();
+        write_inst_kind(&mut w, &plain, &t);
+        assert_eq!(w.buf, [6, 0, 4], "plain load keeps tag 6 and its payload");
+        let mut w = Writer::new();
+        write_inst_kind(&mut w, &vol, &t);
+        assert_eq!(w.buf[0], 19, "volatile load uses tag 19");
+        let bytes = encode(&m, &interner);
+        assert_eq!(bytes[4], VERSION as u8);
+        assert_eq!(VERSION, 2, "volatile/atomics need no format-version bump");
+        let m2 = decode(&bytes, &mut interner).expect("decode");
+        let func = m2.function(crate::ir::FuncId::from_index(0));
+        assert!((0..func.inst_count()).all(|i| !func.inst(crate::ir::InstId::from_index(i)).kind.is_volatile()));
+    }
+
+    #[test]
+    fn bad_atomic_ordering_byte_is_rejected() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("f");
+        let void = m.types_mut().void();
+        let sig = m.types_mut().func(vec![], void, false);
+        let f = m.declare_function(interner.intern("f"), sig);
+        {
+            let mut b = m.build(f);
+            b.create_entry_block();
+            b.fence(crate::ir::AtomicOrdering::SeqCst);
+            b.ret(None);
+        }
+        let mut bytes = encode(&m, &interner);
+        // The fence is `25 <ordering>`; corrupt the ordering byte (seq_cst = 4).
+        let at = bytes.windows(2).rposition(|w| w == [25, 4]).expect("fence encoded as [25, 4]");
+        bytes[at + 1] = 9;
+        assert!(matches!(
+            decode(&bytes, &mut interner),
+            Err(DecodeError::InvalidTag { what: "atomic ordering", tag: 9 })
+        ));
     }
 
     #[test]

@@ -195,6 +195,36 @@ impl Interp<'_> {
                 let size = imm_u32(ops, 2)? as usize;
                 store_mem(&mut fr.mem, addr(&ptr)?, size, &val);
             }
+            // The interpreter is single-threaded: an atomic's sequential meaning
+            // is its whole meaning, and a fence has no effect.
+            VOp::AtomicRmw => {
+                let d = def(ops, 0)?;
+                let ptr = addr(&self.rd(fr, use_reg(ops, 1)?))?;
+                let val = self.rd(fr, use_reg(ops, 2)?);
+                let size = imm_u32(ops, 3)? as usize;
+                let op = crate::ir::RmwOp::from_code(u64::from(imm_u32(ops, 4)?))
+                    .ok_or("atomic_rmw: bad operation code")?;
+                let w = (8 * size) as u32;
+                let old = load_mem(&fr.mem, ptr, size);
+                let bits = |v: &Int| mask(v, w).to_u64().unwrap_or(0);
+                let new = op.apply(bits(&old), bits(&val), w);
+                store_mem(&mut fr.mem, ptr, size, &Int::from_u64(new));
+                fr.regs.insert(d, old);
+            }
+            VOp::CmpXchg => {
+                let d = def(ops, 0)?;
+                let ptr = addr(&self.rd(fr, use_reg(ops, 1)?))?;
+                let expected = self.rd(fr, use_reg(ops, 2)?);
+                let new = self.rd(fr, use_reg(ops, 3)?);
+                let size = imm_u32(ops, 4)? as usize;
+                let w = (8 * size) as u32;
+                let old = load_mem(&fr.mem, ptr, size);
+                if old == mask(&expected, w) {
+                    store_mem(&mut fr.mem, ptr, size, &mask(&new, w));
+                }
+                fr.regs.insert(d, old);
+            }
+            VOp::Fence => {}
             VOp::FrameAddr => {
                 let d = def(ops, 0)?;
                 let slot = frame_slot(ops, 1)?;

@@ -266,3 +266,181 @@ fn struct_field_and_array_elem_offsets() {
     // field_offset directly: field 1 is at byte 8.
     assert_eq!(module.types().field_offset(s, 1), (8, i64_));
 }
+
+// ---------------------------------------------------------------------------
+// Volatile accesses, atomics and fences (docs/ir-design.md §6b)
+// ---------------------------------------------------------------------------
+
+/// A module exercising every volatile / atomic form: volatile load and store,
+/// `atomic_load`/`atomic_store` at every legal ordering, every `atomic_rmw`
+/// operation, `cmpxchg` (with its success flag), and every legal fence, over
+/// `i8`/`i16`/`i32`/`i64`/`ptr`, on a global and on a parameter pointer. Shared
+/// by the text, binary and verifier tests.
+pub(crate) const ATOMICS_LF: &str = r#"
+module "atomics"
+global @g : i32 = i32 0
+global @gp : ptr = ptr null
+
+func @f(ptr, i64) -> i64 {
+entry ^0(%p: ptr, %n: i64):
+  %a = load volatile @g align 4 : i32
+  store volatile %a, @g align 4 : i32
+  %b = atomic_load relaxed %p align 8 : i64
+  %c = atomic_load acquire %p align 8 : i64
+  %d = atomic_load seq_cst @gp align 8 : ptr
+  atomic_store relaxed %b, %p align 8 : i64
+  atomic_store release %c, %p align 8 : i64
+  atomic_store seq_cst %d, @gp align 8 : ptr
+  %x0 = atomic_rmw xchg seq_cst %p, %n align 8 : i64
+  %x1 = atomic_rmw add relaxed %p, i64 1 align 8 : i64
+  %x2 = atomic_rmw sub acquire %p, i64 2 align 8 : i64
+  %x3 = atomic_rmw and release %p, i64 3 align 8 : i64
+  %x4 = atomic_rmw nand acq_rel %p, i64 4 align 8 : i64
+  %x5 = atomic_rmw or seq_cst %p, i64 5 align 8 : i64
+  %x6 = atomic_rmw xor seq_cst %p, i64 6 align 8 : i64
+  %x7 = atomic_rmw max seq_cst @g, i32 7 align 4 : i32
+  %x8 = atomic_rmw min seq_cst @g, i32 8 align 4 : i32
+  %x9 = atomic_rmw umax seq_cst @g, i32 9 align 4 : i32
+  %x10 = atomic_rmw umin seq_cst @g, i32 10 align 4 : i32
+  %x11 = atomic_rmw xchg seq_cst @gp, %p align 8 : ptr
+  %x12 = atomic_rmw add seq_cst %p, i8 1 align 1 : i8
+  %x13 = atomic_rmw add seq_cst %p, i16 1 align 2 : i16
+  %old = cmpxchg seq_cst relaxed %p, %n, i64 42 align 8 : i64
+  %ok = icmp eq %old, %n : i1
+  %pold = cmpxchg acq_rel acquire @gp, ptr null, %p align 16 : ptr
+  fence acquire
+  fence release
+  fence acq_rel
+  fence seq_cst
+  %r = select %ok, %old, %x1 : i64
+  ret %r
+}
+"#;
+
+/// Parse [`ATOMICS_LF`] (panicking on a parse error).
+pub(crate) fn atomics_module(syms: &mut StrInterner) -> Module {
+    crate::ir::text::parse_module(ATOMICS_LF, crate::support::diagnostics::FileId::new(0), syms)
+        .unwrap_or_else(|e| panic!("parse ATOMICS_LF: {e:?}"))
+}
+
+#[test]
+fn atomics_fixture_verifies_and_carries_every_form() {
+    let mut syms = StrInterner::new();
+    let m = atomics_module(&mut syms);
+    crate::verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let f = m.function(FuncId::from_index(0));
+    let kinds: Vec<&InstKind> =
+        f.blocks().flat_map(|(_, b)| b.insts().iter().map(|&i| &f.inst(i).kind)).collect();
+    assert_eq!(kinds.iter().filter(|k| k.is_volatile()).count(), 2);
+    assert_eq!(kinds.iter().filter(|k| matches!(k, InstKind::AtomicRmw { .. })).count(), 14);
+    assert_eq!(kinds.iter().filter(|k| matches!(k, InstKind::CmpXchg { .. })).count(), 2);
+    assert_eq!(kinds.iter().filter(|k| matches!(k, InstKind::Fence(_))).count(), 4);
+    assert!(kinds.iter().all(|k| !k.is_atomic() || k.has_side_effect()), "every atomic is kept by DCE");
+    assert!(kinds.iter().all(|k| !k.is_volatile() || k.has_side_effect()), "volatile is kept by DCE");
+}
+
+#[test]
+fn builder_atomics_use_natural_alignment() {
+    use crate::ir::inst::{AtomicOrdering, RmwOp};
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("b");
+    let i16t = m.types_mut().int(16);
+    let i64t = m.types_mut().int(64);
+    let ptr = m.types_mut().ptr();
+    let sig = m.types_mut().func(vec![ptr, i16t], i64t, false);
+    let f = m.declare_function(syms.intern("f"), sig);
+    {
+        let mut b = m.build(f);
+        let e = b.create_entry_block();
+        let p = b.param(e, 0);
+        let h = b.param(e, 1);
+        let v = b.load_volatile(i16t, p, 2);
+        b.store_volatile(i16t, p, v, 2);
+        b.atomic_store(i16t, p, h, AtomicOrdering::Release);
+        let l = b.atomic_load(ptr, p, AtomicOrdering::Acquire);
+        b.atomic_rmw(RmwOp::Or, p, h, AtomicOrdering::Relaxed);
+        let old = b.cmpxchg(p, l, l, AtomicOrdering::SeqCst, AtomicOrdering::Acquire);
+        let ok = b.cmpxchg_success(old, l);
+        b.fence(AtomicOrdering::SeqCst);
+        let r = b.cast(crate::ir::CastOp::ZExt, ok, i64t);
+        b.ret(Some(r));
+    }
+    crate::verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let func = m.function(f);
+    let aligns: Vec<u32> = func
+        .blocks()
+        .flat_map(|(_, b)| b.insts().to_vec())
+        .filter_map(|i| match func.inst(i).kind {
+            InstKind::AtomicLoad { align, .. }
+            | InstKind::AtomicStore { align, .. }
+            | InstKind::AtomicRmw { align, .. }
+            | InstKind::CmpXchg { align, .. } => Some(align),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(aligns, vec![2, 8, 2, 8], "atomics default to natural alignment");
+}
+
+#[test]
+fn rmw_apply_matches_std_atomics() {
+    use crate::ir::inst::RmwOp;
+    use std::sync::atomic::{AtomicI8, AtomicI32, AtomicU8, AtomicU64, Ordering::SeqCst};
+    // An independent oracle: the standard library's own fetch_* operations.
+    for &(old, v) in &[(0x7Fu8, 0x81u8), (0x80, 0x7F), (0xFF, 0x01), (5, 250), (0, 0)] {
+        let s = |op: RmwOp| op.apply(u64::from(old), u64::from(v), 8);
+        let after_i = |f: &dyn Fn(&AtomicI8)| {
+            let a = AtomicI8::new(old as i8);
+            f(&a);
+            u64::from(a.load(SeqCst) as u8)
+        };
+        let after_u = |f: &dyn Fn(&AtomicU8)| {
+            let a = AtomicU8::new(old);
+            f(&a);
+            u64::from(a.load(SeqCst))
+        };
+        assert_eq!(s(RmwOp::Xchg), u64::from(v));
+        assert_eq!(s(RmwOp::Add), after_u(&|a| { a.fetch_add(v, SeqCst); }));
+        assert_eq!(s(RmwOp::Sub), after_u(&|a| { a.fetch_sub(v, SeqCst); }));
+        assert_eq!(s(RmwOp::And), after_u(&|a| { a.fetch_and(v, SeqCst); }));
+        assert_eq!(s(RmwOp::Nand), after_u(&|a| { a.fetch_nand(v, SeqCst); }));
+        assert_eq!(s(RmwOp::Or), after_u(&|a| { a.fetch_or(v, SeqCst); }));
+        assert_eq!(s(RmwOp::Xor), after_u(&|a| { a.fetch_xor(v, SeqCst); }));
+        assert_eq!(s(RmwOp::Max), after_i(&|a| { a.fetch_max(v as i8, SeqCst); }));
+        assert_eq!(s(RmwOp::Min), after_i(&|a| { a.fetch_min(v as i8, SeqCst); }));
+        assert_eq!(s(RmwOp::UMax), after_u(&|a| { a.fetch_max(v, SeqCst); }));
+        assert_eq!(s(RmwOp::UMin), after_u(&|a| { a.fetch_min(v, SeqCst); }));
+    }
+    // 32- and 64-bit spot checks of the signed/unsigned split and wrapping.
+    let a = AtomicI32::new(-5);
+    a.fetch_max(3, SeqCst);
+    assert_eq!(RmwOp::Max.apply((-5i32) as u32 as u64, 3, 32), a.load(SeqCst) as u32 as u64);
+    let u = AtomicU64::new(u64::MAX);
+    u.fetch_add(2, SeqCst);
+    assert_eq!(RmwOp::Add.apply(u64::MAX, 2, 64), u.load(SeqCst));
+    assert_eq!(RmwOp::UMin.apply((-5i32) as u32 as u64, 3, 32), 3);
+}
+
+#[test]
+fn ordering_and_rmw_codes_round_trip() {
+    use crate::ir::inst::{AtomicOrdering, RmwOp};
+    for o in AtomicOrdering::ALL {
+        assert_eq!(AtomicOrdering::from_code(u64::from(o.code())), Some(o));
+        assert_eq!(AtomicOrdering::from_name(o.name()), Some(o));
+    }
+    for op in RmwOp::ALL {
+        assert_eq!(RmwOp::from_code(u64::from(op.code())), Some(op));
+        assert_eq!(RmwOp::from_name(op.name()), Some(op));
+    }
+    assert_eq!(AtomicOrdering::from_code(5), None);
+    assert_eq!(RmwOp::from_code(11), None);
+    // Which orderings each op admits.
+    use AtomicOrdering::*;
+    let names = |f: fn(AtomicOrdering) -> bool| -> Vec<&str> {
+        AtomicOrdering::ALL.into_iter().filter(|&o| f(o)).map(AtomicOrdering::name).collect()
+    };
+    assert_eq!(names(AtomicOrdering::valid_for_load), ["relaxed", "acquire", "seq_cst"]);
+    assert_eq!(names(AtomicOrdering::valid_for_store), ["relaxed", "release", "seq_cst"]);
+    assert_eq!(names(AtomicOrdering::valid_for_fence), ["acquire", "release", "acq_rel", "seq_cst"]);
+    assert!(SeqCst.is_acquire() && SeqCst.is_release() && AcqRel.is_acquire() && AcqRel.is_release());
+    assert!(!Relaxed.is_acquire() && !Relaxed.is_release() && !Acquire.is_release() && !Release.is_acquire());
+}

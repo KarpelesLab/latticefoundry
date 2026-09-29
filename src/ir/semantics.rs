@@ -47,8 +47,11 @@
 //!
 //! ## What is *not* here
 //!
-//! Stateful and positional ops — `Alloca`, `DynAlloca`, `Load`, `Store`,
-//! `Call`, `Syscall` (an opaque effect on the outside world, which no pure
+//! Stateful and positional ops — `Alloca`, `DynAlloca`, `Load`, `Store`
+//! (volatile or not), the atomics `AtomicLoad`, `AtomicStore`, `AtomicRmw`,
+//! `CmpXchg` and `Fence` (whose sequential meaning over a memory state is
+//! documented on each opcode in [`crate::ir::inst`] and in `docs/ir-design.md`
+//! §6b), `Call`, `Syscall` (an opaque effect on the outside world, which no pure
 //! evaluator can perform), and the
 //! terminators `Ret`/`Br`/`CondBr`/`Switch`/`Unreachable` — are about memory
 //! and control-flow *state*, not pure value production. They belong to the
@@ -242,7 +245,8 @@ fn float_kind(types: &TypeContext, ty: TypeId) -> Option<FloatKind> {
 /// # Panics
 ///
 /// Panics if `kind` is a stateful or terminator opcode (`Alloca`, `DynAlloca`,
-/// `Load`, `Store`, `Call`, `Syscall`, `Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`); those are
+/// `Load`, `Store`, the atomics and `Fence`, `Call`, `Syscall`, `Ret`, `Br`,
+/// `CondBr`, `Switch`, `Unreachable`); those are
 /// not pure value production and are handled by the interpreter/verifier layer,
 /// not here. Callers must only pass value-producing opcodes.
 pub fn eval(
@@ -271,6 +275,11 @@ pub fn eval(
         | InstKind::DynAlloca { .. }
         | InstKind::Load { .. }
         | InstKind::Store { .. }
+        | InstKind::AtomicLoad { .. }
+        | InstKind::AtomicStore { .. }
+        | InstKind::AtomicRmw { .. }
+        | InstKind::CmpXchg { .. }
+        | InstKind::Fence(_)
         | InstKind::Call
         | InstKind::Syscall
         | InstKind::Ret

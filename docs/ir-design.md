@@ -253,6 +253,128 @@ dedicated opcode:
   lowerings), and verifiable (typed operands, a checked arity, and an honest
   "unknown" in the refinement checker).
 
+## 6b. Volatile accesses, atomics and fences  *(decided)*
+
+Memory-mapped I/O needs accesses the optimizer must leave exactly as written,
+and concurrent code (a front end's `Atomic[T]`, mutexes, lock-free queues)
+needs indivisible read-modify-writes and inter-thread ordering. Both are
+first-class in the IR rather than intrinsics or inline assembly, for the same
+reasons as `syscall` (§6a): their effects stay precise and checkable.
+
+### Volatile
+
+`volatile` is a flag on the ordinary `load`/`store`:
+
+```text
+%v = load volatile %p align 4 : i32
+store volatile %v, %p align 4 : i32
+```
+
+A volatile access is an observable event in its own right. It is performed
+**exactly once**, at **exactly** the accessed type's width, in program order
+relative to every other volatile access, atomic, fence, call and syscall. So it
+is never removed (not even an unused load, nor a store a later store overwrites),
+duplicated, merged with an identical neighbor, widened or narrowed, hoisted or
+sunk, promoted to a register (mem2reg leaves a slot with a volatile access in
+memory), or forwarded from a store; its result is ⊤ in every abstract domain.
+Volatile is *not* atomic (a wide volatile access may tear) and orders nothing
+but other volatile accesses: use an atomic for synchronization.
+
+- **Rejected: volatile in the [`Flags`](#7-instruction-flags-one-unified-model)
+  set.** A flag licenses optimization and its violation yields poison; volatile
+  is the opposite, a restriction with no poison reading. It lives on the
+  memory op, like its accessed type and alignment.
+
+### Atomics
+
+Five opcodes, each carrying a C11-style memory ordering:
+
+```text
+%v   = atomic_load <ord> %p align A : T                  ; relaxed | acquire | seq_cst
+       atomic_store <ord> %v, %p align A : T              ; relaxed | release | seq_cst
+%old = atomic_rmw <op> <ord> %p, %v align A : T           ; any ordering
+%old = cmpxchg <success> <failure> %p, %expected, %new align A : T
+       fence <ord>                                        ; acquire | release | acq_rel | seq_cst
+```
+
+- **Orderings** are `relaxed`, `acquire`, `release`, `acq_rel`, `seq_cst`, with
+  the C11/C++11 meanings (`relaxed` is atomic but unordered; the IR has no
+  weaker LLVM-style `unordered`). The verifier rejects orderings that mean
+  nothing for an op: a releasing load, an acquiring store, a `relaxed` fence, and
+  a `cmpxchg` *failure* ordering other than a load ordering. The failure ordering
+  may be stronger than the success one (as C++17 allows).
+- **`<op>`** of `atomic_rmw`: `xchg`, `add`, `sub`, `and`, `nand`, `or`, `xor`,
+  `max`, `min` (signed), `umax`, `umin` (unsigned); arithmetic wraps.
+- **Types** are `i8`, `i16`, `i32`, `i64` and `ptr` (`ptr` only for loads,
+  stores, `xchg` and `cmpxchg`). The alignment is explicit in the text (as on
+  `load`/`store`) but must be at least the type's size: atomics are **naturally
+  aligned**. The builder helpers (`atomic_load`, `atomic_store`, `atomic_rmw`,
+  `cmpxchg`, `fence`) always use natural alignment.
+- **`cmpxchg` has one result, the old value.** Instructions produce a single
+  value, and an aggregate result would be an address (§6), so rather than a
+  `{T, i1}` pair the op returns `old`, and the success flag is
+  `icmp eq %old, %expected` (`FunctionBuilder::cmpxchg_success`). This is exact
+  because the exchange is *strong* (it never fails spuriously): it happened iff
+  the old value equals `expected`, bitwise. A weak (spuriously failing) form
+  would need a real second result and is left out until a front end wants it.
+
+**Sequential semantics** (all a single-threaded evaluator observes): an
+`atomic_load`/`atomic_store` is a `load`/`store` of `T`; `atomic_rmw` reads
+`old`, writes `op(old, v)`, returns `old`; `cmpxchg` reads `old`, writes `new` if
+`old == expected`, returns `old`; a fence does nothing. A misaligned, poison or
+dangling address is UB; a poison stored/operand value stores poison; a poison
+`expected` (or loaded `old`) in a `cmpxchg` is UB, since the comparison would
+branch on poison.
+
+**Constraints on optimization.** Every atomic and fence is kept by DCE and SCCP
+(including an unused `relaxed` load: dropping it would be sound, but keeping it
+is simpler and obviously correct), never hoisted, sunk, duplicated or merged,
+and its result is ⊤ in every domain. No transform moves a memory operation
+*up* across an acquire (`acquire`, `acq_rel`, `seq_cst` load, rmw, cmpxchg or
+fence) or *down* across a release; `seq_cst` operations and `acq_rel`/`seq_cst`
+fences are full barriers. The current passes satisfy this structurally: none of
+them moves any memory operation (LICM hoists only pure ops, the e-graph emits
+effectful ops verbatim in their original order, mem2reg only rewrites slots
+whose address never escapes). The reference evaluator (`ir::semantics`) treats
+these ops like the other stateful ops, and the refinement checker (B2) reports
+any function containing one, or any result-less effect such as a store or a
+fence, as `Unknown`, never as a proof.
+
+**Binary form.** Volatile `load`/`store` use their own opcode tags (19/20) with
+the same payload as tags 6/7, and the atomics use tags 21–25, so existing
+`.lfb` version-2 streams are unchanged and no version bump was needed.
+
+### Lowering
+
+Clean-room from each ISA's memory model. Volatile accesses are one ordinary
+load/store of exactly the declared width on every target. Atomics:
+
+| IR | x86-64 (TSO) |
+|---|---|
+| `atomic_load` (any ordering) | `mov` |
+| `atomic_store relaxed`/`release` | `mov` |
+| `atomic_store seq_cst` | `xchg` |
+| `atomic_rmw xchg` | `xchg` |
+| `atomic_rmw add`/`sub` | `lock xadd` (`sub` negates first) |
+| other `atomic_rmw` | `lock cmpxchg` loop |
+| `cmpxchg` | `lock cmpxchg` (`rax`) |
+| `fence seq_cst` | `mfence` |
+| `fence` acquire/release/acq_rel | nothing |
+
+The AArch64 and RISC-V backends do not lower atomics yet (they stop with a
+clear "not yet supported" error).
+
+On x86-64 every `lock`ed instruction and `xchg` with memory is a full barrier,
+so the orderings of rmw/cmpxchg need nothing more; loads are never reordered with
+loads nor stores with stores, so acquire loads and release stores are plain
+`mov`s, and only a `seq_cst` store (which must not pass a later load) needs the
+`xchg`. The fixed `rax` of `cmpxchg` is modeled with the allocator's range-based
+fixed-register intervals: `mov rax, expected; lock cmpxchg; mov old, rax` is one
+contiguous window with every operand materialized before it. The `lock cmpxchg`
+retry loop is a single pseudo-instruction expanded at encode time with an
+internal label, so the allocator sees one instruction with `rax` and a scratch
+register as clobbered defs.
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than

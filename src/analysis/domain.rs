@@ -180,6 +180,7 @@ pub(crate) fn concrete_eval(
         | crate::ir::InstKind::Store { .. }
         | crate::ir::InstKind::Call
         | crate::ir::InstKind::Syscall => None,
+        kind if kind.is_atomic() => None,
         kind => match eval(types, inst.ty, kind, &inst.flags, operands) {
             EvalOutcome::Value(v) => Some(v),
             EvalOutcome::UndefinedBehavior => None,

@@ -105,6 +105,18 @@ pub enum VOp {
     /// opaque effect whose operands stay live) and the interpreter refuses to
     /// execute it rather than invent a result.
     Syscall = 32,
+    /// `[Def d, Use ptr, Use val, Imm size, Imm op]` — atomic read-modify-write
+    /// (`atomic_rmw`): `d = *ptr; *ptr = op(d, val)` over `size` bytes, `op`
+    /// being an [`RmwOp::code`](crate::ir::RmwOp::code). The interpreter is
+    /// single-threaded, so the sequential meaning is exact.
+    AtomicRmw = 33,
+    /// `[Def d, Use ptr, Use expected, Use new, Imm size]` — atomic
+    /// compare-and-exchange (`cmpxchg`): `d = *ptr; if d == expected { *ptr =
+    /// new }` over `size` bytes.
+    CmpXchg = 34,
+    /// `[Imm ordering]` — a memory fence. No sequential effect; kept so the
+    /// barrier stays visible in the MIR.
+    Fence = 35,
 }
 
 impl VOp {
@@ -117,10 +129,11 @@ impl VOp {
     /// Decode a target [`Opcode`] back to a [`VOp`].
     pub fn decode(op: Opcode) -> VOp {
         use VOp::*;
-        const TABLE: [VOp; 33] = [
+        const TABLE: [VOp; 36] = [
             Li, Move, Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, ICmp,
             Select, Cast, Load, Store, FrameAddr, GlobalAddr, Call, Ret, Jmp, BrCond, Switch,
-            Unreachable, StackStore, StackLoad, Unsupported, DynAlloca, Syscall,
+            Unreachable, StackStore, StackLoad, Unsupported, DynAlloca, Syscall, AtomicRmw,
+            CmpXchg, Fence,
         ];
         TABLE[op.0 as usize]
     }
@@ -439,7 +452,10 @@ impl TargetIsel for VirtualTarget {
                     ],
                 ));
             }
-            InstKind::Load { ty, .. } => {
+            // A volatile access and an atomic load/store are the same machine
+            // access at the same width: the virtual machine is single-threaded
+            // and never reorders or elides its loads and stores.
+            InstKind::Load { ty, .. } | InstKind::AtomicLoad { ty, .. } => {
                 let d = lo.result_reg(inst);
                 let ptr = lo.reg(inst.operands()[0]);
                 let size = lo.byte_size(*ty);
@@ -452,7 +468,7 @@ impl TargetIsel for VirtualTarget {
                     ],
                 ));
             }
-            InstKind::Store { ty, .. } => {
+            InstKind::Store { ty, .. } | InstKind::AtomicStore { ty, .. } => {
                 let ptr = lo.reg(inst.operands()[0]);
                 let val = lo.reg(inst.operands()[1]);
                 let size = lo.byte_size(*ty);
@@ -490,6 +506,45 @@ impl TargetIsel for VirtualTarget {
                 let d = lo.result_reg(inst);
                 let s = lo.reg(inst.operands()[0]);
                 lo.emit(self.emit_move(Reg::Virtual(d), Reg::Virtual(s)));
+            }
+            InstKind::AtomicRmw { op, ty, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(inst.operands()[0]);
+                let val = lo.reg(inst.operands()[1]);
+                let size = lo.byte_size(*ty);
+                lo.emit(MachineInst::new(
+                    VOp::AtomicRmw.opcode(),
+                    vec![
+                        MachineOperand::Def(Reg::Virtual(d)),
+                        MachineOperand::Use(Reg::Virtual(ptr)),
+                        MachineOperand::Use(Reg::Virtual(val)),
+                        MachineOperand::Imm(Int::from_u64(size)),
+                        MachineOperand::Imm(Int::from_u64(u64::from(op.code()))),
+                    ],
+                ));
+            }
+            InstKind::CmpXchg { ty, .. } => {
+                let d = lo.result_reg(inst);
+                let ptr = lo.reg(inst.operands()[0]);
+                let expected = lo.reg(inst.operands()[1]);
+                let new = lo.reg(inst.operands()[2]);
+                let size = lo.byte_size(*ty);
+                lo.emit(MachineInst::new(
+                    VOp::CmpXchg.opcode(),
+                    vec![
+                        MachineOperand::Def(Reg::Virtual(d)),
+                        MachineOperand::Use(Reg::Virtual(ptr)),
+                        MachineOperand::Use(Reg::Virtual(expected)),
+                        MachineOperand::Use(Reg::Virtual(new)),
+                        MachineOperand::Imm(Int::from_u64(size)),
+                    ],
+                ));
+            }
+            InstKind::Fence(ordering) => {
+                lo.emit(MachineInst::new(
+                    VOp::Fence.opcode(),
+                    vec![MachineOperand::Imm(Int::from_u64(u64::from(ordering.code())))],
+                ));
             }
             InstKind::Call => self.lower_call(lo, inst),
             InstKind::Syscall => {

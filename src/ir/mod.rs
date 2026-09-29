@@ -33,8 +33,8 @@ pub mod types;
 pub mod value;
 
 pub use inst::{
-    BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred, SwitchCase,
-    SwitchData, UnaryOp, Use,
+    AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred,
+    RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
 pub use merge::{MergeError, merge_modules};
 pub use semantics::{EvalOutcome, FoldResult, SemValue, eval, fold};
@@ -506,4 +506,4 @@ impl Block {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -276,16 +276,10 @@ fn terminator_choice(
     }
 }
 
-/// Whether an opcode has a side effect that forbids dropping it (mirrors DCE).
+/// Whether an opcode has a side effect that forbids dropping it (mirrors DCE):
+/// stores, calls, syscalls, allocations, atomics, fences, volatile loads.
 fn has_side_effect(kind: &InstKind) -> bool {
-    matches!(
-        kind,
-        InstKind::Alloca { .. }
-            | InstKind::DynAlloca { .. }
-            | InstKind::Store { .. }
-            | InstKind::Call
-            | InstKind::Syscall
-    )
+    kind.has_side_effect()
 }
 
 // ---------------------------------------------------------------------------
