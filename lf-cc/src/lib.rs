@@ -123,19 +123,52 @@ pub fn build_image_with(
         ));
     }
     let obj = compile_program(&program, source, input_name, opt, debug)?;
+    link_image(vec![obj], debug)
+}
 
+/// The result of [`compile_module_with`]: the translation unit's in-memory
+/// object module plus its file-scope `asm(...)` templates.
+#[derive(Debug)]
+pub struct CompiledModule {
+    /// The compiled C code, ready for [`link_image`] or
+    /// `latticefoundry::mc::elf::write`.
+    pub module: ObjectModule,
+    /// The file-scope asm templates, in source order (see [`CompiledObject`]).
+    pub toplevel_asm: Vec<String>,
+}
+
+/// Compile one translation unit to an in-memory [`ObjectModule`] (plus its
+/// file-scope asm). A unit without file-scope asm can go straight to the
+/// framework's own static linker ([`link_image`]); one with it needs the ELF
+/// link path, since its assembled code is a separate ELF object.
+pub fn compile_module_with(
+    source: &str,
+    input_name: &str,
+    opts: &PpOptions,
+    opt: OptLevel,
+    debug: bool,
+) -> Result<CompiledModule, BuildError> {
+    let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
+    let module = compile_program(&program, source, input_name, opt, debug)?;
+    Ok(CompiledModule { module, toplevel_asm: program.toplevel_asm })
+}
+
+/// Link in-memory objects (from [`compile_module_with`]) into a static,
+/// libc-free x86-64 executable image with the framework's own linker core,
+/// which synthesizes a `_start` that calls `main` and exits with its result.
+pub fn link_image(objects: Vec<ObjectModule>, debug: bool) -> Result<Vec<u8>, BuildError> {
     let image_opts = ImageOptions { debug, ..ImageOptions::default() };
-    link::link_executable(vec![obj], &image_opts)
+    link::link_executable(objects, &image_opts)
         .map_err(|e| BuildError::Backend(format!("link error: {e}")))
 }
 
 /// Compile a translation unit to a **relocatable ELF object** (the `-c` mode).
 ///
 /// Unlike [`build_image_with`], this stops before linking and returns the ELF
-/// `.o` bytes, so the object can be linked by an external linker against a real
+/// `.o` bytes, so the object can be linked by a GNU-style linker against a real
 /// libc (calls to undefined symbols like `printf`/`malloc` become relocations
-/// the system linker resolves). This is how lf-cc-compiled hosted programs are
-/// tested.
+/// the linker resolves). The driver's hosted link feeds these objects to `qld`
+/// through `latticefoundry::link::gnu`.
 ///
 /// A translation unit with file-scope `asm(...)` declarations is rejected here
 /// (their code would otherwise be silently dropped); use
@@ -178,11 +211,10 @@ pub fn compile_object_with(
     opt: OptLevel,
     debug: bool,
 ) -> Result<CompiledObject, BuildError> {
-    let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
-    let obj = compile_program(&program, source, input_name, opt, debug)?;
+    let compiled = compile_module_with(source, input_name, opts, opt, debug)?;
     Ok(CompiledObject {
-        object: latticefoundry::mc::elf::write(&obj),
-        toplevel_asm: program.toplevel_asm,
+        object: latticefoundry::mc::elf::write(&compiled.module),
+        toplevel_asm: compiled.toplevel_asm,
     })
 }
 
