@@ -351,6 +351,37 @@ fn random_function(rng: &mut Rng, name: &str, steps: usize, floats: bool) -> Str
     b
 }
 
+/// Selects over split `<8 x i64>` vectors whose 32 lanes all stay live to
+/// the end: heavy register pressure (and spilling) around selects on the
+/// scalarizing targets, where select lowerings once named more registers than
+/// the spill scratches cover.
+pub(crate) const PRESSURE_SRC: &str = r#"
+module "pressure"
+func @pressure(i64, i64, i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
+  %va = splat %a : <8 x i64>
+  %vb = splat %b : <8 x i64>
+  %w = add %va, <8 x i64> (i64 1, i64 2, i64 3, i64 4, i64 5, i64 6, i64 7, i64 8) : <8 x i64>
+  %x = mul %vb, <8 x i64> (i64 3, i64 5, i64 7, i64 11, i64 13, i64 17, i64 19, i64 23) : <8 x i64>
+  %y = xor %w, %x : <8 x i64>
+  %z = sub %x, %w : <8 x i64>
+  %c1 = trunc %c : i1
+  %d1 = trunc %d : i1
+  %s1 = select %c1, %w, %x : <8 x i64>
+  %s2 = select %d1, %y, %z : <8 x i64>
+  %m = icmp ult %s1, %s2 : <8 x i1>
+  %s3 = select %m, %w, %z : <8 x i64>
+  %t1 = add %s1, %s2 : <8 x i64>
+  %t2 = xor %t1, %s3 : <8 x i64>
+  %t3 = add %t2, %y : <8 x i64>
+  %t4 = xor %t3, %x : <8 x i64>
+  %r = reduce add %t4 : i64
+  %r2 = reduce xor %s3 : i64
+  %o = add %r, %r2 : i64
+  ret %o
+}
+"#;
+
 /// Random 64-bit inputs, biased toward interesting bit patterns.
 pub(crate) fn random_inputs(rng: &mut Rng) -> Vec<i64> {
     (0..4)
@@ -558,6 +589,59 @@ pub(crate) fn lanes_src() -> String {
         s += &func(
             name,
             &format!("  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %sh = shufflevector %x, %y, {mask} : {ty}\n  %out = bitcast %sh : <2 x i64>\n"),
+        );
+    }
+    s
+}
+
+/// Masks of every width carried around a loop as block parameters, `select`
+/// with a scalar condition, shuffles taking only the second operand, and mask
+/// lane insert/extract/splat.
+pub(crate) fn masks_src() -> String {
+    let mut s = String::from("module \"vmask\"\n");
+    for (t, n) in [("i8", 16u32), ("i16", 8), ("i32", 4), ("i64", 2)] {
+        let ty = format!("<{n} x {t}>");
+        let mt = format!("<{n} x i1>");
+        let second: Vec<String> = (0..n).map(|i| (n + (i * 3) % n).to_string()).collect();
+        s += &format!(
+            "func @loop_{t}(i64, i64, i64, i64) -> i64 {{
+entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
+  %p0 = insertelement <2 x i64> poison, %a, 0 : <2 x i64>
+  %x0 = insertelement %p0, %b, 1 : <2 x i64>
+  %p1 = insertelement <2 x i64> poison, %c, 0 : <2 x i64>
+  %y0 = insertelement %p1, %d, 1 : <2 x i64>
+  %x = {cast} %x0 : {ty}
+  %y = {cast} %y0 : {ty}
+  %m0 = icmp ult %x, %y : {mt}
+  br ^1(i64 0, %m0, %x)
+^1(%i: i64, %m: {mt}, %acc: {ty}):
+  %sh = shufflevector %y, %acc, [{sec}] : {ty}
+  %e = extractelement %m, {last} : i1
+  %ins = insertelement %m, %e, 0 : {mt}
+  %nm = xor %ins, %m0 : {mt}
+  %odd = trunc %i : i1
+  %pick = select %odd, %sh, %acc : {ty}
+  %sp = splat %odd : {mt}
+  %both = and %nm, %sp : {mt}
+  %acc2 = select %both, %pick, %x : {ty}
+  %i2 = add %i, i64 1 : i64
+  %k = icmp ult %i2, i64 5 : i1
+  cond_br %k, ^1(%i2, %nm, %acc2), ^2(%acc2, %nm)
+^2(%v: {ty}, %mm: {mt}):
+  %w = sext %mm : {ty}
+  %u = add %v, %w : {ty}
+  %out = {cast} %u : <2 x i64>
+  %l = extractelement %out, 0 : i64
+  %h = extractelement %out, 1 : i64
+  %hm = mul %h, i64 1000003 : i64
+  %r = xor %l, %hm : i64
+  ret %r
+}}
+",
+            sec = second.join(", "),
+            last = n - 1,
+            // A same-type bitcast is not a conversion; `freeze` is the identity here.
+            cast = if t == "i64" { "freeze" } else { "bitcast" },
         );
     }
     s

@@ -14,7 +14,7 @@ use crate::ir::{FuncId, Module};
 use crate::link::{ImageOptions, link_executable, write_executable};
 use crate::support::StrInterner;
 use crate::target::vector_fixtures::{
-    FLOAT_SRC, INPUTS, INT_OPS, cases, compare_src, int_arith_src, lanes_src,
+    FLOAT_SRC, INPUTS, INT_OPS, cases, compare_src, int_arith_src, lanes_src, masks_src,
     Case, Rng, assert_matches, parse, random_inputs, random_program, reference, with_stdout_main,
 };
 use crate::transform::pipeline::{OptLevel, optimize};
@@ -233,6 +233,12 @@ entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
 #[test]
 fn illegal_types_reductions_memory_and_calls_match_the_reference() {
     check_native(MIXED_SRC, &cases(&["mixed", "fred", "framed"], &INPUTS), "mix");
+}
+
+#[test]
+fn masks_in_loops_and_scalar_selects_match_the_reference() {
+    let src = masks_src();
+    check_native(&src, &cases(&["loop_i8", "loop_i16", "loop_i32", "loop_i64"], &INPUTS), "mask");
 }
 
 #[test]

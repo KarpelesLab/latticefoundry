@@ -237,6 +237,16 @@ pub enum A64Op {
     /// `[Def d, Imm lo, Imm hi]` — a 128-bit constant through `x16`:
     /// `movz/movk x16, lo; fmov Dd, x16; movz/movk x16, hi; ins Vd.d[1], x16`.
     NeonConst = 72,
+    /// `[Use cond]` — `cmp cond, #0` (`subs xzr, cond, xzr`), setting the flags
+    /// for the [`A64Op::CselNe`] that immediately follows. Spill and reload code
+    /// the allocator may place between the two (`ldr`/`str`/`add` without
+    /// `s`) never touches the flags.
+    CmpZero = 73,
+    /// `[Def d, Use t, Use f]` — `csel d, t, f, ne` on the flags of the
+    /// preceding [`A64Op::CmpZero`]. Splitting `select` in two keeps every
+    /// instruction at three register operands, which the three spill scratches
+    /// always cover.
+    CselNe = 74,
 }
 
 impl A64Op {
@@ -251,7 +261,8 @@ impl A64Op {
     /// audit of the lowering (`docs/ir-design.md` §6d): the terminators
     /// `BrCond`/`Switch` and the exclusive-monitor retry loops of `AtomicRmw`
     /// and `CmpXchg` (which also compares the loaded value). Everything else
-    /// — in particular `Csel` (a `select`), `CmpCset`, the variable shifts,
+    /// — in particular `CmpZero` + `CselNe` (a `select`), `Csel`, `CmpCset`,
+    /// the variable shifts,
     /// `Mul`, `Sbfx`/`Ubfx`, the float conversions, and every NEON op
     /// (`NeonOp3` … `NeonConst`: a vector `select` is an `and`/`bic`/`orr`
     /// blend) — is straight-line code. (The prologue's probe loop counts a
@@ -263,14 +274,14 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 73] = [
+        const TABLE: [A64Op; 75] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
             AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
             Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc, Sbfx, Ubfx, LoadAcq, StoreRel,
             Dmb, AtomicRmw, CmpXchg, NeonOp3, NeonOp2, NeonShift, NeonDup, NeonDupLane, NeonUmov,
-            NeonInsGpr, NeonInsElem, NeonLoad, NeonStore, NeonConst,
+            NeonInsGpr, NeonInsElem, NeonLoad, NeonStore, NeonConst, CmpZero, CselNe,
         ];
         TABLE[op.0 as usize]
     }
@@ -1553,10 +1564,8 @@ impl TargetIsel for AArch64Target {
                 let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = lo.reg(inst.operands()[1]);
                 let f = lo.reg(inst.operands()[2]);
-                lo.emit(MachineInst::new(
-                    A64Op::Csel.opcode(),
-                    vec![def_v(d), use_v(c), use_v(t), use_v(f)],
-                ));
+                lo.emit(MachineInst::new(A64Op::CmpZero.opcode(), vec![use_v(c)]));
+                lo.emit(MachineInst::new(A64Op::CselNe.opcode(), vec![def_v(d), use_v(t), use_v(f)]));
             }
             InstKind::Freeze | InstKind::Declassify => {
                 let d = lo.result_reg(inst);

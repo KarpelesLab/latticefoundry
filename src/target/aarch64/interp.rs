@@ -143,6 +143,9 @@ struct Frame {
     ret_val: Option<Int>,
     /// The function this activation runs (for its virtual registers' classes).
     fidx: usize,
+    /// The `Z` flag's complement as `CmpZero` left it (the only flag state a
+    /// following `CselNe` reads).
+    flag_ne: bool,
 }
 
 /// What a completed call hands back: the primary scalar return and a snapshot of
@@ -213,6 +216,7 @@ impl Machine<'_> {
             slot_val: DetHashMap::default(),
             ret_val: None,
             fidx,
+            flag_ne: false,
         };
         for (p, v) in inputs {
             fr.regs.insert(Reg::Physical(*p), v.clone());
@@ -321,6 +325,14 @@ impl Machine<'_> {
                 let w = reg_width(imm_u32(ops, 4)?);
                 let r = eval_cond(cc, &a, &bb, w);
                 fr.regs.insert(d, if r { Int::ONE } else { Int::ZERO });
+            }
+            A64Op::CmpZero => {
+                fr.flag_ne = !self.rd(fr, use_reg(ops, 0)?).is_zero();
+            }
+            A64Op::CselNe => {
+                let d = def(ops, 0)?;
+                let v = if fr.flag_ne { self.rd(fr, use_reg(ops, 1)?) } else { self.rd(fr, use_reg(ops, 2)?) };
+                fr.regs.insert(d, v);
             }
             A64Op::Csel => {
                 let d = def(ops, 0)?;

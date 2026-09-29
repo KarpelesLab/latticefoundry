@@ -12,8 +12,8 @@ use super::isel::{A64Op, AArch64Target, NeonLegality};
 use crate::codegen::legalize::{ScalarOnly, VectorLegality, legalized, uses_vectors};
 use crate::ir::FuncId;
 use crate::target::vector_fixtures::{
-    Case, FLOAT_SRC, INPUTS, INT_OPS, Rng, assert_matches, cases, compare_src, int_arith_src, lanes_src, parse,
-    random_inputs, random_program, reference,
+    Case, FLOAT_SRC, INPUTS, INT_OPS, PRESSURE_SRC, Rng, assert_matches, cases, compare_src, int_arith_src, lanes_src,
+    masks_src, parse, random_inputs, random_program, reference,
 };
 
 use puremp::Int;
@@ -89,7 +89,7 @@ fn neon_integer_arithmetic_matches_the_reference() {
 
 #[test]
 fn neon_compares_floats_and_lane_moves_match_the_reference() {
-    for (src, tag) in [(compare_src(), "cmp"), (FLOAT_SRC.to_string(), "flt"), (lanes_src(), "lane")] {
+    for (src, tag) in [(compare_src(), "cmp"), (FLOAT_SRC.to_string(), "flt"), (lanes_src(), "lane"), (masks_src(), "mask")] {
         let (m, syms) = parse(&src);
         let names: Vec<String> = m.functions().map(|f| syms.resolve(f.name).to_owned()).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -265,3 +265,15 @@ fn neon_encodings_match_llvm_mc() {
     assert!(n > 150, "{n} NEON encodings checked");
 }
 
+
+#[test]
+fn selects_under_register_pressure_allocate_and_run() {
+    let cs: Vec<Case> = [[1i64, 2, 1, 0], [-7, 1 << 40, 0, 1], [0, 0, 3, 3]]
+        .iter()
+        .map(|a| ("pressure".to_string(), a.to_vec()))
+        .collect();
+    let want = reference(PRESSURE_SRC, &cs);
+    for legality in [&NeonLegality as &dyn VectorLegality, &ScalarOnly] {
+        assert_matches("pressure", &cs, &run_cases(PRESSURE_SRC, &cs, legality), &want);
+    }
+}

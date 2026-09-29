@@ -1179,6 +1179,8 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             b.word(subs_reg(sf, XZR.into(), a, bb)); // cmp a, b
             b.word(cset(sf, d, cc)); // cset d, cond  (result is a 32/64-bit 0/1)
         }
+        A64Op::CmpZero => b.word(subs_reg(1, XZR.into(), rnum(&ops[0]), XZR.into())), // cmp cond, xzr
+        A64Op::CselNe => b.word(csel(1, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), 0x1)), // csel ..., NE
         A64Op::Csel => {
             let d = rnum(&ops[0]);
             let c = rnum(&ops[1]);

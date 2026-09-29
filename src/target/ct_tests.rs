@@ -287,7 +287,8 @@ entry ^0(%c: i1, %a: i64, %b: i64):
     let x = ops(&X86_64Target::new().select_with_syms(&m, f, &syms));
     assert!(x.contains(&X86Op::Cmovne.opcode().0));
     let a = ops(&AArch64Target::new().select(&m, f));
-    assert!(a.contains(&A64Op::Csel.opcode().0));
+    // AArch64: `cmp cond, #0` + `csel` (a flag-setting compare, no branch).
+    assert!(a.contains(&A64Op::CselNe.opcode().0) && !a.contains(&A64Op::BrCond.opcode().0));
     // RISC-V selects with the branchless `f ^ ((t ^ f) & -c)`.
     let r = ops(&RiscvTarget::new().select(&m, f));
     assert!(r.contains(&RvOp::Xor.opcode().0) && r.contains(&RvOp::And.opcode().0));

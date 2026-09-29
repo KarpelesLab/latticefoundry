@@ -8,7 +8,9 @@ use super::interp;
 use super::isel::RiscvTarget;
 use crate::codegen::legalize::{ScalarOnly, legalized, uses_vectors};
 use crate::ir::FuncId;
-use crate::target::vector_fixtures::{Case, Rng, assert_matches, parse, random_inputs, random_program, reference};
+use crate::target::vector_fixtures::{
+    Case, PRESSURE_SRC, Rng, assert_matches, parse, random_inputs, random_program, reference,
+};
 
 use puremp::Int;
 
@@ -50,4 +52,14 @@ fn scalarized_random_vector_programs_match_the_reference() {
         let got = run_cases(&src, &cs);
         assert_matches(&format!("riscv rand{p}"), &cs, &got, &want);
     }
+}
+
+#[test]
+fn selects_under_register_pressure_allocate_and_run() {
+    let cs: Vec<Case> = [[1i64, 2, 1, 0], [-7, 1 << 40, 0, 1], [0, 0, 3, 3]]
+        .iter()
+        .map(|a| ("pressure".to_string(), a.to_vec()))
+        .collect();
+    let want = reference(PRESSURE_SRC, &cs);
+    assert_matches("pressure", &cs, &run_cases(PRESSURE_SRC, &cs), &want);
 }
