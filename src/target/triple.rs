@@ -24,6 +24,11 @@
 //! the first component is the architecture, and the OS is recognized from any
 //! later component. A bare `thumbv7m` means bare metal (a Cortex-M runs no
 //! Linux); every other bare architecture means Linux.
+//!
+//! WebAssembly (`wasm32`, `wasm32-unknown-unknown`) has no operating system in
+//! this sense: its OS is [`TargetOs::None`], its object format
+//! [`ObjectFormat::Wasm`] whatever the OS, and its calling convention
+//! [`CallConvKind::Wasm32`].
 
 use std::fmt;
 
@@ -63,24 +68,29 @@ pub enum ObjectFormat {
     Coff,
     /// Mach-O ([`crate::mc::macho`]).
     MachO,
+    /// A WebAssembly module ([`crate::target::wasm32`]).
+    Wasm,
 }
 
 impl ObjectFormat {
-    /// The canonical short name (`elf`, `coff`, `macho`).
+    /// The canonical short name (`elf`, `coff`, `macho`, `wasm`).
     pub fn name(self) -> &'static str {
         match self {
             ObjectFormat::Elf => "elf",
             ObjectFormat::Coff => "coff",
             ObjectFormat::MachO => "macho",
+            ObjectFormat::Wasm => "wasm",
         }
     }
 
-    /// Parse a format name: `elf`, `coff` (or `pe`), `macho` (or `mach-o`).
+    /// Parse a format name: `elf`, `coff` (or `pe`), `macho` (or `mach-o`),
+    /// `wasm`.
     pub fn parse(s: &str) -> Option<ObjectFormat> {
         match s.to_ascii_lowercase().as_str() {
             "elf" => Some(ObjectFormat::Elf),
             "coff" | "pe" | "pe-coff" => Some(ObjectFormat::Coff),
             "macho" | "mach-o" => Some(ObjectFormat::MachO),
+            "wasm" => Some(ObjectFormat::Wasm),
             _ => None,
         }
     }
@@ -100,6 +110,9 @@ pub enum CallConvKind {
     /// The 32-bit Arm AAPCS, base standard (soft-float: floating-point values
     /// in core registers), as Cortex-M code uses it.
     Aapcs,
+    /// WebAssembly's typed calls: every argument a wasm parameter (an `i128`
+    /// two `i64`s), results as wasm results.
+    Wasm32,
 }
 
 /// An architecture plus an operating system.
@@ -136,9 +149,15 @@ impl Triple {
             // ARMv7-M (Cortex-M3) and ARMv7E-M (Cortex-M4/M7, whose DSP and
             // FPU extensions the backend does not use) share the backend.
             "thumbv7m" | "thumbv7em" | "thumb" | "thumbv7" => TargetArch::Thumb,
+            "wasm32" => TargetArch::Wasm32,
             _ => return None,
         };
         let rest: Vec<&str> = parts.collect();
+        if arch == TargetArch::Wasm32 {
+            // `wasm32`, `wasm32-unknown-unknown`, `wasm32-none`: no OS.
+            let bare = rest.iter().all(|p| matches!(*p, "unknown" | "none"));
+            return bare.then_some(Triple::new(arch, TargetOs::None));
+        }
         let mut os = None;
         for part in &rest {
             let found = match *part {
@@ -177,6 +196,9 @@ impl Triple {
 
     /// The object format this OS uses.
     pub fn object_format(self) -> ObjectFormat {
+        if self.arch == TargetArch::Wasm32 {
+            return ObjectFormat::Wasm;
+        }
         match self.os {
             TargetOs::Linux | TargetOs::None => ObjectFormat::Elf,
             TargetOs::Windows => ObjectFormat::Coff,
@@ -192,6 +214,7 @@ impl Triple {
             (TargetArch::AArch64, _) => CallConvKind::Aapcs64,
             (TargetArch::Riscv64, _) => CallConvKind::RiscvLp64,
             (TargetArch::Thumb, _) => CallConvKind::Aapcs,
+            (TargetArch::Wasm32, _) => CallConvKind::Wasm32,
         }
     }
 
@@ -246,6 +269,10 @@ mod tests {
         for (s, arch, os) in cases {
             assert_eq!(Triple::parse(s), Some(Triple::new(arch, os)), "{s}");
         }
+        for s in ["wasm32", "wasm32-unknown-unknown", "wasm32-none"] {
+            assert_eq!(Triple::parse(s), Some(Triple::new(TargetArch::Wasm32, TargetOs::None)), "{s}");
+        }
+        assert_eq!(Triple::parse("wasm32-linux"), None);
         assert_eq!(Triple::parse("mips-linux"), None);
         assert_eq!(Triple::parse("x86_64-plan9"), None);
         assert_eq!(Triple::parse("thumbv6m-none-eabi"), None, "ARMv6-M is not supported");
@@ -271,14 +298,19 @@ mod tests {
             Triple::parse("aarch64-pc-windows-msvc").unwrap().call_conv(),
             CallConvKind::Aapcs64
         );
+        let wasm = Triple::parse("wasm32-unknown-unknown").unwrap();
+        assert_eq!(wasm.object_format(), ObjectFormat::Wasm);
+        assert_eq!(wasm.call_conv(), CallConvKind::Wasm32);
+        assert_eq!(wasm.to_string(), "wasm32-none");
     }
 
     #[test]
     fn format_names() {
-        for f in [ObjectFormat::Elf, ObjectFormat::Coff, ObjectFormat::MachO] {
+        for f in [ObjectFormat::Elf, ObjectFormat::Coff, ObjectFormat::MachO, ObjectFormat::Wasm] {
             assert_eq!(ObjectFormat::parse(f.name()), Some(f));
         }
         assert_eq!(ObjectFormat::parse("pe"), Some(ObjectFormat::Coff));
-        assert_eq!(ObjectFormat::parse("wasm"), None);
+        assert_eq!(ObjectFormat::parse("wasm"), Some(ObjectFormat::Wasm));
+        assert_eq!(ObjectFormat::parse("xcoff"), None);
     }
 }

@@ -2,7 +2,9 @@
 //! serializes an [`ObjectModule`] in the format a [`Triple`] calls for — ELF
 //! ([`crate::mc::elf`]), PE/COFF ([`crate::mc::coff`]) or Mach-O
 //! ([`crate::mc::macho`]) — plus the error the non-ELF writers return when a
-//! module holds something their format cannot express.
+//! module holds something their format cannot express. The wasm format holds
+//! the relocatable wasm object the [wasm32 backend](crate::target::wasm32)
+//! already wrote into its envelope.
 
 use std::fmt;
 
@@ -53,8 +55,9 @@ pub fn write_object(obj: &ObjectModule, triple: Triple) -> Result<Vec<u8>, Objec
 /// # Errors
 ///
 /// Returns an error when the format has no writer for `arch` (ELF is written
-/// for x86-64 and 32-bit Arm Thumb; COFF and Mach-O for x86-64 and AArch64),
-/// or when the module holds a relocation the format cannot express.
+/// for x86-64 and 32-bit Arm Thumb; COFF and Mach-O for x86-64 and AArch64;
+/// wasm for wasm32 only), or when the module holds a relocation the format
+/// cannot express.
 pub fn write_object_as(
     obj: &ObjectModule,
     arch: TargetArch,
@@ -108,6 +111,13 @@ pub fn write_object_as(
             };
             crate::mc::macho::write(obj, cpu)
         }
+        ObjectFormat::Wasm => match (arch, crate::target::wasm32::envelope_bytes(obj)) {
+            (TargetArch::Wasm32, Some(bytes)) => Ok(bytes.to_vec()),
+            (TargetArch::Wasm32, None) => {
+                Err(ObjectWriteError::new("not a wasm32 compilation (no wasm object in the module)"))
+            }
+            (other, _) => Err(ObjectWriteError::new(format!("no wasm object writer for {}", other.name()))),
+        },
     }
 }
 

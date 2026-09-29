@@ -21,6 +21,12 @@
 //! position-independent executable against the host C library (its `main` is
 //! called by the C runtime), and `-c --pic`/`-c --pie` pick an object's
 //! relocation model.
+//!
+//! `--target wasm32` (or `wasm32-unknown-unknown`) builds a self-contained
+//! **WebAssembly module** (`.wasm`: memory, stack pointer, function table and
+//! data included; undefined functions imported from `"env"`), and with `-c` a
+//! relocatable wasm object for `wasm-ld`. A module that declares no data
+//! layout gets the wasm32 one (ILP32).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -78,7 +84,8 @@ fn print_usage() {
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
     println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
     println!("                 aarch64-windows, aarch64-apple-darwin, thumbv7m-none-eabi (Cortex-M),");
-    println!("                 ... (ABI + object format)");
+    println!("                 ... (ABI + object format), wasm32 (a WebAssembly module;");
+    println!("                 with -c, a wasm-ld object)");
     println!("  -c             emit a relocatable object instead of linking");
     println!("  --format F     object format for -c: elf, coff or macho (default: the target's)");
     println!("  --oformat F    executable format: elf (default), binary or ihex (firmware)");
@@ -174,6 +181,12 @@ fn build(args: &[String]) -> Result<(), String> {
         })?
     };
 
+    // A module that did not declare a layout (so has the LP64 default) is
+    // compiled with the wasm32 one: its pointers are 32 bits.
+    if opts.target.arch == TargetArch::Wasm32 && *module.data_layout() == latticefoundry::ir::DataLayout::lp64() {
+        module.set_data_layout(target::wasm32::data_layout());
+    }
+
     // Verify (Structural tier) unless suppressed.
     if opts.verify {
         verify_or_err(&module, "input")?;
@@ -193,6 +206,9 @@ fn build(args: &[String]) -> Result<(), String> {
         .with_stack_probes(opts.stack_probes)
         .with_os(triple.os)
         .with_reloc_model(opts.reloc_model());
+    if triple.arch == TargetArch::Wasm32 {
+        return build_wasm(&opts, &module, &syms, &cg);
+    }
     let compiled = match triple.arch {
         TargetArch::X86_64 if opts.debug => {
             let comp_dir = std::env::current_dir()
@@ -255,6 +271,34 @@ fn build(args: &[String]) -> Result<(), String> {
             "cannot link a {triple} executable yet: emit an object with -c and link it with the platform's linker"
         )),
     }
+}
+
+/// `lf build --target wasm32`: a self-contained wasm module, or with `-c` a
+/// relocatable wasm object.
+fn build_wasm(opts: &BuildOptions, module: &Module, syms: &StrInterner, cg: &CodegenOptions) -> Result<(), String> {
+    if opts.debug {
+        return Err("-g is supported for x86-64 only, not wasm32".to_owned());
+    }
+    let mut compiled = target::wasm32::compile(module, syms, cg).map_err(|e| e.to_string())?;
+    if opts.stack_usage {
+        print_stack_usage(&compiled.stack, opts.entry.as_deref().unwrap_or("main"));
+    }
+    let stem = default_output(&opts.inputs[0]);
+    let (bytes, ext) = if opts.output_kind == OutputKind::Object {
+        if opts.format.is_some_and(|f| f != ObjectFormat::Wasm) {
+            return Err("a wasm32 object can only be written in the wasm format".to_owned());
+        }
+        (compiled.object.to_relocatable(), "o")
+    } else {
+        if let Some(entry) = &opts.entry {
+            let f = compiled.object.funcs.iter_mut().find(|f| f.name == *entry && f.body.is_some());
+            f.ok_or_else(|| format!("--entry: no function '{entry}' is defined"))?.export = true;
+        }
+        let linked = compiled.object.to_linked(&target::wasm32::LinkOptions::default()).map_err(|e| format!("link error: {e}"))?;
+        (linked, "wasm")
+    };
+    let output = opts.output.clone().unwrap_or_else(|| format!("{stem}.{ext}"));
+    std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"))
 }
 
 /// Write `obj` as an ELF object and link it with qld into a shared library
@@ -495,6 +539,9 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     }
     if object_only && oformat.is_some() {
         return Err("--oformat applies to executables, not to -c".to_owned());
+    }
+    if target.arch == TargetArch::Wasm32 && (oformat.is_some() || base.is_some()) {
+        return Err("--oformat/--base do not apply to wasm32".to_owned());
     }
     if target.os == TargetOs::Darwin && output_kind == OutputKind::Executable {
         return Err(format!("cannot link a {target} executable yet: use -c"));

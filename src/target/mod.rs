@@ -39,6 +39,10 @@ pub enum TargetArch {
     /// 32-bit Arm Cortex-M, Thumb-2 (ARMv7-M / ARMv7E-M), soft-float AAPCS
     /// ([`thumb`]).
     Thumb,
+    /// 32-bit WebAssembly (`wasm32`): a structured stack machine with its own
+    /// module format, compiled without the register-machine pipeline (see
+    /// [`wasm32`]).
+    Wasm32,
 }
 
 impl TargetArch {
@@ -49,6 +53,7 @@ impl TargetArch {
             TargetArch::AArch64 => "aarch64",
             TargetArch::Riscv64 => "riscv64",
             TargetArch::Thumb => "thumbv7m",
+            TargetArch::Wasm32 => "wasm32",
         }
     }
 }
@@ -69,6 +74,14 @@ pub enum CodegenError {
         /// The requested model.
         model: RelocModel,
     },
+    /// The module uses something the target cannot express (for wasm32: a
+    /// `syscall`, `f16`, a second address space, a variadic call, ...).
+    Unsupported {
+        /// The target.
+        arch: TargetArch,
+        /// What is unsupported, and where.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for CodegenError {
@@ -79,6 +92,7 @@ impl std::fmt::Display for CodegenError {
                 "the {arch} backend does not generate position-independent code yet \
                  (relocation model {model:?}); only x86_64 supports PIC/PIE"
             ),
+            CodegenError::Unsupported { arch, message } => write!(f, "{arch}: {message}"),
         }
     }
 }
@@ -103,14 +117,17 @@ pub fn check_options(arch: TargetArch, opts: &CodegenOptions) -> Result<(), Code
 }
 
 /// Compile `module` for `arch` under `opts`: the target-generic, fallible entry
-/// point over each backend's `compile_module_with`. With
+/// point over each backend's `compile_module_with`. For
+/// [`TargetArch::Wasm32`] the object is an envelope around a relocatable wasm
+/// object (see [`wasm32::compile_module_with`]). With
 /// [`RelocModel::Pic`] (e.g. `CodegenOptions::default().with_pic(true)`) the
 /// result is a position-independent relocatable object ready for a shared
 /// library (link it with [`crate::link::gnu::shared_library_args`]).
 ///
 /// # Errors
 ///
-/// When `arch`'s backend cannot honor `opts` (see [`check_options`]).
+/// When `arch`'s backend cannot honor `opts` (see [`check_options`]), or
+/// cannot compile the module ([`CodegenError::Unsupported`], wasm32 only).
 pub fn compile_module_for(
     arch: TargetArch,
     module: &Module,
@@ -123,5 +140,7 @@ pub fn compile_module_for(
         TargetArch::AArch64 => aarch64::compile_module_with(module, syms, opts),
         TargetArch::Riscv64 => riscv::compile_module_with(module, syms, opts),
         TargetArch::Thumb => thumb::compile_module_with(module, syms, opts),
+        TargetArch::Wasm32 => wasm32::compile_module_with(module, syms, opts)
+            .map_err(|e| CodegenError::Unsupported { arch, message: e.to_string() })?,
     })
 }
