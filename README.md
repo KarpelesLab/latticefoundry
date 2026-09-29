@@ -118,6 +118,12 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
   with qld: ELF objects, archives, shared libraries, dynamic executables.
 - `link::gnu::host_c_link_args` links backend output against the host C
   library directly, without calling a system compiler or linker.
+- `lf build --shared -o libfoo.so [-soname libfoo.so.1]` builds a **shared
+  library** of C-ABI functions from IR: x86-64 position-independent code
+  (GOT/PLT for preemptible symbols, direct RIP-relative for `internal`/
+  `hidden`), linked by qld with no text relocations. `--pie` builds a PIE
+  executable against the host libc, and `-c --pic` stops at the object.
+  Globals and functions take `hidden`/`protected` visibility.
 
 | Target  | Coverage | Validation |
 | ------- | -------- | ---------- |
@@ -125,7 +131,7 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
 | AArch64 | Integer, scalar FP, AAPCS64 struct-by-value | Encodings checked against `llvm-mc`; A64-MIR interpreter |
 | RISC-V  | RV64IM integer | Encodings checked against `llvm-mc`; interpreter |
 
-Not done yet: shared-library *output* from our own pipeline, a disassembler
+Not done yet: position-independent code on AArch64/RISC-V, a disassembler
 (`lf-dis`), sanitizers, RISC-V FP and
 relocations, dynamic `alloca` on AArch64/RISC-V, and the deferred bets (B6
 region form, B7 full content-addressing, B10 provenance types, B11 verified

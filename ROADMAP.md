@@ -28,6 +28,9 @@ the exit criteria are what "done" means for each phase.
 > - the **`-O0..-O3`** pipeline
 > - **LTO**
 > - a native **dynamic stack allocation** op (`DynAlloca`)
+> - **shared-library output** on x86-64: position-independent code
+>   (`CodegenOptions::reloc_model`, GOT/PLT), symbol visibility
+>   (`hidden`/`protected`), `lf build --shared`/`--pie` linked by qld
 > - **stack usage reports** (per-function frame sizes from the frame layout,
 >   worst-case depth over the call graph, `lf build --stack-usage`) and
 >   **stack probes** (on by default) on all three targets
@@ -49,7 +52,8 @@ the exit criteria are what "done" means for each phase.
 >
 > Still open in Phase 10:
 >
-> - dynamic (shared-object) linking
+> - position-independent code on AArch64 and RISC-V (shared-library output
+>   is x86-64 only)
 > - sanitizers
 > - RISC-V FP, C extension and relocations
 > - `DynAlloca` on AArch64 and RISC-V
@@ -368,6 +372,17 @@ first-class on x86-64: `compile_module` emits every defined global into
 symbol binding and `R_X86_64_64` relocations for address-valued initializers
 (`ptr @sym ± off`), through the shared `codegen::data` emitter that AArch64 and
 RISC-V can adopt by passing their absolute-pointer relocation.
+**Position-independent code** on x86-64 (`CodegenOptions::reloc_model`:
+`Static`/`Pie`/`Pic`): addresses of preemptible or external symbols load from
+the GOT (`mov reg, [rip + sym@GOTPCREL]`), locally bound ones (`internal`,
+`hidden`, PIE definitions) use a direct `lea` (`R_X86_64_PC32`), calls stay
+`R_X86_64_PLT32`, and pointer-holding constants move to `.data.rel.ro`; no
+absolute 32-bit relocation is emitted. Symbol **visibility** (`hidden`/
+`protected`, [ir-design §4b](docs/ir-design.md)) reaches ELF `st_other`, and
+functions take `internal`/`weak` linkage. AArch64 and RISC-V reject the PIC
+models with a clear error (`target::compile_module_for`); they need GOT
+sequences (`adrp`+`ldr` `R_AARCH64_ADR_GOT_PAGE`/`LD64_GOT_LO12_NC`, `auipc`+`ld`
+`R_RISCV_GOT_HI20`).
 
 ### **Phase 8 — Linker & first end-to-end**  ✅
 
@@ -384,7 +399,12 @@ Produce a runnable program.
 *Progress:* the static linker core is done for `.lfo` and in-memory objects.
 ELF objects, archives, shared libraries and hosted (libc) executables are linked
 by our own `qld` through `link::gnu`; `lf-ld` sends each input to the right
-linker. Programs with static data link and run: `.rodata` maps into an `R`
+linker. `lf build --shared [-soname N]` links PIC output into a **shared
+library** (`link::gnu::shared_library_args`: `-shared -z text -z noexecstack`,
+`DT_NEEDED libc`), and `--pie` a PIE against the host libc; tests load the
+library from gcc-built C (`-L -l` and `dlopen`), check exports, SONAME and the
+absence of text relocations, and check interposition (a default-visibility
+symbol can be preempted, a hidden one cannot). Programs with static data link and run: `.rodata` maps into an `R`
 segment, `.data`+`.bss` into one `RW` segment (`.bss` zero-filled through
 `memsz > filesz`), and data relocations are applied in place. Segments are
 packed back to back in the file and each starts on a fresh page in memory at
