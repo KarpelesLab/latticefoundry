@@ -8,24 +8,50 @@ deliverables and exit criteria for each phase.
 The roadmap is a living document: phases are refined as earlier ones land, and
 the exit criteria are what "done" means for each phase.
 
-> **Status.** Phases **0–9 are complete** (milestone **M5** reached) and Phase
-> **10 is in progress**. `lf build foo.lf -o foo` compiles a LatticeFoundry IR
-> module to a static ELF64 executable that runs on the bare Linux x86-64 kernel —
-> no libc, no system linker, 100% LatticeFoundry code — and a **JIT** runs the
-> same code in-process. The verification bets are all live and interlocking:
-> **B1** (semantics-first opcodes), **B2** (z3rs-checked refinement, used by SCCP
-> and the e-graph), **B3** (proof-carrying certificates), **B4** (equality-
-> saturation optimizer), **B5** (z3rs superoptimizer), **B8** (one lattice engine
-> + four sound domains), **B9** (cost model). ~324 tests, every commit green
-> (build/test/clippy clean; `unsafe` only in the JIT's `exec_mem`; only our own
-> crates). A second target — **AArch64** — is implemented (60/60 instructions
-> match `llvm-mc`; validated by an A64-MIR interpreter since the host can't
-> execute ARM), proving the framework is genuinely retargetable. **DWARF debug
-> info** (`lf build -g`; gdb loads the binary and maps addresses to `.lf` source),
-> an **`-O0..-O3` pipeline**, and **LTO** (merge multiple modules → whole-program
-> optimization with cross-module inlining) are all done. ~366 tests. Remaining
-> Phase 10 breadth: RISC-V target, sanitizers, and the deferred bets (B6 region
-> form, B7 full content-addressing, B10 provenance types, B11 verified lowering).
+> **Status (2026-09).** Phases **0–9 are complete** and most of **Phase 10**
+> is done. `lf build foo.lf -o foo` compiles IR to a static ELF64 executable that
+> runs on the bare Linux x86-64 kernel, with no libc and no system linker. A
+> **JIT** runs the same code in-process. The verification bets are all working
+> and build on each other:
+>
+> - **B1**: semantics-first opcodes
+> - **B2**: refinement checked by z3rs, now over multi-block acyclic functions
+> - **B3**: proof-carrying certificates
+> - **B4**: an equality-saturation optimizer
+> - **B5**: a z3rs superoptimizer
+> - **B8**: one lattice engine with four sound domains
+> - **B9**: a cost model
+>
+> Other Phase 10 work that is done:
+>
+> - **DWARF** (`lf build -g`)
+> - the **`-O0..-O3`** pipeline
+> - **LTO**
+> - a native **dynamic stack allocation** op (`DynAlloca`)
+> - three targets:
+>   - **x86-64** executes, with the full System V ABI including
+>     struct-by-value and variadics.
+>   - **AArch64** covers integer, FP and the AAPCS64 aggregate ABI, validated
+>     with `llvm-mc` and an interpreter.
+>   - **RISC-V RV64IM** covers integer, validated the same way.
+>
+> About 460 framework tests pass, and every commit is green: build, test and
+> clippy all clean. `unsafe` appears only in the JIT's `exec_mem`, and the only
+> dependencies are our own crates.
+>
+> The **`lf-cc`** C frontend (a separate nested crate, §8) covers C89–C23. It
+> builds **gzip, bzip2, GNU make and bash** from source, and each works like the
+> system build (gzip and bzip2 output is byte-identical). Milestone **M8** is
+> reached; **M9** (real `/usr/include`) is next.
+>
+> Still open in Phase 10:
+>
+> - dynamic (shared-object) linking
+> - sanitizers
+> - RISC-V FP, C extension and relocations
+> - `DynAlloca` on AArch64 and RISC-V
+> - the deferred bets: B6 (region form), B7 (full content-addressing), B10
+>   (provenance types) and B11 (verified lowering)
 
 ---
 
@@ -127,12 +153,15 @@ binaries: lf (umbrella)   lf-opt   lf-as   lf-dis   lf-ld
 | ------------------------- | ------------------------------------------------------- |
 | `support`                 | interning, arenas, small ADTs; numeric core (`puremp`)  |
 | `ir`                      | IR data model, type system, builder, text/binary format |
-| `verify`                  | well-formedness checking; SMT-backed condition checks   |
+| `verify`                  | well-formedness checking; SMT-backed refinement; certificates |
+| `analysis`                | one lattice fixpoint engine + abstract domains          |
 | `pass`                    | pass manager, analysis caching, pipeline description     |
+| `transform`               | optimizations, e-graph, superoptimizer, `-O` pipeline   |
 | `codegen`                 | target-independent lowering to machine IR               |
-| `mc`                      | machine-code encoding and object emission               |
-| `target`                  | target registry and per-target tables                   |
+| `mc`                      | machine-code encoding, object emission, DWARF           |
+| `target`                  | target registry; `x86_64`, `aarch64`, `riscv`           |
 | `link`                    | linker core                                             |
+| `jit`                     | in-process execution of compiled code                   |
 
 ### Binaries (`src/bin/`)
 
@@ -176,7 +205,7 @@ the exit criteria that define completion. **Bold** phases are the critical path
 to "compile a function to a running native executable" (the first end-to-end
 milestone, Phase 8).
 
-### Phase 0 — Foundations & scaffolding  ✅ *in progress*
+### Phase 0 — Foundations & scaffolding  ✅
 
 Bring up the package and the low-level support layer.
 
@@ -191,7 +220,7 @@ Bring up the package and the low-level support layer.
 *Next in this phase:* a general arena allocator, a deterministic hash map, and a
 diagnostics type with source spans.
 
-### **Phase 1 — Core IR**  *(carries bets B1, T5)*
+### **Phase 1 — Core IR**  *(carries bets B1, T5)*  ✅
 
 The typed SSA data model and the programmatic builder — designed *semantics-first*
 (see [ir-design](docs/ir-design.md)).
@@ -216,7 +245,7 @@ The typed SSA data model and the programmatic builder — designed *semantics-fi
 use/def lists are consistent under mutation; each opcode has a semantics that
 `z3rs` can consume; covered by unit tests.
 
-### **Phase 2 — Textual & binary format, and the verifier**  *(carries bet B2, first cut)*
+### **Phase 2 — Textual & binary format, and the verifier**  *(carries bet B2, first cut)*  ✅
 
 Make IR persistable and checkable.
 
@@ -235,7 +264,7 @@ Make IR persistable and checkable.
 `read(write(m)) == m` for a corpus; verifier rejects a suite of malformed
 modules with precise diagnostics; one rewrite is `Refinement`-checked end to end.
 
-### Phase 3 — Analysis: one lattice engine  *(is bet B8; carries B7 substrate)*
+### Phase 3 — Analysis: one lattice engine  *(is bet B8; carries B7 substrate)*  ✅
 
 The analysis layer **is** a single abstract-interpretation engine, not a drawer
 of bespoke analyses (tenet T4).
@@ -255,7 +284,7 @@ of bespoke analyses (tenet T4).
 brute-force oracle on random CFGs; transfer-function soundness checks pass;
 invalidation verified (a mutating pass forces recomputation).
 
-### Phase 4 — Optimizations  *(grows bets B4, B9 on B2)*
+### Phase 4 — Optimizations  *(grows bets B4, B9 on B2)*  ✅
 
 A useful baseline of optimizations, verified by construction.
 
@@ -273,7 +302,7 @@ A useful baseline of optimizations, verified by construction.
 and preserves verifier validity; an `-O1`/`-O2` pipeline measurably shrinks a
 benchmark corpus; the e-graph rule set is `z3rs`-verified.
 
-### **Phase 5 — Target-independent code generation**
+### **Phase 5 — Target-independent code generation**  ✅
 
 Lower optimized IR toward machine instructions.
 
@@ -285,7 +314,7 @@ Lower optimized IR toward machine instructions.
 
 *Exit:* MIR for a target verifies and, once Phase 6/7 land, assembles and runs.
 
-### **Phase 6 — Machine-code layer**
+### **Phase 6 — Machine-code layer**  ✅
 
 Turn instructions into bytes and objects.
 
@@ -309,7 +338,13 @@ Concrete backends. x86-64 is the bring-up target.
 *Exit (per target):* the execution test suite passes on real hardware/emulator
 for the target's ABI; encodings match the architecture manual.
 
-### **Phase 8 — Linker & first end-to-end**
+*Progress:* x86-64 ✅ (integer, SSE, full System V ABI incl. struct-by-value
+and variadics; executes natively). AArch64 ✅ integer + scalar FP + AAPCS64
+aggregates (validated vs `llvm-mc` + an A64-MIR interpreter; no native
+execution on the x86-64 host). RISC-V 🔶 RV64IM integer only (validated vs
+`llvm-mc` + interpreter); F/D, C and relocations remain.
+
+### **Phase 8 — Linker & first end-to-end**  ✅
 
 Produce a runnable program.
 
@@ -321,7 +356,7 @@ Produce a runnable program.
 
 *Exit:* end-to-end tests compile → link → execute across the Phase 7 targets.
 
-### Phase 9 — Certified tier: proof-carrying IR  *(is bet B3)*
+### Phase 9 — Certified tier: proof-carrying IR  *(is bet B3)*  ✅
 
 Deepen the verification story from "checked in CI" (B2, already in use since
 Phase 2) to "certificate-checked" (`z3rs` is developed separately; we integrate,
@@ -349,6 +384,11 @@ Depth once the pipeline is solid.
 *Exit:* JIT runs the execution suite; debuggers show source lines for compiled
 programs.
 
+*Progress:* JIT ✅, DWARF line tables (`lf build -g`, gdb-loadable) ✅,
+`-O0..-O3` + LTO ✅, z3rs superoptimizer ✅, native dynamic stack allocation
+(`DynAlloca`, x86-64) ✅. Open: dynamic linking, PGO hooks, sanitizers, richer
+alias analysis.
+
 ## 5. Testing strategy
 
 - **Unit tests** in every module, from Phase 0.
@@ -360,8 +400,9 @@ programs.
 
 ## 6. Non-goals (for now)
 
-- Language front ends (parsers, type checkers for a source language). Languages
-  target our IR; producing that IR is their concern.
+- Language front ends *inside the framework library*. Languages target our IR;
+  the one front end we build, `lf-cc`, is a separate crate (§8) that consumes
+  the library like any other client.
 - A stable public API or ABI before the pipeline is end-to-end.
 - Windows/macOS object and executable formats before ELF is solid.
 - Matching the performance of a mature production compiler; correctness and a
@@ -378,7 +419,7 @@ programs.
 | M4        | Emit assembled objects for x86-64                        | 5–7   | ✅ done |
 | **M5**    | **Compile `.lf` → native executable that runs**          | 8     | ✅ **done** |
 | M6        | Certified tier: proof-carrying pipeline                  | 9     | ✅ done |
-| M7        | JIT, debug info, LTO                                     | 10    | 🔶 JIT + superopt done; DWARF/LTO/more targets pending |
+| M7        | JIT, debug info, LTO                                     | 10    | ✅ done (dynamic linking, sanitizers still open) |
 | **M8**    | **`lf-cc` builds gzip from source → byte-identical to GNU gzip** | lf-cc | ✅ **done** |
 | **M9**    | **`lf-cc` compiles against the real `/usr/include`**     | lf-cc | ⬜ roadmap goal |
 
@@ -393,6 +434,24 @@ things a Linux From Scratch build compiles).
 Today `lf-cc` covers essentially the full C language surface through C23, has a
 `-c` object-emit mode, and links against the real libc via the system linker. The
 gap to a genuine bootstrap compiler is **the headers**.
+
+### Packages built so far (with minimal hosted-header stubs)
+
+| Package     | Result |
+| ----------- | ------ |
+| gzip 1.2.4  | ✅ **M8** — all 14 files; output byte-identical to GNU gzip |
+| bzip2 1.0.8 | ✅ all 8 files; output byte-identical, interop both directions |
+| make 3.82   | ✅ all 27 files; builds real projects identically to system make |
+| bash 3.2    | ✅ all 130 core files; feature battery identical to system bash |
+
+Each package exposed a handful of real gaps: K&R functions, implicit int,
+GNU keyword aliases, wide literals and `alloca`, plus a few miscompiles. All of
+them were fixed at the source, and every fix also counts toward M9.
+
+Remaining C niche items: `_BitInt` wider than 64 bits, a true 80-bit
+`long double`, `_Complex`, VLAs, flexible array members, and gcc object-ABI
+compatibility for struct-by-value. Whole-program struct-by-value is already
+correct; the gap is only in mixing `lf-cc` objects with gcc-compiled ones.
 
 ### M9 — Consume the real `/usr/include` (the headline goal)
 
@@ -421,5 +480,6 @@ requires, roughly:
 This is a substantial multi-phase effort (a robust GNU-C-dialect front end), but
 it is what turns `lf-cc` from "compiles our programs" into "can build the base
 system." M8 (gzip via minimal stubs) is the on-ramp; M9 (real headers) is the
-goal; further LFS packages (`bzip2`, `make`, a shell, `coreutils`, eventually a
-C library and the compiler itself) are the horizon beyond it.
+goal; further LFS packages (`coreutils`, eventually a C library and the
+compiler itself) are the horizon beyond it — `bzip2`, `make` and a shell
+(`bash`) already build via stubs.
