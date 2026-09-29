@@ -1194,11 +1194,21 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
 
 /// Like [`compile_module`], under `opts`, and also returning every defined
 /// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
+///
+/// # Panics
+///
+/// If `opts` asks for position-independent code
+/// ([`RelocModel::is_pic`](crate::codegen::RelocModel::is_pic)): the RISC-V
+/// backend does not generate it yet. Use
+/// [`crate::target::compile_module_for`] to get that as an error instead.
 pub fn compile_module_with(
     module: &Module,
     syms: &StrInterner,
     opts: &CodegenOptions,
 ) -> CompiledModule {
+    if let Err(e) = crate::target::check_options(crate::target::TargetArch::Riscv64, opts) {
+        panic!("{e}");
+    }
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
     let mut stack = StackReport::new();
@@ -1234,5 +1244,6 @@ pub fn compile_module_with(
             len,
         ));
     }
+    crate::codegen::linkage::apply_symbol_attrs(module, syms, &mut obj);
     CompiledModule { object: obj, stack }
 }

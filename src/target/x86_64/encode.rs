@@ -727,6 +727,33 @@ struct EncodeCtx<'a> {
     layout: &'a FrameLayout,
     func_name: &'a dyn Fn(u32) -> String,
     global_name: &'a dyn Fn(u32) -> String,
+    /// Which symbols' addresses must be loaded from the GOT (position-
+    /// independent code; see [`crate::codegen::linkage`]).
+    got: GotQuery<'a>,
+}
+
+/// Per-function and per-global "address through the GOT?" predicates, by IR
+/// index. Both are constant `false` for position-dependent code.
+#[derive(Clone, Copy)]
+struct GotQuery<'a> {
+    func: &'a dyn Fn(u32) -> bool,
+    global: &'a dyn Fn(u32) -> bool,
+}
+
+impl GotQuery<'static> {
+    /// Position-dependent code: no symbol goes through the GOT.
+    const NONE: GotQuery<'static> = GotQuery { func: &|_| false, global: &|_| false };
+}
+
+/// `lea d, [rip + sym]` (`R_X86_64_PC32`), or with `via_got`
+/// `mov d, [rip + sym@GOTPCREL]` (`R_X86_64_GOTPCREL`): the address of a
+/// symbol, directly or from its GOT slot.
+fn symbol_addr(e: &mut Emitter, d: u8, sym: String, via_got: bool) {
+    e.u8(rex(true, d >= 8, false, false));
+    e.u8(if via_got { 0x8B } else { 0x8D });
+    e.u8(modrm(0, d, 5));
+    let kind = if via_got { RelocKind::GotPcRel } else { RelocKind::Pc32 };
+    e.reference(kind, Ref::Symbol(sym), 0);
 }
 
 /// The two-address expansion of a commutative ALU op `d = a OP b`.
@@ -1025,11 +1052,9 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 MachineOperand::Global(g) => g,
                 _ => panic!("GlobalAddr expects a global operand"),
             };
-            // lea d, [rip + disp32]  with a PC32 relocation to the global.
-            e.u8(rex(true, d >= 8, false, false));
-            e.u8(0x8D);
-            e.u8(modrm(0, d, 5));
-            e.pcrel32(Ref::Symbol((ctx.global_name)(g)), 0);
+            // lea d, [rip + disp32]  with a PC32 relocation to the global, or
+            // under PIC a GOT load for a preemptible/external one.
+            symbol_addr(e, d, (ctx.global_name)(g), (ctx.got.global)(g));
         }
         X86Op::FuncAddr => {
             let d = rnum(&ops[0]);
@@ -1041,10 +1066,9 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             // symbol — the same materialization as GlobalAddr, but naming a
             // function. Taking a function's address for a function pointer; a
             // *direct* call still uses `E8` + PLT32 (the `Call`/`Func` arm).
-            e.u8(rex(true, d >= 8, false, false));
-            e.u8(0x8D);
-            e.u8(modrm(0, d, 5));
-            e.pcrel32(Ref::Symbol((ctx.func_name)(f)), 0);
+            // Under PIC a preemptible/external function's address comes from
+            // the GOT, so every component agrees on its canonical address.
+            symbol_addr(e, d, (ctx.func_name)(f), (ctx.got.func)(f));
         }
         X86Op::Movsx => {
             let d = rnum(&ops[0]);
@@ -1401,7 +1425,7 @@ pub fn encode_function(
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
 ) -> Emitted {
-    encode_function_inner(mf, layout, func_name, global_name, None)
+    encode_function_inner(mf, layout, func_name, global_name, GotQuery::NONE, None)
 }
 
 /// Like [`encode_function`], but also collects the `(function-relative offset,
@@ -1416,7 +1440,8 @@ pub fn encode_function_lines(
     global_name: &dyn Fn(u32) -> String,
 ) -> (Emitted, Vec<(u64, u32)>) {
     let mut rows = Vec::new();
-    let emitted = encode_function_inner(mf, layout, func_name, global_name, Some(&mut rows));
+    let emitted =
+        encode_function_inner(mf, layout, func_name, global_name, GotQuery::NONE, Some(&mut rows));
     (emitted, rows)
 }
 
@@ -1425,11 +1450,12 @@ fn encode_function_inner(
     layout: &FrameLayout,
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
+    got: GotQuery<'_>,
     mut lines: Option<&mut Vec<(u64, u32)>>,
 ) -> Emitted {
     let mut e = Emitter::new();
     let labels: Vec<_> = (0..mf.num_blocks()).map(|_| e.create_label()).collect();
-    let ctx = EncodeCtx { labels: &labels, layout, func_name, global_name };
+    let ctx = EncodeCtx { labels: &labels, layout, func_name, global_name, got };
 
     // Emit the entry block first (so the function symbol at offset 0 is the
     // entry), then the remaining blocks in arena order.
@@ -1484,12 +1510,20 @@ fn compile_function_full(
         syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
     };
     let stack = layout.stack_usage(&mf, &func_name);
+    let model = opts.reloc_model;
+    let got_func = |idx: u32| {
+        !crate::codegen::linkage::func_binds_locally(module, crate::ir::FuncId::from_index(idx as usize), model)
+    };
+    let got_global = |idx: u32| {
+        !crate::codegen::linkage::global_binds_locally(module, crate::ir::GlobalId::from_index(idx as usize), model)
+    };
     let mut rows = Vec::new();
     let emitted = encode_function_inner(
         &mf,
         &layout,
         &func_name,
         &global_name,
+        GotQuery { func: &got_func, global: &got_global },
         if lines { Some(&mut rows) } else { None },
     );
     FunctionOutput { emitted, rows, stack }
@@ -1636,7 +1670,14 @@ fn build_module(
         }
     }
 
-    crate::codegen::data::emit_globals(module, syms, &mut obj, RelocKind::Abs64);
+    // Under PIC, pointer-holding constants go to `.data.rel.ro` (see
+    // `codegen::data`), and the object says it needs no executable stack.
+    let pic = opts.reloc_model.is_pic();
+    crate::codegen::data::emit_globals_with(module, syms, &mut obj, RelocKind::Abs64, pic);
+    crate::codegen::linkage::apply_symbol_attrs(module, syms, &mut obj);
+    if pic {
+        obj.add_section(Section::new(".note.GNU-stack", SectionKind::Debug, 1));
+    }
 
     if let Some(source) = debug {
         let text_size = obj.section(text).bytes.len() as u64;

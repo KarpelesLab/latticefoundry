@@ -16,7 +16,8 @@
 //!   size) with a [`SectionKind`] and an alignment.
 //! - A [`Symbol`] names a location: either **defined** at an offset inside a
 //!   section, or **undefined** (an external reference the linker resolves). It
-//!   carries a [`SymbolBinding`] (local/global/weak) and a [`SymbolType`].
+//!   carries a [`SymbolBinding`] (local/global/weak), a [`SymbolType`], and a
+//!   [`SymbolVisibility`] (default/protected/hidden).
 //! - A [`Relocation`] records that a field at some offset inside a section must
 //!   be patched with the address of a [`Symbol`], according to a
 //!   [`RelocKind`], plus a RELA-style `addend`.
@@ -141,6 +142,30 @@ pub enum SymbolBinding {
     Weak,
 }
 
+/// A symbol's visibility outside the linked component (the ELF `st_other`
+/// field): who can see it and whether it can be preempted at run time. See
+/// [`crate::ir::Visibility`] for the IR-level meaning.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum SymbolVisibility {
+    /// `STV_DEFAULT`: exported and preemptible.
+    #[default]
+    Default,
+    /// `STV_PROTECTED`: exported, not preemptible.
+    Protected,
+    /// `STV_HIDDEN`: not exported from the linked component.
+    Hidden,
+}
+
+impl From<crate::ir::Visibility> for SymbolVisibility {
+    fn from(v: crate::ir::Visibility) -> SymbolVisibility {
+        match v {
+            crate::ir::Visibility::Default => SymbolVisibility::Default,
+            crate::ir::Visibility::Protected => SymbolVisibility::Protected,
+            crate::ir::Visibility::Hidden => SymbolVisibility::Hidden,
+        }
+    }
+}
+
 /// What a symbol denotes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SymbolType {
@@ -181,6 +206,8 @@ pub struct Symbol {
     pub value: SymbolValue,
     /// The size in bytes of the entity (0 if unknown / not applicable).
     pub size: u64,
+    /// The visibility (`STV_*`); [`SymbolVisibility::Default`] unless set.
+    pub visibility: SymbolVisibility,
 }
 
 impl Symbol {
@@ -199,6 +226,7 @@ impl Symbol {
             kind,
             value: SymbolValue::Defined { section, offset },
             size,
+            visibility: SymbolVisibility::Default,
         }
     }
 
@@ -210,7 +238,15 @@ impl Symbol {
             kind: SymbolType::NoType,
             value: SymbolValue::Undefined,
             size: 0,
+            visibility: SymbolVisibility::Default,
         }
+    }
+
+    /// This symbol with the given visibility.
+    #[must_use]
+    pub fn with_visibility(mut self, visibility: SymbolVisibility) -> Symbol {
+        self.visibility = visibility;
+        self
     }
 
     /// Whether this symbol is undefined (an external reference).

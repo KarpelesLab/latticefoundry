@@ -23,6 +23,13 @@
 //! the [`RelocKind`] a target uses for an absolute pointer (`Abs64` on the
 //! 64-bit targets, which each ELF writer maps to its `R_*_64`).
 //!
+//! For position-independent output ([`emit_globals_with`] with `relro`), a
+//! `constant` global whose initializer holds an address goes to
+//! **`.data.rel.ro`** (`PROGBITS`, `WA`) instead of `.rodata`: its pointer fields
+//! need load-time (dynamic) relocations, which a read-only segment cannot take
+//! without text relocations; the linker places `.data.rel.ro` in the `RELRO`
+//! region, which the dynamic loader makes read-only once relocated.
+//!
 //! Each global is placed at its type's alignment and every section takes the
 //! largest alignment it holds. The symbol binding follows the global's
 //! [`Linkage`]: external → `Global`, internal → `Local`, weak → `Weak`. A global
@@ -32,8 +39,8 @@
 //! undefined symbol the linker resolves.
 //!
 //! Emission is deterministic (tenet T5): globals are visited in module order and
-//! the sections are appended in the fixed order `.rodata`, `.data`, `.bss`, each
-//! only when non-empty.
+//! the sections are appended in the fixed order `.rodata`, `.data`, `.bss`,
+//! `.data.rel.ro`, each only when non-empty.
 
 use crate::ir::{AddrTarget, Const, ConstId, FloatBits, GlobalId, Linkage, Module, Type};
 use crate::mc::object::{
@@ -101,11 +108,25 @@ pub fn emit_globals(
     obj: &mut ObjectModule,
     abs_ptr: RelocKind,
 ) {
+    emit_globals_with(module, syms, obj, abs_ptr, false);
+}
+
+/// Like [`emit_globals`]; with `relro` (position-independent output), constant
+/// globals holding addresses go to `.data.rel.ro` rather than `.rodata` (see the
+/// [module docs](self)).
+pub fn emit_globals_with(
+    module: &Module,
+    syms: &StrInterner,
+    obj: &mut ObjectModule,
+    abs_ptr: RelocKind,
+    relro: bool,
+) {
     let types = module.types();
     let mut accs = [
         Acc::new(SectionKind::Rodata, ".rodata"),
         Acc::new(SectionKind::Data, ".data"),
         Acc::new(SectionKind::Bss, ".bss"),
+        Acc::new(SectionKind::Data, ".data.rel.ro"),
     ];
     let mut placed: Vec<Placed> = Vec::new();
 
@@ -119,7 +140,9 @@ pub fn emit_globals(
         let mut img = Image { bytes: vec![0u8; layout.size as usize], relocs: Vec::new() };
         serialize(module, syms, init, 0, &mut img, abs_ptr);
 
-        let which = if attrs.constant {
+        let which = if attrs.constant && relro && !img.relocs.is_empty() {
+            3
+        } else if attrs.constant {
             0
         } else if img.relocs.is_empty() && img.bytes.iter().all(|&b| b == 0) {
             2
@@ -147,7 +170,7 @@ pub fn emit_globals(
     }
 
     // Materialize the non-empty sections in fixed order.
-    let mut ids: [Option<SectionId>; 3] = [None; 3];
+    let mut ids: [Option<SectionId>; 4] = [None; 4];
     for (i, acc) in accs.into_iter().enumerate() {
         if acc.size == 0 {
             continue;

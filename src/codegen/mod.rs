@@ -21,7 +21,11 @@
 //! - [`data`] — the target-independent emission of global data (initializer
 //!   serialization, `.rodata`/`.data`/`.bss` placement, data relocations) that
 //!   each backend's `compile_module` calls with its absolute-pointer reloc kind;
-//! - [`options`] — the [`CodegenOptions`] knobs (stack probes) and the
+//! - [`linkage`] — symbol binding decisions shared by the backends: which
+//!   symbols bind locally under a [`RelocModel`] (direct vs. GOT addressing),
+//!   and the IR linkage/visibility applied to the object's symbols;
+//! - [`options`] — the [`CodegenOptions`] knobs (stack probes, relocation
+//!   model) and the
 //!   [`CompiledModule`] result of the backends' `compile_module_with`;
 //! - [`stack`] — per-function [`StackUsage`] reports taken
 //!   from the frame layouts, worst-case stack-depth analysis over the call
@@ -33,6 +37,7 @@
 pub mod data;
 pub mod interp;
 pub mod isel;
+pub mod linkage;
 pub mod mir;
 pub mod options;
 pub mod regalloc;
@@ -41,7 +46,7 @@ pub mod target;
 pub mod vtarget;
 
 pub use mir::MachineFunction;
-pub use options::{CodegenOptions, CompiledModule};
+pub use options::{CodegenOptions, CompiledModule, RelocModel};
 pub use stack::{StackAssumptions, StackBound, StackBoundError, StackReport, StackUsage};
 pub use target::MachineTarget;
 pub use vtarget::VirtualTarget;

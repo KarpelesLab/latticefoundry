@@ -29,11 +29,47 @@ pub struct CodegenOptions {
     /// sequences. Turn it off only where the worst-case stack depth is proven to
     /// fit (e.g. with [`StackReport::worst_case_depth`]).
     pub stack_probes: bool,
+    /// The **relocation model** (default [`RelocModel::Static`]): whether the
+    /// code must run at any load address, and which symbols may be preempted
+    /// by another component at run time. See [`RelocModel`] and
+    /// [`crate::codegen::linkage`].
+    pub reloc_model: RelocModel,
+}
+
+/// How position-dependent the generated code may be, and so how it addresses
+/// symbols (`docs/ir-design.md` §4b).
+///
+/// Every model addresses code and data RIP-relatively where the target allows
+/// it; they differ in which symbols are reached *through the GOT*.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum RelocModel {
+    /// A position-dependent (or statically linked) executable: every symbol is
+    /// addressed directly and resolved at static link time. The default, and
+    /// what LatticeFoundry's own static linker consumes.
+    #[default]
+    Static,
+    /// Position-independent code for an **executable** (`-fPIE`): symbols the
+    /// module defines bind locally (an executable is never preempted), so only
+    /// references to symbols defined elsewhere — possibly in a shared library —
+    /// go through the GOT.
+    Pie,
+    /// Position-independent code for a **shared library** (`-fPIC`): a
+    /// default- or protected-visibility symbol may resolve outside the
+    /// library, so its address comes from the GOT and calls to it go through
+    /// the PLT. Only `internal` and `hidden` symbols are addressed directly.
+    Pic,
+}
+
+impl RelocModel {
+    /// Whether code must be position-independent (`Pie` or `Pic`).
+    pub fn is_pic(self) -> bool {
+        self != RelocModel::Static
+    }
 }
 
 impl Default for CodegenOptions {
     fn default() -> CodegenOptions {
-        CodegenOptions { stack_probes: true }
+        CodegenOptions { stack_probes: true, reloc_model: RelocModel::Static }
     }
 }
 
@@ -42,6 +78,18 @@ impl CodegenOptions {
     pub fn with_stack_probes(mut self, on: bool) -> CodegenOptions {
         self.stack_probes = on;
         self
+    }
+
+    /// Set the relocation model (see [`CodegenOptions::reloc_model`]).
+    pub fn with_reloc_model(mut self, model: RelocModel) -> CodegenOptions {
+        self.reloc_model = model;
+        self
+    }
+
+    /// Shorthand: position-independent code for a shared library
+    /// ([`RelocModel::Pic`]) when `on`, else [`RelocModel::Static`].
+    pub fn with_pic(self, on: bool) -> CodegenOptions {
+        self.with_reloc_model(if on { RelocModel::Pic } else { RelocModel::Static })
     }
 }
 

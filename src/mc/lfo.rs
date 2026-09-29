@@ -33,7 +33,7 @@ use std::fmt;
 
 use crate::mc::object::{
     ObjectModule, RelocKind, Relocation, Section, SectionId, SectionKind, Symbol, SymbolBinding,
-    SymbolId, SymbolType, SymbolValue,
+    SymbolId, SymbolType, SymbolValue, SymbolVisibility,
 };
 
 /// Four-byte file signature: "LFO" followed by a NUL, identifying a `.lfo`.
@@ -276,6 +276,25 @@ fn binding_code(b: SymbolBinding) -> u8 {
     }
 }
 
+/// The visibility rides in bits 4–5 of the binding byte (`0` default, `1`
+/// protected, `2` hidden), so version-1 files without it still decode.
+fn visibility_code(v: SymbolVisibility) -> u8 {
+    match v {
+        SymbolVisibility::Default => 0,
+        SymbolVisibility::Protected => 1 << 4,
+        SymbolVisibility::Hidden => 2 << 4,
+    }
+}
+
+fn visibility_from(c: u8) -> Result<SymbolVisibility, DecodeError> {
+    Ok(match c >> 4 {
+        0 => SymbolVisibility::Default,
+        1 => SymbolVisibility::Protected,
+        2 => SymbolVisibility::Hidden,
+        _ => return Err(DecodeError::InvalidTag { what: "visibility", tag: u32::from(c) }),
+    })
+}
+
 fn binding_from(c: u8) -> Result<SymbolBinding, DecodeError> {
     Ok(match c {
         0 => SymbolBinding::Local,
@@ -363,7 +382,7 @@ pub fn encode(obj: &ObjectModule) -> Vec<u8> {
     w.uvarint(obj.symbols().len() as u64);
     for sym in obj.symbols() {
         w.str(&sym.name);
-        w.u8(binding_code(sym.binding));
+        w.u8(binding_code(sym.binding) | visibility_code(sym.visibility));
         w.u8(symtype_code(sym.kind));
         w.uvarint(sym.size);
         match sym.value {
@@ -427,7 +446,9 @@ pub fn decode(bytes: &[u8]) -> Result<ObjectModule, DecodeError> {
     let nsymbols = r.uindex()?;
     for _ in 0..nsymbols {
         let name = r.str()?.to_owned();
-        let binding = binding_from(r.u8()?)?;
+        let bits = r.u8()?;
+        let binding = binding_from(bits & 0x0f)?;
+        let visibility = visibility_from(bits)?;
         let kind = symtype_from(r.u8()?)?;
         let size = r.uvarint()?;
         let value = match r.u8()? {
@@ -439,7 +460,7 @@ pub fn decode(bytes: &[u8]) -> Result<ObjectModule, DecodeError> {
             }
             t => return Err(DecodeError::InvalidTag { what: "symbol-value", tag: u32::from(t) }),
         };
-        obj.add_symbol(Symbol { name, binding, kind, value, size });
+        obj.add_symbol(Symbol { name, binding, kind, value, size, visibility });
     }
     let nsymbols = obj.symbols().len();
 
@@ -575,6 +596,24 @@ mod tests {
         assert_eq!(m2.relocations().len(), 4);
         assert_eq!(m2.sections()[3].size(), 4096, ".bss reserved size survives");
         assert!(m2.symbol_id("printf").is_some());
+    }
+
+    #[test]
+    fn symbol_visibility_round_trips() {
+        use crate::mc::object::SymbolVisibility;
+        let mut m = ObjectModule::new("vis");
+        let s = m.add_section(Section::new(".text", SectionKind::Text, 1));
+        let def = Symbol::defined("h", SymbolBinding::Global, SymbolType::Func, s, 0, 0);
+        m.add_symbol(def.with_visibility(SymbolVisibility::Hidden));
+        let undef = Symbol::undefined("p", SymbolBinding::Weak);
+        m.add_symbol(undef.with_visibility(SymbolVisibility::Protected));
+        m.add_symbol(Symbol::undefined("d", SymbolBinding::Global));
+        let m2 = decode(&encode(&m)).expect("decode");
+        assert_eq!(m, m2);
+        assert_eq!(m2.symbols()[0].visibility, SymbolVisibility::Hidden);
+        assert_eq!(m2.symbols()[1].visibility, SymbolVisibility::Protected);
+        assert_eq!(m2.symbols()[1].binding, SymbolBinding::Weak);
+        assert_eq!(m2.symbols()[2].visibility, SymbolVisibility::Default);
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //! [`Section`]: crate::mc::object::Section
 
 use crate::mc::object::{
-    ObjectModule, RelocKind, SectionKind, SymbolBinding, SymbolType, SymbolValue,
+    ObjectModule, RelocKind, SectionKind, SymbolBinding, SymbolType, SymbolValue, SymbolVisibility,
 };
 
 // ===========================================================================
@@ -59,6 +59,9 @@ const SHF_EXECINSTR: u64 = 0x4;
 const STB_LOCAL: u8 = 0;
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK: u8 = 2;
+const STV_DEFAULT: u8 = 0;
+const STV_HIDDEN: u8 = 2;
+const STV_PROTECTED: u8 = 3;
 
 const STT_NOTYPE: u8 = 0;
 const STT_OBJECT: u8 = 1;
@@ -121,6 +124,14 @@ fn binding_code(b: SymbolBinding) -> u8 {
         SymbolBinding::Local => STB_LOCAL,
         SymbolBinding::Global => STB_GLOBAL,
         SymbolBinding::Weak => STB_WEAK,
+    }
+}
+
+fn visibility_code(v: SymbolVisibility) -> u8 {
+    match v {
+        SymbolVisibility::Default => STV_DEFAULT,
+        SymbolVisibility::Hidden => STV_HIDDEN,
+        SymbolVisibility::Protected => STV_PROTECTED,
     }
 }
 
@@ -201,10 +212,10 @@ fn write_shdr(
 }
 
 /// Write one `Elf64_Sym` (24 bytes) into `buf`.
-fn write_sym(buf: &mut Vec<u8>, name: u32, info: u8, shndx: u16, value: u64, size: u64) {
+fn write_sym(buf: &mut Vec<u8>, name: u32, info: u8, other: u8, shndx: u16, value: u64, size: u64) {
     buf.extend_from_slice(&name.to_le_bytes());
     buf.push(info);
-    buf.push(0); // st_other
+    buf.push(other); // st_other: the visibility in its low two bits
     buf.extend_from_slice(&shndx.to_le_bytes());
     buf.extend_from_slice(&value.to_le_bytes());
     buf.extend_from_slice(&size.to_le_bytes());
@@ -296,7 +307,7 @@ pub fn write(obj: &ObjectModule) -> Vec<u8> {
 
     // --- build .symtab content ---
     let mut symtab = Vec::new();
-    write_sym(&mut symtab, 0, 0, SHN_UNDEF, 0, 0); // null symbol
+    write_sym(&mut symtab, 0, 0, 0, SHN_UNDEF, 0, 0); // null symbol
     for &obj_idx in &order {
         let s = &obj.symbols()[obj_idx];
         let info = (binding_code(s.binding) << 4) | symtype_code(s.kind);
@@ -304,7 +315,8 @@ pub fn write(obj: &ObjectModule) -> Vec<u8> {
             SymbolValue::Defined { section, offset } => (user_elf_index(section.index()), offset),
             SymbolValue::Undefined => (SHN_UNDEF, 0),
         };
-        write_sym(&mut symtab, sym_name_off[obj_idx], info, shndx, value, s.size);
+        let other = visibility_code(s.visibility);
+        write_sym(&mut symtab, sym_name_off[obj_idx], info, other, shndx, value, s.size);
     }
 
     // --- build .rela.* content per user section ---
