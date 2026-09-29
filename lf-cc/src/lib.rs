@@ -21,7 +21,7 @@ pub mod preprocess;
 pub mod sema;
 
 pub use cstd::CStd;
-pub use preprocess::{MacroOp, PpOptions};
+pub use preprocess::{MacroOp, PpOptions, SourceLocation, SourceMap, default_system_include_dirs};
 
 use latticefoundry::ir::Module;
 use latticefoundry::link::{self, ImageOptions};
@@ -75,16 +75,29 @@ pub fn check_source_with(
     source: &str,
     opts: &PpOptions,
 ) -> Result<sema::Program, Vec<Diagnostic>> {
-    let tokens = preprocess::preprocess(source, opts)?;
-    let unit = parse::parse(tokens, opts.std)?;
-    sema::check(&unit, opts.std)
+    check_source_mapped(source, opts).map_err(|(diags, _)| diags)
+}
+
+/// Like [`check_source_with`], but a failure also returns the [`SourceMap`]
+/// that resolves the diagnostics' spans to file, line and column (errors in
+/// included headers point into those headers; see [`SourceMap::render`]).
+pub fn check_source_mapped(
+    source: &str,
+    opts: &PpOptions,
+) -> Result<sema::Program, (Vec<Diagnostic>, SourceMap)> {
+    let (tokens, map) = preprocess::preprocess_mapped(source, opts);
+    let checked = tokens
+        .and_then(|tokens| parse::parse(tokens, opts.std))
+        .and_then(|unit| sema::check(&unit, opts.std));
+    checked.map_err(|diags| (diags, map))
 }
 
 /// Why a full source-to-executable build failed.
 #[derive(Debug)]
 pub enum BuildError {
-    /// Lex/parse/type errors from the front end (carry source spans).
-    Frontend(Vec<Diagnostic>),
+    /// Lex/parse/type errors from the front end, with the [`SourceMap`] their
+    /// spans resolve through.
+    Frontend(Vec<Diagnostic>, SourceMap),
     /// A back-end failure (verification, codegen, or linking).
     Backend(String),
 }
@@ -113,7 +126,7 @@ pub fn build_image_with(
     opt: OptLevel,
     debug: bool,
 ) -> Result<Vec<u8>, BuildError> {
-    let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
+    let program = check_source_mapped(source, opts).map_err(|(d, m)| BuildError::Frontend(d, m))?;
     if !program.toplevel_asm.is_empty() {
         // The self-contained linker consumes only our own object modules; the
         // assembled file-scope asm is a separate ELF object that needs the
@@ -148,7 +161,7 @@ pub fn compile_module_with(
     opt: OptLevel,
     debug: bool,
 ) -> Result<CompiledModule, BuildError> {
-    let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
+    let program = check_source_mapped(source, opts).map_err(|(d, m)| BuildError::Frontend(d, m))?;
     let module = compile_program(&program, source, input_name, opt, debug)?;
     Ok(CompiledModule { module, toplevel_asm: program.toplevel_asm })
 }
