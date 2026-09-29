@@ -8,16 +8,32 @@
 //! [`crate::parse`]r consumes, so the preprocessor sits between raw text and the
 //! parser without either of them knowing about the other.
 //!
-//! Provenance: every emitted token carries a [`Span`] into the *main* source
-//! (file 0) so the existing diagnostic renderer and DWARF line map keep working
-//! unchanged; tokens produced from an included file or a macro body are attributed
-//! to their triggering construct in the main source, while `__LINE__`/`__FILE__`
-//! report the true presumed location tracked during expansion.
+//! Provenance: every file the translation unit reads (the main source, each
+//! `#include`d header — once per inclusion — and each builtin header) is given
+//! its own disjoint range of one *virtual offset space*, recorded in a
+//! [`SourceMap`]. Every emitted token carries a [`Span`] (always `FileId(0)`)
+//! whose offsets lie in the range of the file the token was spelled in, so a
+//! diagnostic anywhere downstream resolves to the right file, line and column
+//! (plus its include chain) through the map. The main source occupies
+//! `[0, len]`, so offsets into it are plain byte offsets exactly as before, and
+//! span arithmetic (`Span::merge`) never meets two different file ids. Tokens
+//! produced by a macro expansion are attributed to the invocation site;
+//! `__LINE__`/`__FILE__` report the true presumed location tracked during
+//! expansion.
+//!
+//! Header search follows the conventional layered model: for `"…"` the
+//! including file's directory, then the `-iquote` directories; then (for both
+//! forms) `-I`, `-isystem`, the builtin compiler headers
+//! ([`crate::headers`]), the host's standard system directories, and finally
+//! `-idirafter`. `#include_next` resumes the search after the directory the
+//! current file was found in, which is how the builtin headers and a C
+//! library's headers layer on top of each other.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use latticefoundry::support::diagnostics::{Diagnostic, FileId, Span};
+use latticefoundry::support::diagnostics::{Diagnostic, FileId, Severity, Span};
 
 use crate::ast::{CType, StrKind};
 use crate::cstd::CStd;
@@ -41,15 +57,36 @@ pub struct PpOptions {
     pub std: CStd,
     /// `-I` search directories (searched for both `"…"` and `<…>` includes).
     pub include_dirs: Vec<PathBuf>,
+    /// `-iquote` directories: searched for `"…"` includes only, after the
+    /// including file's own directory and before [`include_dirs`](Self::include_dirs).
+    pub quote_dirs: Vec<PathBuf>,
+    /// `-isystem` directories: searched after `-I` and before the builtin
+    /// headers.
+    pub system_dirs: Vec<PathBuf>,
+    /// The standard system include directories (searched after the builtin
+    /// headers). Empty by default; the driver fills it with
+    /// [`default_system_include_dirs`] unless `-nostdinc` is given.
+    pub stdinc_dirs: Vec<PathBuf>,
+    /// `-idirafter` directories: searched last of all.
+    pub after_dirs: Vec<PathBuf>,
     /// `-D` / `-U` command-line macros, in order.
     pub cmdline: Vec<MacroOp>,
     /// The main source file's name (used for `__FILE__`, diagnostics, and to
     /// resolve `"…"` includes relative to its directory).
     pub main_file_name: String,
-    /// Consult the builtin freestanding standard headers (`<stddef.h>`,
-    /// `<stdint.h>`, …) for an `#include` not found on the `-I` path. Enabled by
-    /// default; the driver's `-nostdinc` clears it.
+    /// Consult the builtin compiler headers (`<stddef.h>`, `<stdint.h>`, …),
+    /// which sit on the search chain between `-isystem` and the standard system
+    /// directories. Enabled by default; the driver's `-nostdinc` clears it.
     pub builtin_headers: bool,
+    /// A hosted implementation (`__STDC_HOSTED__ == 1`). Off by default for the
+    /// library (a freestanding translation unit); the driver turns it on unless
+    /// `-ffreestanding` is given. When hosted, the builtin `<limits.h>` and
+    /// `<stdint.h>` layer over the C library's own (via `#include_next`), and a
+    /// `stdc-predef.h` found on the system search chain is pre-included.
+    pub hosted: bool,
+    /// Optimization is enabled (`-O1` and up): predefines `__OPTIMIZE__` once the
+    /// parser accepts the statement expressions C library headers then use.
+    pub optimize: bool,
 }
 
 impl Default for PpOptions {
@@ -57,42 +94,220 @@ impl Default for PpOptions {
         PpOptions {
             std: CStd::default(),
             include_dirs: Vec::new(),
+            quote_dirs: Vec::new(),
+            system_dirs: Vec::new(),
+            stdinc_dirs: Vec::new(),
+            after_dirs: Vec::new(),
             cmdline: Vec::new(),
             main_file_name: "input.c".to_owned(),
             builtin_headers: true,
+            hosted: false,
+            optimize: false,
         }
     }
 }
 
+/// The host's standard system include directories, in search order: the
+/// site-local `/usr/local/include`, the Debian-style multiarch directory for
+/// this target (`/usr/include/x86_64-linux-gnu`), then `/usr/include`. Only the
+/// directories that exist are returned.
+pub fn default_system_include_dirs() -> Vec<PathBuf> {
+    ["/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include"]
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
 /// Preprocess `main_source` into the final token stream for the parser.
 pub fn preprocess(main_source: &str, opts: &PpOptions) -> Result<Vec<Token>, Vec<Diagnostic>> {
-    let mut pp = Pp::new(
-        opts.std,
-        &opts.include_dirs,
-        &opts.main_file_name,
-        main_source.len(),
-        opts.builtin_headers,
-    );
-    pp.define_predefined();
+    preprocess_mapped(main_source, opts).0
+}
+
+/// Like [`preprocess`], but also return the [`SourceMap`] that resolves every
+/// token and diagnostic span to its file, line and column (it is returned
+/// whether or not preprocessing succeeded, so errors can be rendered).
+pub fn preprocess_mapped(
+    main_source: &str,
+    opts: &PpOptions,
+) -> (Result<Vec<Token>, Vec<Diagnostic>>, SourceMap) {
+    let mut pp = Pp::new(opts, main_source);
+    pp.define_predefined(opts);
     pp.apply_cmdline(&opts.cmdline);
+
+    if opts.hosted {
+        pp.preinclude("stdc-predef.h");
+    }
 
     let main_idx = 0u32;
     let toks = pp.lex_file(main_source, main_idx);
     pp.process_file(main_idx, toks);
 
-    if pp.diags.iter().any(Diagnostic::is_error) {
-        return Err(pp.diags);
-    }
-    let out = std::mem::take(&mut pp.out);
-    let tokens = pp.finalize(out);
-    if pp.diags.iter().any(Diagnostic::is_error) {
-        return Err(pp.diags);
-    }
-    Ok(tokens)
+    let result = if pp.diags.iter().any(Diagnostic::is_error) {
+        Err(std::mem::take(&mut pp.diags))
+    } else {
+        let out = std::mem::take(&mut pp.out);
+        let tokens = pp.finalize(out);
+        if pp.diags.iter().any(Diagnostic::is_error) {
+            Err(std::mem::take(&mut pp.diags))
+        } else {
+            Ok(tokens)
+        }
+    };
+    (result, pp.map)
 }
 
 /// The maximum `#include` nesting depth (cycle guard).
 const INCLUDE_DEPTH_LIMIT: usize = 200;
+
+/// The source files of one translation unit laid out in a single virtual offset
+/// space (see the [module docs](self)): resolves a token/diagnostic [`Span`]
+/// offset back to its file, line, column, and include chain.
+#[derive(Clone, Default)]
+pub struct SourceMap {
+    /// The files in allocation order (ascending, disjoint `base` ranges).
+    files: Vec<SourceFile>,
+}
+
+/// One file (one inclusion of it) in a [`SourceMap`].
+#[derive(Clone)]
+struct SourceFile {
+    /// The display name (the path as found, or `<name>` for a builtin header).
+    name: String,
+    /// The file's text (shared between repeated inclusions of one file).
+    text: Arc<str>,
+    /// The virtual offset of the file's first byte; it spans `[base, base+len]`.
+    base: u32,
+    /// The virtual offset of the `#include` directive that brought this file
+    /// in (`None` for the main source and pre-included files).
+    included_at: Option<u32>,
+}
+
+impl std::fmt::Debug for SourceMap {
+    // The file texts (whole system headers) are deliberately left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.files.iter().map(|s| (&s.name, s.base))).finish()
+    }
+}
+
+/// A resolved source position (1-based line and column).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceLocation {
+    /// The file's display name.
+    pub file: String,
+    /// The 1-based line number.
+    pub line: u32,
+    /// The 1-based column (in bytes).
+    pub column: u32,
+}
+
+impl std::fmt::Display for SourceLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.file, self.line, self.column)
+    }
+}
+
+impl SourceMap {
+    /// A map holding only a main source named `name` (what the lexer-level
+    /// entry points and callers without a preprocessor run can use).
+    pub fn single(name: &str, text: &str) -> SourceMap {
+        let mut map = SourceMap::default();
+        map.add(name.to_owned(), Arc::from(text), None);
+        map
+    }
+
+    /// Register a file; returns its base offset, or `None` if the virtual
+    /// offset space (4 GiB) is exhausted.
+    fn add(&mut self, name: String, text: Arc<str>, included_at: Option<u32>) -> Option<u32> {
+        let base = match self.files.last() {
+            Some(last) => last.base.checked_add(u32::try_from(last.text.len()).ok()?)?.checked_add(1)?,
+            None => 0,
+        };
+        base.checked_add(u32::try_from(text.len()).ok()?)?;
+        self.files.push(SourceFile { name, text, base, included_at });
+        Some(base)
+    }
+
+    /// The number of files (inclusions) recorded.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether no file is recorded.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    fn file_at(&self, offset: u32) -> Option<&SourceFile> {
+        let idx = self.files.partition_point(|f| f.base <= offset).checked_sub(1)?;
+        self.files.get(idx)
+    }
+
+    /// Resolve a virtual offset to its file, line and column.
+    pub fn locate(&self, offset: u32) -> Option<SourceLocation> {
+        let f = self.file_at(offset)?;
+        let local = (offset - f.base) as usize;
+        let before = f.text.as_bytes().get(..local.min(f.text.len()))?;
+        let line = 1 + before.iter().filter(|&&b| b == b'\n').count() as u32;
+        let line_start = before.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let column = 1 + (before.len() - line_start) as u32;
+        Some(SourceLocation { file: f.name.clone(), line, column })
+    }
+
+    /// The include chain of the file containing `offset`, innermost first: the
+    /// location of each `#include` directive that led to it.
+    pub fn include_chain(&self, offset: u32) -> Vec<SourceLocation> {
+        let mut chain = Vec::new();
+        let mut cur = self.file_at(offset).and_then(|f| f.included_at);
+        while let Some(site) = cur {
+            if chain.len() > INCLUDE_DEPTH_LIMIT {
+                break;
+            }
+            let Some(loc) = self.locate(site) else { break };
+            chain.push(loc);
+            cur = self.file_at(site).and_then(|f| f.included_at);
+        }
+        chain
+    }
+
+    /// Render diagnostics as `file:line:col: severity: message` lines (plus
+    /// their notes), each preceded by an `In file included from …` chain when
+    /// it lies in an included file. Spanless diagnostics are attributed to the
+    /// main file.
+    pub fn render(&self, diags: &[Diagnostic]) -> String {
+        let main = self.files.first().map(|f| f.name.as_str()).unwrap_or("<input>");
+        let mut out = String::new();
+        for d in diags {
+            let sev = severity_name(d.severity);
+            match d.span.and_then(|s| self.locate(s.start).map(|l| (s, l))) {
+                Some((span, loc)) => {
+                    for (i, site) in self.include_chain(span.start).iter().enumerate() {
+                        let lead = if i == 0 { "In file included from" } else { "                 from" };
+                        out.push_str(&format!("{lead} {}:{}:\n", site.file, site.line));
+                    }
+                    out.push_str(&format!("{loc}: {sev}: {}\n", d.message));
+                }
+                None => out.push_str(&format!("{main}: {sev}: {}\n", d.message)),
+            }
+            for n in &d.notes {
+                match n.span.and_then(|s| self.locate(s.start)) {
+                    Some(loc) => out.push_str(&format!("{loc}: note: {}\n", n.message)),
+                    None => out.push_str(&format!("{main}: note: {}\n", n.message)),
+                }
+            }
+        }
+        out
+    }
+}
+
+fn severity_name(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Note => "note",
+    }
+}
+
 
 /// A preprocessing token.
 #[derive(Clone, Debug)]
@@ -101,13 +316,13 @@ struct PpTok {
     /// True presumed line for `__LINE__` (physical line; `#line`/`__LINE__`
     /// apply the active delta at use).
     line: u32,
-    /// Owning pp-file index (0 = main); used for span remapping and `__FILE__`.
+    /// Owning pp-file index (0 = main); used for `__FILE__`.
     file: u32,
     /// First token of a logical line (directive detection).
     bol: bool,
     /// Whitespace/comment preceded this token (stringize spacing).
     space_before: bool,
-    /// Byte span within the owning file (remapped to the main source at finalize).
+    /// Span in the virtual offset space (see [`SourceMap`]).
     span: Span,
     /// Blue-paint hide set: macros that must not re-expand this token.
     hideset: BTreeSet<String>,
@@ -181,20 +396,55 @@ struct Cond {
     seen_else: bool,
 }
 
+/// One entry of the header search chain.
+#[derive(Clone, Debug, PartialEq)]
+enum SearchDir {
+    /// A directory on disk.
+    Dir(PathBuf),
+    /// The builtin compiler headers ([`builtin_header`]).
+    Builtin,
+}
+
+/// Where an `#include` resolved.
+#[derive(Debug)]
+enum Found {
+    /// A file on disk, and the index of the search-chain entry it was found in
+    /// (`None` when found relative to the including file's directory).
+    Disk(PathBuf, Option<usize>),
+    /// A builtin header (its text), found at search-chain entry `usize`.
+    Builtin(&'static str, usize),
+}
+
 /// The preprocessor state.
 #[derive(Debug)]
 struct Pp {
     std: CStd,
-    include_dirs: Vec<PathBuf>,
+    /// The header search chain: the `-iquote` entries first, then the entries
+    /// shared by both include forms, starting at `angle_start`.
+    search: Vec<SearchDir>,
+    /// Index into `search` where the `<…>` search begins.
+    angle_start: usize,
     macros: HashMap<String, Macro>,
-    /// Display names per pp-file (index = file id).
+    /// Display names per pp-file (index = pp-file id), used for `__FILE__`.
     filenames: Vec<String>,
-    /// Filesystem paths per pp-file (for resolving relative includes).
-    file_paths: Vec<PathBuf>,
-    /// Main-source byte offset each pp-file's tokens are attributed to.
-    include_site: Vec<u32>,
+    /// The directory `"…"` includes of each pp-file are resolved against
+    /// (`None` for a builtin header).
+    file_dirs: Vec<Option<PathBuf>>,
+    /// The canonical path of each pp-file on disk (`#pragma once`, guards).
+    file_canon: Vec<Option<PathBuf>>,
+    /// The search-chain entry each pp-file was found in (`#include_next`).
+    found_in: Vec<Option<usize>>,
+    /// The virtual base offset of each pp-file (see [`SourceMap`]).
+    file_base: Vec<u32>,
+    /// Every file read, laid out in the virtual offset space.
+    map: SourceMap,
     /// Canonical paths guarded by `#pragma once`.
     pragma_once: HashSet<PathBuf>,
+    /// Files whose whole content is wrapped in `#ifndef GUARD … #endif`: once
+    /// `GUARD` is defined, a re-inclusion is a no-op and is skipped unread.
+    guards: HashMap<PathBuf, String>,
+    /// File texts already read (shared by repeated inclusions).
+    texts: HashMap<PathBuf, Arc<str>>,
     out: Vec<PpTok>,
     diags: Vec<Diagnostic>,
     depth: usize,
@@ -203,49 +453,99 @@ struct Pp {
     /// `#line` filename override for the current file.
     file_override: Option<String>,
     main_len: u32,
-    /// Whether the builtin freestanding headers are consulted as a fallback.
-    builtin_headers: bool,
+    /// The next `__COUNTER__` value.
+    counter: u64,
+    /// The pp-file whose lines are being processed (for `__has_include`).
+    cur_file: u32,
+}
+
+/// A file about to be entered (see `Pp::enter_file`).
+#[derive(Debug)]
+struct NewFile {
+    /// Display name.
+    name: String,
+    text: Arc<str>,
+    /// Directory for its `"…"` includes (`None` for a builtin header).
+    dir: Option<PathBuf>,
+    /// Canonical path on disk.
+    canon: Option<PathBuf>,
+    /// The search-chain entry it was found in.
+    found: Option<usize>,
 }
 
 impl Pp {
-    fn new(
-        std: CStd,
-        include_dirs: &[PathBuf],
-        main_name: &str,
-        main_len: usize,
-        builtin_headers: bool,
-    ) -> Pp {
+    fn new(opts: &PpOptions, main_source: &str) -> Pp {
+        // Assemble the search chain, keeping only the first occurrence of a
+        // directory. A user directory (`-I`, `-isystem`) that names one of the
+        // standard system directories is dropped instead, so the C library's
+        // headers keep their place after the builtin compiler headers (their
+        // `#include_next` layering depends on it); likewise a `-I` naming an
+        // `-isystem` directory.
+        let standard: Vec<&PathBuf> = opts.stdinc_dirs.iter().chain(&opts.after_dirs).collect();
+        let is_standard = |d: &PathBuf| standard.iter().any(|s| same_dir(s, d));
+        let is_isystem = |d: &PathBuf| opts.system_dirs.iter().any(|s| same_dir(s, d));
+        let mut search: Vec<SearchDir> =
+            opts.quote_dirs.iter().cloned().map(SearchDir::Dir).collect();
+        let angle_start = search.len();
+        let push = |search: &mut Vec<SearchDir>, d: SearchDir| {
+            let dup = search[angle_start..].iter().any(|s| match (s, &d) {
+                (SearchDir::Dir(a), SearchDir::Dir(b)) => same_dir(a, b),
+                (a, b) => a == b,
+            });
+            if !dup {
+                search.push(d);
+            }
+        };
+        for d in opts.include_dirs.iter().filter(|d| !is_standard(d) && !is_isystem(d)) {
+            push(&mut search, SearchDir::Dir(d.clone()));
+        }
+        for d in opts.system_dirs.iter().filter(|d| !is_standard(d)) {
+            push(&mut search, SearchDir::Dir(d.clone()));
+        }
+        if opts.builtin_headers {
+            push(&mut search, SearchDir::Builtin);
+        }
+        for d in opts.stdinc_dirs.iter().chain(&opts.after_dirs) {
+            push(&mut search, SearchDir::Dir(d.clone()));
+        }
+
+        let main_name = opts.main_file_name.as_str();
+        let map = SourceMap::single(main_name, main_source);
+        let main_dir = Path::new(main_name).parent().map(Path::to_path_buf);
         Pp {
-            std,
-            include_dirs: include_dirs.to_vec(),
+            std: opts.std,
+            search,
+            angle_start,
             macros: HashMap::new(),
             filenames: vec![main_name.to_owned()],
-            file_paths: vec![PathBuf::from(main_name)],
-            include_site: vec![0],
+            file_dirs: vec![main_dir],
+            file_canon: vec![std::fs::canonicalize(main_name).ok()],
+            found_in: vec![None],
+            file_base: vec![0],
+            map,
             pragma_once: HashSet::new(),
+            guards: HashMap::new(),
+            texts: HashMap::new(),
             out: Vec::new(),
             diags: Vec::new(),
             depth: 0,
             line_delta: 0,
             file_override: None,
-            main_len: main_len as u32,
-            builtin_headers,
+            main_len: main_source.len() as u32,
+            counter: 0,
+            cur_file: 0,
         }
     }
 
     fn error(&mut self, msg: impl Into<String>, span: Span) {
-        self.diags.push(Diagnostic::error(msg).with_span(self.remap(span)));
+        self.diags.push(Diagnostic::error(msg).with_span(span));
     }
 
-    /// Remap a token span (in its owning file) to the main source (file 0).
-    fn remap(&self, sp: Span) -> Span {
-        let idx = sp.file.index() as usize;
-        if idx == 0 {
-            Span::new(FileId::new(0), sp.start, sp.end)
-        } else {
-            let off = self.include_site.get(idx).copied().unwrap_or(0);
-            Span::point(FileId::new(0), off)
-        }
+    /// A span over `[start, end)` of pp-file `file_idx`, in the virtual offset
+    /// space.
+    fn fspan(&self, file_idx: u32, start: usize, end: usize) -> Span {
+        let base = self.file_base.get(file_idx as usize).copied().unwrap_or(0);
+        Span::new(FileId::new(0), base + start as u32, base + end as u32)
     }
 
     // --- predefined & command-line macros -----------------------------------
@@ -265,29 +565,73 @@ impl Pp {
         self.macros.insert(name.to_owned(), Macro { params: None, variadic: false, body });
     }
 
-    fn define_predefined(&mut self) {
+    /// Define a function-like macro from its `name(params) body` spelling.
+    fn define_function(&mut self, spec: &str) {
+        let toks: Vec<PpTok> = self
+            .lex_file(spec, 0)
+            .into_iter()
+            .map(|mut t| {
+                t.span = Span::point(FileId::new(0), 0);
+                t
+            })
+            .collect();
+        self.add_define(&toks);
+    }
+
+    /// The predefined macros: the standard's (`__STDC__`, `__STDC_HOSTED__`,
+    /// `__STDC_VERSION__`), and the target/ABI description a C library's
+    /// headers are written against — the x86-64 SysV LP64 data model on
+    /// GNU/Linux ELF.
+    ///
+    /// GNU compatibility level: the GNU dialects predefine `__GNUC__` 4,
+    /// `__GNUC_MINOR__` 2, `__GNUC_PATCHLEVEL__` 1 — the conservative baseline
+    /// of GNU C (statement expressions, `__typeof__`, `__attribute__`, asm
+    /// labels, `__builtin_expect`/`__builtin_constant_p`, `__extension__`, …)
+    /// that other GNU-compatible compilers also claim. Headers gate newer
+    /// compiler capabilities on the version number: glibc, for instance,
+    /// switches to `__builtin_bswap*` at GCC 4.3/4.8, declares the
+    /// `_Float128`/`__float128` interfaces from GCC 4.3/4.4, and treats
+    /// `_Float32`/`_Float64`/`_Float32x`/`_Float64x` as built-in keywords (not
+    /// its own typedefs) from GCC 7. lf-cc implements none of those, so
+    /// claiming a newer version would steer the headers into constructs it
+    /// cannot compile. Individual newer capabilities are advertised instead
+    /// through `__has_builtin`/`__has_attribute`/`__has_feature`.
+    ///
+    /// Deliberately *not* predefined: `__SIZEOF_INT128__` (no `__int128`),
+    /// `__SSE__`/`__SSE2__`/`__MMX__` (no vector types or intrinsics; the
+    /// headers keyed on them include `<*intrin.h>`), `__GCC_ATOMIC_*` and
+    /// `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_*` (no `__atomic_*`/`__sync_*`
+    /// builtins), `__STDC_UTF_16__` (`u""` literals are not UTF-16-encoded
+    /// beyond the BMP), `__STDC_EMBED_*__` (no `__has_embed`), and
+    /// `__PIC__`/`__PIE__`.
+    fn define_predefined(&mut self, opts: &PpOptions) {
+        let gnu = self.std.is_gnu();
         self.define_object("__STDC__", "1");
-        self.define_object("__STDC_HOSTED__", "0");
+        self.define_object("__STDC_HOSTED__", if opts.hosted { "1" } else { "0" });
         if let Some(v) = self.std.stdc_version() {
             self.define_object("__STDC_VERSION__", &format!("{v}L"));
         }
-        // Target predefined macros for a freestanding x86-64 ELF/Linux target.
-        for name in ["__x86_64__", "__amd64__", "__LP64__", "__linux__", "__unix__", "__ELF__"] {
+        if !gnu {
+            self.define_object("__STRICT_ANSI__", "1");
+        }
+        self.define_object("__STDC_UTF_32__", "1");
+
+        // Target: x86-64, LP64, GNU/Linux, ELF. The non-reserved spellings
+        // (`linux`, `unix`) only in the GNU dialects, where they are permitted.
+        for name in [
+            "__x86_64__", "__x86_64", "__amd64__", "__amd64", "__LP64__", "_LP64", "__linux__",
+            "__linux", "__gnu_linux__", "__unix__", "__unix", "__ELF__",
+        ] {
             self.define_object(name, "1");
         }
-        // The compiler-provided type/size macros that real (GNU/glibc) headers
-        // build their own typedefs on, e.g. `typedef __SIZE_TYPE__ size_t;`.
-        // These are not GNU-gated — gcc predefines them under every dialect.
-        // Values are the x86-64 LP64 SysV choices.
+        if gnu {
+            self.define_object("linux", "1");
+            self.define_object("unix", "1");
+        }
+
+        // The data model: sizes, widths, byte order.
+        let long_double = &LDBL_FORMAT;
         for (name, val) in [
-            ("__SIZE_TYPE__", "long unsigned int"),
-            ("__PTRDIFF_TYPE__", "long int"),
-            ("__INTPTR_TYPE__", "long int"),
-            ("__UINTPTR_TYPE__", "long unsigned int"),
-            ("__INTMAX_TYPE__", "long int"),
-            ("__UINTMAX_TYPE__", "long unsigned int"),
-            ("__WCHAR_TYPE__", "int"),
-            ("__WINT_TYPE__", "unsigned int"),
             ("__CHAR_BIT__", "8"),
             ("__SIZEOF_SHORT__", "2"),
             ("__SIZEOF_INT__", "4"),
@@ -297,19 +641,165 @@ impl Pp {
             ("__SIZEOF_SIZE_T__", "8"),
             ("__SIZEOF_PTRDIFF_T__", "8"),
             ("__SIZEOF_WCHAR_T__", "4"),
+            ("__SIZEOF_WINT_T__", "4"),
+            ("__SIZEOF_FLOAT__", "4"),
+            ("__SIZEOF_DOUBLE__", "8"),
+            ("__SIZEOF_LONG_DOUBLE__", long_double.size),
+            ("__ORDER_LITTLE_ENDIAN__", "1234"),
+            ("__ORDER_BIG_ENDIAN__", "4321"),
+            ("__ORDER_PDP_ENDIAN__", "3412"),
+            ("__BYTE_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
+            ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
+            // Plain `char` is signed: `__CHAR_UNSIGNED__` is not defined.
+            ("__SCHAR_MAX__", "0x7f"),
+            ("__SHRT_MAX__", "0x7fff"),
+            ("__INT_MAX__", "0x7fffffff"),
+            ("__LONG_MAX__", "0x7fffffffffffffffL"),
+            ("__LONG_LONG_MAX__", "0x7fffffffffffffffLL"),
+            ("__WCHAR_MAX__", "0x7fffffff"),
+            ("__WCHAR_MIN__", "(-__WCHAR_MAX__ - 1)"),
+            ("__WINT_MAX__", "0xffffffffU"),
+            ("__WINT_MIN__", "0U"),
+            ("__PTRDIFF_MAX__", "0x7fffffffffffffffL"),
+            ("__SIZE_MAX__", "0xffffffffffffffffUL"),
+            ("__INTMAX_MAX__", "0x7fffffffffffffffL"),
+            ("__UINTMAX_MAX__", "0xffffffffffffffffUL"),
+            ("__INTPTR_MAX__", "0x7fffffffffffffffL"),
+            ("__UINTPTR_MAX__", "0xffffffffffffffffUL"),
+            ("__SIG_ATOMIC_MAX__", "0x7fffffff"),
+            ("__SIG_ATOMIC_MIN__", "(-__SIG_ATOMIC_MAX__ - 1)"),
+            ("__SCHAR_WIDTH__", "8"),
+            ("__SHRT_WIDTH__", "16"),
+            ("__INT_WIDTH__", "32"),
+            ("__LONG_WIDTH__", "64"),
+            ("__LONG_LONG_WIDTH__", "64"),
+            ("__PTRDIFF_WIDTH__", "64"),
+            ("__SIG_ATOMIC_WIDTH__", "32"),
+            ("__SIZE_WIDTH__", "64"),
+            ("__WCHAR_WIDTH__", "32"),
+            ("__WINT_WIDTH__", "32"),
+            ("__INTMAX_WIDTH__", "64"),
+            ("__INTPTR_WIDTH__", "64"),
+            // The types the C library builds its own typedefs on
+            // (`typedef __SIZE_TYPE__ size_t;` and friends).
+            ("__SIZE_TYPE__", "long unsigned int"),
+            ("__PTRDIFF_TYPE__", "long int"),
+            ("__WCHAR_TYPE__", "int"),
+            ("__WINT_TYPE__", "unsigned int"),
+            ("__INTMAX_TYPE__", "long int"),
+            ("__UINTMAX_TYPE__", "long unsigned int"),
+            ("__CHAR16_TYPE__", "short unsigned int"),
+            ("__CHAR32_TYPE__", "unsigned int"),
+            ("__SIG_ATOMIC_TYPE__", "int"),
+            ("__INTPTR_TYPE__", "long int"),
+            ("__UINTPTR_TYPE__", "long unsigned int"),
         ] {
             self.define_object(name, val);
         }
+        // Exact-, least- and fast-width integer types, their limits and widths,
+        // and the constant-suffix macros.
+        for (bits, sty, uty, smax, umax, sfx, usfx) in [
+            ("8", "signed char", "unsigned char", "0x7f", "0xff", "", ""),
+            ("16", "short int", "short unsigned int", "0x7fff", "0xffff", "", ""),
+            ("32", "int", "unsigned int", "0x7fffffff", "0xffffffffU", "", "U"),
+            ("64", "long int", "long unsigned int", "0x7fffffffffffffffL", "0xffffffffffffffffUL", "L", "UL"),
+        ] {
+            self.define_object(&format!("__INT{bits}_TYPE__"), sty);
+            self.define_object(&format!("__UINT{bits}_TYPE__"), uty);
+            self.define_object(&format!("__INT{bits}_MAX__"), smax);
+            self.define_object(&format!("__UINT{bits}_MAX__"), umax);
+            self.define_object(&format!("__INT_LEAST{bits}_TYPE__"), sty);
+            self.define_object(&format!("__UINT_LEAST{bits}_TYPE__"), uty);
+            self.define_object(&format!("__INT_LEAST{bits}_MAX__"), smax);
+            self.define_object(&format!("__UINT_LEAST{bits}_MAX__"), umax);
+            self.define_object(&format!("__INT_LEAST{bits}_WIDTH__"), bits);
+            // LP64: the fast types of 16 bits and more are `long`.
+            let (fs, fu, fsmax, fumax, fw) = if bits == "8" {
+                (sty, uty, smax, umax, bits)
+            } else {
+                ("long int", "long unsigned int", "0x7fffffffffffffffL", "0xffffffffffffffffUL", "64")
+            };
+            self.define_object(&format!("__INT_FAST{bits}_TYPE__"), fs);
+            self.define_object(&format!("__UINT_FAST{bits}_TYPE__"), fu);
+            self.define_object(&format!("__INT_FAST{bits}_MAX__"), fsmax);
+            self.define_object(&format!("__UINT_FAST{bits}_MAX__"), fumax);
+            self.define_object(&format!("__INT_FAST{bits}_WIDTH__"), fw);
+            let paste = |s: &str| if s.is_empty() { "c".to_owned() } else { format!("c ## {s}") };
+            self.define_function(&format!("__INT{bits}_C(c) {}", paste(sfx)));
+            self.define_function(&format!("__UINT{bits}_C(c) {}", paste(usfx)));
+        }
+        self.define_function("__INTMAX_C(c) c ## L");
+        self.define_function("__UINTMAX_C(c) c ## UL");
+
+        // Floating types: IEEE-754 binary32 and binary64, and `long double` as
+        // lf-cc implements it (see [`LDBL_FORMAT`]).
+        self.define_object("__FLT_RADIX__", "2");
+        self.define_object("__FLT_EVAL_METHOD__", "0");
+        self.define_object("__FLT_EVAL_METHOD_TS_18661_3__", "0");
+        self.define_object("__FINITE_MATH_ONLY__", "0");
+        self.define_object("__DECIMAL_DIG__", long_double.decimal_dig);
+        for (p, f) in [("FLT", &FLT_FORMAT), ("DBL", &DBL_FORMAT), ("LDBL", long_double)] {
+            for (field, val) in [
+                ("MANT_DIG", f.mant_dig),
+                ("DIG", f.dig),
+                ("MIN_EXP", f.min_exp),
+                ("MIN_10_EXP", f.min_10_exp),
+                ("MAX_EXP", f.max_exp),
+                ("MAX_10_EXP", f.max_10_exp),
+                ("DECIMAL_DIG", f.decimal_dig),
+                ("MAX", f.max),
+                ("NORM_MAX", f.max),
+                ("MIN", f.min),
+                ("EPSILON", f.epsilon),
+                ("DENORM_MIN", f.denorm_min),
+                ("HAS_DENORM", "1"),
+                ("HAS_INFINITY", "1"),
+                ("HAS_QUIET_NAN", "1"),
+                ("IS_IEC_60559", "1"),
+            ] {
+                let v = match field {
+                    "MAX" | "NORM_MAX" | "MIN" | "EPSILON" | "DENORM_MIN" => format!("{val}{}", f.suffix),
+                    _ => val.to_owned(),
+                };
+                self.define_object(&format!("__{p}_{field}__"), &v);
+            }
+        }
+
         // The prefix the ABI prepends to C names at the symbol level: none on
         // ELF. glibc builds its asm labels from it (`__ASMNAME`), so an undefined
         // macro would leak its own name into every redirected symbol.
         self.define_object("__USER_LABEL_PREFIX__", "");
+        self.define_object("__REGISTER_PREFIX__", "");
         self.define_object("__DATE__", "\"Jan  1 2020\"");
         self.define_object("__TIME__", "\"00:00:00\"");
-        if self.std.is_gnu() {
-            self.define_object("__GNUC__", "13");
-            self.define_object("__GNUC_MINOR__", "0");
-            self.define_object("__GNUC_PATCHLEVEL__", "0");
+        let base = escape_string(&opts.main_file_name);
+        self.define_object("__BASE_FILE__", &format!("\"{base}\""));
+
+        // `__OPTIMIZE__` makes C library headers swap functions for
+        // optimized macro forms — glibc's <ctype.h> `tolower`/`toupper` become
+        // GNU statement expressions `({ … })` — so it is only claimed once the
+        // parser accepts those (see `STATEMENT_EXPRESSIONS`).
+        if opts.optimize && STATEMENT_EXPRESSIONS {
+            self.define_object("__OPTIMIZE__", "1");
+        }
+        // `__NO_INLINE__` is gcc's "no function is inlined" signal. C libraries
+        // key their `extern __inline __attribute__((__gnu_inline__))`
+        // definitions (glibc: `__USE_EXTERN_INLINES`) on its absence; lf-cc
+        // ignores `gnu_inline` and would emit such a body as a strong external
+        // definition, so the headers must never offer them.
+        self.define_object("__NO_INLINE__", "1");
+
+        if gnu {
+            self.define_object("__GNUC__", "4");
+            self.define_object("__GNUC_MINOR__", "2");
+            self.define_object("__GNUC_PATCHLEVEL__", "1");
+            self.define_object("__VERSION__", "\"4.2.1 Compatible lf-cc\"");
+            // The `inline` semantics in force: ISO C99 from C99 on, GNU89 before.
+            if self.std.is_c99() {
+                self.define_object("__GNUC_STDC_INLINE__", "1");
+            } else {
+                self.define_object("__GNUC_GNU_INLINE__", "1");
+            }
         }
     }
 
@@ -322,21 +812,29 @@ impl Pp {
                         None => (spec.clone(), "1".to_owned()),
                     };
                     // Support function-like `-D 'f(x)=body'` by re-lexing.
-                    let synth = format!("{name} {body}");
-                    let toks = self.lex_file(&synth, 0);
-                    let cleaned: Vec<PpTok> = toks
-                        .into_iter()
-                        .map(|mut t| {
-                            t.span = Span::point(FileId::new(0), 0);
-                            t
-                        })
-                        .collect();
-                    self.add_define(&cleaned);
+                    self.define_function(&format!("{name} {body}"));
                 }
                 MacroOp::Undef(name) => {
                     self.macros.remove(name);
                 }
             }
+        }
+    }
+
+    /// Pre-include `name` (gcc-style `stdc-predef.h`) from the standard system
+    /// directories, if present there: it predefines the C library's view of
+    /// the implementation (`__STDC_IEC_559__`, `__STDC_ISO_10646__`, …).
+    fn preinclude(&mut self, name: &str) {
+        let Some(builtin) = self.search.iter().position(|d| *d == SearchDir::Builtin) else {
+            return;
+        };
+        let start = builtin + 1;
+        let found = self.search.iter().enumerate().skip(start).find_map(|(i, d)| match d {
+            SearchDir::Dir(dir) if dir.join(name).is_file() => Some((dir.join(name), i)),
+            _ => None,
+        });
+        if let Some((path, idx)) = found {
+            self.include_disk(path, Some(idx), None, Span::point(FileId::new(0), 0));
         }
     }
 
@@ -379,13 +877,8 @@ impl Pp {
                         }
                         None => {
                             self.diags.push(
-                                Diagnostic::error("unterminated literal").with_span(
-                                    self.remap(Span::new(
-                                        FileId::new(file_idx),
-                                        start as u32,
-                                        pos as u32,
-                                    )),
-                                ),
+                                Diagnostic::error("unterminated literal")
+                                    .with_span(self.fspan(file_idx, start, pos)),
                             );
                             continue;
                         }
@@ -399,7 +892,7 @@ impl Pp {
                     None => {
                         self.diags.push(
                             Diagnostic::error("unterminated string literal")
-                                .with_span(self.remap(Span::new(FileId::new(file_idx), start as u32, pos as u32))),
+                                .with_span(self.fspan(file_idx, start, pos)),
                         );
                         continue;
                     }
@@ -410,7 +903,7 @@ impl Pp {
                     None => {
                         self.diags.push(
                             Diagnostic::error("unterminated character constant")
-                                .with_span(self.remap(Span::new(FileId::new(file_idx), start as u32, pos as u32))),
+                                .with_span(self.fspan(file_idx, start, pos)),
                         );
                         continue;
                     }
@@ -421,7 +914,7 @@ impl Pp {
             } else {
                 self.diags.push(
                     Diagnostic::error(format!("unexpected character '{}'", c as char))
-                        .with_span(self.remap(Span::new(FileId::new(file_idx), start as u32, (start + 1) as u32))),
+                        .with_span(self.fspan(file_idx, start, start + 1)),
                 );
                 pos += 1;
                 continue;
@@ -433,7 +926,7 @@ impl Pp {
                 file: file_idx,
                 bol,
                 space_before: space,
-                span: Span::new(FileId::new(file_idx), start as u32, pos as u32),
+                span: self.fspan(file_idx, start, pos),
                 hideset: BTreeSet::new(),
             });
             bol = false;
@@ -482,11 +975,7 @@ impl Pp {
                             Diagnostic::error(
                                 "'//' line comments are a C99 feature (use -std=c99 or later)",
                             )
-                            .with_span(self.remap(Span::new(
-                                FileId::new(file_idx),
-                                start as u32,
-                                (start + 2) as u32,
-                            ))),
+                            .with_span(self.fspan(file_idx, start, start + 2)),
                         );
                     }
                     *pos += 2;
@@ -517,7 +1006,7 @@ impl Pp {
                     if !closed {
                         self.diags.push(
                             Diagnostic::error("unterminated block comment").with_span(
-                                self.remap(Span::new(FileId::new(file_idx), start as u32, *pos as u32)),
+                                self.fspan(file_idx, start, *pos),
                             ),
                         );
                     }
@@ -595,15 +1084,17 @@ impl Pp {
     // --- file processing ----------------------------------------------------
 
     fn process_file(&mut self, file_idx: u32, toks: Vec<PpTok>) {
-        let dir = self
-            .file_paths
-            .get(file_idx as usize)
-            .and_then(|p| p.parent())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let saved_file = std::mem::replace(&mut self.cur_file, file_idx);
         let mut cond: Vec<Cond> = Vec::new();
         let mut run: Vec<PpTok> = Vec::new();
         let mut i = 0usize;
+        // Multiple-inclusion guard detection: a file whose every token lies
+        // inside one `#ifndef G` … `#endif` group (with no `#else`/`#elif` on
+        // it) is a no-op once `G` is defined, so a later inclusion can be
+        // skipped without even reading it.
+        let guard = guard_macro(&toks);
+        let mut guard_ok = guard.is_some();
+        let mut guard_closed = false;
 
         while i < toks.len() {
             let start = i;
@@ -613,6 +1104,9 @@ impl Pp {
             }
             let line = &toks[start..j];
             i = j;
+            if guard_closed {
+                guard_ok = false;
+            }
 
             let active = cond.last().map(|c| c.active).unwrap_or(true);
             if line[0].bol && matches!(line[0].kind, PpKind::Hash) {
@@ -621,7 +1115,17 @@ impl Pp {
                     let e = self.expand(r);
                     self.out.extend(e);
                 }
-                self.handle_directive(file_idx, &dir, line, &mut cond);
+                if cond.len() == 1
+                    && matches!(line.get(1).map(|t| &t.kind), Some(PpKind::Ident(n))
+                        if matches!(n.as_str(), "else" | "elif" | "elifdef" | "elifndef"))
+                {
+                    guard_ok = false;
+                }
+                let depth_before = cond.len();
+                self.handle_directive(file_idx, line, &mut cond);
+                if depth_before == 1 && cond.is_empty() {
+                    guard_closed = true;
+                }
             } else if active {
                 run.extend(line.iter().cloned());
             }
@@ -632,11 +1136,19 @@ impl Pp {
             self.out.extend(e);
         }
         if !cond.is_empty() {
-            self.diags.push(Diagnostic::error("unterminated `#if` (missing `#endif`)"));
+            let at = toks.last().map(|t| t.span).unwrap_or_else(|| self.fspan(file_idx, 0, 0));
+            self.error("unterminated `#if` (missing `#endif`)", at);
+        } else if guard_ok
+            && guard_closed
+            && let Some(g) = guard
+            && let Some(Some(canon)) = self.file_canon.get(file_idx as usize)
+        {
+            self.guards.insert(canon.clone(), g);
         }
+        self.cur_file = saved_file;
     }
 
-    fn handle_directive(&mut self, file_idx: u32, dir: &Path, line: &[PpTok], cond: &mut Vec<Cond>) {
+    fn handle_directive(&mut self, file_idx: u32, line: &[PpTok], cond: &mut Vec<Cond>) {
         let active = cond.last().map(|c| c.active).unwrap_or(true);
         let dname: &str = match line.get(1).map(|t| &t.kind) {
             Some(PpKind::Ident(n)) => n.as_str(),
@@ -707,8 +1219,9 @@ impl Pp {
                     self.error("`#undef` expects an identifier", dspan);
                 }
             }
-            "include" => self.do_include(file_idx, dir, &line[2..], dspan),
-            "embed" => self.do_embed(dir, &line[2..], &line[0]),
+            "include" => self.do_include(file_idx, &line[2..], dspan, false),
+            "include_next" => self.do_include(file_idx, &line[2..], dspan, true),
+            "embed" => self.do_embed(file_idx, &line[2..], &line[0]),
             "error" => {
                 let msg = spell_line(&line[2..]);
                 self.error(format!("#error {msg}"), dspan);
@@ -716,17 +1229,19 @@ impl Pp {
             "warning" => {
                 let msg = spell_line(&line[2..]);
                 self.diags
-                    .push(Diagnostic::warning(format!("#warning {msg}")).with_span(self.remap(dspan)));
+                    .push(Diagnostic::warning(format!("#warning {msg}")).with_span(dspan));
             }
             "pragma" => {
                 if let Some(PpKind::Ident(n)) = line.get(2).map(|t| &t.kind)
                     && n == "once"
-                    && let Some(p) = self.file_paths.get(file_idx as usize).cloned()
+                    && let Some(Some(canon)) = self.file_canon.get(file_idx as usize).cloned()
                 {
-                    let canon = std::fs::canonicalize(&p).unwrap_or(p);
                     self.pragma_once.insert(canon);
                 }
             }
+            // `#ident "…"` / `#sccs "…"`: version strings for the object file's
+            // comment section; accepted and dropped.
+            "ident" | "sccs" => {}
             "line" => self.handle_line(&line[2..], line[0].line, dspan),
             "\0linemarker" => self.handle_line(&line[1..], line[0].line, dspan),
             other => self.error(format!("invalid preprocessing directive #{other}"), dspan),
@@ -769,80 +1284,140 @@ impl Pp {
     }
 
     fn is_defined(&self, name: &str) -> bool {
-        name == "__LINE__" || name == "__FILE__" || self.macros.contains_key(name)
+        matches!(
+            name,
+            "__LINE__"
+                | "__FILE__"
+                | "__COUNTER__"
+                | "__INCLUDE_LEVEL__"
+                | "__has_include"
+                | "__has_include_next"
+                | "__has_builtin"
+                | "__has_attribute"
+                | "__has_c_attribute"
+                | "__has_feature"
+                | "__has_extension"
+        ) || self.macros.contains_key(name)
     }
 
-    fn do_include(&mut self, file_idx: u32, dir: &Path, args: &[PpTok], dspan: Span) {
+    /// Execute `#include` (or, with `next`, `#include_next`).
+    fn do_include(&mut self, file_idx: u32, args: &[PpTok], dspan: Span, next: bool) {
         let (name, angled) = match self.parse_header_name(args) {
             Some(v) => v,
             None => {
-                self.error("`#include` expects \"file\" or <file>", dspan);
+                let d = if next { "#include_next" } else { "#include" };
+                self.error(format!("`{d}` expects \"file\" or <file>"), dspan);
                 return;
             }
         };
-        let Some(path) = self.resolve_include(&name, angled, dir) else {
-            // Not on disk: fall back to a builtin freestanding header, if enabled.
-            if self.builtin_headers
-                && let Some(text) = builtin_header(&name)
-            {
-                self.include_builtin(file_idx, &name, text, dspan);
-            } else {
-                self.error(format!("cannot find include file {name:?}"), dspan);
+        match self.find_include(&name, angled, file_idx, next) {
+            Some(Found::Disk(path, idx)) => self.include_disk(path, idx, Some(dspan.start), dspan),
+            Some(Found::Builtin(text, idx)) => self.include_builtin(&name, text, idx, dspan),
+            None => self.error(format!("cannot find include file {name:?}"), dspan),
+        }
+    }
+
+    /// Resolve a header name along the search chain. `"…"` looks in the
+    /// including file's directory first, then the whole chain; `<…>` starts at
+    /// the angle-bracket part of the chain. With `next` (`#include_next`, and
+    /// `__has_include_next`) the search resumes after the chain entry the
+    /// current file was found in; a file not found through the chain (the main
+    /// source, or a `"…"` include resolved next to its includer) searches as a
+    /// plain `#include` would.
+    fn find_include(&self, name: &str, angled: bool, cur: u32, next: bool) -> Option<Found> {
+        let mut start = if angled { self.angle_start } else { 0 };
+        let mut own_dir = !angled;
+        if next && let Some(Some(i)) = self.found_in.get(cur as usize) {
+            start = start.max(i + 1);
+            own_dir = false;
+        }
+        if own_dir && let Some(Some(dir)) = self.file_dirs.get(cur as usize) {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(Found::Disk(cand, None));
             }
-            return;
-        };
+        }
+        for (i, d) in self.search.iter().enumerate().skip(start) {
+            match d {
+                SearchDir::Dir(dir) => {
+                    let cand = dir.join(name);
+                    if cand.is_file() {
+                        return Some(Found::Disk(cand, Some(i)));
+                    }
+                }
+                SearchDir::Builtin => {
+                    if let Some(text) = builtin_header(name) {
+                        return Some(Found::Builtin(text, i));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Include a header file from disk, found at search-chain entry `found`.
+    fn include_disk(&mut self, path: PathBuf, found: Option<usize>, included_at: Option<u32>, dspan: Span) {
         let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if self.pragma_once.contains(&canon) {
             return;
         }
-        if self.depth >= INCLUDE_DEPTH_LIMIT {
-            self.error("`#include` nested too deeply (cyclic include?)", dspan);
+        if let Some(g) = self.guards.get(&canon)
+            && self.macros.contains_key(g)
+        {
             return;
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                self.error(format!("cannot read include file {path:?}: {e}"), dspan);
-                return;
-            }
+        let text = match self.texts.get(&canon) {
+            Some(t) => t.clone(),
+            None => match std::fs::read(&path) {
+                // Invalid UTF-8 (say, a Latin-1 comment) is replaced, not fatal;
+                // spans then index the replaced text the source map stores.
+                Ok(bytes) => {
+                    let t: Arc<str> = Arc::from(String::from_utf8_lossy(&bytes).as_ref());
+                    self.texts.insert(canon.clone(), t.clone());
+                    t
+                }
+                Err(e) => {
+                    self.error(format!("cannot read include file {path:?}: {e}"), dspan);
+                    return;
+                }
+            },
         };
-
-        let attribution =
-            if file_idx == 0 { dspan.start } else { self.include_site[file_idx as usize] };
-        let new_idx = self.filenames.len() as u32;
-        self.filenames.push(path.display().to_string());
-        self.file_paths.push(path);
-        self.include_site.push(attribution);
-
-        let toks = self.lex_file(&text, new_idx);
-        let saved_delta = self.line_delta;
-        let saved_override = self.file_override.take();
-        self.line_delta = 0;
-        self.depth += 1;
-        self.process_file(new_idx, toks);
-        self.depth -= 1;
-        self.line_delta = saved_delta;
-        self.file_override = saved_override;
+        let dir = path.parent().map(Path::to_path_buf);
+        let file = NewFile { name: path.display().to_string(), text, dir, canon: Some(canon), found };
+        self.enter_file(file, included_at, dspan);
     }
 
-    /// Process a builtin freestanding header's embedded source `text` as a
-    /// virtual file named `<name>` (its own include guard makes re-inclusion
-    /// idempotent), attributing every token to the `#include` site so provenance,
-    /// `__FILE__`, and `#line` behave exactly as for an on-disk header.
-    fn include_builtin(&mut self, file_idx: u32, name: &str, text: &str, dspan: Span) {
+    /// Include builtin header `name` (found at search-chain entry `found`) as a
+    /// virtual file named `<name>`; its own include guard makes re-inclusion
+    /// idempotent, and `__FILE__`, `#line` and diagnostics behave exactly as for
+    /// an on-disk header.
+    fn include_builtin(&mut self, name: &str, text: &'static str, found: usize, dspan: Span) {
+        let display = format!("<{name}>");
+        let key = PathBuf::from(&display);
+        let text = self.texts.entry(key).or_insert_with(|| Arc::from(text)).clone();
+        let file = NewFile { name: display, text, dir: None, canon: None, found: Some(found) };
+        self.enter_file(file, Some(dspan.start), dspan);
+    }
+
+    /// Register a new pp-file (one inclusion of `file`, by the directive at
+    /// virtual offset `included_at`) and process it.
+    fn enter_file(&mut self, file: NewFile, included_at: Option<u32>, dspan: Span) {
         if self.depth >= INCLUDE_DEPTH_LIMIT {
             self.error("`#include` nested too deeply (cyclic include?)", dspan);
             return;
         }
-        let display = format!("<{name}>");
-        let attribution =
-            if file_idx == 0 { dspan.start } else { self.include_site[file_idx as usize] };
+        let Some(base) = self.map.add(file.name.clone(), file.text.clone(), included_at) else {
+            self.error("translation unit too large (4 GiB of source)", dspan);
+            return;
+        };
         let new_idx = self.filenames.len() as u32;
-        self.filenames.push(display.clone());
-        self.file_paths.push(PathBuf::from(display));
-        self.include_site.push(attribution);
+        self.filenames.push(file.name);
+        self.file_dirs.push(file.dir);
+        self.file_canon.push(file.canon);
+        self.found_in.push(file.found);
+        self.file_base.push(base);
 
-        let toks = self.lex_file(text, new_idx);
+        let toks = self.lex_file(&file.text, new_idx);
         let saved_delta = self.line_delta;
         let saved_override = self.file_override.take();
         self.line_delta = 0;
@@ -859,7 +1434,7 @@ impl Pp {
     /// byte values (each `0..=255`) into the token stream. The optional parameters
     /// `limit(N)`, `prefix(…)`, `suffix(…)`, and `if_empty(…)` are honored per the
     /// standard (see [`EmbedParams`]).
-    fn do_embed(&mut self, dir: &Path, args: &[PpTok], site: &PpTok) {
+    fn do_embed(&mut self, file_idx: u32, args: &[PpTok], site: &PpTok) {
         let dspan = site.span;
         if !self.std.is_c23() {
             self.error("`#embed` is a C23 feature (use -std=c23 or later)", dspan);
@@ -878,7 +1453,7 @@ impl Pp {
         let Some(params) = self.parse_embed_params(rest, dspan) else {
             return;
         };
-        let Some(path) = self.resolve_include(&name, angled, dir) else {
+        let Some(path) = self.resolve_embed(&name, angled, file_idx) else {
             self.error(format!("cannot find embed resource {name:?}"), dspan);
             return;
         };
@@ -1051,20 +1626,13 @@ impl Pp {
         }
     }
 
-    fn resolve_include(&self, name: &str, angled: bool, dir: &Path) -> Option<PathBuf> {
-        if !angled {
-            let cand = dir.join(name);
-            if cand.is_file() {
-                return Some(cand);
-            }
+    /// Resolve an `#embed` resource name: the `#include` search, ignoring the
+    /// builtin headers (which are not resources).
+    fn resolve_embed(&self, name: &str, angled: bool, cur: u32) -> Option<PathBuf> {
+        match self.find_include(name, angled, cur, false) {
+            Some(Found::Disk(path, _)) => Some(path),
+            _ => None,
         }
-        for inc in &self.include_dirs {
-            let cand = inc.join(name);
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-        None
     }
 
     fn add_define(&mut self, toks: &[PpTok]) {
@@ -1082,8 +1650,17 @@ impl Pp {
             && matches!(first.kind, PpKind::Punct(Punct::LParen))
             && !first.space_before
         {
-            if let Some((params, variadic, body_start)) = self.parse_params(rest) {
-                let body = clean_body(&rest[body_start..]);
+            if let Some((params, variadic, va_name, body_start)) = self.parse_params(rest) {
+                let mut body = clean_body(&rest[body_start..]);
+                // GNU named variadic parameter (`args...`): its uses in the body
+                // denote the variable arguments, exactly like `__VA_ARGS__`.
+                if let Some(va) = va_name {
+                    for t in &mut body {
+                        if matches!(&t.kind, PpKind::Ident(n) if *n == va) {
+                            t.kind = PpKind::Ident("__VA_ARGS__".to_owned());
+                        }
+                    }
+                }
                 self.macros.insert(name, Macro { params: Some(params), variadic, body });
             }
             return;
@@ -1093,19 +1670,30 @@ impl Pp {
     }
 
     /// Parse a function-like parameter list starting at `rest[0] == '('`.
-    /// Returns the parameters, whether variadic, and the body start index.
-    fn parse_params(&mut self, rest: &[PpTok]) -> Option<(Vec<String>, bool, usize)> {
+    /// Returns the parameters, whether variadic, the name of a GNU named
+    /// variadic parameter (`args...`), and the body start index.
+    #[allow(clippy::type_complexity)]
+    fn parse_params(&mut self, rest: &[PpTok]) -> Option<(Vec<String>, bool, Option<String>, usize)> {
         let mut params = Vec::new();
         let mut variadic = false;
+        let mut va_name = None;
         let mut i = 1usize; // skip '('
         if matches!(rest.get(i).map(|t| &t.kind), Some(PpKind::Punct(Punct::RParen))) {
-            return Some((params, variadic, i + 1));
+            return Some((params, variadic, va_name, i + 1));
         }
         loop {
             match rest.get(i).map(|t| &t.kind) {
                 Some(PpKind::Punct(Punct::Ellipsis)) => {
                     variadic = true;
                     i += 1;
+                    break;
+                }
+                Some(PpKind::Ident(n))
+                    if matches!(rest.get(i + 1).map(|t| &t.kind), Some(PpKind::Punct(Punct::Ellipsis))) =>
+                {
+                    variadic = true;
+                    va_name = Some(n.clone());
+                    i += 2;
                     break;
                 }
                 Some(PpKind::Ident(n)) => {
@@ -1133,7 +1721,7 @@ impl Pp {
             self.error("expected ')' to close macro parameter list", sp);
             return None;
         }
-        Some((params, variadic, i + 1))
+        Some((params, variadic, va_name, i + 1))
     }
 
     // --- macro expansion ----------------------------------------------------
@@ -1164,6 +1752,28 @@ impl Pp {
             }
             if name == "__FILE__" {
                 out.push(self.make_file_tok(&t));
+                continue;
+            }
+            if name == "__COUNTER__" {
+                let n = self.counter;
+                self.counter += 1;
+                out.push(number_tok(&n.to_string(), &t));
+                continue;
+            }
+            if name == "__INCLUDE_LEVEL__" {
+                out.push(number_tok(&self.depth.to_string(), &t));
+                continue;
+            }
+            // The C99 `_Pragma ( string-literal )` operator: a pragma produced by
+            // macro expansion. No pragma lf-cc honors is meaningful here (they
+            // are diagnostics/optimization controls), so the operator is
+            // consumed and dropped.
+            if name == "_Pragma"
+                && matches!(input.front().map(|x| &x.kind), Some(PpKind::Punct(Punct::LParen)))
+                && matches!(input.get(1).map(|x| &x.kind), Some(PpKind::Str(_)))
+                && matches!(input.get(2).map(|x| &x.kind), Some(PpKind::Punct(Punct::RParen)))
+            {
+                input.drain(..3);
                 continue;
             }
             let Some(mac) = self.macros.get(&name).cloned() else {
@@ -1440,8 +2050,13 @@ impl Pp {
     // --- #if constant expression --------------------------------------------
 
     fn eval_if(&mut self, toks: &[PpTok], at: &PpTok) -> bool {
+        // The `defined` and `__has_*` operators are evaluated before macro
+        // expansion (their operands are names, not expressions), and once more
+        // afterwards for the ones a macro expansion produced (glibc's
+        // `__glibc_has_attribute (x)` expands to `__has_attribute (x)`).
         let replaced = self.replace_defined(toks, at.span);
         let expanded = self.expand(replaced);
+        let expanded = self.replace_defined(&expanded, at.span);
         match self.eval_const_expr(&expanded, at.span) {
             Ok(v) => v != 0,
             Err(d) => {
@@ -1451,13 +2066,21 @@ impl Pp {
         }
     }
 
-    /// Replace `defined X` / `defined(X)` with `1` or `0` before expansion.
+    /// Replace `defined X` / `defined(X)` with `1` or `0`, and each `__has_*`
+    /// query (`__has_include`, `__has_include_next`, `__has_builtin`,
+    /// `__has_attribute`, `__has_c_attribute`, `__has_feature`,
+    /// `__has_extension`) with its value.
     fn replace_defined(&mut self, toks: &[PpTok], at: Span) -> Vec<PpTok> {
         let mut out = Vec::new();
         let mut i = 0usize;
         while i < toks.len() {
             let t = &toks[i];
-            if matches!(&t.kind, PpKind::Ident(n) if n == "defined") {
+            let PpKind::Ident(op) = &t.kind else {
+                out.push(t.clone());
+                i += 1;
+                continue;
+            };
+            if op == "defined" {
                 let (name, consumed) = match toks.get(i + 1).map(|x| &x.kind) {
                     Some(PpKind::Ident(n)) => (Some(n.clone()), 2),
                     Some(PpKind::Punct(Punct::LParen)) => {
@@ -1484,8 +2107,68 @@ impl Pp {
                     }
                 }
             }
-            out.push(t.clone());
-            i += 1;
+            let is_query = matches!(
+                op.as_str(),
+                "__has_include"
+                    | "__has_include_next"
+                    | "__has_builtin"
+                    | "__has_attribute"
+                    | "__has_c_attribute"
+                    | "__has_feature"
+                    | "__has_extension"
+            );
+            if !is_query {
+                out.push(t.clone());
+                i += 1;
+                continue;
+            }
+            // The parenthesized operand: everything up to the matching `)`.
+            let Some(PpKind::Punct(Punct::LParen)) = toks.get(i + 1).map(|x| &x.kind) else {
+                self.error(format!("missing '(' after `{op}`"), t.span);
+                i += 1;
+                continue;
+            };
+            let mut j = i + 2;
+            let mut depth = 0usize;
+            while let Some(x) = toks.get(j) {
+                match x.kind {
+                    PpKind::Punct(Punct::LParen) => depth += 1,
+                    PpKind::Punct(Punct::RParen) if depth == 0 => break,
+                    PpKind::Punct(Punct::RParen) => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j >= toks.len() {
+                self.error(format!("missing ')' after `{op}` operand"), t.span);
+                return out;
+            }
+            let operand = &toks[i + 2..j];
+            let value = match op.as_str() {
+                "__has_include" | "__has_include_next" => {
+                    let next = op == "__has_include_next";
+                    match self.parse_header_name(operand) {
+                        Some((name, angled)) => {
+                            i128::from(self.find_include(&name, angled, self.cur_file, next).is_some())
+                        }
+                        None => {
+                            self.error(format!("`{op}` expects \"file\" or <file>"), t.span);
+                            0
+                        }
+                    }
+                }
+                _ => {
+                    let name = spell_joined(operand);
+                    match op.as_str() {
+                        "__has_builtin" => i128::from(has_builtin(&name)),
+                        "__has_attribute" => i128::from(has_gnu_attribute(&name)),
+                        "__has_c_attribute" => has_c_attribute(&name),
+                        _ => i128::from(has_feature(&name, self.std)),
+                    }
+                }
+            };
+            out.push(number_tok(&value.to_string(), t));
+            i = j + 1;
         }
         out
     }
@@ -1495,38 +2178,42 @@ impl Pp {
         for t in toks {
             let item = match &t.kind {
                 PpKind::Number(s) => match eval_number(s, self.std) {
-                    Ok(NumVal::Int(v, _)) => EItem::Num(v),
+                    // Out-of-range values were rejected by `eval_number`; the
+                    // constant's type decides signed vs unsigned arithmetic.
+                    Ok(NumVal::Int(v, ty)) => {
+                        EItem::Num(PpVal { bits: v as u64, unsigned: ty.is_integer() && !ty.is_signed() })
+                    }
                     Ok(NumVal::Float(..)) => {
                         return Err(Diagnostic::error(
                             "floating constant in a preprocessor `#if` expression",
                         )
-                        .with_span(self.remap(t.span)));
+                        .with_span(t.span));
                     }
-                    Err(m) => return Err(Diagnostic::error(m).with_span(self.remap(t.span))),
+                    Err(m) => return Err(Diagnostic::error(m).with_span(t.span)),
                 },
-                PpKind::Char(raw) => EItem::Num(eval_char(raw)),
+                PpKind::Char(raw) => EItem::Num(PpVal::signed(eval_char(raw) as i64)),
                 PpKind::Ident(n) => {
                     // Remaining identifiers evaluate to 0 (C23 `true` is 1).
-                    EItem::Num(i128::from(self.std.is_c23() && n == "true"))
+                    EItem::Num(PpVal::truth(self.std.is_c23() && n == "true"))
                 }
                 PpKind::Punct(p) => EItem::Op(*p),
                 PpKind::Str(_) => {
                     return Err(Diagnostic::error("string literal in `#if` expression")
-                        .with_span(self.remap(t.span)));
+                        .with_span(t.span));
                 }
                 PpKind::Hash | PpKind::HashHash | PpKind::Placemarker => {
                     return Err(Diagnostic::error("invalid token in `#if` expression")
-                        .with_span(self.remap(t.span)));
+                        .with_span(t.span));
                 }
             };
             items.push(item);
         }
-        let mut ev = Ev { items: &items, pos: 0, at: self.remap(at) };
+        let mut ev = Ev { items: &items, pos: 0, at, skip: 0 };
         let v = ev.expr()?;
         if ev.pos != ev.items.len() {
             return Err(Diagnostic::error("trailing tokens in `#if` expression").with_span(ev.at));
         }
-        Ok(v)
+        Ok(v.value())
     }
 
     // --- finalize -----------------------------------------------------------
@@ -1534,7 +2221,7 @@ impl Pp {
     fn finalize(&mut self, toks: Vec<PpTok>) -> Vec<Token> {
         let mut out = Vec::with_capacity(toks.len() + 1);
         for t in toks {
-            let span = self.remap(t.span);
+            let span = t.span;
             let kind = match &t.kind {
                 PpKind::Ident(name) => match self.classify_ident(name, span) {
                     Some(k) => k,
@@ -1650,10 +2337,38 @@ impl Pp {
 
 // --- free helpers -----------------------------------------------------------
 
+/// A value in a `#if` expression: per C (6.10.1), every integer is evaluated
+/// as `intmax_t` or `uintmax_t` — 64 bits on this target — so `bits` holds the
+/// two's-complement representation and `unsigned` selects the interpretation.
+#[derive(Clone, Copy, Debug)]
+struct PpVal {
+    bits: u64,
+    unsigned: bool,
+}
+
+impl PpVal {
+    fn signed(v: i64) -> PpVal {
+        PpVal { bits: v as u64, unsigned: false }
+    }
+
+    fn truth(b: bool) -> PpVal {
+        PpVal::signed(i64::from(b))
+    }
+
+    fn is_true(self) -> bool {
+        self.bits != 0
+    }
+
+    /// The mathematical value.
+    fn value(self) -> i128 {
+        if self.unsigned { i128::from(self.bits) } else { i128::from(self.bits as i64) }
+    }
+}
+
 /// The evaluator's simplified token.
 #[derive(Clone, Copy, Debug)]
 enum EItem {
-    Num(i128),
+    Num(PpVal),
     Op(Punct),
 }
 
@@ -1662,6 +2377,10 @@ struct Ev<'a> {
     items: &'a [EItem],
     pos: usize,
     at: Span,
+    /// Nesting depth of operands that are not evaluated (the untaken arm of
+    /// `?:`, the right side of a short-circuited `&&`/`||`): a division by
+    /// zero there is not an error.
+    skip: u32,
 }
 
 impl Ev<'_> {
@@ -1676,44 +2395,65 @@ impl Ev<'_> {
         Diagnostic::error(msg.to_owned()).with_span(self.at)
     }
 
-    fn expr(&mut self) -> Result<i128, Diagnostic> {
+    fn expr(&mut self) -> Result<PpVal, Diagnostic> {
         self.ternary()
     }
 
-    fn ternary(&mut self) -> Result<i128, Diagnostic> {
+    /// Parse an operand that is evaluated only when `live`.
+    fn operand<T>(&mut self, live: bool, f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>) -> Result<T, Diagnostic> {
+        if !live {
+            self.skip += 1;
+        }
+        let r = f(self);
+        if !live {
+            self.skip -= 1;
+        }
+        r
+    }
+
+    fn ternary(&mut self) -> Result<PpVal, Diagnostic> {
         let c = self.binary(0)?;
         if self.peek() == Some(Punct::Question) {
             self.pos += 1;
-            let t = self.expr()?;
+            let t = self.operand(c.is_true(), Self::expr)?;
             if self.peek() != Some(Punct::Colon) {
                 return Err(self.err("expected ':' in `#if` conditional"));
             }
             self.pos += 1;
-            let e = self.ternary()?;
-            Ok(if c != 0 { t } else { e })
+            let e = self.operand(!c.is_true(), Self::ternary)?;
+            // The result has the common type of the two arms.
+            let unsigned = t.unsigned || e.unsigned;
+            let v = if c.is_true() { t } else { e };
+            Ok(PpVal { bits: v.bits, unsigned })
         } else {
             Ok(c)
         }
     }
 
-    fn binary(&mut self, min_prec: u8) -> Result<i128, Diagnostic> {
+    fn binary(&mut self, min_prec: u8) -> Result<PpVal, Diagnostic> {
         let mut lhs = self.unary()?;
         while let Some((prec, op)) = self.peek().and_then(binop_prec) {
             if prec < min_prec {
                 break;
             }
             self.pos += 1;
-            let rhs = self.binary(prec + 1)?;
+            let live = match op {
+                Punct::AmpAmp => lhs.is_true(),
+                Punct::PipePipe => !lhs.is_true(),
+                _ => true,
+            };
+            let rhs = self.operand(live, |ev| ev.binary(prec + 1))?;
             lhs = apply_binop(op, lhs, rhs, self)?;
         }
         Ok(lhs)
     }
 
-    fn unary(&mut self) -> Result<i128, Diagnostic> {
+    fn unary(&mut self) -> Result<PpVal, Diagnostic> {
         match self.peek() {
             Some(Punct::Minus) => {
                 self.pos += 1;
-                Ok(self.unary()?.wrapping_neg())
+                let v = self.unary()?;
+                Ok(PpVal { bits: v.bits.wrapping_neg(), ..v })
             }
             Some(Punct::Plus) => {
                 self.pos += 1;
@@ -1721,17 +2461,18 @@ impl Ev<'_> {
             }
             Some(Punct::Bang) => {
                 self.pos += 1;
-                Ok(i128::from(self.unary()? == 0))
+                Ok(PpVal::truth(!self.unary()?.is_true()))
             }
             Some(Punct::Tilde) => {
                 self.pos += 1;
-                Ok(!self.unary()?)
+                let v = self.unary()?;
+                Ok(PpVal { bits: !v.bits, ..v })
             }
             _ => self.primary(),
         }
     }
 
-    fn primary(&mut self) -> Result<i128, Diagnostic> {
+    fn primary(&mut self) -> Result<PpVal, Diagnostic> {
         match self.items.get(self.pos) {
             Some(EItem::Num(v)) => {
                 self.pos += 1;
@@ -1768,35 +2509,55 @@ fn binop_prec(p: Punct) -> Option<(u8, Punct)> {
     Some((prec, p))
 }
 
-fn apply_binop(op: Punct, a: i128, b: i128, ev: &Ev<'_>) -> Result<i128, Diagnostic> {
+/// Apply a binary operator with the usual arithmetic conversions of
+/// `intmax_t`/`uintmax_t` (either operand unsigned makes both unsigned; a shift
+/// has its left operand's type; comparisons and logical operators yield a
+/// signed 0/1).
+fn apply_binop(op: Punct, a: PpVal, b: PpVal, ev: &Ev<'_>) -> Result<PpVal, Diagnostic> {
+    let unsigned = a.unsigned || b.unsigned;
+    let (x, y) = (a.bits, b.bits);
+    let (sx, sy) = (x as i64, y as i64);
+    let arith = |bits: u64| PpVal { bits, unsigned };
+    let (lt, eq) = if unsigned { (x < y, x == y) } else { (sx < sy, sx == sy) };
     Ok(match op {
-        Punct::PipePipe => i128::from(a != 0 || b != 0),
-        Punct::AmpAmp => i128::from(a != 0 && b != 0),
-        Punct::Pipe => a | b,
-        Punct::Caret => a ^ b,
-        Punct::Amp => a & b,
-        Punct::EqEq => i128::from(a == b),
-        Punct::Ne => i128::from(a != b),
-        Punct::Lt => i128::from(a < b),
-        Punct::Le => i128::from(a <= b),
-        Punct::Gt => i128::from(a > b),
-        Punct::Ge => i128::from(a >= b),
-        Punct::Shl => a.wrapping_shl(b as u32),
-        Punct::Shr => a.wrapping_shr(b as u32),
-        Punct::Plus => a.wrapping_add(b),
-        Punct::Minus => a.wrapping_sub(b),
-        Punct::Star => a.wrapping_mul(b),
-        Punct::Slash => {
-            if b == 0 {
-                return Err(ev.err("division by zero in `#if` expression"));
-            }
-            a.wrapping_div(b)
+        Punct::PipePipe => PpVal::truth(a.is_true() || b.is_true()),
+        Punct::AmpAmp => PpVal::truth(a.is_true() && b.is_true()),
+        Punct::Pipe => arith(x | y),
+        Punct::Caret => arith(x ^ y),
+        Punct::Amp => arith(x & y),
+        Punct::EqEq => PpVal::truth(eq),
+        Punct::Ne => PpVal::truth(!eq),
+        Punct::Lt => PpVal::truth(lt),
+        Punct::Le => PpVal::truth(lt || eq),
+        Punct::Gt => PpVal::truth(!lt && !eq),
+        Punct::Ge => PpVal::truth(!lt),
+        Punct::Shl | Punct::Shr => {
+            // An out-of-range count is undefined; take the limit of the shift.
+            let count = if b.unsigned || sy >= 0 { y.min(64) as u32 } else { 64 };
+            let bits = match (op, a.unsigned) {
+                (Punct::Shl, _) => x.checked_shl(count).unwrap_or(0),
+                (_, true) => x.checked_shr(count).unwrap_or(0),
+                _ => sx.checked_shr(count).unwrap_or(if sx < 0 { -1 } else { 0 }) as u64,
+            };
+            PpVal { bits, unsigned: a.unsigned }
         }
-        Punct::Percent => {
-            if b == 0 {
+        Punct::Plus => arith(x.wrapping_add(y)),
+        Punct::Minus => arith(x.wrapping_sub(y)),
+        Punct::Star => arith(x.wrapping_mul(y)),
+        Punct::Slash | Punct::Percent => {
+            if y == 0 {
+                if ev.skip > 0 {
+                    return Ok(arith(0));
+                }
                 return Err(ev.err("division by zero in `#if` expression"));
             }
-            a.wrapping_rem(b)
+            let bits = match (op, unsigned) {
+                (Punct::Slash, true) => x / y,
+                (Punct::Slash, false) => sx.wrapping_div(sy) as u64,
+                (_, true) => x % y,
+                _ => sx.wrapping_rem(sy) as u64,
+            };
+            arith(bits)
         }
         _ => return Err(ev.err("unsupported operator in `#if` expression")),
     })
@@ -2412,3 +3173,236 @@ fn punct_spelling(p: Punct) -> &'static str {
         Punct::Dot => ".",
     }
 }
+
+// --- search chain, guards and feature queries --------------------------------
+
+/// Whether two search directories name the same directory (canonically, when
+/// both exist).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The include-guard macro of a file whose first line is `#ifndef G`,
+/// `#if !defined G` or `#if !defined(G)` (whether the guard group really
+/// encloses the whole file is checked while the file is processed).
+fn guard_macro(toks: &[PpTok]) -> Option<String> {
+    let first = toks.first()?;
+    if !first.bol || !matches!(first.kind, PpKind::Hash) {
+        return None;
+    }
+    let line_end = toks.iter().skip(1).position(|t| t.bol).map_or(toks.len(), |p| p + 1);
+    let kinds: Vec<&PpKind> = toks[1..line_end].iter().map(|t| &t.kind).collect();
+    let ident = |k: &PpKind, s: &str| matches!(k, PpKind::Ident(n) if n == s);
+    let name = |k: &PpKind| match k {
+        PpKind::Ident(n) => Some(n.clone()),
+        _ => None,
+    };
+    match kinds.as_slice() {
+        [d, g] if ident(d, "ifndef") => name(g),
+        [d, PpKind::Punct(Punct::Bang), def, g] if ident(d, "if") && ident(def, "defined") => name(g),
+        [d, PpKind::Punct(Punct::Bang), def, PpKind::Punct(Punct::LParen), g, PpKind::Punct(Punct::RParen)]
+            if ident(d, "if") && ident(def, "defined") =>
+        {
+            name(g)
+        }
+        _ => None,
+    }
+}
+
+/// Spell a query operand's tokens with no separators (`gnu :: packed` →
+/// `gnu::packed`).
+fn spell_joined(toks: &[PpTok]) -> String {
+    toks.iter().map(|t| t.kind.spelling()).collect()
+}
+
+/// Strip the `__name__` decoration an attribute or builtin may be spelled
+/// with.
+fn undecorate(name: &str) -> &str {
+    name.strip_prefix("__").and_then(|n| n.strip_suffix("__")).unwrap_or(name)
+}
+
+/// `__has_builtin(name)`: whether lf-cc implements the builtin `name` with its
+/// documented meaning. Kept in sync with what the parser and `sema` accept:
+/// the `va_*` family (dedicated AST nodes), `alloca`, `expect`, `constant_p`
+/// (conservatively 0 — still a correct implementation), and the library-alias
+/// builtins whose aliased function has the builtin's exact result type (the
+/// pointer-returning string/memory functions and the `int`-returning
+/// comparisons). Anything else — in particular builtins `sema` would silently
+/// alias to an implicitly-declared `int` function — answers 0.
+fn has_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "__builtin_va_start"
+            | "__builtin_va_arg"
+            | "__builtin_va_end"
+            | "__builtin_va_copy"
+            | "__builtin_alloca"
+            | "__builtin_expect"
+            | "__builtin_constant_p"
+            | "__builtin_memcpy"
+            | "__builtin_memmove"
+            | "__builtin_memset"
+            | "__builtin_strcpy"
+            | "__builtin_strncpy"
+            | "__builtin_strcat"
+            | "__builtin_strncat"
+            | "__builtin_strchr"
+            | "__builtin_strrchr"
+            | "__builtin_strstr"
+            | "__builtin_strpbrk"
+            | "__builtin_memcmp"
+            | "__builtin_strcmp"
+            | "__builtin_strncmp"
+    ) || (BUILTIN_VA_LIST_TYPE && name == "__builtin_va_list")
+}
+
+/// Whether the parser implements the `__builtin_va_list` type keyword. The
+/// builtin `<stdarg.h>` spells `__gnuc_va_list` with it when available and
+/// otherwise declares the psABI `struct __va_list_tag[1]` itself.
+const BUILTIN_VA_LIST_TYPE: bool = false;
+
+/// Whether the parser accepts GNU statement expressions `({ … })`, which C
+/// library headers use in their `__OPTIMIZE__` macro forms. Until it does,
+/// `-O1`+ does not predefine `__OPTIMIZE__`.
+const STATEMENT_EXPRESSIONS: bool = false;
+
+/// `__has_attribute(name)` (GNU `__attribute__` names, bare or `__x__`-
+/// decorated): true only for attributes whose meaning lf-cc provides — which,
+/// since attributes are parsed and then ignored, means the attributes that are
+/// pure diagnostics or optimization hints (ignoring them is a correct
+/// implementation). Attributes that change layout, linkage, or code (`aligned`,
+/// `packed`, `section`, `alias`, `weak`, `cleanup`, `constructor`, `mode`,
+/// `vector_size`, `gnu_inline`, `transparent_union`, …) answer 0.
+fn has_gnu_attribute(name: &str) -> bool {
+    let name = name.strip_prefix("gnu::").unwrap_or(name);
+    matches!(
+        undecorate(name),
+        "noreturn"
+            | "unused"
+            | "used"
+            | "maybe_unused"
+            | "deprecated"
+            | "unavailable"
+            | "warn_unused_result"
+            | "nonnull"
+            | "returns_nonnull"
+            | "nothrow"
+            | "leaf"
+            | "pure"
+            | "const"
+            | "malloc"
+            | "alloc_size"
+            | "alloc_align"
+            | "format"
+            | "format_arg"
+            | "sentinel"
+            | "cold"
+            | "hot"
+            | "noinline"
+            | "noclone"
+            | "noipa"
+            | "always_inline"
+            | "artificial"
+            | "access"
+            | "fallthrough"
+            | "may_alias"
+            | "warning"
+            | "error"
+            | "no_instrument_function"
+            | "externally_visible"
+            | "returns_twice"
+    )
+}
+
+/// `__has_c_attribute(name)`: the C23 standard attributes lf-cc accepts (as
+/// hints it may ignore), valued by the standard's date codes; `gnu::` ones per
+/// [`has_gnu_attribute`]; 0 otherwise.
+fn has_c_attribute(name: &str) -> i128 {
+    if let Some(gnu) = name.strip_prefix("gnu::") {
+        return i128::from(has_gnu_attribute(gnu));
+    }
+    match undecorate(name) {
+        "deprecated" | "fallthrough" | "maybe_unused" => 201904,
+        "nodiscard" => 202003,
+        "noreturn" | "_Noreturn" => 202202,
+        "unsequenced" | "reproducible" => 202207,
+        _ => 0,
+    }
+}
+
+/// `__has_feature(name)` / `__has_extension(name)`: the C language features
+/// lf-cc implements under the selected standard; everything else (sanitizers,
+/// modules, …) answers 0.
+fn has_feature(name: &str, std: CStd) -> bool {
+    match name {
+        "c_alignas" | "c_alignof" | "c_static_assert" | "c_generic_selections" => std.is_c11(),
+        _ => false,
+    }
+}
+
+/// The characteristics of a binary floating format, spelled as the values of
+/// the `__FLT_*__`/`__DBL_*__`/`__LDBL_*__` predefined macros (which the
+/// builtin `<float.h>` is written in terms of).
+#[derive(Debug)]
+struct FloatFormat {
+    /// `sizeof` of the type.
+    size: &'static str,
+    mant_dig: &'static str,
+    dig: &'static str,
+    min_exp: &'static str,
+    min_10_exp: &'static str,
+    max_exp: &'static str,
+    max_10_exp: &'static str,
+    decimal_dig: &'static str,
+    max: &'static str,
+    min: &'static str,
+    epsilon: &'static str,
+    denorm_min: &'static str,
+    /// The constant suffix of the type's literals.
+    suffix: &'static str,
+}
+
+/// IEEE-754 binary32 (`float`).
+const FLT_FORMAT: FloatFormat = FloatFormat {
+    size: "4",
+    mant_dig: "24",
+    dig: "6",
+    min_exp: "(-125)",
+    min_10_exp: "(-37)",
+    max_exp: "128",
+    max_10_exp: "38",
+    decimal_dig: "9",
+    max: "3.40282346638528859811704183484516925e+38",
+    min: "1.17549435082228750796873653722224568e-38",
+    epsilon: "1.19209289550781250000000000000000000e-7",
+    denorm_min: "1.40129846432481707092372958328991613e-45",
+    suffix: "F",
+};
+
+/// IEEE-754 binary64 (`double`).
+const DBL_FORMAT: FloatFormat = FloatFormat {
+    size: "8",
+    mant_dig: "53",
+    dig: "15",
+    min_exp: "(-1021)",
+    min_10_exp: "(-307)",
+    max_exp: "1024",
+    max_10_exp: "308",
+    decimal_dig: "17",
+    max: "1.79769313486231570814527423731704357e+308",
+    min: "2.22507385850720138309023271733240406e-308",
+    epsilon: "2.22044604925031308084726333618164062e-16",
+    denorm_min: "4.94065645841246544176568792868221372e-324",
+    suffix: "",
+};
+
+/// `long double` as lf-cc implements it today: binary64, 8 bytes (see
+/// `ast::FloatTy`). The predefined `__LDBL_*__`/`__SIZEOF_LONG_DOUBLE__`
+/// macros and so `<float.h>` describe this type, not the psABI's x87 format.
+const LDBL_FORMAT: FloatFormat = FloatFormat { suffix: "L", ..DBL_FORMAT };

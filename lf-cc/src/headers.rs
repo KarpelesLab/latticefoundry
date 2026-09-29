@@ -1,12 +1,19 @@
-//! Builtin freestanding C standard headers.
+//! Builtin compiler-provided C standard headers.
 //!
-//! LatticeFoundry's `lf-cc` targets a *freestanding* x86-64 Linux (LP64)
-//! environment with no libc on disk, so the small set of headers a freestanding
-//! translation unit is entitled to (`<stddef.h>`, `<stdint.h>`, `<stdbool.h>`,
-//! `<limits.h>`, `<stdalign.h>`, `<iso646.h>`, `<stdnoreturn.h>`, `<float.h>`,
-//! `<stdarg.h>`) is embedded here as source text and handed to the preprocessor
-//! when an `#include` of one of these names is not satisfied on the `-I` search
-//! path. See [`crate::preprocess`] for how the fallback is wired in.
+//! The headers a *freestanding* translation unit is entitled to (`<stddef.h>`,
+//! `<stdint.h>`, `<stdbool.h>`, `<limits.h>`, `<stdalign.h>`, `<iso646.h>`,
+//! `<stdnoreturn.h>`, `<float.h>`, `<stdarg.h>`) belong to the compiler, not to
+//! the C library, so `lf-cc` embeds them here as source text. The preprocessor
+//! places them on the header search chain after `-I`/`-isystem` and before the
+//! host's system directories (see [`crate::preprocess`]), which is where a C
+//! library expects "the compiler's headers" to be:
+//!
+//! * glibc obtains single items from `<stddef.h>`/`<stdarg.h>` through the
+//!   `__need_*` protocol, which these headers honor;
+//! * in a hosted translation unit `<limits.h>` and `<stdint.h>` layer over the
+//!   C library's own headers of the same name with `#include_next`.
+//!
+//! With `-nostdinc` they are not consulted at all.
 //!
 //! All values are written for the frozen target ABI (design tenet T1, from the
 //! standard + the psABI): two's-complement, `char` = 1 byte and **signed**,
@@ -17,9 +24,9 @@
 //! C23 (which promoted several library macros to keywords) and earlier revisions,
 //! so the same embedded text is correct under every `--std`.
 
-/// Look up a builtin freestanding header by its include name (e.g. `"stdint.h"`
-/// or `"sys/types.h"` — only the freestanding set is recognized). Returns the
-/// header's source text, or `None` if no builtin header has that name.
+/// Look up a builtin header by its include name (e.g. `"stdint.h"`; only the
+/// freestanding set is recognized). Returns the header's source text, or
+/// `None` if no builtin header has that name.
 pub fn builtin_header(name: &str) -> Option<&'static str> {
     Some(match name {
         "stddef.h" => STDDEF_H,
@@ -35,29 +42,100 @@ pub fn builtin_header(name: &str) -> Option<&'static str> {
     })
 }
 
-/// `<stddef.h>`: `NULL`, `size_t`, `ptrdiff_t`, `wchar_t`, `max_align_t`,
+/// `<stddef.h>`: `NULL`, `size_t`, `ptrdiff_t`, `wchar_t`, `max_align_t` (C11),
 /// `offsetof`.
-const STDDEF_H: &str = r##"#ifndef _LF_STDDEF_H
-#define _LF_STDDEF_H
+///
+/// It also honors the *selective-definition protocol* C library headers use to
+/// obtain single items from it without the rest of the header's namespace: if
+/// any `__need_X` macro is defined on entry (`__need_size_t`,
+/// `__need_ptrdiff_t`, `__need_wchar_t`, `__need_wint_t`, `__need_NULL`,
+/// `__need_max_align_t`, `__need_offsetof`), only the requested items are
+/// provided and each `__need_X` is undefined again. `wint_t` is only ever
+/// provided on request; the `_WINT_T` macro records that it has been (the
+/// convention glibc's `<bits/types/wint_t.h>` checks). Every item has its own
+/// guard, so any sequence of full and partial inclusions defines each once.
+const STDDEF_H: &str = r##"/* lf-cc builtin <stddef.h> */
+#if !defined __need_size_t && !defined __need_ptrdiff_t && !defined __need_wchar_t \
+    && !defined __need_wint_t && !defined __need_NULL && !defined __need_max_align_t \
+    && !defined __need_offsetof
+/* The whole header. */
+# define _LF_STDDEF_H 1
+# define __need_size_t
+# define __need_ptrdiff_t
+# define __need_wchar_t
+# define __need_NULL
+# define __need_offsetof
+# if defined __STDC_VERSION__ && __STDC_VERSION__ >= 201112L
+#  define __need_max_align_t
+# endif
+#endif
 
-#define NULL ((void*)0)
+#ifdef __need_size_t
+# ifndef _LF_SIZE_T
+#  define _LF_SIZE_T
+typedef __SIZE_TYPE__ size_t;
+# endif
+# undef __need_size_t
+#endif
 
-typedef unsigned long size_t;
-typedef long ptrdiff_t;
-typedef int wchar_t;
+#ifdef __need_ptrdiff_t
+# ifndef _LF_PTRDIFF_T
+#  define _LF_PTRDIFF_T
+typedef __PTRDIFF_TYPE__ ptrdiff_t;
+# endif
+# undef __need_ptrdiff_t
+#endif
 
+#ifdef __need_wchar_t
+# ifndef _LF_WCHAR_T
+#  define _LF_WCHAR_T
+typedef __WCHAR_TYPE__ wchar_t;
+# endif
+# undef __need_wchar_t
+#endif
+
+#ifdef __need_wint_t
+# ifndef _WINT_T
+#  define _WINT_T 1
+typedef __WINT_TYPE__ wint_t;
+# endif
+# undef __need_wint_t
+#endif
+
+#ifdef __need_NULL
+# undef NULL
+# define NULL ((void *)0)
+# undef __need_NULL
+#endif
+
+#ifdef __need_max_align_t
+# ifndef _LF_MAX_ALIGN_T
+#  define _LF_MAX_ALIGN_T
 /* An object type whose alignment is the greatest fundamental alignment. The
    exact members are unspecified; only its alignment is normative. */
 typedef struct { long long __lf_ll; double __lf_d; } max_align_t;
+# endif
+# undef __need_max_align_t
+#endif
 
-#define offsetof(t, m) ((size_t)&((t*)0)->m)
-
-#endif /* _LF_STDDEF_H */
+#ifdef __need_offsetof
+# undef offsetof
+# define offsetof(t, m) ((__SIZE_TYPE__)&((t *)0)->m)
+# undef __need_offsetof
+#endif
 "##;
 
 /// `<stdint.h>`: exact-/least-/fast-width integer typedefs, pointer/max types,
 /// their limit macros, and the `INTn_C`/`UINTn_C` constant-suffix macros. LP64.
-const STDINT_H: &str = r##"#ifndef _LF_STDINT_H
+///
+/// In a hosted translation unit whose C library has its own `<stdint.h>`,
+/// that header is used instead (`#include_next`): the library's other headers
+/// define the same typedefs under its own guard macros, so its `<stdint.h>` is
+/// the one that composes with them.
+const STDINT_H: &str = r##"/* lf-cc builtin <stdint.h> */
+#if __STDC_HOSTED__ && defined __has_include_next && __has_include_next(<stdint.h>)
+# include_next <stdint.h>
+#elif !defined _LF_STDINT_H
 #define _LF_STDINT_H
 
 /* Exact-width integer types. */
@@ -193,7 +271,14 @@ const STDBOOL_H: &str = r##"#ifndef _LF_STDBOOL_H
 
 /// `<limits.h>`: `CHAR_BIT`, and the width limits of the standard integer types.
 /// `char` is signed on this target, so `CHAR_MIN`/`CHAR_MAX` == `SCHAR_*`.
-const LIMITS_H: &str = r##"#ifndef _LF_LIMITS_H
+///
+/// In a hosted translation unit the C library's `<limits.h>` (POSIX limits such
+/// as `PATH_MAX`) is layered on top with `#include_next`. glibc's header chains
+/// back to "the compiler's `<limits.h>`" unless `_GCC_LIMITS_H_` is defined —
+/// the macro glibc documents as the compiler header's marker — so this header
+/// defines it to say its limits are already in place.
+const LIMITS_H: &str = r##"/* lf-cc builtin <limits.h> */
+#ifndef _LF_LIMITS_H
 #define _LF_LIMITS_H
 
 #define CHAR_BIT   8
@@ -222,6 +307,12 @@ const LIMITS_H: &str = r##"#ifndef _LF_LIMITS_H
 #define LLONG_MIN  (-9223372036854775807LL - 1)
 #define LLONG_MAX  9223372036854775807LL
 #define ULLONG_MAX 18446744073709551615ULL
+
+#define _GCC_LIMITS_H_ 1
+
+#if __STDC_HOSTED__ && defined __has_include_next && __has_include_next(<limits.h>)
+# include_next <limits.h>
+#endif
 
 #endif /* _LF_LIMITS_H */
 "##;
@@ -274,59 +365,66 @@ const STDNORETURN_H: &str = r##"#ifndef _LF_STDNORETURN_H
 #endif /* _LF_STDNORETURN_H */
 "##;
 
-/// `<float.h>`: characteristics of the IEEE-754 binary32 (`float`) and binary64
-/// (`double`) types (and the x87 80-bit `long double`).
-const FLOAT_H: &str = r##"#ifndef _LF_FLOAT_H
+/// `<float.h>`: characteristics of the floating types, written in terms of the
+/// predefined `__FLT_*__`/`__DBL_*__`/`__LDBL_*__` macros so there is one
+/// source of truth: IEEE-754 binary32 `float`, binary64 `double`, and
+/// `long double` as lf-cc implements it (currently binary64 as well).
+const FLOAT_H: &str = r##"/* lf-cc builtin <float.h> */
+#ifndef _LF_FLOAT_H
 #define _LF_FLOAT_H
 
-#define FLT_RADIX        2
+#define FLT_RADIX        __FLT_RADIX__
 #define FLT_ROUNDS       1
-#define FLT_EVAL_METHOD  0
-#define DECIMAL_DIG      21
+#define FLT_EVAL_METHOD  __FLT_EVAL_METHOD__
+#define DECIMAL_DIG      __DECIMAL_DIG__
 
-#define FLT_MANT_DIG     24
-#define DBL_MANT_DIG     53
-#define LDBL_MANT_DIG    64
+#define FLT_MANT_DIG     __FLT_MANT_DIG__
+#define DBL_MANT_DIG     __DBL_MANT_DIG__
+#define LDBL_MANT_DIG    __LDBL_MANT_DIG__
 
-#define FLT_DIG          6
-#define DBL_DIG          15
-#define LDBL_DIG         18
+#define FLT_DIG          __FLT_DIG__
+#define DBL_DIG          __DBL_DIG__
+#define LDBL_DIG         __LDBL_DIG__
 
-#define FLT_MIN_EXP      (-125)
-#define DBL_MIN_EXP      (-1021)
-#define LDBL_MIN_EXP     (-16381)
+#define FLT_DECIMAL_DIG  __FLT_DECIMAL_DIG__
+#define DBL_DECIMAL_DIG  __DBL_DECIMAL_DIG__
+#define LDBL_DECIMAL_DIG __LDBL_DECIMAL_DIG__
 
-#define FLT_MAX_EXP      128
-#define DBL_MAX_EXP      1024
-#define LDBL_MAX_EXP     16384
+#define FLT_MIN_EXP      __FLT_MIN_EXP__
+#define DBL_MIN_EXP      __DBL_MIN_EXP__
+#define LDBL_MIN_EXP     __LDBL_MIN_EXP__
 
-#define FLT_MIN_10_EXP   (-37)
-#define DBL_MIN_10_EXP   (-307)
-#define LDBL_MIN_10_EXP  (-4931)
+#define FLT_MAX_EXP      __FLT_MAX_EXP__
+#define DBL_MAX_EXP      __DBL_MAX_EXP__
+#define LDBL_MAX_EXP     __LDBL_MAX_EXP__
 
-#define FLT_MAX_10_EXP   38
-#define DBL_MAX_10_EXP   308
-#define LDBL_MAX_10_EXP  4932
+#define FLT_MIN_10_EXP   __FLT_MIN_10_EXP__
+#define DBL_MIN_10_EXP   __DBL_MIN_10_EXP__
+#define LDBL_MIN_10_EXP  __LDBL_MIN_10_EXP__
 
-#define FLT_MAX          3.40282346638528859811704183484516925e+38F
-#define DBL_MAX          1.79769313486231570814527423731704357e+308
-#define LDBL_MAX         1.18973149535723176502e+4932L
+#define FLT_MAX_10_EXP   __FLT_MAX_10_EXP__
+#define DBL_MAX_10_EXP   __DBL_MAX_10_EXP__
+#define LDBL_MAX_10_EXP  __LDBL_MAX_10_EXP__
 
-#define FLT_EPSILON      1.19209289550781250000000000000000000e-7F
-#define DBL_EPSILON      2.22044604925031308084726333618164062e-16
-#define LDBL_EPSILON     1.08420217248550443401e-19L
+#define FLT_MAX          __FLT_MAX__
+#define DBL_MAX          __DBL_MAX__
+#define LDBL_MAX         __LDBL_MAX__
 
-#define FLT_MIN          1.17549435082228750796873653722224568e-38F
-#define DBL_MIN          2.22507385850720138309023271733240406e-308
-#define LDBL_MIN         3.36210314311209350626e-4932L
+#define FLT_EPSILON      __FLT_EPSILON__
+#define DBL_EPSILON      __DBL_EPSILON__
+#define LDBL_EPSILON     __LDBL_EPSILON__
 
-#define FLT_TRUE_MIN     1.40129846432481707092372958328991613e-45F
-#define DBL_TRUE_MIN     4.94065645841246544176568792868221372e-324
-#define LDBL_TRUE_MIN    3.64519953188247460253e-4951L
+#define FLT_MIN          __FLT_MIN__
+#define DBL_MIN          __DBL_MIN__
+#define LDBL_MIN         __LDBL_MIN__
 
-#define FLT_HAS_SUBNORM  1
-#define DBL_HAS_SUBNORM  1
-#define LDBL_HAS_SUBNORM 1
+#define FLT_TRUE_MIN     __FLT_DENORM_MIN__
+#define DBL_TRUE_MIN     __DBL_DENORM_MIN__
+#define LDBL_TRUE_MIN    __LDBL_DENORM_MIN__
+
+#define FLT_HAS_SUBNORM  __FLT_HAS_DENORM__
+#define DBL_HAS_SUBNORM  __DBL_HAS_DENORM__
+#define LDBL_HAS_SUBNORM __LDBL_HAS_DENORM__
 
 #endif /* _LF_FLOAT_H */
 "##;
@@ -338,22 +436,44 @@ const FLOAT_H: &str = r##"#ifndef _LF_FLOAT_H
 /// compiler builtins the frontend recognizes and lowers against the register
 /// save area / overflow area set up by a variadic function's prologue. Defined
 /// under every `--std` (variadic functions predate C89).
-const STDARG_H: &str = r##"#ifndef _LF_STDARG_H
-#define _LF_STDARG_H
-
+///
+/// The underlying type is also exported as `__gnuc_va_list`, and a C library
+/// header that only needs that name (glibc's `<stdio.h>`, `<wchar.h>`, …)
+/// requests it alone with `#define __need___va_list` before the include: then
+/// nothing else is defined and `__need___va_list` is undefined again. `va_list`
+/// itself is guarded by `_VA_LIST_DEFINED`, the macro glibc's headers use when
+/// they declare `va_list` from `__gnuc_va_list` themselves.
+const STDARG_H: &str = r##"/* lf-cc builtin <stdarg.h> */
+#ifndef _LF_GNUC_VA_LIST
+#define _LF_GNUC_VA_LIST
+#if __has_builtin(__builtin_va_list)
+typedef __builtin_va_list __gnuc_va_list;
+#else
 typedef struct __va_list_tag {
     unsigned gp_offset;
     unsigned fp_offset;
     void *overflow_arg_area;
     void *reg_save_area;
 } __va_list_tag;
+typedef __va_list_tag __gnuc_va_list[1];
+#endif
+#endif /* _LF_GNUC_VA_LIST */
 
-typedef __va_list_tag va_list[1];
+#ifdef __need___va_list
+# undef __need___va_list
+#elif !defined _LF_STDARG_H
+#define _LF_STDARG_H
+
+#ifndef _VA_LIST_DEFINED
+#define _VA_LIST_DEFINED
+typedef __gnuc_va_list va_list;
+#endif
 
 #define va_start(ap, last) __builtin_va_start(ap, last)
 #define va_arg(ap, type)   __builtin_va_arg(ap, type)
 #define va_end(ap)         __builtin_va_end(ap)
 #define va_copy(dst, src)  __builtin_va_copy(dst, src)
+#define __va_copy(dst, src) __builtin_va_copy(dst, src)
 
 #endif /* _LF_STDARG_H */
 "##;

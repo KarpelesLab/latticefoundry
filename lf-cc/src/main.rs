@@ -30,11 +30,11 @@ use latticefoundry::link::gnu::{HostCrt, host_c_link_args, link_gnu};
 use latticefoundry::mc::asm::{AsmOptions, AsmSource, assemble, assemble_file};
 use latticefoundry::mc::elf;
 use latticefoundry::mc::object::ObjectModule;
-use latticefoundry::support::diagnostics::{Diagnostic, Severity};
+use latticefoundry::support::diagnostics::Diagnostic;
 use latticefoundry::target::TargetArch;
 use latticefoundry::transform::pipeline::OptLevel;
 
-use lf_cc::{BuildError, CStd, MacroOp, PpOptions};
+use lf_cc::{BuildError, CStd, MacroOp, PpOptions, SourceMap};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -69,11 +69,21 @@ struct Options {
     emit_lf: bool,
     emit_obj: bool,
     std: CStd,
+    /// `-I` directories.
     include_dirs: Vec<PathBuf>,
+    /// `-iquote` directories.
+    quote_dirs: Vec<PathBuf>,
+    /// `-isystem` directories.
+    system_dirs: Vec<PathBuf>,
+    /// `-idirafter` directories.
+    after_dirs: Vec<PathBuf>,
     lib_dirs: Vec<String>,
     cmdline: Vec<MacroOp>,
     nostdinc: bool,
     nostdlib: bool,
+    /// `-ffreestanding`: `__STDC_HOSTED__` is 0 and the builtin headers do not
+    /// layer over the C library's.
+    freestanding: bool,
 }
 
 impl Options {
@@ -81,9 +91,17 @@ impl Options {
         PpOptions {
             std: self.std,
             include_dirs: self.include_dirs.clone(),
+            quote_dirs: self.quote_dirs.clone(),
+            system_dirs: self.system_dirs.clone(),
+            // The host's system headers are searched by default, after the
+            // builtin compiler headers; `-nostdinc` drops both.
+            stdinc_dirs: if self.nostdinc { Vec::new() } else { lf_cc::default_system_include_dirs() },
+            after_dirs: self.after_dirs.clone(),
             cmdline: self.cmdline.clone(),
             main_file_name: input.to_owned(),
             builtin_headers: !self.nostdinc,
+            hosted: !self.freestanding,
+            optimize: self.opt != OptLevel::O0,
         }
     }
 
@@ -120,9 +138,9 @@ fn run(args: &[String]) -> Result<(), String> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("module")
                 .to_owned();
-            let (module, syms) =
-                lf_cc::compile_to_ir_with(&source, &module_name, &opts.pp_options(input), opts.debug)
-                    .map_err(|diags| render_diags(input, &source, &diags))?;
+            let program = lf_cc::check_source_mapped(&source, &opts.pp_options(input))
+                .map_err(|(diags, map)| render_diags(&map, &diags))?;
+            let (module, syms) = lf_cc::lower::lower(&program, &source, &module_name, opts.debug);
             let out = text::print_module(&module, &syms);
             match (&opts.output, n_sources) {
                 (Some(path), _) => {
@@ -190,7 +208,7 @@ fn run(args: &[String]) -> Result<(), String> {
             .collect();
         let image = lf_cc::link_image(modules, opts.debug).map_err(|e| match e {
             BuildError::Backend(msg) => msg,
-            BuildError::Frontend(_) => "link failed".to_owned(),
+            BuildError::Frontend(..) => "link failed".to_owned(),
         })?;
         return link::write_executable(&output, &image);
     }
@@ -274,9 +292,9 @@ fn compile_item(opts: &Options, item: &Item) -> Result<Unit, String> {
             let source = read_source(input)?;
             let compiled =
                 lf_cc::compile_module_with(&source, input, &opts.pp_options(input), opts.opt, opts.debug)
-                    .map_err(|e| build_error(input, &source, e))?;
+                    .map_err(|e| build_error(input, e))?;
             let asm = lf_cc::assemble_toplevel_asm(&compiled.toplevel_asm, input)
-                .map_err(|e| build_error(input, &source, e))?;
+                .map_err(|e| build_error(input, e))?;
             Ok(Unit::C { module: compiled.module, asm })
         }
         Item::Asm(input) => assemble_file(Path::new(input), &AsmOptions::new(TargetArch::X86_64))
@@ -317,13 +335,17 @@ fn freestanding_crt0() -> Result<Vec<u8>, String> {
     assemble(&[AsmSource { name: "crt0.s", text: src }], &AsmOptions::new(TargetArch::X86_64))
 }
 
+/// Read a C source. Invalid UTF-8 (a Latin-1 comment, say) is replaced rather
+/// than rejected, as the preprocessor does for headers.
 fn read_source(input: &str) -> Result<String, String> {
-    std::fs::read_to_string(input).map_err(|e| format!("cannot read {input}: {e}"))
+    std::fs::read(input)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .map_err(|e| format!("cannot read {input}: {e}"))
 }
 
-fn build_error(input: &str, source: &str, e: BuildError) -> String {
+fn build_error(input: &str, e: BuildError) -> String {
     match e {
-        BuildError::Frontend(diags) => render_diags(input, source, &diags),
+        BuildError::Frontend(diags, map) => render_diags(&map, &diags),
         BuildError::Backend(msg) => format!("{input}: {msg}"),
     }
 }
@@ -381,7 +403,7 @@ fn is_ignored_flag(arg: &str) -> bool {
         "-fstack-clash-protection", "-fno-stack-clash-protection", "-fno-semantic-interposition",
         "-fstack-protector", "-fstack-protector-strong", "-fstack-protector-all",
         "-fno-stack-protector", "-fno-builtin", "-fbuiltin", "-fno-inline", "-finline-functions",
-        "-fno-strict-overflow", "-ffreestanding",
+        "-fno-strict-overflow",
     ];
     const PREFIX: &[&str] = &[
         "-march=", "-mtune=", "-fdiagnostics-", "-fmessage-length=", "-fvisibility=",
@@ -405,10 +427,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         emit_obj: false,
         std: CStd::default(),
         include_dirs: Vec::new(),
+        quote_dirs: Vec::new(),
+        system_dirs: Vec::new(),
+        after_dirs: Vec::new(),
         lib_dirs: Vec::new(),
         cmdline: Vec::new(),
         nostdinc: false,
         nostdlib: false,
+        freestanding: false,
     };
 
     let mut it = args.iter();
@@ -434,9 +460,12 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-s" => opts.items.push(Item::LinkerArg("--strip-all".to_owned())),
             "-Os" | "-Oz" => opts.opt = OptLevel::O2,
             "-Og" => opts.opt = OptLevel::O1,
-            "-I" | "-isystem" | "-iquote" | "-idirafter" => {
-                opts.include_dirs.push(PathBuf::from(value(arg)?))
-            }
+            "-I" => opts.include_dirs.push(PathBuf::from(value(arg)?)),
+            "-isystem" => opts.system_dirs.push(PathBuf::from(value(arg)?)),
+            "-iquote" => opts.quote_dirs.push(PathBuf::from(value(arg)?)),
+            "-idirafter" => opts.after_dirs.push(PathBuf::from(value(arg)?)),
+            "-ffreestanding" => opts.freestanding = true,
+            "-fhosted" => opts.freestanding = false,
             "-D" => opts.cmdline.push(MacroOp::Define(value("-D")?)),
             "-U" => opts.cmdline.push(MacroOp::Undef(value("-U")?)),
             "-L" => opts.lib_dirs.push(value("-L")?),
@@ -447,6 +476,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 .extend(arg[4..].split(',').filter(|a| !a.is_empty()).map(|a| Item::LinkerArg(a.to_owned()))),
             _ if is_ignored_flag(arg) => {}
             _ if arg.starts_with("-I") => opts.include_dirs.push(PathBuf::from(&arg[2..])),
+            _ if arg.starts_with("-isystem") => opts.system_dirs.push(PathBuf::from(&arg[8..])),
+            _ if arg.starts_with("-iquote") => opts.quote_dirs.push(PathBuf::from(&arg[7..])),
+            _ if arg.starts_with("-idirafter") => opts.after_dirs.push(PathBuf::from(&arg[10..])),
             _ if arg.starts_with("-D") => opts.cmdline.push(MacroOp::Define(arg[2..].to_owned())),
             _ if arg.starts_with("-U") => opts.cmdline.push(MacroOp::Undef(arg[2..].to_owned())),
             _ if arg.starts_with("-L") => opts.lib_dirs.push(arg[2..].to_owned()),
@@ -494,7 +526,12 @@ fn print_usage() {
     println!("  -g / --debug   emit DWARF debug info (source lines)");
     println!("  --std=<std>    C standard: c89/c99/c11/c17/c23 or gnuNN (default: gnu17)");
     println!("  -I <dir>       add a directory to the #include search path (repeatable)");
-    println!("  -nostdinc      do not consult the builtin freestanding standard headers");
+    println!("  -iquote <dir>  search <dir> for #include \"...\" only (before -I)");
+    println!("  -isystem <dir> search <dir> after -I, before the standard directories");
+    println!("  -idirafter <d> search <d> after all other directories");
+    println!("  -nostdinc      search neither the builtin compiler headers nor the host's");
+    println!("                 system directories (/usr/local/include, /usr/include)");
+    println!("  -ffreestanding freestanding environment (__STDC_HOSTED__ == 0)");
     println!("  -D name[=val]  predefine a macro (repeatable)");
     println!("  -U name        undefine a macro (repeatable)");
     println!("  -L <dir>       add a library search directory");
@@ -517,40 +554,11 @@ fn stem(input: &str) -> String {
         .unwrap_or_else(|| "a".to_owned())
 }
 
-/// Render a batch of front-end diagnostics against the C source for the terminal.
-fn render_diags(path: &str, source: &str, diags: &[Diagnostic]) -> String {
-    let mut out = String::new();
-    for d in diags {
-        let sev = match d.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-            Severity::Note => "note",
-        };
-        match d.span {
-            Some(span) => {
-                let (line, col) = line_col(source, span.start);
-                out.push_str(&format!("{path}:{line}:{col}: {sev}: {}\n", d.message));
-            }
-            None => out.push_str(&format!("{path}: {sev}: {}\n", d.message)),
-        }
-    }
+/// Render a batch of front-end diagnostics for the terminal: each at its real
+/// file:line:col (inside an included header when that is where it arose, with
+/// the include chain), then an error count.
+fn render_diags(map: &SourceMap, diags: &[Diagnostic]) -> String {
+    let mut out = map.render(diags);
     out.push_str(&format!("{} error(s)", diags.iter().filter(|d| d.is_error()).count()));
     out
-}
-
-fn line_col(src: &str, offset: u32) -> (u32, u32) {
-    let mut line = 1u32;
-    let mut col = 1u32;
-    for (i, b) in src.bytes().enumerate() {
-        if i as u32 >= offset {
-            break;
-        }
-        if b == b'\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
 }
