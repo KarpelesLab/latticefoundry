@@ -42,7 +42,7 @@ the exit criteria are what "done" means for each phase.
 > The **`lf-cc`** C frontend (a separate nested crate, §8) covers C89–C23. It
 > builds **gzip, bzip2, GNU make and bash** from source, and each works like the
 > system build (gzip and bzip2 output is byte-identical). Milestone **M8** is
-> reached; **M9** (real `/usr/include`) is next.
+> reached, and **M9** (compile against the real `/usr/include`) is reached too.
 >
 > Still open in Phase 10:
 >
@@ -451,7 +451,7 @@ alias analysis.
 | M6        | Certified tier: proof-carrying pipeline                  | 9     | ✅ done |
 | M7        | JIT, debug info, LTO                                     | 10    | ✅ done (dynamic linking, sanitizers still open) |
 | **M8**    | **`lf-cc` builds gzip from source → byte-identical to GNU gzip** | lf-cc | ✅ **done** |
-| **M9**    | **`lf-cc` compiles against the real `/usr/include`**     | lf-cc | ⬜ roadmap goal |
+| **M9**    | **`lf-cc` compiles against the real `/usr/include`**     | lf-cc | ✅ **done** (Lua, SQLite, gzip, bzip2 against real glibc) |
 
 ## 8. lf-cc: toward a bootstrap-capable C compiler
 
@@ -465,7 +465,7 @@ Today `lf-cc` covers essentially the full C language surface through C23, has a
 `-c` object-emit mode, and links against the real libc via the system linker. The
 gap to a genuine bootstrap compiler is **the headers**.
 
-### Packages built so far (with minimal hosted-header stubs)
+### Packages built so far
 
 | Package     | Result |
 | ----------- | ------ |
@@ -473,6 +473,8 @@ gap to a genuine bootstrap compiler is **the headers**.
 | bzip2 1.0.8 | ✅ all 8 files; output byte-identical, interop both directions |
 | make 3.82   | ✅ all 27 files; builds real projects identically to system make |
 | bash 3.2    | ✅ all 130 core files; feature battery identical to system bash |
+| Lua 5.4.6   | ✅ **real glibc headers**; byte-identical to gcc at -O0/-O2 (M9) |
+| SQLite 3.45 | ✅ **real glibc headers**, amalgamation + shell; byte-identical to gcc (M9) |
 
 `lf-cc` is now its own driver. It links through our `qld` against the host
 libc (or statically with `-nostdlib`), so gzip builds with **no gcc or system
@@ -487,7 +489,21 @@ Remaining C niche items: `_BitInt` wider than 64 bits, a true 80-bit
 compatibility for struct-by-value. Whole-program struct-by-value is already
 correct; the gap is only in mixing `lf-cc` objects with gcc-compiled ones.
 
-### M9 — Consume the real `/usr/include` (the headline goal)
+### M9 — Consume the real `/usr/include` ✅
+
+*Status (2026-09-29):* **reached.** `/usr/include` is searched by default, and
+the ~120 glibc headers tested (the 28 core ones plus ~95 more) all compile.
+gzip, bzip2, Lua and SQLite build against them with output byte-identical
+to gcc's. Remaining, each with a clear error today:
+- GCC vector types, `_Atomic`, `__thread`/TLS;
+- `__int128`/`_Float128`/`_Complex` *values* (declarations work);
+- a true 80-bit `long double`;
+- `__label__`, `__auto_type` and range designators;
+- `tgmath.h` and `stdatomic.h`;
+- C99 plain-`inline` external-definition semantics;
+- SSE classification for float-only unions and packed structs.
+
+The original plan follows.
 
 Real system builds `#include <stdio.h>` etc., and glibc's headers are dense with
 GNU/glibc constructs `lf-cc` does not yet accept. Making `lf-cc` a drop-in that

@@ -163,11 +163,19 @@ Real packages built from source with `lf-cc`:
 | bzip2 1.0.8 | Output byte-identical; interoperates with the system bzip2 in both directions |
 | make 3.82   | All 27 files; builds real projects identically |
 | bash 3.2    | All 130 core files; the feature battery matches the system bash |
+| Lua 5.4.6   | Against the real glibc headers; output byte-identical to a gcc build at -O0 and -O2 |
+| SQLite 3.45 | Amalgamation + shell, against the real glibc headers; byte-identical to gcc |
 
-gzip is now built and linked by `lf-cc` alone, with no gcc at any step. These
-builds still use minimal stub hosted headers. The next milestone,
-**M9**, is compiling against the real glibc `/usr/include`, which means covering
-the full GNU C dialect. The goal after that is a bootstrap-capable compiler.
+Milestone **M9** is reached: `lf-cc` compiles against the **real** glibc
+`/usr/include`, searched by default, with no stub headers. The ~120 glibc
+headers tested all compile. gzip, bzip2, Lua and SQLite build that way,
+and `lf-cc` links them itself through qld. make and bash were built earlier
+against stub headers.
+Coverage includes GNU attributes in every position, statement expressions,
+computed goto, case ranges, `__builtin_*`, and the System V struct ABI, so
+objects mix with gcc-compiled code. Known gaps: `long double` is `double`,
+and there are no vector types, `_Atomic`, TLS, or `__int128`/`_Float128`
+arithmetic. The next goal is a bootstrap-capable compiler.
 
 Build and test `lf-cc` from inside its own directory (`cd lf-cc && cargo test`).
 The root `cargo build` does not touch it.
