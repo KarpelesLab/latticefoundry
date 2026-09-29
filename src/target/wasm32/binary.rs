@@ -524,8 +524,14 @@ impl WasmObject {
             w.section(sec::GLOBAL, &p);
         }
         {
-            let exported: Vec<(usize, &Function)> =
-                self.funcs.iter().enumerate().filter(|(_, f)| f.export && f.body.is_some()).collect();
+            // Export names are unique: a function called `memory` or
+            // `__heap_base` stays unexported.
+            let exported: Vec<(usize, &Function)> = self
+                .funcs
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.export && f.body.is_some() && !matches!(f.name.as_str(), "memory" | "__heap_base"))
+                .collect();
             let mut p = Vec::new();
             count(&mut p, exported.len() + 2);
             leb::write_name(&mut p, "memory");

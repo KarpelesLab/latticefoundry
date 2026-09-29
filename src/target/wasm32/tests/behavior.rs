@@ -2,7 +2,7 @@
 //! switches, an irreducible CFG, recursion), memory and globals, calls
 //! (direct, indirect, host imports), atomics, and `i128` values.
 
-use super::{differential, no_node};
+use super::{differential, differential_optimized, no_node};
 
 /// `(function, args)` cases from a compact list.
 fn cases(list: &[(&'static str, &[u128])]) -> Vec<(&'static str, Vec<u128>)> {
@@ -267,6 +267,9 @@ fn control_flow() {
     }
     let Some(t) = differential("control", CONTROL, &list) else { return no_node("control_flow") };
     assert_eq!(t.skipped, 0, "{t:?}");
+    // The same calls against the program after the -O2 pipeline.
+    let t = differential_optimized("control", CONTROL, &list).expect("node");
+    assert_eq!(t.skipped, 0, "{t:?}");
 }
 
 pub(super) const MEMORY: &str = r#"
@@ -471,6 +474,9 @@ fn memory_and_globals() {
     }
     let Some(t) = differential("memory", MEMORY, &list) else { return no_node("memory_and_globals") };
     assert_eq!(t.skipped, 0, "{t:?}");
+    // The same calls against the program after the -O2 pipeline.
+    let t = differential_optimized("memory", MEMORY, &list).expect("node");
+    assert_eq!(t.skipped, 0, "{t:?}");
 }
 
 pub(super) const CALLS: &str = r#"
@@ -578,6 +584,9 @@ fn calls() {
         list.push(("narrow_caller", vec![x]));
     }
     let Some(t) = differential("calls", CALLS, &list) else { return no_node("calls") };
+    assert_eq!(t.skipped, 0, "{t:?}");
+    // The same calls against the program after the -O2 pipeline.
+    let t = differential_optimized("calls", CALLS, &list).expect("node");
     assert_eq!(t.skipped, 0, "{t:?}");
 }
 
@@ -708,6 +717,9 @@ fn atomics() {
     }
     let Some(t) = differential("atomics", ATOMICS, &list) else { return no_node("atomics") };
     assert_eq!(t.skipped, 0, "{t:?}");
+    // The same calls against the program after the -O2 pipeline.
+    let t = differential_optimized("atomics", ATOMICS, &list).expect("node");
+    assert_eq!(t.skipped, 0, "{t:?}");
 }
 
 pub(super) const WIDE: &str = r#"
@@ -810,5 +822,8 @@ fn wide_integers() {
         list.push(("widen", vec![a & u128::from(u64::MAX), a >> 96]));
     }
     let Some(t) = differential("wide", WIDE, &list) else { return no_node("wide_integers") };
+    assert_eq!(t.skipped, 0, "{t:?}");
+    // The same calls against the program after the -O2 pipeline.
+    let t = differential_optimized("wide", WIDE, &list).expect("node");
     assert_eq!(t.skipped, 0, "{t:?}");
 }

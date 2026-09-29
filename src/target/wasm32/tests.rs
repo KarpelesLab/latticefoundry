@@ -16,6 +16,7 @@ mod behavior;
 mod encoding;
 mod node;
 mod programs;
+mod random;
 mod refinterp;
 
 use super::{compile, data_layout};
@@ -101,6 +102,20 @@ pub(crate) fn differential(tag: &str, src: &str, cases: &[(&str, Vec<u128>)]) ->
     let (m, syms) = parse(src);
     let wasm = linked(&m, &syms);
     differential_module(tag, &m, &syms, &wasm, cases)
+}
+
+/// [`differential`], but the wasm comes from the program after the `-O2`
+/// pipeline, while the reference still runs the original: a check of the
+/// optimizer and the backend together.
+pub(crate) fn differential_optimized(tag: &str, src: &str, cases: &[(&str, Vec<u128>)]) -> Option<Tally> {
+    let (m, syms) = parse(src);
+    let (mut opt, opt_syms) = parse(src);
+    crate::transform::pipeline::optimize(&mut opt, crate::transform::pipeline::OptLevel::O2);
+    if let Err(d) = crate::verify::verify_module(&opt) {
+        panic!("{tag}: the optimized module does not verify: {d:?}");
+    }
+    let wasm = linked(&opt, &opt_syms);
+    differential_module(&format!("{tag}-O2"), &m, &syms, &wasm, cases)
 }
 
 /// [`differential`] on an already compiled module.

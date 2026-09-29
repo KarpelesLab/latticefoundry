@@ -552,6 +552,41 @@ fn unsupported_constructs_are_errors() {
     assert!(!c.object.to_relocatable().is_empty());
 }
 
+/// Wide multiplication and division become libgcc-named imports (the host or
+/// a runtime object supplies them); export names stay unique.
+#[test]
+fn libcall_imports_and_unique_exports() {
+    let src = r#"
+module "libcalls"
+func @mul128(i128, i128) -> i128 {
+entry ^0(%a: i128, %b: i128):
+  %r = mul %a, %b : i128
+  ret %r
+}
+func @udiv128(i128, i128) -> i128 {
+entry ^0(%a: i128, %b: i128):
+  %r = udiv %a, %b : i128
+  ret %r
+}
+func @memory() -> i32 {
+entry ^0:
+  ret i32 7
+}
+"#;
+    let (m, syms) = parse(src);
+    let wasm = linked(&m, &syms);
+    let secs = sections(&wasm);
+    let imports = &secs.iter().find(|(id, _)| *id == 2).expect("an import section").1;
+    for name in [&b"__multi3"[..], b"__udivti3"] {
+        assert!(imports.windows(name.len()).any(|w| w == name), "import {}", String::from_utf8_lossy(name));
+    }
+    let exports = export_names(&secs.iter().find(|(id, _)| *id == 7).unwrap().1);
+    assert_eq!(exports, ["memory", "__heap_base", "mul128", "udiv128"]);
+    if node::node().is_some() {
+        assert_eq!(node::validate("libcalls", &wasm), Some(true));
+    }
+}
+
 #[test]
 fn data_layout_is_ilp32_with_native_i64() {
     let dl = crate::target::wasm32::data_layout();
