@@ -34,6 +34,8 @@ pub(crate) mod regs;
 mod interp;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod stack_tests;
 
-pub use encode::{compile_function, compile_module};
+pub use encode::{compile_function, compile_module, compile_module_with};
 pub use isel::{A64Op, AArch64Target};

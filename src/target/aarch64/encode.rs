@@ -20,12 +20,34 @@
 //!    whole-field patcher cannot express, so branch resolution is done here) and
 //!    turning `bl`/global references into relocations;
 //! 4. assembles the functions of a module into an [`ObjectModule`]
-//!    ([`compile_module`]).
+//!    ([`compile_module`]); [`compile_module_with`] also takes
+//!    [`CodegenOptions`] and returns each function's [`StackUsage`], read off the
+//!    same [`FrameLayout`] the prologue is built from.
+//!
+//! **Large frames and stack probes.** Stack-pointer adjustments and `sp`-relative
+//! slot offsets of any size are encoded (`#imm12, lsl #12` + `#imm12` pairs up
+//! to 16 MiB, beyond that through `x16`). With probes on (the default, see
+//! [`crate::codegen::stack`]), a `sub sp` of at least [`STACK_PROBE_INTERVAL`]
+//! bytes is emitted as
+//!
+//! ```text
+//! sub sp, sp, #1, lsl #12 ; str xzr, [sp]      // × pages, when pages <= 4
+//!
+//! mov x16, #pages                               // otherwise, a counted loop
+//! L: sub sp, sp, #1, lsl #12 ; str xzr, [sp] ; subs x16, x16, #1 ; b.ne L
+//! sub sp, sp, #remainder                        // < 4096, if nonzero
+//! ```
+//!
+//! `x16` (IP0) is volatile, never allocated, and holds nothing live inside a
+//! function body or at its entry, so it serves as this module's
+//! large-offset/loop scratch.
 //!
 //! The encoding tables are implemented from the published ARM A64 instruction
 //! encodings (tenet T1), not copied from any assembler.
 
 use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, PReg, Reg, RegClass, StackSlot};
+use crate::codegen::options::{CodegenOptions, CompiledModule};
+use crate::codegen::stack::{STACK_PROBE_INTERVAL, StackReport, StackUsage, scan_calls};
 use crate::codegen::regalloc;
 use crate::ir::Module;
 use crate::mc::emit::{Emitted, EmittedReloc};
@@ -363,6 +385,39 @@ pub struct FrameLayout {
     cs_off: Vec<u32>,
     /// The `sub sp` amount below the fp/lr save (16-byte aligned).
     extra: u32,
+    /// The outgoing stack-argument area at the bottom of the frame (bytes).
+    outgoing: u64,
+    /// Whether the prologue's `sub sp` emits stack probes.
+    probes: bool,
+}
+
+impl FrameLayout {
+    /// The stack usage this layout gives `mf` (whose MIR supplies the call
+    /// information; `func_name` resolves a function index — the callees and `mf`
+    /// itself — to its symbol name): the 16-byte `x29`/`x30` pair pushed by
+    /// `stp ..., [sp, #-16]!` plus the `sub sp` amount — exactly what the
+    /// prologue built from this layout moves `sp` by. `bl` pushes nothing.
+    pub fn stack_usage(
+        &self,
+        mf: &MachineFunction,
+        func_name: &dyn Fn(u32) -> String,
+    ) -> StackUsage {
+        let scan = scan_calls(mf, A64Op::Call.opcode(), A64Op::Svc.opcode(), None);
+        let extra = u64::from(self.extra);
+        StackUsage {
+            name: func_name(mf.info().source),
+            frame_size: 16 + extra,
+            return_address: 0,
+            saved_registers: 16 + 8 * self.cs_regs.len() as u64,
+            sp_adjust: extra,
+            outgoing_args: self.outgoing,
+            dynamic_alloca: scan.dynamic_alloca,
+            direct_callees: scan.direct.iter().map(|&f| func_name(f)).collect(),
+            indirect_calls: scan.indirect,
+            syscalls: scan.syscalls,
+            probed: self.probes,
+        }
+    }
 }
 
 /// Round `value` up to a multiple of `align` (a power of two ≥ 1).
@@ -370,8 +425,18 @@ fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 
-/// Compute the frame layout of an allocated machine function.
+/// Compute the frame layout of an allocated machine function, with the default
+/// [`CodegenOptions`] (stack probes on).
 pub fn layout_frame(mf: &MachineFunction, target: &AArch64Target) -> FrameLayout {
+    layout_frame_with(mf, target, &CodegenOptions::default())
+}
+
+/// Compute the frame layout of an allocated machine function under `opts`.
+pub fn layout_frame_with(
+    mf: &MachineFunction,
+    target: &AArch64Target,
+    opts: &CodegenOptions,
+) -> FrameLayout {
     use crate::codegen::target::MachineTarget;
     let callee: Vec<PReg> = target.callee_saved().to_vec();
 
@@ -420,7 +485,7 @@ pub fn layout_frame(mf: &MachineFunction, target: &AArch64Target) -> FrameLayout
     }
     let extra = align_up(off, 16) as u32;
 
-    FrameLayout { slot_off, cs_regs, cs_off, extra }
+    FrameLayout { slot_off, cs_regs, cs_off, extra, outgoing, probes: opts.stack_probes }
 }
 
 fn def_preg(r: PReg) -> MachineOperand {
@@ -443,7 +508,11 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
         MachineInst::new(A64Op::MovFpSp.opcode(), Vec::new()),
     ];
     if layout.extra > 0 {
-        prologue.push(MachineInst::new(A64Op::SubSp.opcode(), vec![imm_op(u64::from(layout.extra))]));
+        // The second operand requests the probed form.
+        prologue.push(MachineInst::new(
+            A64Op::SubSp.opcode(),
+            vec![imm_op(u64::from(layout.extra)), imm_op(u64::from(layout.probes))],
+        ));
     }
     for (&cs, &off) in layout.cs_regs.iter().zip(&layout.cs_off) {
         prologue.push(MachineInst::new(
@@ -747,17 +816,17 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         A64Op::FrameAddr => {
             let d = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            b.word(add_imm(1, d, SP.into(), off));
+            addsub_any(b, false, d, SP.into(), u64::from(off));
         }
         A64Op::StoreFrame => {
             let src = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            b.word(frame_ldst(rclass(&ops[0]), false, src, off));
+            frame_ldst_any(b, rclass(&ops[0]), false, src, off);
         }
         A64Op::LoadFrame => {
             let dst = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            b.word(frame_ldst(rclass(&ops[0]), true, dst, off));
+            frame_ldst_any(b, rclass(&ops[0]), true, dst, off);
         }
         A64Op::GlobalAddr => {
             let d = rnum(&ops[0]);
@@ -812,17 +881,20 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         A64Op::StpFpLr => b.word(stp_pre(FP.into(), LR.into(), SP.into(), -2)),
         A64Op::LdpFpLr => b.word(ldp_post(FP.into(), LR.into(), SP.into(), 2)),
         A64Op::MovFpSp => b.word(add_imm(1, FP.into(), SP.into(), 0)),
-        A64Op::SubSp => b.word(sub_imm(1, SP.into(), SP.into(), uimm(&ops[0]) as u32)),
-        A64Op::AddSp => b.word(add_imm(1, SP.into(), SP.into(), uimm(&ops[0]) as u32)),
+        A64Op::SubSp => {
+            let probe = ops.get(1).is_some_and(|o| uimm(o) != 0);
+            sub_sp(b, uimm(&ops[0]), probe);
+        }
+        A64Op::AddSp => addsub_any(b, false, SP.into(), SP.into(), uimm(&ops[0])),
         A64Op::SaveReg => {
             let r = rnum(&ops[0]);
             let off = uimm(&ops[1]) as u32;
-            b.word(frame_ldst(rclass(&ops[0]), false, r, off));
+            frame_ldst_any(b, rclass(&ops[0]), false, r, off);
         }
         A64Op::RestoreReg => {
             let r = rnum(&ops[0]);
             let off = uimm(&ops[1]) as u32;
-            b.word(frame_ldst(rclass(&ops[0]), true, r, off));
+            frame_ldst_any(b, rclass(&ops[0]), true, r, off);
         }
 
         // --- scalar floating-point ----------------------------------------
@@ -945,6 +1017,82 @@ fn frame_ldst(class: RegClass, load: bool, rt: u32, off: u32) -> u32 {
     }
 }
 
+/// This module's large-offset / probe-loop scratch, `x16` (IP0): volatile, never
+/// allocated, and never live across our own instruction sequences.
+const IP0: u32 = 16;
+
+/// `rd = rn + amount` (or `- amount` when `sub`) for any `amount`; `rd`/`rn` may
+/// be `sp`. Up to 16 MiB this is `#hi, lsl #12` then `#lo` (one word when either
+/// half is zero); beyond, `amount` goes through `x16` and the extended-register
+/// form (`uxtx`, which accepts `sp`).
+fn addsub_any(b: &mut A64Buf, sub: bool, rd: u32, rn: u32, amount: u64) {
+    let base = if sub { 0x5100_0000 } else { 0x1100_0000 };
+    if amount < 1 << 24 {
+        let hi = (amount >> 12) as u32;
+        let lo = (amount & 0xFFF) as u32;
+        let mut src = rn;
+        if hi != 0 {
+            b.word(addsub_imm(base, 1, rd, src, hi) | (1 << 22)); // #hi, lsl #12
+            src = rd;
+        }
+        if lo != 0 || hi == 0 {
+            b.word(addsub_imm(base, 1, rd, src, lo));
+        }
+    } else {
+        encode_movri(b, IP0, amount);
+        let op = if sub { 0xCB20_6000 } else { 0x8B20_6000 }; // add/sub Xd|SP, Xn|SP, x16, uxtx
+        b.word(op | (IP0 << 16) | (rn << 5) | rd);
+    }
+}
+
+/// A 64-bit spill/reload `[sp, #off]` for any `off` (8-aligned): the scaled
+/// `imm12` form when it reaches, else `x16 = sp + (off & !0xFFF)` and the
+/// remainder as the immediate.
+fn frame_ldst_any(b: &mut A64Buf, class: RegClass, load: bool, rt: u32, off: u32) {
+    if off / 8 < 4096 {
+        b.word(frame_ldst(class, load, rt, off));
+        return;
+    }
+    addsub_any(b, false, IP0, SP.into(), u64::from(off & !0xFFF));
+    let imm12 = (off & 0xFFF) / 8;
+    b.word(match class {
+        RegClass::Gpr => ldst_uimm(load, SIZE_DWORD, rt, IP0, imm12),
+        RegClass::Fp => fp_ldst_uimm(load, SIZE_DWORD, rt, IP0, imm12),
+    });
+}
+
+/// Pages up to which a probed `sub sp` is unrolled rather than looped.
+const PROBE_UNROLL: u64 = 4;
+
+/// The prologue's `sub sp, sp, #amount`, probed (see the module docs) when
+/// `probe` and `amount` is at least [`STACK_PROBE_INTERVAL`].
+fn sub_sp(b: &mut A64Buf, amount: u64, probe: bool) {
+    if !probe || amount < STACK_PROBE_INTERVAL {
+        addsub_any(b, true, SP.into(), SP.into(), amount);
+        return;
+    }
+    let pages = amount / STACK_PROBE_INTERVAL;
+    let rem = amount % STACK_PROBE_INTERVAL;
+    let step = STACK_PROBE_INTERVAL as u32 >> 12;
+    let sub_page = addsub_imm(0x5100_0000, 1, SP.into(), SP.into(), step) | (1 << 22);
+    let probe_word = ldst_uimm(false, SIZE_DWORD, XZR.into(), SP.into(), 0); // str xzr, [sp]
+    if pages <= PROBE_UNROLL {
+        for _ in 0..pages {
+            b.word(sub_page);
+            b.word(probe_word);
+        }
+    } else {
+        encode_movri(b, IP0, pages);
+        b.word(sub_page);
+        b.word(probe_word);
+        b.word(addsub_imm(0x7100_0000, 1, IP0, IP0, 1)); // subs x16, x16, #1
+        b.word(b_cond(0x1, -3)); // b.ne (back to the sub)
+    }
+    if rem > 0 {
+        b.word(sub_imm(1, SP.into(), SP.into(), rem as u32));
+    }
+}
+
 /// Materialize a 64-bit constant into `rd` with a minimal `movz`/`movn`/`movk`
 /// chain: seed with `movz` (or `movn`, when more lanes are all-ones) and patch
 /// the remaining differing lanes with `movk`.
@@ -1015,13 +1163,19 @@ pub fn encode_function(
     Emitted { bytes: b.bytes, relocations: b.relocs }
 }
 
-/// Compile one function of `module` to its encoded bytes and relocations. Runs
-/// isel → register allocation → frame layout → prologue/epilogue → encoding.
-pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
+/// Run isel → register allocation → frame layout → prologue/epilogue →
+/// encoding for one function under `opts`, returning the code and its stack
+/// usage (`syms` names the callees).
+fn compile_function_full(
+    module: &Module,
+    func: crate::ir::FuncId,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+) -> (Emitted, StackUsage) {
     let target = AArch64Target::new();
     let mut mf = target.select(module, func);
     regalloc::allocate(&mut mf, &target);
-    let layout = layout_frame(&mf, &target);
+    let layout = layout_frame_with(&mf, &target, opts);
     insert_prologue_epilogue(&mut mf, &layout);
     let func_name = |idx: u32| -> String {
         syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
@@ -1029,23 +1183,43 @@ pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInte
     let global_name = |idx: u32| -> String {
         syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
     };
-    encode_function(&mf, &layout, &func_name, &global_name)
+    let stack = layout.stack_usage(&mf, &func_name);
+    (encode_function(&mf, &layout, &func_name, &global_name), stack)
+}
+
+/// Compile one function of `module` to its encoded bytes and relocations. Runs
+/// isel → register allocation → frame layout → prologue/epilogue → encoding.
+pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
+    compile_function_full(module, func, syms, &CodegenOptions::default()).0
 }
 
 /// Compile every defined function of `module` into a relocatable
 /// [`ObjectModule`]: a single `.text` section with one global function symbol
 /// per definition, and the call/global relocations wired to (undefined-if-new)
-/// symbols. `syms` resolves the interned function/global names.
+/// symbols. `syms` resolves the interned function/global names. Uses the
+/// default [`CodegenOptions`] (stack probes on); see [`compile_module_with`].
 pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
+    compile_module_with(module, syms, &CodegenOptions::default()).object
+}
+
+/// Like [`compile_module`], under `opts`, and also returning every defined
+/// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
+pub fn compile_module_with(
+    module: &Module,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+) -> CompiledModule {
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
+    let mut stack = StackReport::new();
 
     for (i, f) in module.functions().enumerate() {
         if f.is_declaration() {
             continue;
         }
         let fid = crate::ir::FuncId::from_index(i);
-        let emitted = compile_function(module, fid, syms);
+        let (emitted, usage) = compile_function_full(module, fid, syms, opts);
+        stack.push(usage);
         // 4-align this function's start within .text (A64 instructions are words).
         {
             let sec = obj.section_mut(text);
@@ -1077,5 +1251,5 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
             });
         }
     }
-    obj
+    CompiledModule { object: obj, stack }
 }
