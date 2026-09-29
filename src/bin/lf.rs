@@ -10,7 +10,11 @@
 //! convention and object format), `-c` stops at a relocatable object (ELF,
 //! PE/COFF or Mach-O; `--format` overrides the triple's), and `--oformat
 //! binary|ihex` writes a firmware image instead of an ELF executable. Windows
-//! executables are linked by qld's PE driver.
+//! executables are linked by qld's PE driver. A Cortex-M target
+//! (`thumbv7m-none-eabi`, `thumbv7em-none-eabi`) links through qld with a
+//! generated vector table and reset handler, and `--oformat binary|ihex` turns
+//! the result into a flashable image (`-L`/`-l` add the runtime library, e.g.
+//! `-lgcc`, for the soft-float and 64-bit division helpers).
 //!
 //! For x86-64 Linux, `--shared` builds a **shared library** of position-
 //! independent code (linked by `qld`, optional `-soname`), `--pie` a
@@ -73,17 +77,18 @@ fn print_usage() {
     println!("  --stack-usage  print each function's stack frame and the worst-case depth");
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
     println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
-    println!("                 aarch64-windows, aarch64-apple-darwin, ... (ABI + object format)");
+    println!("                 aarch64-windows, aarch64-apple-darwin, thumbv7m-none-eabi (Cortex-M),");
+    println!("                 ... (ABI + object format)");
     println!("  -c             emit a relocatable object instead of linking");
     println!("  --format F     object format for -c: elf, coff or macho (default: the target's)");
     println!("  --oformat F    executable format: elf (default), binary or ihex (firmware)");
     println!("  --base ADDR    image load address (default 0x400000); for binary/ihex, where");
-    println!("                 the first byte of code goes");
+    println!("                 the first byte of code goes; for Cortex-M, the flash origin (default 0)");
     println!("  --shared       build a shared library (position-independent; default lib<input>.so)");
     println!("  -soname <name> set the shared library's DT_SONAME");
     println!("  --pie          build a position-independent executable against the host C library");
     println!("  --pic          with -c: position-independent code for a shared library");
-    println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie)");
+    println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie, Cortex-M)");
     println!("`lf build` compiles one or more IR modules to a static native executable");
     println!("(for a Windows target, a PE executable whose entry point is `main`).");
     println!("With several inputs (or --lto), the modules are IR-linked into one, the");
@@ -238,12 +243,13 @@ fn build(args: &[String]) -> Result<(), String> {
             let output = output_or(ext);
             std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"))
         }
+        (TargetArch::Thumb, ObjectFormat::Elf, format) => link_cortex_m(&opts, obj, &entry, format, &output_or),
         (TargetArch::X86_64 | TargetArch::AArch64, ObjectFormat::Coff, None) => {
             let entry = opts.entry.as_deref().unwrap_or("main");
             link_pe(&obj, triple, entry, &output_or("exe"), opts.base)
         }
         (_, _, Some(_)) => Err(format!(
-            "--oformat binary/ihex needs an x86-64 ELF target (Linux or bare metal), not {triple}"
+            "--oformat binary/ihex needs an x86-64 or Cortex-M ELF target, not {triple}"
         )),
         _ => Err(format!(
             "cannot link a {triple} executable yet: emit an object with -c and link it with the platform's linker"
@@ -280,6 +286,49 @@ fn link_with_qld(opts: &BuildOptions, obj: &latticefoundry::mc::object::ObjectMo
     };
     let result = gnu::link_gnu("lf", &args).map_err(|e| format!("link error: {e}"));
     let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Link a Cortex-M program with qld: the compiled object plus a generated
+/// vector table and reset handler calling `entry`, flash at `--base` (default
+/// 0), into an ELF executable (`-o`, default `<input>.elf`) or, with
+/// `--oformat binary|ihex`, a flashable image of its loadable contents.
+fn link_cortex_m(
+    opts: &BuildOptions,
+    obj: ObjectModule,
+    entry: &str,
+    format: Option<RawFormat>,
+    output_or: &dyn Fn(&str) -> String,
+) -> Result<(), String> {
+    use latticefoundry::target::thumb::firmware;
+    let mut layout = firmware::MemoryLayout::default();
+    if let Some(b) = opts.base {
+        layout.flash_origin = b;
+    }
+    let startup = firmware::startup_object(entry, 32);
+    let Some(format) = format else {
+        let out = output_or("elf");
+        return firmware::link_elf(&[obj, startup], &layout, &opts.link_extra, Path::new(&out))
+            .map_err(|e| format!("link error: {e}"));
+    };
+    let (ext, fill) = match format {
+        RawFormat::Binary => ("bin", 0xff),
+        RawFormat::Ihex => ("hex", 0xff),
+    };
+    let output = output_or(ext);
+    let elf_path = format!("{output}.lf-tmp.elf");
+    let result = (|| {
+        firmware::link_elf(&[obj, startup], &layout, &opts.link_extra, Path::new(&elf_path))
+            .map_err(|e| format!("link error: {e}"))?;
+        let elf = std::fs::read(&elf_path).map_err(|e| format!("cannot read {elf_path}: {e}"))?;
+        let segments = raw::load_segments(&elf)?;
+        let bytes = match format {
+            RawFormat::Binary => raw::to_binary(&segments, fill)?.1,
+            RawFormat::Ihex => raw::to_ihex(&segments, firmware::elf32_entry(&elf))?.into_bytes(),
+        };
+        std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"))
+    })();
+    let _ = std::fs::remove_file(&elf_path);
     result
 }
 
@@ -425,8 +474,9 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     if soname.is_some() && output_kind != OutputKind::Shared {
         return Err("-soname only applies to --shared".to_owned());
     }
-    if !link_extra.is_empty() && !matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
-        return Err("-L/-l only apply to --shared and --pie".to_owned());
+    let cortex_m = target.arch == TargetArch::Thumb && output_kind == OutputKind::Executable;
+    if !link_extra.is_empty() && !cortex_m && !matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
+        return Err("-L/-l only apply to --shared, --pie and Cortex-M executables".to_owned());
     }
     if entry.is_some() && matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
         return Err("--entry only applies to executables linked by lf (not --shared or --pie)".to_owned());
