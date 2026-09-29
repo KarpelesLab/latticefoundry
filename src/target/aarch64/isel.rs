@@ -1111,7 +1111,9 @@ impl AArch64Target {
                     reg_moves.push((areg, v));
                 } else {
                     // A 16-byte vector takes a 16-aligned 16-byte slot.
-                    let sz = lo.byte_size(ty);
+                    // A vector (mask included) crosses as its 16-byte register
+                    // image, whatever its memory size.
+                    let sz = if lo.types().is_vector(ty) { 16 } else { lo.byte_size(ty) };
                     if sz == 16 {
                         stack_off = align_up_u64(stack_off, 16);
                         let dp = self.lea_sp(lo, stack_off);
@@ -1350,7 +1352,9 @@ impl AArch64Target {
                     };
                     lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(pv), use_p(areg)]));
                 } else {
-                    let sz = lo.byte_size(ty);
+                    // A vector (mask included) crosses as its 16-byte register
+                    // image, whatever its memory size.
+                    let sz = if lo.types().is_vector(ty) { 16 } else { lo.byte_size(ty) };
                     if sz == 16 {
                         stack_in = align_up_u64(stack_in, 16);
                         let p = self.lea_fp(lo, stack_in);
@@ -1556,6 +1560,11 @@ impl TargetIsel for AArch64Target {
                     A64Op::Add.opcode(),
                     vec![def_v(d), use_v(base), use_v(off), imm(64)],
                 ));
+            }
+            // A float select blends `v` registers (a GPR csel cannot).
+            InstKind::Select if lo.mf().vreg_class(lo.result_reg(inst)) == RegClass::Fp => {
+                let ops = inst.operands().to_vec();
+                self.neon_select(lo, inst, &ops);
             }
             InstKind::Select => {
                 // Branchless (`csel`), so a secret condition is constant-time (§6d).

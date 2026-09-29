@@ -1175,7 +1175,9 @@ impl X86_64Target {
                     reg_moves.push((a, v));
                 } else {
                     // A 16-byte vector takes a 16-aligned 16-byte slot.
-                    let sz = lo.byte_size(ty);
+                    // A vector (mask included) crosses as its 16-byte register
+                    // image, whatever its memory size.
+                    let sz = if lo.types().is_vector(ty) { 16 } else { lo.byte_size(ty) };
                     if sz == 16 {
                         stack_off = align_up_u64(stack_off, 16);
                     }
@@ -1517,7 +1519,9 @@ impl X86_64Target {
                     };
                     lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(pv), use_p(a)]));
                 } else {
-                    let sz = lo.byte_size(ty);
+                    // A vector (mask included) crosses as its 16-byte register
+                    // image, whatever its memory size.
+                    let sz = if lo.types().is_vector(ty) { 16 } else { lo.byte_size(ty) };
                     if sz == 16 {
                         stack_in = align_up_u64(stack_in, 16);
                     }
@@ -1795,6 +1799,11 @@ impl TargetIsel for X86_64Target {
                     X86Op::Add.opcode(),
                     vec![def_v(d), use_v(base), use_v(off), imm(64)],
                 ));
+            }
+            // A float select blends xmm registers (a GPR cmov cannot).
+            InstKind::Select if lo.mf().vreg_class(lo.result_reg(inst)) == RegClass::Fp => {
+                let ops = inst.operands().to_vec();
+                self.vec_select(lo, inst, &ops);
             }
             InstKind::Select => {
                 let d = lo.result_reg(inst);

@@ -12,7 +12,7 @@ use super::isel::{A64Op, AArch64Target, NeonLegality};
 use crate::codegen::legalize::{ScalarOnly, VectorLegality, legalized, uses_vectors};
 use crate::ir::FuncId;
 use crate::target::vector_fixtures::{
-    Case, FLOAT_SRC, INPUTS, INT_OPS, PRESSURE_SRC, Rng, assert_matches, cases, compare_src, int_arith_src, lanes_src,
+    Case, EDGES_SRC, FLOAT_SRC, INPUTS, INT_OPS, PRESSURE_SRC, Rng, assert_matches, cases, compare_src, int_arith_src, lanes_src,
     masks_src, parse, random_inputs, random_program, reference,
 };
 
@@ -275,5 +275,16 @@ fn selects_under_register_pressure_allocate_and_run() {
     let want = reference(PRESSURE_SRC, &cs);
     for legality in [&NeonLegality as &dyn VectorLegality, &ScalarOnly] {
         assert_matches("pressure", &cs, &run_cases(PRESSURE_SRC, &cs, legality), &want);
+    }
+}
+
+#[test]
+fn mask_stores_float_selects_and_wrapped_shifts() {
+    // (Stack-passed arguments need a modeled stack pointer, which the
+    // pre-allocation interpreter lacks; x86-64 runs that case natively.)
+    let cs = cases(&["store_mask", "fsel", "wrapshift"], &INPUTS);
+    let want = reference(EDGES_SRC, &cs);
+    for legality in [&NeonLegality as &dyn VectorLegality, &ScalarOnly] {
+        assert_matches("edges", &cs, &run_cases(EDGES_SRC, &cs, legality), &want);
     }
 }

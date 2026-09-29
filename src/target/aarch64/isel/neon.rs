@@ -319,23 +319,7 @@ impl AArch64Target {
             InstKind::ICmp(pred) => self.neon_icmp(lo, inst, *pred, &ops),
             InstKind::FCmp(pred) => self.neon_fcmp(lo, inst, *pred, &ops),
             InstKind::Cast(op) => self.neon_cast(lo, inst, *op, &ops),
-            InstKind::Select => {
-                let (k, _, cw) = self.nshape(lo, inst.ty);
-                let mask = if lo.types().is_vector(lo.func().value_type(ops[0])) {
-                    lo.reg(ops[0])
-                } else {
-                    let c = self.clean_cond(lo, ops[0]);
-                    let m = self.neon_bool_mask(lo, c);
-                    self.ndup(lo, m, 32)
-                };
-                let es = esize_of(k, cw);
-                let t = lo.reg(ops[1]);
-                let f = lo.reg(ops[2]);
-                let keep_t = self.n3(lo, NeonOp::And, es, mask, t);
-                let keep_f = self.n3(lo, NeonOp::Bic, es, f, mask);
-                let r = self.n3(lo, NeonOp::Orr, es, keep_t, keep_f);
-                self.nfinish(lo, inst, r);
-            }
+            InstKind::Select => self.neon_select(lo, inst, &ops),
             InstKind::ExtractElement { lane } => {
                 let (k, _, cw) = self.nshape(lo, lo.func().value_type(ops[0]));
                 let v = lo.reg(ops[0]);
@@ -413,13 +397,33 @@ impl AArch64Target {
         true
     }
 
+    /// `select` as a bitwise blend of whole `v` registers: a vector (mask or
+    /// broadcast `i1` condition), or a scalar float (a GPR `csel` cannot move
+    /// FP registers).
+    pub(super) fn neon_select(&self, lo: &mut Lower<'_, Self>, inst: &InstData, ops: &[ValueId]) {
+        let mask = if lo.types().is_vector(lo.func().value_type(ops[0])) {
+            lo.reg(ops[0])
+        } else {
+            let c = self.clean_cond(lo, ops[0]);
+            let m = self.neon_bool_mask(lo, c);
+            self.ndup(lo, m, 32)
+        };
+        // The blend is bitwise, so the lane size is immaterial.
+        let t = lo.reg(ops[1]);
+        let f = lo.reg(ops[2]);
+        let keep_t = self.n3(lo, NeonOp::And, 8, mask, t);
+        let keep_f = self.n3(lo, NeonOp::Bic, 8, f, mask);
+        let r = self.n3(lo, NeonOp::Orr, 8, keep_t, keep_f);
+        self.nfinish(lo, inst, r);
+    }
+
     fn neon_bin(&self, lo: &mut Lower<'_, Self>, inst: &InstData, op: BinOp, ops: &[ValueId]) {
         let (k, _, cw) = self.nshape(lo, inst.ty);
         let es = esize_of(k, cw);
         let a = lo.reg(ops[0]);
         let r = match (k, op) {
             (Lanes::Int(w), BinOp::Shl | BinOp::LShr | BinOp::AShr) => {
-                match uniform_const(lo.module().consts(), lo.func(), ops[1]) {
+                match uniform_const(lo.module().consts(), lo.func(), ops[1], w) {
                     // A count ≥ the lane width is poison: any result will do.
                     Some(c) if c < u64::from(w) => {
                         let c = c as u32;

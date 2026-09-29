@@ -104,8 +104,8 @@ impl VectorLegality for Sse2Legality {
                 Some((Lanes::Int(w), ..)) => match op {
                     BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor => true,
                     BinOp::Mul => w == 16 || w == 32,
-                    BinOp::Shl | BinOp::LShr => w >= 16 && uniform_const(consts, func, ops[1]).is_some(),
-                    BinOp::AShr => (w == 16 || w == 32) && uniform_const(consts, func, ops[1]).is_some(),
+                    BinOp::Shl | BinOp::LShr => w >= 16 && uniform_const(consts, func, ops[1], w).is_some(),
+                    BinOp::AShr => (w == 16 || w == 32) && uniform_const(consts, func, ops[1], w).is_some(),
                     op if op.is_minmax_sat() => minmax_sat_opcode(*op, w).is_some(),
                     _ => false,
                 },
@@ -388,7 +388,7 @@ impl X86_64Target {
                 self.vop(lo, a, b, VEnc::op(pfx, opc, comm))
             }
             (Lanes::Int(w), BinOp::Shl | BinOp::LShr | BinOp::AShr) => {
-                let c = uniform_const(lo.module().consts(), lo.func(), ops[1])
+                let c = uniform_const(lo.module().consts(), lo.func(), ops[1], w)
                     .expect("a uniform constant shift amount");
                 let opcode = match w {
                     16 => 0x71,
@@ -567,7 +567,9 @@ impl X86_64Target {
         self.finish(lo, inst, r);
     }
 
-    fn vec_select(&self, lo: &mut Lower<'_, Self>, inst: &InstData, ops: &[ValueId]) {
+    /// Also the lowering of a scalar float `select` (a blend of whole xmm
+    /// registers; a GPR `cmov` cannot move xmm values).
+    pub(super) fn vec_select(&self, lo: &mut Lower<'_, Self>, inst: &InstData, ops: &[ValueId]) {
         let mask = if lo.types().is_vector(lo.func().value_type(ops[0])) {
             self.oper(lo, ops[0])
         } else {

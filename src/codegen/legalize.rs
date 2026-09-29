@@ -484,7 +484,19 @@ impl<'a, 'b> Rewriter<'a, 'b> {
     fn const_lanes(&mut self, c: crate::ir::ConstId, ty: TypeId) -> Vec<ValueId> {
         let (elem, n) = self.types().vector_parts(ty).expect("a vector constant");
         match self.b.consts().get(c).clone() {
-            Const::Aggregate { elems, .. } => elems.into_iter().map(|e| self.b.use_const(e)).collect(),
+            // Integer lanes are reduced to their bit pattern (constants are not
+            // stored normalized, and scalar backends read e.g. a shift count
+            // off the stored value).
+            Const::Aggregate { elems, .. } => elems
+                .into_iter()
+                .map(|e| match self.b.consts().get(e).clone() {
+                    Const::Int { ty, value } => {
+                        let w = self.types().bit_width(ty).expect("an integer lane");
+                        self.b.const_int(ty, value.mod_2k(w))
+                    }
+                    _ => self.b.use_const(e),
+                })
+                .collect(),
             _ => (0..n).map(|_| self.b.poison(elem)).collect(),
         }
     }
@@ -664,11 +676,24 @@ impl<'a, 'b> Rewriter<'a, 'b> {
                 for (i, l) in lanes.into_iter().enumerate() {
                     let off = i as u64 * size;
                     let p = self.lane_addr(base, off);
-                    let kind = InstKind::Store { ty: elem, align: lane_align(*align, off), volatile: false, secret: *secret };
-                    self.b.append_inst(kind, vec![p, l], Flags::NONE, None);
+                    let (ty, v) = self.memory_lane(elem, l);
+                    let kind = InstKind::Store { ty, align: lane_align(*align, off), volatile: false, secret: *secret };
+                    self.b.append_inst(kind, vec![p, v], Flags::NONE, None);
                 }
             }
             other => unreachable!("no vector form of {other:?} reaches the legalizer"),
+        }
+    }
+
+    /// A lane as it is stored: an `i1` lane is one byte holding exactly 0 or 1,
+    /// so it is widened with `zext` to `i8` (a register may hold an `i1` with
+    /// garbage above bit 0, e.g. an all-ones mask lane); other lanes as is.
+    fn memory_lane(&mut self, elem: TypeId, l: ValueId) -> (TypeId, ValueId) {
+        if self.types().bit_width(elem) == Some(1) && !self.types().get(elem).is_float() {
+            let i8t = self.b.types_mut().int(8);
+            (i8t, self.b.cast(CastOp::ZExt, l, i8t))
+        } else {
+            (elem, l)
         }
     }
 
@@ -823,7 +848,8 @@ impl<'a, 'b> Rewriter<'a, 'b> {
                     for (i, l) in self.lanes(v).into_iter().enumerate() {
                         let off = i as u64 * size;
                         let p = self.lane_addr(out, off);
-                        self.b.store(elem, p, l, lane_align(align, off));
+                        let (ty, v) = self.memory_lane(elem, l);
+                        self.b.store(ty, p, v, lane_align(align, off));
                     }
                     self.b.ret(None);
                 } else {

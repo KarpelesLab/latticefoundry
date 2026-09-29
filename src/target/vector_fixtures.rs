@@ -382,6 +382,83 @@ entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
 }
 "#;
 
+/// Edge cases: masks passed on the stack (more vector arguments than vector
+/// registers), stored masks (one 0/1 byte per lane), scalar and illegal-vector
+/// float selects, and a shift amount written out of range of its lane type
+/// (constants are reduced modulo the lane width).
+pub(crate) const EDGES_SRC: &str = r#"
+module "edges"
+func @nine(<4 x i1>, <4 x i1>, <4 x i1>, <4 x i1>, <4 x i1>, <4 x i1>, <4 x i1>, <4 x i1>, <4 x i1>) -> <4 x i32> {
+entry ^0(%m0: <4 x i1>, %m1: <4 x i1>, %m2: <4 x i1>, %m3: <4 x i1>, %m4: <4 x i1>, %m5: <4 x i1>, %m6: <4 x i1>, %m7: <4 x i1>, %m8: <4 x i1>):
+  %x = xor %m8, %m0 : <4 x i1>
+  %w = sext %x : <4 x i32>
+  ret %w
+}
+
+func @stack_masks(i64, i64, i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
+  %p0 = insertelement <2 x i64> poison, %a, 0 : <2 x i64>
+  %x0 = insertelement %p0, %b, 1 : <2 x i64>
+  %v = bitcast %x0 : <4 x i32>
+  %m = icmp ne %v, <4 x i32> (i32 0, i32 0, i32 0, i32 0) : <4 x i1>
+  %z = icmp eq %v, <4 x i32> (i32 7, i32 7, i32 7, i32 7) : <4 x i1>
+  %r = call @nine(%z, %z, %z, %z, %z, %z, %z, %z, %m) : <4 x i32>
+  %q = bitcast %r : <2 x i64>
+  %l = extractelement %q, 0 : i64
+  %h = extractelement %q, 1 : i64
+  %hm = mul %h, i64 1000003 : i64
+  %o = xor %l, %hm : i64
+  ret %o
+}
+
+func @store_mask(i64, i64, i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
+  %p0 = insertelement <2 x i64> poison, %a, 0 : <2 x i64>
+  %x0 = insertelement %p0, %b, 1 : <2 x i64>
+  %v = bitcast %x0 : <4 x i32>
+  %m = icmp ne %v, <4 x i32> (i32 0, i32 0, i32 0, i32 0) : <4 x i1>
+  %slot = alloca i32 : ptr
+  store %m, %slot align 4 : <4 x i1>
+  %bytes = load %slot align 4 : i32
+  %r = zext %bytes : i64
+  ret %r
+}
+
+func @fsel(i64, i64, i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
+  %fa = bitcast %a : f64
+  %fb = bitcast %b : f64
+  %k = trunc %c : i1
+  %s = select %k, %fa, %fb : f64
+  %i = trunc %d : i32
+  %lo = trunc %a : i32
+  %f1 = bitcast %lo : f32
+  %f2 = bitcast %i : f32
+  %v1 = splat %f1 : <2 x f32>
+  %v2 = insertelement %v1, %f2, 1 : <2 x f32>
+  %j = trunc %d : i1
+  %t = select %j, %v1, %v2 : <2 x f32>
+  %tb = bitcast %t : i64
+  %sb = bitcast %s : i64
+  %r = xor %sb, %tb : i64
+  ret %r
+}
+
+func @wrapshift(i64, i64, i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
+  %p0 = insertelement <2 x i64> poison, %a, 0 : <2 x i64>
+  %x0 = insertelement %p0, %b, 1 : <2 x i64>
+  %x = bitcast %x0 : <8 x i16>
+  %s = shl %x, <8 x i16> (i16 65539, i16 65539, i16 65539, i16 65539, i16 65539, i16 65539, i16 65539, i16 65539) : <8 x i16>
+  %t = lshr %s, <8 x i16> (i16 -65533, i16 -65533, i16 -65533, i16 -65533, i16 -65533, i16 -65533, i16 -65533, i16 -65533) : <8 x i16>
+  %q = bitcast %t : <2 x i64>
+  %l = extractelement %q, 0 : i64
+  %h = extractelement %q, 1 : i64
+  %r = xor %l, %h : i64
+  ret %r
+}
+"#;
+
 /// Random 64-bit inputs, biased toward interesting bit patterns.
 pub(crate) fn random_inputs(rng: &mut Rng) -> Vec<i64> {
     (0..4)

@@ -38,9 +38,10 @@ pub(crate) fn shape(types: &TypeContext, ty: TypeId) -> Option<(Lanes, u32, u32)
     Some((kind, n, 128 / n))
 }
 
-/// A constant vector operand whose defined lanes are all the same integer
-/// (poison lanes allow any value): that integer.
-pub(crate) fn uniform_const(consts: &ConstPool, func: &Function, v: ValueId) -> Option<u64> {
+/// A constant vector operand of `width`-bit integer lanes whose defined lanes
+/// are all the same integer (poison lanes allow any value): that integer,
+/// reduced modulo `2^width` (constants are not stored normalized).
+pub(crate) fn uniform_const(consts: &ConstPool, func: &Function, v: ValueId, width: u32) -> Option<u64> {
     let ValueDef::Const(c) = func.value(v).def else {
         return None;
     };
@@ -52,7 +53,7 @@ pub(crate) fn uniform_const(consts: &ConstPool, func: &Function, v: ValueId) -> 
                 match consts.get(e) {
                     Const::Poison(_) => {}
                     Const::Int { value, .. } => {
-                        let x = value.to_u64().unwrap_or(u64::MAX);
+                        let x = value.mod_2k(width).to_u64().unwrap_or(u64::MAX);
                         if out.is_some_and(|o| o != x) {
                             return None;
                         }
