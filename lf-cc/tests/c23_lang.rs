@@ -174,8 +174,8 @@ fn run_exit(bin: &Path) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
-    use std::os::unix::process::ExitStatusExt;
-    panic!("{} killed by signal {:?}", bin.display(), status.signal());
+    // No exit code: killed by a signal (`Display` names it on Unix).
+    panic!("{} terminated abnormally: {status}", bin.display());
 }
 
 #[test]
