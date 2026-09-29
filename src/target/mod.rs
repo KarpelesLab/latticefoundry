@@ -6,6 +6,7 @@
 
 pub mod aarch64;
 pub mod riscv;
+pub mod triple;
 pub mod x86_64;
 
 pub(crate) mod rt_words;
@@ -16,6 +17,9 @@ use crate::support::StrInterner;
 
 #[cfg(test)]
 pub(crate) mod atomic_fixtures;
+
+#[doc(inline)]
+pub use triple::{CallConvKind, ObjectFormat, TargetOs, Triple};
 
 /// A supported target architecture.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

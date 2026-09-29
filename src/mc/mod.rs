@@ -21,18 +21,29 @@
 //! - [`lfo`] — our versioned, compact, lossless `.lfo` object serialization.
 //! - [`elf`] — an ELF64 `ET_REL` writer for x86-64, implemented from the ELF
 //!   specification.
+//! - [`coff`] — a PE/COFF object writer for x86-64 and ARM64, from the PE/COFF
+//!   specification.
+//! - [`macho`] — a Mach-O `MH_OBJECT` writer for x86-64 and arm64, from the
+//!   Mach-O file-format reference.
+//! - [`format`](mod@format) — [`write_object`], which picks the writer a
+//!   [`Triple`](crate::target::Triple) calls for.
 //! - [`asm`] — textual assembly → ELF objects, via our own `rsasm` assembler.
 //!
 //! Everything here is deterministic (tenet T5): the same inputs always produce
 //! byte-identical output.
 
 pub mod asm;
+pub mod coff;
 pub mod dwarf;
 pub mod elf;
 pub mod emit;
+pub mod format;
 pub mod lfo;
+pub mod macho;
 pub mod object;
 
+#[doc(inline)]
+pub use format::{ObjectWriteError, write_object};
 #[doc(inline)]
 pub use emit::{Emitted, Emitter, Label};
 #[doc(inline)]
