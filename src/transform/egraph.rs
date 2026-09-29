@@ -246,8 +246,10 @@ enum NodeOp {
     Bin(BinOp, Flags),
     /// Integer comparison (result `i1`).
     ICmp(IntPred),
-    /// Integer cast (`trunc`/`zext`/`sext`).
-    Cast(CastOp),
+    /// Integer cast (`trunc`/`zext`/`sext`) with its result type. The operand
+    /// does not determine a cast's type (`zext x : i32` and `zext x : i64` are
+    /// different values), so the type is part of the hash-consed node.
+    Cast(CastOp, TypeId),
     /// Ternary select.
     Select,
     /// `freeze`.
@@ -373,7 +375,7 @@ impl<'a> EGraph<'a> {
                     for &o in inst.operands() {
                         children.push(self.class_of(func, o));
                     }
-                    let op = node_op(&inst.kind, inst.flags).expect("modeled op has a NodeOp");
+                    let op = node_op(&inst.kind, inst.flags, ty).expect("modeled op has a NodeOp");
                     ENode { op, children }
                 } else {
                     ENode { op: NodeOp::Leaf(v), children: Vec::new() }
@@ -1070,11 +1072,13 @@ fn modeled_value(func: &Function, types: &TypeContext, v: ValueId) -> bool {
 }
 
 /// The [`NodeOp`] for a modeled opcode (with its flags for `Bin`).
-fn node_op(kind: &InstKind, flags: Flags) -> Option<NodeOp> {
+fn node_op(kind: &InstKind, flags: Flags, result_ty: TypeId) -> Option<NodeOp> {
     match kind {
         InstKind::Bin(op) if !op.is_float() => Some(NodeOp::Bin(*op, flags)),
         InstKind::ICmp(pred) => Some(NodeOp::ICmp(*pred)),
-        InstKind::Cast(op @ (CastOp::Trunc | CastOp::ZExt | CastOp::SExt)) => Some(NodeOp::Cast(*op)),
+        InstKind::Cast(op @ (CastOp::Trunc | CastOp::ZExt | CastOp::SExt)) => {
+            Some(NodeOp::Cast(*op, result_ty))
+        }
         InstKind::Select => Some(NodeOp::Select),
         InstKind::Freeze => Some(NodeOp::Freeze),
         _ => None,
@@ -1086,7 +1090,7 @@ fn node_inst(op: &NodeOp) -> Option<(InstKind, Flags)> {
     match op {
         NodeOp::Bin(b, f) => Some((InstKind::Bin(*b), *f)),
         NodeOp::ICmp(p) => Some((InstKind::ICmp(*p), Flags::NONE)),
-        NodeOp::Cast(c) => Some((InstKind::Cast(*c), Flags::NONE)),
+        NodeOp::Cast(c, _) => Some((InstKind::Cast(*c), Flags::NONE)),
         NodeOp::Select => Some((InstKind::Select, Flags::NONE)),
         NodeOp::Freeze => Some((InstKind::Freeze, Flags::NONE)),
         NodeOp::Leaf(_) | NodeOp::Const(_) => None,
@@ -1105,7 +1109,7 @@ fn original_enode(
         unreachable!("modeled values are instruction results");
     };
     let inst = func.inst(i);
-    let op = node_op(&inst.kind, inst.flags).expect("modeled op");
+    let op = node_op(&inst.kind, inst.flags, func.value_type(v)).expect("modeled op");
     let children = inst
         .operands()
         .iter()
@@ -1175,7 +1179,7 @@ fn own_cost(op: &NodeOp) -> u64 {
             BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem => 20,
             _ => 2, // add/sub/bitwise/shift and (unreached) float ops
         },
-        NodeOp::ICmp(_) | NodeOp::Cast(_) | NodeOp::Freeze => 2,
+        NodeOp::ICmp(_) | NodeOp::Cast(..) | NodeOp::Freeze => 2,
         NodeOp::Select => 3,
     }
 }
@@ -1372,6 +1376,37 @@ mod tests {
         let tgt = build_fn(&mut m, &mut syms, "mul-assoc_t", &[iw, iw, iw], iw,
             |b, p| { let bc = b.mul(p[1], p[2], Flags::NONE); b.mul(p[0], bc, Flags::NONE) });
         assert_not_refuted(&m, src, tgt, "mul-assoc");
+    }
+
+    /// Two casts of one operand to different types are different values: the
+    /// hash-cons key must include the result type, or `zext x : i32` and `zext x
+    /// : i64` collapse into one class and extraction emits ill-typed code (found
+    /// compiling bzip2's `mainSort` and Lua's parser at -O2).
+    #[test]
+    fn casts_to_different_types_stay_distinct() {
+        use crate::ir::inst::CastOp;
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("eqsat-casts");
+        let i8t = m.types_mut().int(8);
+        let i16t = m.types_mut().int(16);
+        let i32t = m.types_mut().int(32);
+        let i64t = m.types_mut().int(64);
+        let f = build_fn(&mut m, &mut syms, "f", &[i16t], i32t, |b, p| {
+            let a = b.cast(CastOp::ZExt, p[0], i32t);
+            let w = b.cast(CastOp::ZExt, p[0], i64t);
+            let t = b.cast(CastOp::Trunc, w, i32t);
+            let n = b.cast(CastOp::Trunc, p[0], i8t);
+            let nx = b.cast(CastOp::SExt, n, i32t);
+            let s = b.add(a, t, Flags::NONE);
+            let s = b.add(s, nx, Flags::NONE);
+            let two = b.const_i64(i32t, 2);
+            b.mul(s, two, Flags::NONE)
+        });
+        assert!(verify_module(&m).is_ok());
+        assert_eq!(run_eqsat(&mut m, f), Changed::Yes);
+        if let Err(diags) = verify_module(&m) {
+            panic!("output must verify: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        }
     }
 
     #[test]
