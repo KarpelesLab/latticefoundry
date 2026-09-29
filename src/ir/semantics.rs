@@ -649,6 +649,8 @@ fn eval_bitcast(types: &TypeContext, result_ty: TypeId, src: &SemValue) -> EvalO
             ok(SemValue::Float(*fb))
         }
         (SemValue::Ptr(_), Type::Ptr) => ok(src.clone()),
+        // An aggregate value is the address of its storage.
+        (SemValue::Ptr(_), Type::Struct(_) | Type::Array(..)) => ok(src.clone()),
         // Any other bitcast is ill-typed for this evaluator.
         _ => poison(),
     }

@@ -45,7 +45,7 @@
 
 use crate::analysis::cfg::{ControlFlowGraph, Dominators};
 use crate::ir::builder::FunctionBuilder;
-use crate::ir::inst::{InstData, InstKind};
+use crate::ir::inst::{CastOp, InstData, InstKind};
 use crate::ir::types::{Type, TypeId};
 use crate::ir::value::{ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, Module};
@@ -279,7 +279,15 @@ fn splice_callee(
     }
 
     // Enter the inlined body: the caller arguments become the entry parameters.
-    builder.br(callee_new[entry.index()], args);
+    // A call may pass a `ptr` for an aggregate parameter (the struct-by-value
+    // convention makes them interchangeable at a call); block arguments are
+    // strictly typed, so such an argument is bitcast to the parameter's type.
+    let entry_new = callee_new[entry.index()];
+    let ptys: Vec<TypeId> =
+        builder.block_params(entry_new).iter().map(|&p| builder.value_type(p)).collect();
+    let args: Vec<ValueId> =
+        args.iter().zip(&ptys).map(|(&a, &t)| coerce_address(builder, a, t)).collect();
+    builder.br(entry_new, &args);
 
     // Seed the callee value map from the copied block parameters.
     let mut cmap: Vec<Option<ValueId>> = vec![None; callee.value_count()];
@@ -322,7 +330,12 @@ fn rebuild_callee_terminator(
     if matches!(term.kind, InstKind::Ret) {
         let mut cargs = Vec::new();
         if let Some(&v) = term.operands().first() {
-            cargs.push(remap_value(cmap, callee, builder, v));
+            let v = remap_value(cmap, callee, builder, v);
+            // A `ret` of a `ptr` from an aggregate-returning function (the
+            // address of the struct value) meets the continuation's aggregate
+            // parameter.
+            let want = builder.value_type(builder.block_params(cont)[0]);
+            cargs.push(coerce_address(builder, v, want));
         }
         builder.br(cont, &cargs);
     } else {
@@ -330,6 +343,14 @@ fn rebuild_callee_terminator(
         // reading the callee's structure and mapping successors to their copies.
         rebuild_terminator(cmap, callee, builder, callee_new, bb, |_, _, _| {});
     }
+}
+
+/// `v` as a value of type `want`. In verified IR the only type difference a
+/// call/return boundary admits is `ptr` against an aggregate (both denote an
+/// address); inlining turns that boundary into a strictly typed block
+/// argument, so the address is bitcast.
+fn coerce_address(builder: &mut FunctionBuilder<'_>, v: ValueId, want: TypeId) -> ValueId {
+    if builder.value_type(v) == want { v } else { builder.cast(CastOp::Bitcast, v, want) }
 }
 
 /// Copy an instruction verbatim with remapped operands, recording its result.
@@ -489,6 +510,56 @@ mod tests {
             "the add is spliced in"
         );
         assert!(verify_module(&m).is_ok(), "inline output must verify");
+    }
+
+    /// A struct-by-value callee — an aggregate parameter, and an aggregate
+    /// result returned as the `ptr` of a local — called with a `ptr` argument
+    /// (all address-compatible at a call boundary). Inlining turns those
+    /// boundaries into strictly typed block arguments, which must still verify.
+    #[test]
+    fn inlines_struct_by_value_callee() {
+        use crate::ir::inst::CastOp;
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("inline-struct");
+        let i32t = m.types_mut().int(32);
+        let pair = m.types_mut().struct_(vec![i32t, i32t]);
+        let g_sig = m.types_mut().func(vec![pair], pair, false);
+        let g = m.declare_function(syms.intern("g"), g_sig);
+        {
+            let mut b = m.build(g);
+            let e = b.create_entry_block();
+            let v = b.param(e, 0);
+            let r = b.alloca(pair);
+            let x_p = b.struct_field(v, pair, 0);
+            let x = b.load(i32t, x_p, 4);
+            let rx = b.struct_field(r, pair, 0);
+            b.store(i32t, rx, x, 4);
+            b.ret(Some(r));
+        }
+        let f_sig = m.types_mut().func(vec![], i32t, false);
+        let f = m.declare_function(syms.intern("f"), f_sig);
+        {
+            let mut b = m.build(f);
+            b.create_entry_block();
+            let tmp = b.alloca(pair);
+            let gref = b.func_ref(g);
+            // One call passes the storage `ptr` directly, one bitcasts it.
+            let r1 = b.call(gref, &[tmp], pair).expect("g returns a pair");
+            let agg = b.cast(CastOp::Bitcast, tmp, pair);
+            let r2 = b.call(gref, &[agg], pair).expect("g returns a pair");
+            let p1 = b.struct_field(r1, pair, 0);
+            let a = b.load(i32t, p1, 4);
+            let p2 = b.struct_field(r2, pair, 0);
+            let c = b.load(i32t, p2, 4);
+            let s = b.add(a, c, Flags::NONE);
+            b.ret(Some(s));
+        }
+        assert!(verify_module(&m).is_ok());
+        assert_eq!(Inline::new().run(&mut m), Changed::Yes);
+        assert_eq!(n_calls(m.function(f)), 0, "both calls are inlined");
+        if let Err(diags) = verify_module(&m) {
+            panic!("inline output must verify: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        }
     }
 
     /// `g(a, b, c) = if c { a } else { b }` — two blocks, two `ret`s (a diamond).

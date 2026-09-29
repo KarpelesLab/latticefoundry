@@ -42,7 +42,11 @@
 //!   `array_elem`) and as the *address* operand of `load` / `store`, and
 //! - across the *call / return* boundary (a `ptr` may be passed where an
 //!   aggregate parameter is declared, an aggregate value where a `ptr` parameter
-//!   is declared, and likewise for `ret` vs. the return type).
+//!   is declared, and likewise for `ret` vs. the return type), and
+//! - through `bitcast` (`ptr` -> aggregate and back: the identity on the
+//!   address). A backend classifies a call argument by the argument *value's*
+//!   type, so a frontend passing a struct by value bitcasts the address of the
+//!   storage it filled to the struct type.
 //!
 //! **Scalars stay strictly typed** — only the pointer ↔ aggregate pairing is
 //! newly compatible. The single predicate that encodes this is
@@ -602,7 +606,13 @@ impl<'a> Ctx<'a> {
             CastOp::Bitcast => {
                 // Same-size reinterpretation; pointers count as machine-word
                 // sized via the layout, so ptr<->ptr and ptr<->iN(word) agree.
-                from != to && bit_size(m, from) == bit_size(m, to) && bit_size(m, from).is_some()
+                // An aggregate value *is* the address of its storage (see the
+                // module docs), so `ptr` <-> aggregate is the identity on that
+                // address: it is how a frontend turns storage it filled into a
+                // by-value struct argument.
+                (from != to && bit_size(m, from) == bit_size(m, to) && bit_size(m, from).is_some())
+                    || (is_ptr(m, from) && is_aggregate(m, to))
+                    || (is_aggregate(m, from) && is_ptr(m, to))
             }
         };
         if !ok {
