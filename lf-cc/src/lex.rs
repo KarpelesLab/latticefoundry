@@ -128,6 +128,9 @@ pub enum Keyword {
     Typeof,
     /// `typeof_unqual` (C23 / GNU extension)
     TypeofUnqual,
+    /// `__asm__` / `__asm` (always) and `asm` (GNU dialects): an asm label on a
+    /// declarator, an asm statement, or a file-scope asm declaration.
+    Asm,
 }
 
 /// The punctuators and operators recognized by the subset.

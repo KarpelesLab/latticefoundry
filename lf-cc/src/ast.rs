@@ -638,6 +638,45 @@ pub enum StmtKind {
     Label(String, Box<Stmt>),
     /// `goto label;`.
     Goto(String),
+    /// A GNU `asm` statement (basic or extended).
+    Asm(AsmStmt),
+}
+
+/// A GNU `asm` statement: `asm [volatile] [inline] [goto] ( template [:
+/// outputs [: inputs [: clobbers [: labels]]]] );`. A *basic* asm has no
+/// colon at all (`extended == false`); its template is taken literally.
+#[derive(Clone, Debug)]
+pub struct AsmStmt {
+    /// The assembler template (adjacent string literals concatenated, escapes
+    /// already decoded).
+    pub template: String,
+    /// Whether the statement uses the extended (operand-carrying) form.
+    pub extended: bool,
+    /// The `volatile` qualifier.
+    pub is_volatile: bool,
+    /// The `inline` qualifier.
+    pub is_inline: bool,
+    /// The `goto` qualifier.
+    pub is_goto: bool,
+    /// Output operands.
+    pub outputs: Vec<AsmOperand>,
+    /// Input operands.
+    pub inputs: Vec<AsmOperand>,
+    /// Clobber names (`"memory"`, `"cc"`, register names).
+    pub clobbers: Vec<String>,
+    /// The C labels an `asm goto` may jump to.
+    pub labels: Vec<String>,
+}
+
+/// One operand of an extended asm: `[symbolic-name] "constraint" (expr)`.
+#[derive(Clone, Debug)]
+pub struct AsmOperand {
+    /// The optional `[name]` used to refer to the operand in the template.
+    pub name: Option<String>,
+    /// The constraint string (e.g. `"=r"`, `"m"`).
+    pub constraint: String,
+    /// The C expression bound to the operand (an lvalue for outputs).
+    pub expr: Expr,
 }
 
 /// The storage-class specifier applied to a declaration, as far as it affects
@@ -668,6 +707,9 @@ pub struct VarDecl {
     pub align: Option<u64>,
     /// The storage-class specifier (linkage) this declaration carries.
     pub storage: Storage,
+    /// A GNU asm label (`T x asm("sym");`): the assembler symbol that replaces
+    /// the C name at link level. The C name still governs lookup.
+    pub asm_label: Option<String>,
     /// The source span of the declarator.
     pub span: Span,
 }
@@ -698,6 +740,8 @@ pub struct FuncDef {
     pub is_static: bool,
     /// The function body (a list of statements).
     pub body: Vec<Stmt>,
+    /// A GNU asm label (`T f(...) asm("sym") { ... }`) naming the emitted symbol.
+    pub asm_label: Option<String>,
     /// The source span of the function's declarator (its name).
     pub span: Span,
 }
@@ -715,6 +759,9 @@ pub struct FuncProto {
     pub variadic: bool,
     /// Whether the function has internal linkage (`static`).
     pub is_static: bool,
+    /// A GNU asm label (`T f(...) __asm__("sym");`): the assembler symbol calls
+    /// and references to `f` use instead of its C name (glibc's `__REDIRECT`).
+    pub asm_label: Option<String>,
     /// The source span of the declarator.
     pub span: Span,
 }
@@ -728,6 +775,9 @@ pub enum TopLevel {
     Proto(FuncProto),
     /// A global variable declaration.
     Global(VarDecl),
+    /// A file-scope `asm("...");` declaration: its template text, emitted
+    /// verbatim into the assembly the translation unit contributes.
+    Asm(String),
 }
 
 /// A whole translation unit: the ordered top-level declarations of one file,

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CType, Designator, Expr, ExprKind, Field, FloatTy, FuncDef, FuncProto, FuncType,
+    AsmOperand, AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, Field, FloatTy, FuncDef, FuncProto, FuncType,
     GenericAssoc, Init, InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt,
     StmtKind, Storage, StrKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
@@ -249,6 +249,21 @@ impl Parser {
                 self.parse_static_assert()?;
                 continue;
             }
+            // A file-scope `asm("...");` (GNU): basic asm text the translation
+            // unit contributes verbatim to its assembly output.
+            if self.is_kw(Keyword::Asm) {
+                let span = self.peek_span();
+                let stmt = self.parse_asm_stmt()?;
+                self.expect_punct(Punct::Semi, "';' after file-scope asm")?;
+                if stmt.extended || stmt.is_goto {
+                    return Err(Diagnostic::error(
+                        "a file-scope asm declaration takes no operands (basic asm only)",
+                    )
+                    .with_span(span));
+                }
+                items.push(TopLevel::Asm(stmt.template));
+                continue;
+            }
             items.extend(self.parse_top_level()?);
         }
         Ok(items)
@@ -326,18 +341,28 @@ impl Parser {
             let mut items = Vec::new();
             let (name, ty, span) = self.parse_named_declarator(ty0)?;
             self.declare_ordinary(&name, Some(ty.clone()));
+            let asm_label = self.parse_declarator_extensions()?;
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span }));
+            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, asm_label, span }));
             while self.eat_punct(Punct::Comma) {
                 let (name, ty, span) = self.parse_named_declarator(base.clone())?;
                 self.declare_ordinary(&name, Some(ty.clone()));
+                let asm_label = self.parse_declarator_extensions()?;
                 let init = if self.eat_punct(Punct::Assign) {
                     Some(self.parse_initializer()?)
                 } else {
                     None
                 };
-                items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span }));
+                items.push(TopLevel::Global(VarDecl {
+                    name,
+                    ty,
+                    init,
+                    align,
+                    storage,
+                    asm_label,
+                    span,
+                }));
             }
             self.expect_punct(Punct::Semi, "';' after global declaration")?;
             return Ok(items);
@@ -370,6 +395,7 @@ impl Parser {
                     variadic: false,
                     is_static: storage == Storage::Static,
                     body,
+                    asm_label: None,
                     span: name_span,
                 })]);
             }
@@ -382,7 +408,9 @@ impl Parser {
             // A trailing declarator attribute — `f(void) __attribute__((noreturn));`
             // (GNU) or `[[noreturn]]` — sits between the parameter list and the
             // `;`/`{`. bzip2's NORETURN and glibc prototypes rely on this position.
-            self.skip_attributes()?;
+            // So does a GNU asm label (`f(int) __asm__("sym")`, glibc's
+            // `__REDIRECT`), mixed with attributes on either side of it.
+            let asm_label = self.parse_declarator_extensions()?;
             if self.is_punct(Punct::LBrace) {
                 let body = self.parse_block_stmts()?;
                 self.pop_scope();
@@ -393,6 +421,7 @@ impl Parser {
                     variadic,
                     is_static: storage == Storage::Static,
                     body,
+                    asm_label,
                     span: name_span,
                 })]);
             }
@@ -404,6 +433,7 @@ impl Parser {
                 params,
                 variadic,
                 is_static: storage == Storage::Static,
+                asm_label,
                 span: name_span,
             })]);
         }
@@ -412,20 +442,30 @@ impl Parser {
         let mut items = Vec::new();
         let ty = self.parse_array_suffix(ty0)?;
         self.declare_ordinary(&name, Some(ty.clone()));
+        let asm_label = self.parse_declarator_extensions()?;
         let init = if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
         if let Some(i) = &init {
             self.declare_ordinary(&name, Some(self.deduce_array_symbol_type(&ty, i)));
         }
-        items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span: name_span }));
+        items.push(TopLevel::Global(VarDecl {
+            name,
+            ty,
+            init,
+            align,
+            storage,
+            asm_label,
+            span: name_span,
+        }));
         while self.eat_punct(Punct::Comma) {
             let (name, ty, span) = self.parse_named_declarator(base.clone())?;
             self.declare_ordinary(&name, Some(ty.clone()));
+            let asm_label = self.parse_declarator_extensions()?;
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
             if let Some(i) = &init {
                 self.declare_ordinary(&name, Some(self.deduce_array_symbol_type(&ty, i)));
             }
-            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, span }));
+            items.push(TopLevel::Global(VarDecl { name, ty, init, align, storage, asm_label, span }));
         }
         self.expect_punct(Punct::Semi, "';' after global declaration")?;
         Ok(items)
@@ -525,6 +565,140 @@ impl Parser {
                 continue;
             }
             return Ok(());
+        }
+    }
+
+    /// Parse the GNU extensions that may trail a declarator: any mix of
+    /// attribute specifiers and at most one asm label `asm ("symbol")`, as in
+    /// `int f(int) __asm__ ("" "g") __THROW __wur;`. Returns the label, if any.
+    fn parse_declarator_extensions(&mut self) -> PResult<Option<String>> {
+        let mut label: Option<String> = None;
+        loop {
+            self.skip_attributes()?;
+            if !self.is_kw(Keyword::Asm) {
+                return Ok(label);
+            }
+            if label.is_some() {
+                return self.err("a declarator may carry only one asm label");
+            }
+            self.bump(); // asm
+            self.expect_punct(Punct::LParen, "'(' after asm")?;
+            let sym = self.parse_asm_string("an asm label")?;
+            if sym.is_empty() {
+                return self.err("an asm label must name a symbol");
+            }
+            self.expect_punct(Punct::RParen, "')' after asm label")?;
+            label = Some(sym);
+        }
+    }
+
+    /// Parse one or more adjacent narrow string literals (concatenated, as in
+    /// translation phase 6) for an asm template, label, constraint, or clobber.
+    fn parse_asm_string(&mut self, what: &str) -> PResult<String> {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut any = false;
+        while let TokenKind::Str(s, kind) = self.peek().clone() {
+            if kind != StrKind::Narrow {
+                return self.err(format!("{what} must be a narrow string literal"));
+            }
+            bytes.extend_from_slice(&s);
+            self.bump();
+            any = true;
+        }
+        if !any {
+            return self.err(format!("expected a string literal for {what}"));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Parse a GNU asm statement or file-scope asm declaration (the `asm`
+    /// keyword at the cursor) up to its closing `)`; the caller consumes the `;`:
+    ///
+    /// `asm qualifiers ( template [: outputs [: inputs [: clobbers [: labels]]]] )`
+    ///
+    /// The qualifiers are any of `volatile`, `inline`, and `goto`. A `::` is two
+    /// `:` tokens here, so `asm("" ::: "memory")` needs no special casing.
+    fn parse_asm_stmt(&mut self) -> PResult<AsmStmt> {
+        self.bump(); // asm
+        let mut stmt = AsmStmt {
+            template: String::new(),
+            extended: false,
+            is_volatile: false,
+            is_inline: false,
+            is_goto: false,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            labels: Vec::new(),
+        };
+        loop {
+            match self.peek() {
+                TokenKind::Keyword(Keyword::Volatile) => stmt.is_volatile = true,
+                TokenKind::Keyword(Keyword::Inline) => stmt.is_inline = true,
+                // `inline` is a plain identifier under C89, but still an asm
+                // qualifier in GNU C.
+                TokenKind::Ident(n) if n == "inline" => stmt.is_inline = true,
+                TokenKind::Keyword(Keyword::Goto) => stmt.is_goto = true,
+                _ => break,
+            }
+            self.bump();
+        }
+        self.expect_punct(Punct::LParen, "'(' after asm")?;
+        stmt.template = self.parse_asm_string("the asm template")?;
+        // Each section is optional from the right; a present section may be
+        // empty (`asm("" : : "r"(x))`).
+        if self.eat_punct(Punct::Colon) {
+            stmt.extended = true;
+            stmt.outputs = self.parse_asm_operands()?;
+            if self.eat_punct(Punct::Colon) {
+                stmt.inputs = self.parse_asm_operands()?;
+                if self.eat_punct(Punct::Colon) {
+                    if matches!(self.peek(), TokenKind::Str(..)) {
+                        loop {
+                            stmt.clobbers.push(self.parse_asm_string("an asm clobber")?);
+                            if !self.eat_punct(Punct::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    if self.eat_punct(Punct::Colon) && matches!(self.peek(), TokenKind::Ident(_)) {
+                        loop {
+                            stmt.labels.push(self.expect_ident()?.0);
+                            if !self.eat_punct(Punct::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.expect_punct(Punct::RParen, "')' to close asm")?;
+        Ok(stmt)
+    }
+
+    /// Parse a (possibly empty) comma-separated list of extended-asm operands,
+    /// `[name] "constraint" (expr)`, stopping before a `:` or `)`.
+    fn parse_asm_operands(&mut self) -> PResult<Vec<AsmOperand>> {
+        let mut ops = Vec::new();
+        if self.is_punct(Punct::Colon) || self.is_punct(Punct::RParen) {
+            return Ok(ops);
+        }
+        loop {
+            let name = if self.eat_punct(Punct::LBracket) {
+                let (n, _) = self.expect_ident()?;
+                self.expect_punct(Punct::RBracket, "']' after asm operand name")?;
+                Some(n)
+            } else {
+                None
+            };
+            let constraint = self.parse_asm_string("an asm operand constraint")?;
+            self.expect_punct(Punct::LParen, "'(' before asm operand expression")?;
+            let expr = self.parse_expr()?;
+            self.expect_punct(Punct::RParen, "')' after asm operand expression")?;
+            ops.push(AsmOperand { name, constraint, expr });
+            if !self.eat_punct(Punct::Comma) {
+                return Ok(ops);
+            }
         }
     }
 
@@ -1619,6 +1793,11 @@ impl Parser {
                 let span = start.merge(body.span);
                 Ok(self.stmt(StmtKind::Default(body), span))
             }
+            TokenKind::Keyword(Keyword::Asm) => {
+                let stmt = self.parse_asm_stmt()?;
+                let end = self.expect_punct(Punct::Semi, "';' after asm statement")?;
+                Ok(self.stmt(StmtKind::Asm(stmt), start.merge(end)))
+            }
             TokenKind::Keyword(Keyword::Goto) => {
                 self.bump();
                 let (name, _) = self.expect_ident()?;
@@ -1683,9 +1862,10 @@ impl Parser {
         loop {
             let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
             self.declare_ordinary(&name, Some(ty.clone()));
+            let asm_label = self.parse_declarator_extensions()?;
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
-            decls.push(VarDecl { name, ty, init, align, storage, span: name_span });
+            decls.push(VarDecl { name, ty, init, align, storage, asm_label, span: name_span });
             if !self.eat_punct(Punct::Comma) {
                 break;
             }

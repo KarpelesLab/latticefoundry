@@ -25,13 +25,14 @@ pub use preprocess::{MacroOp, PpOptions};
 
 use latticefoundry::ir::Module;
 use latticefoundry::link::{self, ImageOptions};
+use latticefoundry::mc::asm::{self as mcasm, AsmOptions, AsmSource};
 use latticefoundry::mc::object::{
     ObjectModule, RelocKind, Relocation, Section, SectionId, SectionKind, Symbol, SymbolBinding,
     SymbolType,
 };
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::Diagnostic;
-use latticefoundry::target::x86_64;
+use latticefoundry::target::{TargetArch, x86_64};
 use latticefoundry::transform::pipeline::{self, OptLevel};
 use latticefoundry::verify;
 
@@ -113,26 +114,15 @@ pub fn build_image_with(
     debug: bool,
 ) -> Result<Vec<u8>, BuildError> {
     let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
-    let (mut module, syms) = lower::lower(&program, source, input_name, debug);
-
-    verify_or(&module, "lowered")?;
-    pipeline::optimize(&mut module, opt);
-    if opt != OptLevel::O0 {
-        verify_or(&module, "optimized")?;
+    if !program.toplevel_asm.is_empty() {
+        // The self-contained linker consumes only our own object modules; the
+        // assembled file-scope asm is a separate ELF object that needs the
+        // hosted (ELF) link path.
+        return Err(BuildError::Backend(
+            "file-scope asm needs the object path (compile_object_with + an ELF link)".to_owned(),
+        ));
     }
-
-    let mut obj = if debug {
-        let comp_dir = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_owned))
-            .unwrap_or_default();
-        let source_desc = x86_64::DebugSource { file_name: input_name.to_owned(), comp_dir };
-        x86_64::compile_module_debug(&module, &syms, &source_desc)
-    } else {
-        x86_64::compile_module(&module, &syms)
-    };
-    emit_globals(&mut obj, &program.globals);
-    apply_static_linkage(&mut obj, &program.sigs);
+    let obj = compile_program(&program, source, input_name, opt, debug)?;
 
     let image_opts = ImageOptions { debug, ..ImageOptions::default() };
     link::link_executable(vec![obj], &image_opts)
@@ -146,6 +136,10 @@ pub fn build_image_with(
 /// libc (calls to undefined symbols like `printf`/`malloc` become relocations
 /// the system linker resolves). This is how lf-cc-compiled hosted programs are
 /// tested.
+///
+/// A translation unit with file-scope `asm(...)` declarations is rejected here
+/// (their code would otherwise be silently dropped); use
+/// [`compile_object_with`], which returns the asm alongside the object.
 pub fn build_object_with(
     source: &str,
     input_name: &str,
@@ -153,8 +147,77 @@ pub fn build_object_with(
     opt: OptLevel,
     debug: bool,
 ) -> Result<Vec<u8>, BuildError> {
+    let out = compile_object_with(source, input_name, opts, opt, debug)?;
+    if !out.toplevel_asm.is_empty() {
+        return Err(BuildError::Backend(
+            "file-scope asm needs compile_object_with (its assembled object must be linked too)"
+                .to_owned(),
+        ));
+    }
+    Ok(out.object)
+}
+
+/// The result of [`compile_object_with`]: the translation unit's ELF object
+/// plus the templates of its file-scope `asm(...)` declarations.
+#[derive(Clone, Debug)]
+pub struct CompiledObject {
+    /// The relocatable ELF object for the C code.
+    pub object: Vec<u8>,
+    /// The file-scope asm templates, in source order (empty when there are
+    /// none). Assemble them with [`assemble_toplevel_asm`] and link the result
+    /// next to `object`.
+    pub toplevel_asm: Vec<String>,
+}
+
+/// Compile a translation unit to a relocatable ELF object, also returning its
+/// file-scope `asm(...)` templates (see [`CompiledObject`]).
+pub fn compile_object_with(
+    source: &str,
+    input_name: &str,
+    opts: &PpOptions,
+    opt: OptLevel,
+    debug: bool,
+) -> Result<CompiledObject, BuildError> {
     let program = check_source_with(source, opts).map_err(BuildError::Frontend)?;
-    let (mut module, syms) = lower::lower(&program, source, input_name, debug);
+    let obj = compile_program(&program, source, input_name, opt, debug)?;
+    Ok(CompiledObject {
+        object: latticefoundry::mc::elf::write(&obj),
+        toplevel_asm: program.toplevel_asm,
+    })
+}
+
+/// Assemble a translation unit's file-scope asm templates (in order, as one
+/// assembly source, as GCC would emit them into its `.s`) into an x86-64 ELF
+/// relocatable object with our own assembler. Returns `Ok(None)` when there is
+/// no file-scope asm. `input_name` names the C source for diagnostics.
+pub fn assemble_toplevel_asm(
+    templates: &[String],
+    input_name: &str,
+) -> Result<Option<Vec<u8>>, BuildError> {
+    if templates.is_empty() {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    for t in templates {
+        text.push_str(t);
+        text.push('\n');
+    }
+    let name = format!("{input_name} (file-scope asm)");
+    mcasm::assemble(&[AsmSource { name: &name, text: &text }], &AsmOptions::new(TargetArch::X86_64))
+        .map(Some)
+        .map_err(|e| BuildError::Backend(format!("assembling file-scope asm: {e}")))
+}
+
+/// Lower, verify, optimize, and compile a checked program to an x86-64 object
+/// module with its global data and linkage applied.
+fn compile_program(
+    program: &sema::Program,
+    source: &str,
+    input_name: &str,
+    opt: OptLevel,
+    debug: bool,
+) -> Result<ObjectModule, BuildError> {
+    let (mut module, syms) = lower::lower(program, source, input_name, debug);
 
     verify_or(&module, "lowered")?;
     pipeline::optimize(&mut module, opt);
@@ -174,8 +237,7 @@ pub fn build_object_with(
     };
     emit_globals(&mut obj, &program.globals);
     apply_static_linkage(&mut obj, &program.sigs);
-
-    Ok(latticefoundry::mc::elf::write(&obj))
+    Ok(obj)
 }
 
 /// Give each `static` function definition internal linkage by rebinding its
