@@ -151,6 +151,51 @@ relaxed. The verifier (`src/verify/structural.rs`) enforces exactly this: its
 aggregate) gates the `call`/`ret` boundary, and the `ptr_add`/`load`/`store`
 base-and-address checks additionally accept an aggregate-typed operand.
 
+## 6a. Reaching the kernel: a native `syscall` op  *(decided)*
+
+Freestanding programs (`lf build` makes static executables that run on the
+bare Linux kernel, no libc) need a way to talk to the kernel from IR. We add one
+dedicated opcode:
+
+```text
+%r = syscall %nr, %a0, ..., %a5 : i64
+```
+
+- **Operands:** the syscall number plus 0..=6 arguments. Each is `i64` or
+  `ptr` and fills one 64-bit register exactly. There is **no implicit
+  extension**: a front end with a narrower value `zext`s/`sext`s it first (C
+  passes `int` arguments sign-extended). This keeps the op's meaning a pure
+  function of its operands' bits, and the verifier checks it.
+- **Result:** `i64`, the kernel's **raw** return. Linux reports failure as
+  `-errno` in `[-4095, -1]`; the op does not interpret that (a front end's
+  `errno` wrapper does).
+- **Semantics:** an opaque effect on the outside world, exactly as strong as a
+  call to an unknown external function. It may read or write any memory
+  reachable from an escaped pointer (its own pointer operands escape), so it is
+  a full memory clobber. It may not be removed (even with an unused result),
+  duplicated, reordered with other memory operations, calls or syscalls,
+  hoisted, or speculated. Its result is ⊤ in every abstract domain. A poison
+  operand is undefined behavior: the kernel would observe an arbitrary register.
+- **Verification:** the reference evaluator (`ir::semantics`) has no
+  denotation for it, like `call`. The machine interpreters (virtual, AArch64,
+  RISC-V) either take an explicit syscall hook or stop with a clean "unsupported
+  side effect" error; they never invent a result. The refinement checker (B2)
+  treats it as uninterpreted and reports any function containing one as
+  `Unknown`, so it never wrongly proves a rewrite across a syscall.
+- **Lowering** (the Linux syscall ABI): x86-64 puts the number in `rax` and the
+  arguments in `rdi, rsi, rdx, r10, r8, r9`, then runs `syscall`; `rcx` and
+  `r11` are clobbered. AArch64 uses `x8` and `x0..x5`, then `svc #0`. RISC-V
+  uses `a7` and `a0..a5`, then `ecall`. The result comes back in
+  `rax`/`x0`/`a0`.
+- **Rejected: inline assembly.** An asm blob is a string the optimizer and the
+  verifier cannot see into. Every pass would have to treat it as the worst case,
+  every target would need its own text, and B1/B2 would stop at its boundary. A
+  dedicated op says exactly what it does: which registers carry which values,
+  what it may touch, and what it returns. So it stays analyzable (precise
+  effects rather than "anything"), portable (one IR spelling, three backend
+  lowerings), and verifiable (typed operands, a checked arity, and an honest
+  "unknown" in the refinement checker).
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than
