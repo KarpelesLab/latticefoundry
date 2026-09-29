@@ -28,6 +28,9 @@ the exit criteria are what "done" means for each phase.
 > - the **`-O0..-O3`** pipeline
 > - **LTO**
 > - a native **dynamic stack allocation** op (`DynAlloca`)
+> - **stack usage reports** (per-function frame sizes from the frame layout,
+>   worst-case depth over the call graph, `lf build --stack-usage`) and
+>   **stack probes** (on by default) on all three targets
 > - three targets:
 >   - **x86-64** executes, with the full System V ABI including
 >     struct-by-value and variadics.
@@ -416,8 +419,16 @@ programs.
 *Progress:* JIT ✅, DWARF line tables (`lf build -g`, gdb-loadable) ✅,
 `-O0..-O3` + LTO ✅, z3rs superoptimizer ✅, native dynamic stack allocation
 (`DynAlloca`, x86-64) ✅, native `syscall` op (Linux ABI on all three targets;
-x86-64 execution-tested, freestanding) ✅. Open: dynamic linking, PGO hooks, sanitizers, richer
-alias analysis.
+x86-64 execution-tested, freestanding) ✅, per-function stack usage
+(`codegen::stack`: exact static frame sizes read off each target's frame
+layout, callees / indirect calls / syscalls / `dyn_alloca`, and
+`StackReport::worst_case_depth` over the call graph with caller-supplied bounds;
+`compile_module_with` on all three targets, `lf build --stack-usage`) ✅, stack
+probes (`CodegenOptions::stack_probes`, default on: frames and x86-64
+`dyn_alloca` move `sp` one 4 KiB page at a time and touch each step, so an
+overflow faults on the guard; x86-64 execution-tested, AArch64/RISC-V
+emulated; AArch64 frames beyond 4 KiB now encode correctly) ✅. Open: dynamic
+linking, PGO hooks, sanitizers, richer alias analysis.
 
 ## 5. Testing strategy
 

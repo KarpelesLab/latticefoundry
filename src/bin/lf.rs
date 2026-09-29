@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use latticefoundry::codegen::{CodegenOptions, StackAssumptions, StackReport};
 use latticefoundry::ir::{Module, binary, merge_modules, text};
 use latticefoundry::link::{self, ImageOptions};
 use latticefoundry::support::StrInterner;
@@ -47,10 +48,13 @@ fn print_usage() {
     println!(
         "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3] [--entry <name>] [-g] [--lto] [--no-verify]"
     );
+    println!("           [--stack-usage] [--no-stack-probes]");
     println!("  lf --version | --help\n");
     println!("  -O0..-O3       optimization level (default: -O0)");
     println!("  -g / --debug   emit DWARF debug info (source lines, symbols)");
     println!("  --lto          link-time optimize across inputs (implied by 2+ inputs)");
+    println!("  --stack-usage  print each function's stack frame and the worst-case depth");
+    println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
     println!("`lf build` compiles one or more IR modules to a static native executable.");
     println!("With several inputs (or --lto), the modules are IR-linked into one, the");
     println!("-O pipeline runs over the whole program (cross-module inlining), then codegen.");
@@ -64,6 +68,8 @@ struct BuildOptions {
     debug: bool,
     opt: OptLevel,
     lto: bool,
+    stack_usage: bool,
+    stack_probes: bool,
 }
 
 fn build(args: &[String]) -> Result<(), String> {
@@ -106,20 +112,26 @@ fn build(args: &[String]) -> Result<(), String> {
     // Lower to a relocatable object, then link into a static executable. With
     // `-g`, also emit DWARF debug info and a debuggable image (section headers +
     // symbol table + `.debug_*`).
-    let obj = if opts.debug {
+    let cg = CodegenOptions::default().with_stack_probes(opts.stack_probes);
+    let compiled = if opts.debug {
         let comp_dir = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(str::to_owned))
             .unwrap_or_default();
         let file_name = opts.inputs.first().cloned().unwrap_or_default();
         let source = target::x86_64::DebugSource { file_name, comp_dir };
-        target::x86_64::compile_module_debug(&module, &syms, &source)
+        target::x86_64::compile_module_debug_with(&module, &syms, &source, &cg)
     } else {
-        target::x86_64::compile_module(&module, &syms)
+        target::x86_64::compile_module_with(&module, &syms, &cg)
     };
+    let entry = opts.entry.clone().unwrap_or_else(|| ImageOptions::default().entry);
+    if opts.stack_usage {
+        print_stack_usage(&compiled.stack, &entry);
+    }
+    let obj = compiled.object;
     let image_opts = ImageOptions {
         debug: opts.debug,
-        entry: opts.entry.clone().unwrap_or_else(|| ImageOptions::default().entry),
+        entry,
         ..ImageOptions::default()
     };
     let image =
@@ -131,6 +143,20 @@ fn build(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| default_output(&opts.inputs[0]));
     link::write_executable(&output, &image)?;
     Ok(())
+}
+
+/// Print the `--stack-usage` table and the worst-case stack depth from `entry`
+/// (counted from `_start`'s stack pointer just before it calls `entry`).
+fn print_stack_usage(report: &StackReport, entry: &str) {
+    print!("{report}");
+    match report.worst_case_depth(entry, &StackAssumptions::new()) {
+        Ok(bound) => println!(
+            "worst-case stack from '{entry}': {} bytes ({})",
+            bound.bytes,
+            bound.path.join(" -> ")
+        ),
+        Err(why) => println!("worst-case stack from '{entry}': unbounded: {why}"),
+    }
 }
 
 /// Verify `module`, rendering any error diagnostics and returning a driver error
@@ -154,6 +180,8 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut debug = false;
     let mut opt = OptLevel::O0;
     let mut lto = false;
+    let mut stack_usage = false;
+    let mut stack_probes = true;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -163,6 +191,8 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "--no-verify" => verify = false,
             "-g" | "--debug" => debug = true,
             "--lto" => lto = true,
+            "--stack-usage" => stack_usage = true,
+            "--no-stack-probes" => stack_probes = false,
             tok if OptLevel::parse_flag(tok).is_some() => {
                 opt = OptLevel::parse_flag(tok).expect("checked");
             }
@@ -177,7 +207,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         return Err("no input file (see `lf --help`)".to_owned());
     }
 
-    Ok(BuildOptions { inputs, output, entry, verify, debug, opt, lto })
+    Ok(BuildOptions { inputs, output, entry, verify, debug, opt, lto, stack_usage, stack_probes })
 }
 
 /// The default output path: the input with any extension stripped, or `a.out`.
