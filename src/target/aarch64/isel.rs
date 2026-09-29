@@ -84,6 +84,8 @@ pub enum A64Op {
     /// `[Def d, Use a, Use b, Imm cc, Imm width]` — `subs xzr,a,b; cset d, cc`.
     CmpCset = 19,
     /// `[Def d, Use cond, Use t, Use f]` — `cmp cond,#0; csel d, t, f, ne`.
+    /// This is how `select` lowers, so a `select` on a secret condition runs
+    /// without a branch (`docs/ir-design.md` §6d).
     Csel = 20,
     /// `[Def d, Use ptr, Imm size]` — load `size` bytes from `[ptr]`.
     Load = 21,
@@ -209,6 +211,18 @@ impl A64Op {
     #[inline]
     pub fn opcode(self) -> Opcode {
         Opcode(self as u32)
+    }
+
+    /// Whether an instruction of this opcode may execute a conditional branch
+    /// whose direction depends on a register operand — the constant-time
+    /// audit of the lowering (`docs/ir-design.md` §6d): the terminators
+    /// `BrCond`/`Switch` and the exclusive-monitor retry loops of `AtomicRmw`
+    /// and `CmpXchg` (which also compares the loaded value). Everything else
+    /// — in particular `Csel` (a `select`), `CmpCset`, the variable shifts,
+    /// `Mul`, `Sbfx`/`Ubfx` and the float conversions — is straight-line code.
+    /// (The prologue's probe loop counts a constant frame size.)
+    pub fn may_branch_on_data(self, _operands: &[MachineOperand]) -> bool {
+        matches!(self, A64Op::BrCond | A64Op::Switch | A64Op::AtomicRmw | A64Op::CmpXchg)
     }
 
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
@@ -1452,6 +1466,8 @@ impl TargetIsel for AArch64Target {
                 ));
             }
             InstKind::Select => {
+                // Branchless (`csel`), so a secret condition is constant-time (§6d).
+                debug_assert!(!A64Op::Csel.may_branch_on_data(&[]));
                 let d = lo.result_reg(inst);
                 let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = lo.reg(inst.operands()[1]);

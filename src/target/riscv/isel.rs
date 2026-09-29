@@ -118,7 +118,9 @@ pub enum RvOp {
     /// `[Def d, Use a, Use b, Imm pred, Imm width]` — set-if-condition into a GPR,
     /// synthesized from `slt`/`sltu` and `xori`/`seqz`/`snez` (see `pred_code`).
     SetCmp = 23,
-    /// `[Def d, Use cond, Use t, Use f]` — branchless `d = cond ? t : f`.
+    /// `[Def d, Use cond, Use t, Use f]` — branchless `d = cond ? t : f` (a mask
+    /// blend). This is how `select` lowers, so a `select` on a secret condition
+    /// runs without a branch (`docs/ir-design.md` §6d).
     Select = 24,
     /// `[Def d, Use ptr, Imm size]` — load `size` bytes from `[ptr]` (zero-extended).
     Load = 25,
@@ -184,6 +186,18 @@ impl RvOp {
     #[inline]
     pub fn opcode(self) -> Opcode {
         Opcode(self as u32)
+    }
+
+    /// Whether an instruction of this opcode may execute a conditional branch
+    /// whose direction depends on a register operand — the constant-time
+    /// audit of the lowering (`docs/ir-design.md` §6d): the terminators
+    /// `BrCond`/`Switch` and the LR/SC loops of `AtomicRmw` (narrow widths,
+    /// `nand`, and the min/max compares) and `CmpXchg`. Everything else — in
+    /// particular `Select` (a mask blend: `t & -c | f & ~-c`), `SetCmp`
+    /// (`slt`/`sltu`/`xor`), the variable shifts and `Mul` — is straight-line
+    /// code. (The prologue's probe loop counts a constant frame size.)
+    pub fn may_branch_on_data(self, _operands: &[MachineOperand]) -> bool {
+        matches!(self, RvOp::BrCond | RvOp::Switch | RvOp::AtomicRmw | RvOp::CmpXchg)
     }
 
     /// Decode a MIR [`Opcode`] back to an [`RvOp`].
@@ -781,6 +795,9 @@ impl TargetIsel for RiscvTarget {
                 ));
             }
             InstKind::Select => {
+                // Branchless (a mask blend), so a secret condition is
+                // constant-time (§6d).
+                debug_assert!(!RvOp::Select.may_branch_on_data(&[]));
                 let d = lo.result_reg(inst);
                 let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = lo.reg(inst.operands()[1]);

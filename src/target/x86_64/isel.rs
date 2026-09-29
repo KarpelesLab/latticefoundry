@@ -150,7 +150,9 @@ pub enum X86Op {
     SetccCmp = 18,
     /// `[Use r]` — `test r, r` (sets flags for a following cmov).
     Test = 19,
-    /// `[Def d, Use d, Use t]` — `cmovne d, t` (move if ZF=0).
+    /// `[Def d, Use d, Use t]` — `cmovne d, t` (move if ZF=0). This is how
+    /// `select` lowers, so a `select` on a secret condition runs without a
+    /// branch (constant-time discipline, `docs/ir-design.md` §6d).
     Cmovne = 20,
     /// `[Def d, Use ptr, Imm size]` — load `size` bytes from `[ptr]`.
     Load = 21,
@@ -296,6 +298,30 @@ impl X86Op {
     #[inline]
     pub fn opcode(self) -> Opcode {
         Opcode(self as u32)
+    }
+
+    /// Whether an instruction of this opcode with `operands` may execute a
+    /// conditional jump whose direction depends on a register operand — the
+    /// constant-time audit of the lowering (`docs/ir-design.md` §6d). The
+    /// terminators `BrCond`/`Switch` do; so do the encode-time expansions of
+    /// the `u64`↔float conversions (a sign / range test), the `lock cmpxchg`
+    /// retry loop, and `dyn_alloca`'s stack-probe loop over its size. Every
+    /// other opcode — in particular `Cmovne` (a `select`), `SetccCmp`,
+    /// shifts by `cl`, `Imul`, `Movzx`/`Movsx` — is straight-line code. (The
+    /// prologue's probe loop counts a constant frame size.) The IR-level
+    /// constant-time verifier rejects secret operands for every opcode that
+    /// lowers to one of these, which the constant-time isel tests check.
+    pub fn may_branch_on_data(self, operands: &[MachineOperand]) -> bool {
+        let flags = |i: usize| match operands.get(i) {
+            Some(MachineOperand::Imm(v)) => v.to_u64().unwrap_or(0),
+            _ => 0,
+        };
+        match self {
+            X86Op::BrCond | X86Op::Switch | X86Op::RmwLoop | X86Op::DynAlloca => true,
+            X86Op::CvtSi2f => flags(3) & 0b100 != 0,
+            X86Op::CvtF2si => flags(3) & 0b10 != 0,
+            _ => false,
+        }
     }
 
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
@@ -1694,6 +1720,12 @@ impl TargetIsel for X86_64Target {
                 let t = self.oper(lo, inst.operands()[1]);
                 let f = self.oper(lo, inst.operands()[2]);
                 // d = f; test c,c; cmovne d, t   (cond != 0 -> t)
+                // Branchless, so a secret condition is constant-time (§6d).
+                debug_assert!(
+                    [X86Op::MovRR, X86Op::Test, X86Op::Cmovne]
+                        .iter()
+                        .all(|op| !op.may_branch_on_data(&[]))
+                );
                 lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(f)]));
                 lo.emit(MachineInst::new(X86Op::Test.opcode(), vec![use_v(c)]));
                 lo.emit(MachineInst::new(

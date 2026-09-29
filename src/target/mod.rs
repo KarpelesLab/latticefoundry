@@ -17,6 +17,8 @@ use crate::support::StrInterner;
 
 #[cfg(test)]
 pub(crate) mod atomic_fixtures;
+#[cfg(test)]
+mod ct_tests;
 
 #[doc(inline)]
 pub use triple::{CallConvKind, ObjectFormat, TargetOs, Triple};
