@@ -23,11 +23,15 @@
 //! - `regs` — the 16 GPRs as physical registers, the allocatable/scratch split,
 //!   and the SysV calling convention;
 //! - [`isel`] — the [`X86Op`] opcode set and the lowering rules;
+//! - [`runtime`] — the green-thread context-switching runtime (save/restore/
+//!   switch, signal-`ucontext` mapping, `rt_sigaction` + restorer), emitted as
+//!   machine code for a front end to link in;
 //! - [`encode`] — the REX/ModRM/SIB encoder, frame layout + prologue/epilogue,
 //!   and the `compile_function`/`compile_module` drivers.
 
 pub mod encode;
 pub mod isel;
+pub mod runtime;
 pub(crate) mod regs;
 
 #[cfg(test)]
@@ -42,6 +46,8 @@ mod syscall_tests;
 mod data_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod atomic_tests;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod runtime_tests;
 
 pub use encode::{
     DebugSource, compile_function, compile_module, compile_module_debug, compile_module_debug_with,
