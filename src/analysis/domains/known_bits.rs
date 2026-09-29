@@ -309,6 +309,11 @@ impl AbstractDomain for KnownBits {
         ) || inst.kind.is_atomic() {
             return KnownBits::Top;
         }
+        // Vector values (and the lane moves and reductions over them) are not
+        // modeled by this scalar lattice: ⊤.
+        if ctx.types.is_vector(inst.ty) || inst.kind.is_vector_op() {
+            return KnownBits::Top;
+        }
         // An undetermined operand keeps the result undetermined (SCCP optimism).
         if operands.iter().any(KnownBits::is_bottom) {
             return KnownBits::Bottom;

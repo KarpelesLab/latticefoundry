@@ -298,3 +298,37 @@ fn modules_without_secrets_are_trivially_constant_time() {
     let s = crate::ir::tests::secret_module(&mut syms);
     assert!(verify_module_ct(&s).is_ok());
 }
+
+#[test]
+fn vector_code_is_checked_lane_wise() {
+    // Taint flows through splats, lane-wise ops and lane moves. A vector
+    // select on a secret mask is fine (it lowers to a bitwise blend); a
+    // vector division by a secret-derived value, and a branch on an extracted
+    // secret lane, are rejected.
+    let ok = body(
+        "  %v = splat %s : <2 x i64>
+  %w = splat %p : <2 x i64>
+  %m = icmp ult %v, %w : <2 x i1>
+  %b = select %m, %v, %w : <2 x i64>
+  %r = reduce add %b : i64
+  %d = declassify %r : i64
+  ret %d
+",
+    );
+    assert_eq!(roles_default(&ok), []);
+    let bad = body(
+        "  %v = splat %s : <2 x i64>
+  %w = splat %p : <2 x i64>
+  %d = udiv %w, %v : <2 x i64>
+  %e = extractelement %d, 0 : i64
+  %c = icmp eq %e, i64 0 : i1
+  cond_br %c, ^1, ^2
+^1:
+  ret i64 1
+^2:
+  ret i64 0
+",
+    );
+    let r = roles_default(&bad);
+    assert!(r.contains(&CtRole::Division) && r.contains(&CtRole::BranchCondition), "{r:?}");
+}

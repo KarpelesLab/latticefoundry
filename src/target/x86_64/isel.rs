@@ -439,7 +439,9 @@ fn merge_class(acc: Option<Eightbyte>, cls: Eightbyte) -> Option<Eightbyte> {
 fn classify_into(types: &TypeContext, ty: TypeId, offset: u64, ebs: &mut [Option<Eightbyte>]) {
     let cls = match types.get(ty) {
         Type::Int(_) | Type::Ptr | Type::PtrIn(_) | Type::Func(_) => Some(Eightbyte::Integer),
-        Type::Float(_) => Some(Eightbyte::Sse),
+        // A vector field is SSE data (the psABI's SSE+SSEUP pair for a 16-byte
+        // `__m128` is approximated as two SSE eightbytes).
+        Type::Float(_) | Type::Vector(..) => Some(Eightbyte::Sse),
         Type::Struct(fields) => {
             let n = fields.len();
             for i in 0..n {

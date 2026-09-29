@@ -23,6 +23,12 @@
 //!   `select` arms, cast compatibility, and `load`/`store` sanity.
 //! - **Values** — constants are well-typed and referenced functions/globals
 //!   exist.
+//! - **Vectors** (`docs/ir-design.md` §6e) — every `<N x T>` has `N ≥ 1` lanes
+//!   of `i1`/`i8`/`i16`/`i32`/`i64` or a float type; lane-wise ops check their
+//!   scalar rule on the lane types and agree on the lane count (`icmp`/`fcmp`
+//!   give `<N x i1>`, a vector `select` condition is `<N x i1>`); lane indices
+//!   and shuffle-mask entries are in range; `bitcast` preserves the total bit
+//!   width; vector loads/stores are never `volatile`.
 //!
 //! The `Refinement` tier (per-opcode poison/UB refinement obligations discharged
 //! by `z3rs`) is layered on top later and is deliberately *not* implemented
@@ -189,8 +195,9 @@ fn check_init_const(m: &Module, gi: usize, cid: ConstId, diags: &mut Vec<Diagnos
         Const::Aggregate { ty, elems } => {
             let want: Vec<TypeId> = match m.types().get(*ty) {
                 Type::Array(elem, n) if elems.len() as u64 == *n => vec![*elem; elems.len()],
+                Type::Vector(elem, n) if elems.len() == *n as usize => vec![*elem; elems.len()],
                 Type::Struct(fields) if elems.len() == fields.len() => fields.clone(),
-                Type::Array(..) | Type::Struct(_) => {
+                Type::Array(..) | Type::Struct(_) | Type::Vector(..) => {
                     diags.push(global_err(
                         gi,
                         format!(
@@ -299,6 +306,9 @@ impl<'a> Ctx<'a> {
         if self.sig.is_none() {
             self.err("function signature is not a function type");
         }
+        if let Some(bad) = first_bad_vector(self.module, self.func.sig) {
+            self.err(format!("signature uses an invalid vector type {}", render_type(self.module, bad)));
+        }
         // An external declaration (no blocks) needs no body checks.
         if self.func.is_declaration() {
             self.check_values();
@@ -390,10 +400,11 @@ impl<'a> Ctx<'a> {
                 }
                 let (l, r) = (func.value_type(ops[0]), func.value_type(ops[1]));
                 let float = op.is_float();
+                let lane = module.types().scalar_of(ty);
                 if float {
-                    self.want_float(inst, ty, "binary result");
+                    self.want_float(inst, lane, "binary result");
                 } else {
-                    self.want_int(inst, ty, "binary result");
+                    self.want_int(inst, lane, "binary result");
                 }
                 if l != ty || r != ty {
                     self.err(format!(
@@ -410,7 +421,7 @@ impl<'a> Ctx<'a> {
                 if !self.arity(inst, ops, 1) {
                     return;
                 }
-                self.want_float(inst, ty, "fneg result");
+                self.want_float(inst, module.types().scalar_of(ty), "fneg result");
                 let o = func.value_type(ops[0]);
                 if o != ty {
                     self.type_mismatch(inst, "fneg operand", o, ty);
@@ -420,11 +431,12 @@ impl<'a> Ctx<'a> {
                 if !self.arity(inst, ops, 2) {
                     return;
                 }
-                self.want_bool(inst, ty, "icmp result");
                 let (l, r) = (func.value_type(ops[0]), func.value_type(ops[1]));
+                self.want_bool_like(inst, ty, l, "icmp result");
+                let lane = module.types().scalar_of(l);
                 if l != r {
                     self.type_mismatch(inst, "icmp operands", l, r);
-                } else if !is_int(module, l) && !is_ptr(module, l) {
+                } else if !is_int(module, lane) && !is_ptr(module, l) {
                     self.err(format!(
                         "instruction #{}: icmp operands must be integer or pointer, found {}",
                         inst.index(),
@@ -436,11 +448,11 @@ impl<'a> Ctx<'a> {
                 if !self.arity(inst, ops, 2) {
                     return;
                 }
-                self.want_bool(inst, ty, "fcmp result");
                 let (l, r) = (func.value_type(ops[0]), func.value_type(ops[1]));
+                self.want_bool_like(inst, ty, l, "fcmp result");
                 if l != r {
                     self.type_mismatch(inst, "fcmp operands", l, r);
-                } else if !is_float(module, l) {
+                } else if !is_float(module, module.types().scalar_of(l)) {
                     self.err(format!(
                         "instruction #{}: fcmp operands must be floating-point, found {}",
                         inst.index(),
@@ -491,8 +503,12 @@ impl<'a> Ctx<'a> {
                     ));
                 }
             }
-            InstKind::Load { ty: acc, align, .. } => {
+            InstKind::Load { ty: acc, align, volatile, .. } => {
                 self.check_align(inst, "load", *align);
+                self.check_type_wf(inst, *acc);
+                if *volatile && module.types().is_vector(*acc) {
+                    self.err(format!("instruction #{}: a vector load cannot be volatile", inst.index()));
+                }
                 if !self.arity(inst, ops, 1) {
                     return;
                 }
@@ -508,8 +524,12 @@ impl<'a> Ctx<'a> {
                     self.type_mismatch(inst, "load result vs. accessed type", ty, *acc);
                 }
             }
-            InstKind::Store { ty: acc, align, .. } => {
+            InstKind::Store { ty: acc, align, volatile, .. } => {
                 self.check_align(inst, "store", *align);
+                self.check_type_wf(inst, *acc);
+                if *volatile && module.types().is_vector(*acc) {
+                    self.err(format!("instruction #{}: a vector store cannot be volatile", inst.index()));
+                }
                 if !self.arity(inst, ops, 2) {
                     return;
                 }
@@ -640,9 +660,15 @@ impl<'a> Ctx<'a> {
                     return;
                 }
                 let cond = func.value_type(ops[0]);
-                if !is_bool(module, cond) {
+                // `i1` chooses a whole arm; `<N x i1>` chooses per lane of an
+                // `N`-lane result.
+                let per_lane = match (module.types().vector_parts(cond), module.types().vector_parts(ty)) {
+                    (Some((c, n)), Some((_, m))) => is_bool(module, c) && n == m,
+                    _ => false,
+                };
+                if !is_bool(module, cond) && !per_lane {
                     self.err(format!(
-                        "instruction #{}: select condition must be i1, found {}",
+                        "instruction #{}: select condition must be i1 (or <N x i1> for an N-lane result), found {}",
                         inst.index(),
                         render_type(module, cond),
                     ));
@@ -670,6 +696,99 @@ impl<'a> Ctx<'a> {
                 let o = func.value_type(ops[0]);
                 if o != ty {
                     self.type_mismatch(inst, "declassify operand vs. result", o, ty);
+                }
+            }
+            InstKind::ExtractElement { lane } => {
+                if !self.arity(inst, ops, 1) {
+                    return;
+                }
+                let v = func.value_type(ops[0]);
+                match module.types().vector_parts(v) {
+                    Some((elem, n)) => {
+                        self.check_lane(inst, "extractelement", *lane, n);
+                        if elem != ty {
+                            self.type_mismatch(inst, "extractelement result vs. element type", ty, elem);
+                        }
+                    }
+                    None => self.not_vector(inst, "extractelement operand", v),
+                }
+            }
+            InstKind::InsertElement { lane } => {
+                if !self.arity(inst, ops, 2) {
+                    return;
+                }
+                let v = func.value_type(ops[0]);
+                match module.types().vector_parts(v) {
+                    Some((elem, n)) => {
+                        self.check_lane(inst, "insertelement", *lane, n);
+                        let x = func.value_type(ops[1]);
+                        if x != elem {
+                            self.type_mismatch(inst, "insertelement value vs. element type", x, elem);
+                        }
+                        if v != ty {
+                            self.type_mismatch(inst, "insertelement result vs. vector", ty, v);
+                        }
+                    }
+                    None => self.not_vector(inst, "insertelement operand", v),
+                }
+            }
+            InstKind::ShuffleVector(mask) => {
+                if !self.arity(inst, ops, 2) {
+                    return;
+                }
+                let (a, b) = (func.value_type(ops[0]), func.value_type(ops[1]));
+                if a != b {
+                    self.type_mismatch(inst, "shufflevector operands", a, b);
+                    return;
+                }
+                let Some((elem, n)) = module.types().vector_parts(a) else {
+                    self.not_vector(inst, "shufflevector operand", a);
+                    return;
+                };
+                if let Some(&bad) = mask.iter().find(|&&m| u64::from(m) >= 2 * u64::from(n)) {
+                    self.err(format!(
+                        "instruction #{}: shufflevector mask index {bad} is out of range for two {n}-lane operands",
+                        inst.index()
+                    ));
+                }
+                let want_len = module.types().vector_parts(ty);
+                if mask.is_empty() || want_len != Some((elem, mask.len() as u32)) {
+                    self.err(format!(
+                        "instruction #{}: shufflevector result must be <{} x {}>, found {}",
+                        inst.index(),
+                        mask.len(),
+                        render_type(module, elem),
+                        render_type(module, ty),
+                    ));
+                }
+            }
+            InstKind::Splat => {
+                if !self.arity(inst, ops, 1) {
+                    return;
+                }
+                let x = func.value_type(ops[0]);
+                match module.types().vector_parts(ty) {
+                    Some((elem, _)) if elem == x => {}
+                    Some((elem, _)) => self.type_mismatch(inst, "splat operand vs. element type", x, elem),
+                    None => self.not_vector(inst, "splat result", ty),
+                }
+            }
+            InstKind::Reduce(op) => {
+                if !self.arity(inst, ops, 1) {
+                    return;
+                }
+                let v = func.value_type(ops[0]);
+                let Some((elem, _)) = module.types().vector_parts(v) else {
+                    self.not_vector(inst, "reduce operand", v);
+                    return;
+                };
+                if elem != ty {
+                    self.type_mismatch(inst, "reduce result vs. element type", ty, elem);
+                }
+                if op.is_float() {
+                    self.want_float(inst, elem, "reduce lane");
+                } else {
+                    self.want_int(inst, elem, "reduce lane");
                 }
             }
             InstKind::Call => self.check_call(inst, data),
@@ -717,7 +836,96 @@ impl<'a> Ctx<'a> {
 
     fn check_cast(&mut self, inst: InstId, op: CastOp, from: TypeId, to: TypeId) {
         let m = self.module;
-        let ok = match op {
+        let types = m.types();
+        let (fv, tv) = (types.vector_parts(from), types.vector_parts(to));
+        let ok = if op == CastOp::Bitcast && (fv.is_some() || tv.is_some()) {
+            // A vector bitcast reinterprets the packed lane bits: both sides are
+            // integer/float scalars or vectors of the same total width.
+            let bits_ok = |t: TypeId| {
+                types.is_vector(t) || matches!(types.get(t), Type::Int(_) | Type::Float(_))
+            };
+            from != to
+                && bits_ok(from)
+                && bits_ok(to)
+                && types.total_bits(from).is_some()
+                && types.total_bits(from) == types.total_bits(to)
+        } else {
+            match (fv, tv) {
+                // A lane-wise conversion: equal lane counts, the scalar rule on
+                // the lanes.
+                (Some((fe, fnum)), Some((te, tnum))) => fnum == tnum && scalar_cast_ok(m, op, fe, te),
+                (None, None) => scalar_cast_ok(m, op, from, to),
+                _ => false,
+            }
+        };
+        if !ok {
+            self.err(format!(
+                "instruction #{}: {} from {} to {} is not a valid conversion",
+                inst.index(),
+                cast_name(op),
+                render_type(m, from),
+                render_type(m, to),
+            ));
+        }
+    }
+
+    /// A lane index must address one of the vector's `n` lanes.
+    fn check_lane(&mut self, inst: InstId, op: &str, lane: u32, n: u32) {
+        if lane >= n {
+            self.err(format!(
+                "instruction #{}: {op} lane {lane} is out of range for a {n}-lane vector",
+                inst.index()
+            ));
+        }
+    }
+
+    fn not_vector(&mut self, inst: InstId, what: &str, t: TypeId) {
+        self.err(format!(
+            "instruction #{}: {what} must be a vector, found {}",
+            inst.index(),
+            render_type(self.module, t),
+        ));
+    }
+
+    /// A comparison result: `i1` for scalar operands, `<N x i1>` for `N`-lane
+    /// vector operands.
+    fn want_bool_like(&mut self, inst: InstId, ty: TypeId, operand: TypeId, what: &str) {
+        let types = self.module.types();
+        let ok = match (types.vector_parts(operand), types.vector_parts(ty)) {
+            (Some((_, n)), Some((b, m))) => n == m && is_bool(self.module, b),
+            (None, None) => is_bool(self.module, ty),
+            _ => false,
+        };
+        if !ok {
+            let want = match types.vector_parts(operand) {
+                Some((_, n)) => format!("<{n} x i1>"),
+                None => "i1".to_string(),
+            };
+            self.err(format!(
+                "instruction #{}: {what} must be {want}, found {}",
+                inst.index(),
+                render_type(self.module, ty),
+            ));
+        }
+    }
+
+    /// Every vector type reachable from `t` must be well-formed (see
+    /// [`vector_wf`]).
+    fn check_type_wf(&mut self, inst: InstId, t: TypeId) {
+        if let Some(bad) = first_bad_vector(self.module, t) {
+            self.err(format!(
+                "instruction #{}: invalid vector type {} (lanes must number 1..=65536 and be i1, i8, i16, i32, i64 or a float)",
+                inst.index(),
+                render_type(self.module, bad),
+            ));
+        }
+    }
+}
+
+/// The scalar (non-vector) cast rule: the conversions each [`CastOp`] allows.
+fn scalar_cast_ok(m: &Module, op: CastOp, from: TypeId, to: TypeId) -> bool {
+    {
+        match op {
             CastOp::Trunc => matches!(
                 (int_width(m, from), int_width(m, to)),
                 (Some(a), Some(b)) if a > b
@@ -754,17 +962,11 @@ impl<'a> Ctx<'a> {
                     || (is_ptr0(m, from) && is_aggregate(m, to))
                     || (is_aggregate(m, from) && is_ptr0(m, to))
             }
-        };
-        if !ok {
-            self.err(format!(
-                "instruction #{}: {} from {} to {} is not a valid conversion",
-                inst.index(),
-                cast_name(op),
-                render_type(m, from),
-                render_type(m, to),
-            ));
         }
     }
+}
+
+impl Ctx<'_> {
 
     fn check_call(&mut self, inst: InstId, data: &InstData) {
         let func = self.func;
@@ -1062,6 +1264,13 @@ impl<'a> Ctx<'a> {
                     render_type(module, val.ty),
                 ));
             }
+            if let Some(bad) = first_bad_vector(module, val.ty) {
+                self.err(format!(
+                    "value {}: invalid vector type {} (lanes must number 1..=65536 and be i1, i8, i16, i32, i64 or a float)",
+                    v.index(),
+                    render_type(module, bad),
+                ));
+            }
             match &val.def {
                 ValueDef::Const(cid) => {
                     let c = module.consts().get(*cid).clone();
@@ -1198,6 +1407,32 @@ impl<'a> Ctx<'a> {
                         }
                     }
                 }
+                // A vector constant is a first-class operand: one scalar
+                // (integer / float / poison) constant per lane.
+                Type::Vector(elem, n) => {
+                    let (elem, n) = (*elem, *n);
+                    if elems.len() != n as usize {
+                        self.err(format!(
+                            "value {}: vector constant has {} lane(s) but type expects {n}",
+                            v.index(),
+                            elems.len(),
+                        ));
+                    }
+                    for (i, &e) in elems.iter().enumerate() {
+                        let lc = m.consts().get(e);
+                        let scalar =
+                            matches!(lc, Const::Int { .. } | Const::Float { .. } | Const::Poison(_));
+                        if lc.type_id() != elem || !scalar {
+                            self.err(format!(
+                                "value {}: vector lane #{i} must be a {} constant",
+                                v.index(),
+                                render_type(m, elem),
+                            ));
+                        } else {
+                            self.check_const(v, lc);
+                        }
+                    }
+                }
                 _ => self.err(format!(
                     "value {}: aggregate constant has non-aggregate type {}",
                     v.index(),
@@ -1241,16 +1476,6 @@ impl<'a> Ctx<'a> {
         if !is_float(self.module, ty) {
             self.err(format!(
                 "instruction #{}: {what} must be floating-point, found {}",
-                inst.index(),
-                render_type(self.module, ty),
-            ));
-        }
-    }
-
-    fn want_bool(&mut self, inst: InstId, ty: TypeId, what: &str) {
-        if !is_bool(self.module, ty) {
-            self.err(format!(
-                "instruction #{}: {what} must be i1, found {}",
                 inst.index(),
                 render_type(self.module, ty),
             ));
@@ -1364,6 +1589,35 @@ fn render_type(m: &Module, t: TypeId) -> String {
             format!("{{{}}}", inner.join(", "))
         }
         Type::Func(_) => "func".to_string(),
+        Type::Vector(e, n) => format!("<{n} x {}>", render_type(m, *e)),
+    }
+}
+
+/// Whether a vector type is well-formed: `1..=65536` lanes of `i1`, `i8`,
+/// `i16`, `i32`, `i64` or a float type.
+fn vector_wf(m: &Module, t: TypeId) -> bool {
+    match m.types().get(t) {
+        Type::Vector(elem, n) => {
+            (1..=65536).contains(n)
+                && matches!(m.types().get(*elem), Type::Int(1 | 8 | 16 | 32 | 64) | Type::Float(_))
+        }
+        _ => true,
+    }
+}
+
+/// The first ill-formed vector type within `t` (itself, or an array/struct
+/// component or signature part), if any.
+fn first_bad_vector(m: &Module, t: TypeId) -> Option<TypeId> {
+    if !vector_wf(m, t) {
+        return Some(t);
+    }
+    match m.types().get(t) {
+        Type::Array(e, _) => first_bad_vector(m, *e),
+        Type::Struct(fs) => fs.iter().find_map(|&f| first_bad_vector(m, f)),
+        Type::Func(ft) => {
+            ft.params.iter().find_map(|&p| first_bad_vector(m, p)).or_else(|| first_bad_vector(m, ft.ret))
+        }
+        _ => None,
     }
 }
 

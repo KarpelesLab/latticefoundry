@@ -32,7 +32,7 @@
 //! trivially constant-time and costs nothing.
 
 use crate::analysis::secret::{MemRoot, Origin, SecretTaint};
-use crate::ir::inst::{BinOp, CastOp, InstId, InstKind};
+use crate::ir::inst::{BinOp, CastOp, InstId, InstKind, ReduceOp};
 use crate::ir::value::{ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Module};
 use crate::support::diagnostics::Diagnostic;
@@ -225,6 +225,12 @@ pub fn ct_violations_with(
                 InstKind::FCmp(_) => {
                     flag(ops[0], CtRole::FloatOperation);
                     flag(ops[1], CtRole::FloatOperation);
+                }
+                // A reduction is a chain of its scalar op over the lanes (the
+                // lane-wise vector ops go through the arms above).
+                InstKind::Reduce(op) if op.is_float() => flag(ops[0], CtRole::FloatOperation),
+                InstKind::Reduce(ReduceOp::Mul) if !policy.secret_multiply => {
+                    flag(ops[0], CtRole::Multiply);
                 }
                 InstKind::Cast(
                     CastOp::FpTrunc
@@ -431,6 +437,11 @@ fn opcode_name(kind: &InstKind) -> &'static str {
         InstKind::Select => "select",
         InstKind::Freeze => "freeze",
         InstKind::Declassify => "declassify",
+        InstKind::ExtractElement { .. } => "extractelement",
+        InstKind::InsertElement { .. } => "insertelement",
+        InstKind::ShuffleVector(_) => "shufflevector",
+        InstKind::Splat => "splat",
+        InstKind::Reduce(_) => "reduce",
         InstKind::Call => "call",
         InstKind::Syscall => "syscall",
         InstKind::Ret => "ret",

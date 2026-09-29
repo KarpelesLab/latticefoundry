@@ -527,6 +527,92 @@ impl RmwOp {
     }
 }
 
+/// The combining operation of a [`reduce`](InstKind::Reduce) over the lanes of
+/// a vector. Integer reductions are associative and commutative, so their
+/// result does not depend on the order lanes are combined in; the float ones
+/// are **ordered**: `((l0 op l1) op l2) op …`, lane 0 first, each step rounded
+/// (a `reassoc` fast-math flag licenses any other order).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ReduceOp {
+    /// Wrapping integer sum.
+    Add,
+    /// Wrapping integer product.
+    Mul,
+    /// Bitwise and.
+    And,
+    /// Bitwise or.
+    Or,
+    /// Bitwise exclusive-or.
+    Xor,
+    /// Signed minimum.
+    SMin,
+    /// Signed maximum.
+    SMax,
+    /// Unsigned minimum.
+    UMin,
+    /// Unsigned maximum.
+    UMax,
+    /// Ordered floating-point sum (`fadd` lane 0 to lane N-1).
+    FAdd,
+    /// Ordered floating-point product (`fmul` lane 0 to lane N-1).
+    FMul,
+}
+
+impl ReduceOp {
+    /// Every operation (also the binary encoding order).
+    pub const ALL: [ReduceOp; 11] = [
+        ReduceOp::Add,
+        ReduceOp::Mul,
+        ReduceOp::And,
+        ReduceOp::Or,
+        ReduceOp::Xor,
+        ReduceOp::SMin,
+        ReduceOp::SMax,
+        ReduceOp::UMin,
+        ReduceOp::UMax,
+        ReduceOp::FAdd,
+        ReduceOp::FMul,
+    ];
+
+    /// The textual spelling (`add`, `mul`, `and`, `or`, `xor`, `smin`, `smax`,
+    /// `umin`, `umax`, `fadd`, `fmul`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ReduceOp::Add => "add",
+            ReduceOp::Mul => "mul",
+            ReduceOp::And => "and",
+            ReduceOp::Or => "or",
+            ReduceOp::Xor => "xor",
+            ReduceOp::SMin => "smin",
+            ReduceOp::SMax => "smax",
+            ReduceOp::UMin => "umin",
+            ReduceOp::UMax => "umax",
+            ReduceOp::FAdd => "fadd",
+            ReduceOp::FMul => "fmul",
+        }
+    }
+
+    /// Parse a textual spelling (see [`ReduceOp::name`]).
+    pub fn from_name(s: &str) -> Option<ReduceOp> {
+        ReduceOp::ALL.into_iter().find(|o| o.name() == s)
+    }
+
+    /// This operation's position in [`ReduceOp::ALL`] (a stable small code).
+    pub fn code(self) -> u8 {
+        ReduceOp::ALL.iter().position(|&x| x == self).expect("every reduce op is listed") as u8
+    }
+
+    /// The operation with the given [`ReduceOp::code`].
+    pub fn from_code(c: u64) -> Option<ReduceOp> {
+        usize::try_from(c).ok().and_then(|i| ReduceOp::ALL.get(i).copied())
+    }
+
+    /// Whether this is a floating-point reduction (`fadd`/`fmul`).
+    pub fn is_float(self) -> bool {
+        matches!(self, ReduceOp::FAdd | ReduceOp::FMul)
+    }
+}
+
 /// An opcode together with its immediate/structural data.
 ///
 /// Value operands live in [`InstData::operands`], *not* here; this carries only
@@ -744,6 +830,50 @@ pub enum InstKind {
     /// undefined behavior (the kernel would observe an arbitrary register).
     Syscall,
 
+    // --- SIMD vectors (`docs/ir-design.md` §6e) -----------------------------
+    //
+    // The ordinary value ops above — `Bin`, `Unary`, `ICmp`, `FCmp`, `Cast`,
+    // `Select`, `Freeze` — also apply to vectors, **lane-wise**: lane `i` of the
+    // result is the scalar op on lane `i` of each operand, with the scalar
+    // op's poison rule applied per lane (an over-wide shift amount in lane 2
+    // poisons only lane 2) and its UB rule applied to the whole instruction (a
+    // zero divisor in any lane is UB). `icmp`/`fcmp` on `<N x T>` produce
+    // `<N x i1>`; `select` takes an `i1` (whole-vector choice) or an
+    // `<N x i1>` (per-lane choice) condition. A `bitcast` reinterprets the bits
+    // of a whole value, lanes packed lane 0 lowest; a poison lane poisons every
+    // result lane (or the whole scalar) it overlaps. `load`/`store` move a whole
+    // vector (lanes at consecutive element-sized offsets).
+    /// Extract one lane; operand `[vec]`, result type = the element type. The
+    /// lane index is an immediate, which the verifier checks is `< N`. The
+    /// result is the lane's value (poison iff that lane is poison).
+    ExtractElement {
+        /// The lane read.
+        lane: u32,
+    },
+    /// Replace one lane; operands `[vec, elem]`, result type = the vector
+    /// type. Lane `lane` of the result is `elem`; every other lane is `vec`'s.
+    /// Only the replaced lane can become poison from a poison `elem`, and a
+    /// poison `vec` leaves the replaced lane defined.
+    InsertElement {
+        /// The lane written.
+        lane: u32,
+    },
+    /// Shuffle two vectors; operands `[a, b]`, both `<N x T>`; the result is
+    /// `<M x T>` with `M = mask.len()`. Result lane `i` is lane `mask[i]` of the
+    /// concatenation `a ++ b` (indices `0..N` pick from `a`, `N..2N` from `b`).
+    /// The mask is a constant (the verifier checks every index is `< 2N`);
+    /// each result lane is poison iff the lane it picks is.
+    ShuffleVector(Box<[u32]>),
+    /// Broadcast a scalar; operand `[scalar]` of type `T`, result `<N x T>`
+    /// (the instruction type) with every lane equal to it (all lanes poison iff
+    /// the scalar is).
+    Splat,
+    /// Reduce the lanes of a vector to one scalar; operand `[vec]` of type
+    /// `<N x T>`, result `T`. See [`ReduceOp`] for the combining order. Any
+    /// poison lane makes the result poison. The float reductions honor the
+    /// instruction's fast-math flags exactly as a chain of `fadd`/`fmul` would.
+    Reduce(ReduceOp),
+
     // --- terminators --------------------------------------------------------
     /// Return; operands `[value]` for a value-returning function, or `[]` for a
     /// `void` return. Ends the function activation.
@@ -785,6 +915,19 @@ impl InstKind {
                 | InstKind::AtomicRmw { .. }
                 | InstKind::CmpXchg { .. }
                 | InstKind::Fence(_)
+        )
+    }
+
+    /// Whether this opcode is one of the vector-only operations
+    /// (`extractelement`, `insertelement`, `shufflevector`, `splat`, `reduce`).
+    pub fn is_vector_op(&self) -> bool {
+        matches!(
+            self,
+            InstKind::ExtractElement { .. }
+                | InstKind::InsertElement { .. }
+                | InstKind::ShuffleVector(_)
+                | InstKind::Splat
+                | InstKind::Reduce(_)
         )
     }
 

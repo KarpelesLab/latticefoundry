@@ -761,6 +761,13 @@ impl Enc<'_> {
             // An opaque effect on the outside world: the checker has no model of
             // the kernel, so a function containing one is skipped, never proved.
             InstKind::Syscall => return Err(unsupported("syscall (opaque external effect)")),
+            // Vector lane moves and reductions: the encoding is scalar bit-vectors
+            // only, so a function using them is Unknown, never proved.
+            InstKind::ExtractElement { .. }
+            | InstKind::InsertElement { .. }
+            | InstKind::ShuffleVector(_)
+            | InstKind::Splat
+            | InstKind::Reduce(_) => return Err(unsupported("vector op")),
             InstKind::Ret
             | InstKind::Br(_)
             | InstKind::CondBr { .. }

@@ -45,6 +45,22 @@
 //! > has been reconciled with this resolution (div/rem faults are UB, per the
 //! > LLVM convention and the design of [`EvalOutcome`]).
 //!
+//! ## Vectors: lane-wise, poison per lane
+//!
+//! A vector value is [`SemValue::Vector`], one scalar [`SemValue`] per lane, and
+//! **poison is tracked per lane** (resolving the "vector poison granularity"
+//! question of `docs/ir-design.md` §10 in favor of the precise choice; §6e).
+//! The ordinary value ops apply lane-wise: lane `i` of the result is the scalar
+//! op on lane `i` of the operands, so a scalar poison rule (an over-wide shift
+//! amount, a violated `nsw`, an out-of-range `fptosi`) poisons only that lane,
+//! while a scalar UB rule (a zero divisor) makes the **whole** instruction UB.
+//! A whole-value [`SemValue::Poison`] of vector type denotes "every lane
+//! poison"; the two spellings are interchangeable (see [`SemValue::lane`]).
+//! `bitcast` reinterprets bits (lanes packed lane 0 lowest), and a poison lane
+//! poisons every result lane it overlaps. `extractelement`, `insertelement`,
+//! `shufflevector`, `splat` and `reduce` move lanes as documented on their
+//! opcodes in [`crate::ir::inst`].
+//!
 //! ## What is *not* here
 //!
 //! Stateful and positional ops — `Alloca`, `DynAlloca`, `Load`, `Store`
@@ -77,7 +93,7 @@
 //! bits — exactly the two's-complement pattern), the semantics are exact and
 //! host-independent for any width.
 
-use crate::ir::inst::{BinOp, CastOp, Flags, FloatPred, InstKind, IntPred, UnaryOp};
+use crate::ir::inst::{BinOp, CastOp, Flags, FloatPred, InstKind, IntPred, ReduceOp, UnaryOp};
 use crate::ir::types::{FloatKind, Type, TypeContext, TypeId};
 use crate::ir::value::{Const, FloatBits};
 
@@ -118,6 +134,9 @@ pub enum SemValue {
     Ptr(Int),
     /// Poison — a deferred error that taints any dependent operation.
     Poison,
+    /// A vector: one scalar value (never itself a vector) per lane, lane 0
+    /// first. Each lane may independently be [`SemValue::Poison`].
+    Vector(Vec<SemValue>),
 }
 
 impl SemValue {
@@ -140,6 +159,29 @@ impl SemValue {
     /// Whether this value is poison.
     pub fn is_poison(&self) -> bool {
         matches!(self, SemValue::Poison)
+    }
+
+    /// Lane `i` of a vector value. A whole-value poison has every lane poison;
+    /// a scalar is treated as broadcast (only reachable on ill-typed input).
+    pub fn lane(&self, i: usize) -> SemValue {
+        match self {
+            SemValue::Vector(lanes) => lanes.get(i).cloned().unwrap_or(SemValue::Poison),
+            SemValue::Poison => SemValue::Poison,
+            scalar => scalar.clone(),
+        }
+    }
+
+    /// Whether this value refines `src` (`docs/ir-design.md` §5): `src` is
+    /// poison, or the two are equal — lane by lane for vectors, where a poison
+    /// source lane is refined by anything.
+    pub fn refines(&self, src: &SemValue) -> bool {
+        match (src, self) {
+            (SemValue::Poison, _) => true,
+            (SemValue::Vector(s), SemValue::Vector(t)) => {
+                s.len() == t.len() && s.iter().zip(t).all(|(a, b)| b.refines(a))
+            }
+            (s, t) => s == t,
+        }
     }
 
     /// The `(width, bits)` of an integer value, or `None` for other kinds.
@@ -267,17 +309,41 @@ pub fn eval(
     operands: &[SemValue],
 ) -> EvalOutcome {
     match kind {
-        // `select` and `freeze` have bespoke poison rules; everything else
-        // propagates poison from any operand.
-        InstKind::Select => eval_select(operands),
+        // `select` and `freeze` have bespoke poison rules; so do the lane moves
+        // (a poison lane in a vector operand only matters if it is picked).
+        // Everything else propagates poison from any operand.
+        InstKind::Select => eval_select(types, result_ty, operands),
         InstKind::Freeze => eval_freeze(types, result_ty, operands),
         // `declassify` is the identity (poison included).
         InstKind::Declassify => match operands.first() {
             Some(v) => EvalOutcome::Value(v.clone()),
             None => EvalOutcome::UndefinedBehavior,
         },
+        InstKind::ExtractElement { lane } => {
+            ok(operands.first().map_or(SemValue::Poison, |v| v.lane(*lane as usize)))
+        }
+        InstKind::InsertElement { lane } => eval_insert(types, result_ty, *lane, operands),
+        InstKind::ShuffleVector(mask) => eval_shuffle(mask, operands),
+        InstKind::Splat => {
+            let n = types.vector_parts(result_ty).map_or(1, |(_, n)| n as usize);
+            ok(SemValue::Vector(vec![operands.first().cloned().unwrap_or(SemValue::Poison); n]))
+        }
+        InstKind::Reduce(op) => eval_reduce(*op, flags, operands),
 
         _ if operands.iter().any(SemValue::is_poison) => EvalOutcome::Value(SemValue::Poison),
+
+        // A bitcast involving a vector reinterprets the packed lane bits.
+        InstKind::Cast(CastOp::Bitcast)
+            if types.is_vector(result_ty) || matches!(operands.first(), Some(SemValue::Vector(_))) =>
+        {
+            eval_bitcast_bits(types, result_ty, &operands[0])
+        }
+        // Every other value op on vectors is lane-wise.
+        InstKind::Bin(_) | InstKind::Unary(_) | InstKind::ICmp(_) | InstKind::FCmp(_) | InstKind::Cast(_)
+            if types.is_vector(result_ty) =>
+        {
+            eval_lanewise(types, result_ty, kind, flags, operands)
+        }
 
         InstKind::Bin(op) => eval_bin(*op, flags, operands),
         InstKind::Unary(op) => eval_unary(*op, flags, operands),
@@ -308,6 +374,172 @@ pub fn eval(
         | InstKind::Unreachable => {
             panic!("semantics::eval called on a non-value-producing opcode: {kind:?}")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vectors.
+// ---------------------------------------------------------------------------
+
+/// Evaluate a scalar op lane by lane: lane `i` of the result is `kind` on lane
+/// `i` of every operand, at the result's element type. UB in any lane is UB of
+/// the whole instruction; poison stays in its lane.
+fn eval_lanewise(
+    types: &TypeContext,
+    result_ty: TypeId,
+    kind: &InstKind,
+    flags: &Flags,
+    operands: &[SemValue],
+) -> EvalOutcome {
+    let Some((elem, n)) = types.vector_parts(result_ty) else {
+        return poison();
+    };
+    let mut lanes = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        let lane_ops: Vec<SemValue> = operands.iter().map(|o| o.lane(i)).collect();
+        match eval(types, elem, kind, flags, &lane_ops) {
+            EvalOutcome::Value(v) => lanes.push(v),
+            EvalOutcome::UndefinedBehavior => return EvalOutcome::UndefinedBehavior,
+        }
+    }
+    ok(SemValue::Vector(lanes))
+}
+
+/// `insertelement vec, x, lane`: `vec` with lane `lane` replaced by `x`. A
+/// whole-poison `vec` has every *other* lane poison.
+fn eval_insert(types: &TypeContext, result_ty: TypeId, lane: u32, operands: &[SemValue]) -> EvalOutcome {
+    let n = types.vector_parts(result_ty).map_or(0, |(_, n)| n as usize);
+    let base = operands.first().cloned().unwrap_or(SemValue::Poison);
+    let mut lanes: Vec<SemValue> = (0..n).map(|i| base.lane(i)).collect();
+    if let Some(slot) = lanes.get_mut(lane as usize) {
+        *slot = operands.get(1).cloned().unwrap_or(SemValue::Poison);
+    }
+    ok(SemValue::Vector(lanes))
+}
+
+/// `shufflevector a, b, mask`: result lane `i` is lane `mask[i]` of `a ++ b`.
+fn eval_shuffle(mask: &[u32], operands: &[SemValue]) -> EvalOutcome {
+    let a = operands.first().cloned().unwrap_or(SemValue::Poison);
+    let b = operands.get(1).cloned().unwrap_or(SemValue::Poison);
+    // Both operands have the same lane count; learn it from either one (if both
+    // are whole-value poison, so is every result lane).
+    let n = match (&a, &b) {
+        (SemValue::Vector(l), _) | (_, SemValue::Vector(l)) => l.len(),
+        _ => return ok(SemValue::Vector(vec![SemValue::Poison; mask.len()])),
+    };
+    let lanes = mask
+        .iter()
+        .map(|&m| {
+            let m = m as usize;
+            if m < n { a.lane(m) } else { b.lane(m - n) }
+        })
+        .collect();
+    ok(SemValue::Vector(lanes))
+}
+
+/// `reduce op vec`: combine the lanes in order, lane 0 first. Any poison lane
+/// poisons the result (so does a fast-math violation at any float step).
+fn eval_reduce(op: ReduceOp, flags: &Flags, operands: &[SemValue]) -> EvalOutcome {
+    let Some(SemValue::Vector(lanes)) = operands.first() else {
+        return poison();
+    };
+    if lanes.iter().any(SemValue::is_poison) || lanes.is_empty() {
+        return poison();
+    }
+    let mut acc = lanes[0].clone();
+    for l in &lanes[1..] {
+        let step = match op {
+            ReduceOp::FAdd => eval_fbin(BinOp::FAdd, flags, &[acc, l.clone()]),
+            ReduceOp::FMul => eval_fbin(BinOp::FMul, flags, &[acc, l.clone()]),
+            _ => {
+                let (Some((w, a)), Some((_, b))) = (acc.as_int(), l.as_int()) else {
+                    return poison();
+                };
+                let r = match op {
+                    ReduceOp::Add => a.add(b),
+                    ReduceOp::Mul => a.mul(b),
+                    ReduceOp::And => a.bitand(b),
+                    ReduceOp::Or => a.bitor(b),
+                    ReduceOp::Xor => a.bitxor(b),
+                    ReduceOp::SMin => pick(signed(a, w) <= signed(b, w), a, b),
+                    ReduceOp::SMax => pick(signed(a, w) >= signed(b, w), a, b),
+                    ReduceOp::UMin => pick(a <= b, a, b),
+                    ReduceOp::UMax => pick(a >= b, a, b),
+                    ReduceOp::FAdd | ReduceOp::FMul => unreachable!(),
+                };
+                ok(SemValue::int(w, r))
+            }
+        };
+        match step {
+            EvalOutcome::Value(v) if !v.is_poison() => acc = v,
+            other => return other,
+        }
+    }
+    ok(acc)
+}
+
+/// `a` if `first`, else `b` (cloned).
+fn pick(first: bool, a: &Int, b: &Int) -> Int {
+    if first { a.clone() } else { b.clone() }
+}
+
+/// The raw bits of a scalar lane (`None` if it is poison).
+fn lane_raw(v: &SemValue) -> Option<Int> {
+    match v {
+        SemValue::Int { bits, .. } => Some(bits.clone()),
+        SemValue::Float(fb) => Some(Int::from_u64(float_raw(*fb))),
+        _ => None,
+    }
+}
+
+/// A `bitcast` involving a vector: flatten the operand's lanes (lane 0 in the
+/// least-significant bits) into one bit string and cut it into the result's
+/// lanes. A result lane (or a scalar result) overlapping a poison source lane
+/// is poison. The widths agree (the verifier checks it), so a poison source
+/// lane's width — which a poison value does not carry — is the source lane
+/// width recovered from the total.
+fn eval_bitcast_bits(types: &TypeContext, result_ty: TypeId, src: &SemValue) -> EvalOutcome {
+    let total = types.total_bits(result_ty).unwrap_or(0);
+    let lanes: Vec<SemValue> = match src {
+        SemValue::Vector(lanes) => lanes.clone(),
+        SemValue::Int { .. } | SemValue::Float(_) => vec![src.clone()],
+        _ => return poison(),
+    };
+    if lanes.is_empty() {
+        return poison();
+    }
+    let ws = (total / lanes.len() as u64) as u32;
+    let mut acc = Int::ZERO;
+    let mut poison_lanes = Vec::new();
+    for (i, l) in lanes.iter().enumerate() {
+        match lane_raw(l) {
+            Some(b) => acc = acc.bitor(&b.mod_2k(ws).mul_2k(i as u32 * ws)),
+            None => poison_lanes.push(i as u32 * ws),
+        }
+    }
+    // The result lanes: `(element type, count)`; a scalar is one lane.
+    let (elem, count) = types.vector_parts(result_ty).unwrap_or((result_ty, 1));
+    let Some(wd) = types.bit_width(elem) else {
+        return poison();
+    };
+    let mut out = Vec::with_capacity(count as usize);
+    for j in 0..count {
+        let lo = j * wd;
+        let hi = lo + wd;
+        if poison_lanes.iter().any(|&o| o < hi && lo < o + ws) {
+            out.push(SemValue::Poison);
+            continue;
+        }
+        let bits = acc.div_2k_trunc(lo).mod_2k(wd);
+        out.push(match types.get(elem) {
+            Type::Float(k) => SemValue::Float(bits_to_float(bits.to_u64().unwrap_or(0), *k)),
+            _ => SemValue::int(wd, bits),
+        });
+    }
+    if types.is_vector(result_ty) {
+        ok(SemValue::Vector(out))
+    } else {
+        ok(out.pop().unwrap_or(SemValue::Poison))
     }
 }
 
@@ -696,7 +928,11 @@ fn eval_bitcast(types: &TypeContext, result_ty: TypeId, src: &SemValue) -> EvalO
 /// `select cond, t, f`. A poison **condition** yields poison; a poison value in
 /// the *non-selected* arm does not taint the result (`docs/ir-design.md`,
 /// [`InstKind::Select`]).
-fn eval_select(operands: &[SemValue]) -> EvalOutcome {
+///
+/// A vector condition (`<N x i1>`) selects per lane: lane `i` of the result is
+/// lane `i` of `t` or `f` by lane `i` of the condition, and only a poison
+/// condition *lane* poisons its result lane.
+fn eval_select(types: &TypeContext, result_ty: TypeId, operands: &[SemValue]) -> EvalOutcome {
     let (Some(cond), Some(t), Some(f)) =
         (operands.first(), operands.get(1), operands.get(2))
     else {
@@ -706,6 +942,18 @@ fn eval_select(operands: &[SemValue]) -> EvalOutcome {
         SemValue::Poison => poison(),
         SemValue::Int { bits, .. } => {
             if bits.is_zero() { ok(f.clone()) } else { ok(t.clone()) }
+        }
+        SemValue::Vector(cl) => {
+            let n = types.vector_parts(result_ty).map_or(cl.len(), |(_, n)| n as usize);
+            let lanes = (0..n)
+                .map(|i| match cl.get(i) {
+                    Some(SemValue::Int { bits, .. }) => {
+                        if bits.is_zero() { f.lane(i) } else { t.lane(i) }
+                    }
+                    _ => SemValue::Poison,
+                })
+                .collect();
+            ok(SemValue::Vector(lanes))
         }
         _ => poison(),
     }
@@ -718,16 +966,32 @@ fn eval_freeze(types: &TypeContext, result_ty: TypeId, operands: &[SemValue]) ->
     let Some(v) = operands.first() else {
         return poison();
     };
+    // A vector freezes lane by lane: each poison lane becomes the element's
+    // zero, every defined lane is kept.
+    if let Some((elem, n)) = types.vector_parts(result_ty) {
+        let lanes = (0..n as usize)
+            .map(|i| match v.lane(i) {
+                SemValue::Poison => freeze_value(types, elem),
+                l => l,
+            })
+            .collect();
+        return ok(SemValue::Vector(lanes));
+    }
     if !v.is_poison() {
         return ok(v.clone());
     }
-    match types.get(result_ty) {
-        Type::Int(w) => ok(SemValue::Int { width: *w, bits: Int::ZERO }),
-        Type::Float(k) => ok(SemValue::Float(bits_to_float(0, *k))),
-        Type::Ptr | Type::PtrIn(_) => ok(SemValue::ptr(Int::ZERO)),
+    ok(freeze_value(types, result_ty))
+}
+
+/// The fixed value `freeze` gives a poison of scalar type `ty` (all-zero).
+fn freeze_value(types: &TypeContext, ty: TypeId) -> SemValue {
+    match types.get(ty) {
+        Type::Int(w) => SemValue::Int { width: *w, bits: Int::ZERO },
+        Type::Float(k) => SemValue::Float(bits_to_float(0, *k)),
+        Type::Ptr | Type::PtrIn(_) => SemValue::ptr(Int::ZERO),
         // Aggregates/void/func are out of scope for the scalar evaluator; a
         // poison of such a type is left as poison.
-        _ => poison(),
+        _ => SemValue::Poison,
     }
 }
 
@@ -1001,8 +1265,13 @@ fn sem_to_const(v: SemValue, result_ty: TypeId) -> Option<Const> {
         SemValue::Float(bits) => Some(Const::Float { ty: result_ty, bits }),
         SemValue::Ptr(addr) => addr.is_zero().then_some(Const::Null(result_ty)),
         SemValue::Poison => Some(Const::Poison(result_ty)),
+        // A vector constant needs its lane constants interned in a pool this
+        // pool-less folder does not have: not folded (a sound "don't know").
+        SemValue::Vector(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vector_tests;

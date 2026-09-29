@@ -50,7 +50,7 @@ use std::fmt;
 
 use crate::ir::inst::{
     AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred,
-    RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
+    ReduceOp, RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
 use crate::ir::types::{FloatKind, FuncType, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, Value, ValueDef, ValueId};
@@ -95,6 +95,11 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 ///   `declassify` use new opcode tags 26/27/28. A module without secrets
 ///   encodes exactly as in version 4 apart from the version number;
 ///   version-1..4 streams still decode, with nothing secret.
+///
+/// SIMD vectors (`docs/ir-design.md` §6e) only add tag *values* — type tag 16,
+/// opcode tags 40–44 — so no stream without vectors changes and there was no
+/// bump: a reader that predates them rejects such a stream with
+/// [`DecodeError::InvalidTag`] rather than misreading it.
 pub const VERSION: u32 = 5;
 
 /// Bit 7 of a (version ≥ 5) global or function attribute byte: an extension
@@ -590,7 +595,7 @@ fn collect_tables(module: &Module) -> Tables {
     while let Some(t) = tstack.pop() {
         if type_set.insert(t) {
             match types_ctx.get(t) {
-                Type::Array(elem, _) => tstack.push(*elem),
+                Type::Array(elem, _) | Type::Vector(elem, _) => tstack.push(*elem),
                 Type::Struct(fields) => tstack.extend(fields.iter().copied()),
                 Type::Func(ft) => {
                     tstack.extend(ft.params.iter().copied());
@@ -739,6 +744,13 @@ fn write_type(w: &mut Writer, ty: &Type, t: &Tables) {
             }
             w.uvarint(t.ty(ft.ret));
             w.u8(u8::from(ft.variadic));
+        }
+        // A distinct high tag, so other type additions can take the next small
+        // ones without clashing; no version bump (older streams never used it).
+        Type::Vector(elem, lanes) => {
+            w.u8(16);
+            w.uvarint(t.ty(*elem));
+            w.uvarint(u64::from(*lanes));
         }
     }
 }
@@ -1144,6 +1156,28 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
             }
         }
         InstKind::Unreachable => w.u8(16),
+        // Vector ops use tags 40..=44 (`docs/ir-design.md` §6e); streams without
+        // them keep their bytes, so no version bump was needed.
+        InstKind::ExtractElement { lane } => {
+            w.u8(40);
+            w.uvarint(u64::from(*lane));
+        }
+        InstKind::InsertElement { lane } => {
+            w.u8(41);
+            w.uvarint(u64::from(*lane));
+        }
+        InstKind::ShuffleVector(mask) => {
+            w.u8(42);
+            w.uvarint(mask.len() as u64);
+            for &m in mask.iter() {
+                w.uvarint(u64::from(m));
+            }
+        }
+        InstKind::Splat => w.u8(43),
+        InstKind::Reduce(op) => {
+            w.u8(44);
+            w.u8(op.code());
+        }
     }
 }
 
@@ -1296,6 +1330,10 @@ fn read_type(r: &mut Reader<'_>, types: &[TypeId]) -> Result<Type, DecodeError> 
             let ret = resolve(r.uindex()?)?;
             let variadic = r.u8()? != 0;
             Type::Func(FuncType { params, ret, variadic })
+        }
+        16 => {
+            let elem = resolve(r.uindex()?)?;
+            Type::Vector(elem, r.u32()?)
         }
         t => return Err(DecodeError::InvalidTag { what: "type", tag: u32::from(t) }),
     })
@@ -1586,6 +1624,28 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
             InstKind::CmpXchg { ty, align, success, failure }
         }
         25 => InstKind::Fence(ordering_from(r.u8()?)?),
+        40 => InstKind::ExtractElement { lane: r.u32()? },
+        41 => InstKind::InsertElement { lane: r.u32()? },
+        42 => {
+            let n = r.uindex()?;
+            // Each index is at least one byte, so a count beyond the remaining
+            // input is corrupt (and must not drive a huge allocation).
+            if n > r.remaining() {
+                return Err(DecodeError::UnexpectedEof);
+            }
+            let mut mask = Vec::with_capacity(n);
+            for _ in 0..n {
+                mask.push(r.u32()?);
+            }
+            InstKind::ShuffleVector(mask.into_boxed_slice())
+        }
+        43 => InstKind::Splat,
+        44 => {
+            let c = r.u8()?;
+            let op = ReduceOp::from_code(u64::from(c))
+                .ok_or(DecodeError::InvalidTag { what: "reduce op", tag: u32::from(c) })?;
+            InstKind::Reduce(op)
+        }
         t => return Err(DecodeError::InvalidTag { what: "opcode", tag: u32::from(t) }),
     })
 }

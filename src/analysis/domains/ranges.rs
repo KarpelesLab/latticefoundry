@@ -227,6 +227,11 @@ impl AbstractDomain for Range {
         ) || inst.kind.is_atomic() {
             return Range::Top;
         }
+        // Vector values (and the lane moves and reductions over them) are not
+        // modeled by this scalar lattice: ⊤.
+        if ctx.types.is_vector(inst.ty) || inst.kind.is_vector_op() {
+            return Range::Top;
+        }
         // SCCP optimism: an undetermined operand keeps the result undetermined.
         if operands.iter().any(Range::is_bottom) {
             return Range::Bottom;

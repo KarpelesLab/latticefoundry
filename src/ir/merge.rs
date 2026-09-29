@@ -278,6 +278,7 @@ fn remap_type(ty: &Type, type_map: &[TypeId]) -> Type {
     match ty {
         Type::Void | Type::Int(_) | Type::Float(_) | Type::Ptr | Type::PtrIn(_) => ty.clone(),
         Type::Array(elem, len) => Type::Array(type_map[elem.index()], *len),
+        Type::Vector(elem, lanes) => Type::Vector(type_map[elem.index()], *lanes),
         Type::Struct(fields) => {
             Type::Struct(fields.iter().map(|f| type_map[f.index()]).collect())
         }

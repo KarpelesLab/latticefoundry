@@ -1816,7 +1816,7 @@ fn sysv_eightbytes(types: &TypeContext, ty: TypeId) -> Option<Vec<bool>> {
     fn walk(types: &TypeContext, ty: TypeId, off: u64, ebs: &mut [Option<bool>]) {
         let sse = match types.get(ty) {
             Type::Int(_) | Type::Ptr | Type::PtrIn(_) | Type::Func(_) => false,
-            Type::Float(_) => true,
+            Type::Float(_) | Type::Vector(..) => true,
             Type::Struct(fields) => {
                 for i in 0..fields.len() {
                     let (foff, fty) = types.field_offset(ty, i as u32);

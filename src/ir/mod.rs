@@ -35,7 +35,7 @@ pub mod value;
 
 pub use inst::{
     AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred,
-    RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
+    ReduceOp, RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
 pub use datalayout::{DataLayout, DataLayoutError, Endian, PointerSpec};
 pub use merge::{MergeError, merge_modules};
@@ -749,3 +749,5 @@ impl Block {
 
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod vector_tests;

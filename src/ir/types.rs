@@ -70,9 +70,9 @@ impl FloatKind {
 /// A LatticeFoundry IR type.
 ///
 /// Composite types reference their components by [`TypeId`] rather than owning
-/// them, so the whole type graph lives flat inside a [`TypeContext`]. Vectors
-/// and scalable vectors are deliberately deferred until a SIMD target is real
-/// (`docs/ir-design.md` §3).
+/// them, so the whole type graph lives flat inside a [`TypeContext`]. Fixed-width
+/// SIMD vectors are [`Type::Vector`]; scalable vectors are deferred until a
+/// scalable-vector target (SVE/RVV) is real (`docs/ir-design.md` §3, §6e).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Type {
     /// The unit / no-value type, produced by e.g. a bare `ret`.
@@ -96,6 +96,12 @@ pub enum Type {
     Struct(Vec<TypeId>),
     /// A function type `(params...) -> ret`.
     Func(FuncType),
+    /// A fixed-length SIMD vector `<N x T>` of `N ≥ 1` lanes, a first-class
+    /// **value** (unlike an array, which is an address; `docs/ir-design.md` §6e).
+    /// The element type is `i1`, `i8`, `i16`, `i32`, `i64` or a float type (the
+    /// verifier enforces this). Operations act lane-wise and poison is tracked
+    /// per lane.
+    Vector(TypeId, u32),
 }
 
 impl Type {
@@ -126,6 +132,12 @@ impl Type {
             Type::PtrIn(n) => Some(*n),
             _ => None,
         }
+    }
+
+    /// Whether this is a fixed-length vector type.
+    #[inline]
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Type::Vector(..))
     }
 
     /// The width in bits of a scalar (integer or float) type, if it has one.
@@ -260,6 +272,11 @@ impl TypeContext {
         self.intern(Type::Struct(fields))
     }
 
+    /// A fixed-length vector type `<lanes x elem>`.
+    pub fn vector(&mut self, elem: TypeId, lanes: u32) -> TypeId {
+        self.intern(Type::Vector(elem, lanes))
+    }
+
     /// A function type. Pass `ret = void()` for a procedure.
     pub fn func(&mut self, params: Vec<TypeId>, ret: TypeId, variadic: bool) -> TypeId {
         self.intern(Type::Func(FuncType { params, ret, variadic }))
@@ -300,6 +317,36 @@ impl TypeContext {
         match self.get(id) {
             Type::Int(w) => Some(*w),
             t => t.addr_space().map(|a| self.layout.pointer_bits(a)),
+        }
+    }
+
+    /// Whether the referenced type is a vector type.
+    pub fn is_vector(&self, id: TypeId) -> bool {
+        self.get(id).is_vector()
+    }
+
+    /// The `(element type, lane count)` of a vector type, or `None` for any
+    /// other type.
+    pub fn vector_parts(&self, id: TypeId) -> Option<(TypeId, u32)> {
+        match self.get(id) {
+            Type::Vector(elem, n) => Some((*elem, *n)),
+            _ => None,
+        }
+    }
+
+    /// The lane type of a vector, or the type itself for a non-vector: the type
+    /// a lane-wise operation computes on.
+    pub fn scalar_of(&self, id: TypeId) -> TypeId {
+        self.vector_parts(id).map_or(id, |(e, _)| e)
+    }
+
+    /// The total bit width of a scalar or vector type (`lanes × lane width`
+    /// for a vector), or `None` for pointers, aggregates and the like. This is
+    /// the width a `bitcast` must preserve.
+    pub fn total_bits(&self, id: TypeId) -> Option<u64> {
+        match self.get(id) {
+            Type::Vector(elem, n) => self.bit_width(*elem).map(|w| u64::from(w) * u64::from(*n)),
+            t => t.bit_width().map(u64::from),
         }
     }
 
@@ -355,6 +402,15 @@ impl TypeContext {
                     offset = round_up(offset, l.align) + l.size;
                 }
                 Layout { size: round_up(offset, align), align }
+            }
+            // Lanes are packed at the element's size (an `i1` lane takes one
+            // byte); the vector is aligned to its size rounded up to a power of
+            // two, capped at 16 bytes (the SSE/NEON register width).
+            Type::Vector(elem, n) => {
+                let el = self.layout(*elem);
+                let size = el.size * u64::from(*n);
+                let align = size.max(1).next_power_of_two().min(16).max(el.align);
+                Layout { size, align }
             }
         }
     }
@@ -455,6 +511,30 @@ mod tests {
         assert_eq!(cx.align_of(s), 4);
         assert_eq!(cx.field_offset(s, 0), (0, i8_));
         assert_eq!(cx.field_offset(s, 1), (4, i32_));
+    }
+
+    #[test]
+    fn vector_types_and_layout() {
+        let mut cx = TypeContext::new();
+        let i32_ = cx.int(32);
+        let f64_ = cx.float(FloatKind::F64);
+        let v4 = cx.vector(i32_, 4);
+        assert_eq!(v4, cx.vector(i32_, 4));
+        assert_eq!(cx.vector_parts(v4), Some((i32_, 4)));
+        assert_eq!(cx.scalar_of(v4), i32_);
+        assert_eq!(cx.scalar_of(i32_), i32_);
+        assert_eq!(cx.total_bits(v4), Some(128));
+        assert_eq!(cx.bit_width(v4), None, "a vector is not a scalar");
+        assert_eq!((cx.size_of(v4), cx.align_of(v4)), (16, 16));
+        let v3 = cx.vector(i32_, 3);
+        assert_eq!((cx.size_of(v3), cx.align_of(v3), cx.stride(v3)), (12, 16, 16));
+        let v2d = cx.vector(f64_, 2);
+        assert_eq!(cx.total_bits(v2d), Some(128));
+        let v8 = cx.vector(i32_, 8);
+        assert_eq!((cx.size_of(v8), cx.align_of(v8)), (32, 16));
+        let i1 = cx.bool();
+        let m4 = cx.vector(i1, 4);
+        assert_eq!((cx.size_of(m4), cx.total_bits(m4)), (4, Some(4)));
     }
 
     #[test]

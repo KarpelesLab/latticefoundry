@@ -114,6 +114,8 @@ fn is_hoistable_kind(kind: &InstKind) -> bool {
         | InstKind::Freeze
         | InstKind::Declassify
         | InstKind::PtrAdd { .. } => true,
+        // The vector lane moves and reductions are pure and never UB.
+        k if k.is_vector_op() => true,
         _ => false,
     }
 }

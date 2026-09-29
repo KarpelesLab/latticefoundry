@@ -288,6 +288,11 @@ fn hash_type(h: &mut Fnv, types: &TypeContext, ty: TypeId) {
             hash_type(h, types, ft.ret);
             h.write_u8(u8::from(ft.variadic));
         }
+        Type::Vector(elem, n) => {
+            h.write_u8(16);
+            hash_type(h, types, *elem);
+            h.write_u32(*n);
+        }
     }
 }
 

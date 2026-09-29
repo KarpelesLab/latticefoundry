@@ -13,8 +13,8 @@
 //! data layout and lower to `ptr_add` (`docs/ir-design.md` §6).
 
 use crate::ir::inst::{
-    AtomicOrdering, BinOp, CastOp, Flags, FloatPred, InstData, InstId, InstKind, IntPred, RmwOp,
-    SwitchCase, SwitchData, UnaryOp, Use,
+    AtomicOrdering, BinOp, CastOp, Flags, FloatPred, InstData, InstId, InstKind, IntPred, ReduceOp,
+    RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ConstId, ConstPool, FloatBits, ValueDef, ValueId};
@@ -285,14 +285,14 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Integer comparison; result is `i1`.
     pub fn icmp(&mut self, pred: IntPred, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let ty = self.types.bool();
+        let ty = self.bool_like(lhs);
         self.emit(InstKind::ICmp(pred), vec![lhs, rhs], Flags::NONE, Some(ty))
             .expect("icmp has a result")
     }
 
     /// Floating-point comparison; result is `i1`.
     pub fn fcmp(&mut self, pred: FloatPred, lhs: ValueId, rhs: ValueId, flags: Flags) -> ValueId {
-        let ty = self.types.bool();
+        let ty = self.bool_like(lhs);
         self.emit(InstKind::FCmp(pred), vec![lhs, rhs], flags, Some(ty))
             .expect("fcmp has a result")
     }
@@ -300,6 +300,83 @@ impl<'a> FunctionBuilder<'a> {
     /// A conversion to `to_ty`.
     pub fn cast(&mut self, op: CastOp, val: ValueId, to_ty: TypeId) -> ValueId {
         self.emit(InstKind::Cast(op), vec![val], Flags::NONE, Some(to_ty)).expect("cast has a result")
+    }
+
+    /// The result type of a comparison of `v`: `i1` for a scalar, `<N x i1>`
+    /// for an `N`-lane vector.
+    fn bool_like(&mut self, v: ValueId) -> TypeId {
+        let ty = self.value_type(v);
+        let b = self.types.bool();
+        match self.types.vector_parts(ty) {
+            Some((_, n)) => self.types.vector(b, n),
+            None => b,
+        }
+    }
+
+    // --- SIMD vectors (`docs/ir-design.md` §6e) ------------------------------
+
+    /// `extractelement vec, lane`: lane `lane` of a vector (result type = the
+    /// element type).
+    pub fn extract_element(&mut self, vec: ValueId, lane: u32) -> ValueId {
+        let ty = self.value_type(vec);
+        let elem = self.types.scalar_of(ty);
+        self.emit(InstKind::ExtractElement { lane }, vec![vec], Flags::NONE, Some(elem))
+            .expect("extractelement has a result")
+    }
+
+    /// `insertelement vec, elem, lane`: `vec` with lane `lane` replaced.
+    pub fn insert_element(&mut self, vec: ValueId, elem: ValueId, lane: u32) -> ValueId {
+        let ty = self.value_type(vec);
+        self.emit(InstKind::InsertElement { lane }, vec![vec, elem], Flags::NONE, Some(ty))
+            .expect("insertelement has a result")
+    }
+
+    /// `shufflevector a, b, mask`: result lane `i` is lane `mask[i]` of
+    /// `a ++ b`; the result has `mask.len()` lanes of `a`'s element type.
+    pub fn shuffle_vector(&mut self, a: ValueId, b: ValueId, mask: &[u32]) -> ValueId {
+        let ty = self.value_type(a);
+        let elem = self.types.scalar_of(ty);
+        let rty = self.types.vector(elem, mask.len() as u32);
+        let mask: Box<[u32]> = mask.into();
+        self.emit(InstKind::ShuffleVector(mask), vec![a, b], Flags::NONE, Some(rty))
+            .expect("shufflevector has a result")
+    }
+
+    /// `splat x`: a `lanes`-lane vector with every lane equal to `x`.
+    pub fn splat(&mut self, x: ValueId, lanes: u32) -> ValueId {
+        let elem = self.value_type(x);
+        let ty = self.types.vector(elem, lanes);
+        self.emit(InstKind::Splat, vec![x], Flags::NONE, Some(ty)).expect("splat has a result")
+    }
+
+    /// `reduce op vec`: fold the lanes to one scalar (see
+    /// [`ReduceOp`] for the order). `flags` carries
+    /// the fast-math set of a float reduction.
+    pub fn reduce(&mut self, op: ReduceOp, vec: ValueId, flags: Flags) -> ValueId {
+        let ty = self.value_type(vec);
+        let elem = self.types.scalar_of(ty);
+        self.emit(InstKind::Reduce(op), vec![vec], flags, Some(elem)).expect("reduce has a result")
+    }
+
+    /// Intern a constant into the module pool (e.g. the lanes of a vector
+    /// constant built with [`FunctionBuilder::const_vector`]).
+    pub fn intern_const(&mut self, c: Const) -> ConstId {
+        self.consts.intern(c)
+    }
+
+    /// A vector constant operand of type `ty` (a vector type) whose lanes are
+    /// the given constants (each of the element type; poison lanes allowed).
+    pub fn const_vector(&mut self, ty: TypeId, lanes: Vec<ConstId>) -> ValueId {
+        let c = self.consts.intern(Const::Aggregate { ty, elems: lanes });
+        self.func.get_or_make_value(ValueDef::Const(c), ty)
+    }
+
+    /// Replace the signature of the function under construction (a
+    /// [`Type::Func`] id). Must be called before [`FunctionBuilder::create_entry_block`],
+    /// which takes the entry parameters from it; used by rewrites that change
+    /// a function's ABI shape (vector legalization).
+    pub fn set_signature(&mut self, sig: TypeId) {
+        self.func.sig = sig;
     }
 
     // --- memory ------------------------------------------------------------

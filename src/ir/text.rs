@@ -64,6 +64,12 @@
 //!               | "select" operand "," operand "," operand ":" type
 //!               | "freeze" operand ":" type
 //!               | "declassify" operand ":" type
+//!               | "extractelement" operand "," INT ":" type
+//!               | "insertelement" operand "," operand "," INT ":" type
+//!               | "shufflevector" operand "," operand "," "[" INT { "," INT } "]"
+//!                 ":" type
+//!               | "splat" operand ":" type
+//!               | "reduce" redop fm operand ":" type
 //!               | "call" operand "(" [ operand { "," operand } ] ")" ":" type
 //!               | "syscall" operand { "," operand } ":" type
 //!               | "ret" [ operand ]
@@ -79,12 +85,15 @@
 //! ordering    ::= "relaxed" | "acquire" | "release" | "acq_rel" | "seq_cst"
 //! rmwop       ::= "xchg" | "add" | "sub" | "and" | "nand" | "or" | "xor"
 //!               | "max" | "min" | "umax" | "umin"
+//! redop       ::= "add" | "mul" | "and" | "or" | "xor" | "smin" | "smax"
+//!               | "umin" | "umax" | "fadd" | "fmul"
 //! fm          ::= { "nnan" | "ninf" | "nsz" | "reassoc" | "contract" | "afn" }
 //! target      ::= "^" INT [ "(" [ operand { "," operand } ] ")" ]
 //! case        ::= INT ":" target
 //!
 //! operand     ::= "%" name | "@" name | const
 //! const       ::= type ( INT | "0x" HEX | "null" | "poison" )
+//!               | vtype "(" const { "," const } ")"
 //! init        ::= type ( INT | "0x" HEX | "null" | "poison"
 //!                       | "(" [ init { "," init } ] ")"
 //!                       | "@" name [ ( "+" | "-" ) INT ]
@@ -92,7 +101,8 @@
 //! type        ::= "void" | "i" INT | "f16" | "f32" | "f64"
 //!               | "ptr" [ "addrspace" "(" INT ")" ]
 //!               | "[" INT "x" type "]" | "{" [ type { "," type } ] "}"
-//!               | "fn" fnsig
+//!               | vtype | "fn" fnsig
+//! vtype       ::= "<" INT "x" type ">"
 //! name        ::= IDENT | STRING
 //! ```
 //!
@@ -117,7 +127,9 @@
 //! string literal whose UTF-8 bytes number exactly `N` (escapes `\n \t \r \0
 //! \\ \" \xHH`, the last for `HH < 0x80`). The printer always writes the
 //! element form. Aggregate and address constants never appear as instruction
-//! operands.
+//! operands — except a **vector constant**, `<4 x i32> (i32 1, i32 2, i32
+//! poison, i32 4)`, which is an ordinary first-class operand (vectors are
+//! values, not addresses; `docs/ir-design.md` §6e).
 //!
 //! `;` begins a line comment. Integer constants are arbitrary precision
 //! (`puremp::Int`); floating-point constants print as the raw IEEE bit pattern in
@@ -130,8 +142,8 @@ use std::fmt;
 
 use crate::ir::builder::FunctionBuilder;
 use crate::ir::inst::{
-    AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstId, InstKind, IntPred, RmwOp,
-    UnaryOp,
+    AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstId, InstKind, IntPred, ReduceOp,
+    RmwOp, UnaryOp,
 };
 use crate::ir::types::{FloatKind, Type};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, ValueDef, ValueId};
@@ -508,6 +520,49 @@ fn write_inst<W: fmt::Write>(
             write!(f, " : ")?;
             write_type(f, module, data.ty)
         }
+        InstKind::ExtractElement { lane } => {
+            write!(f, "extractelement ")?;
+            op(f, ops[0])?;
+            write!(f, ", {lane} : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::InsertElement { lane } => {
+            write!(f, "insertelement ")?;
+            op(f, ops[0])?;
+            write!(f, ", ")?;
+            op(f, ops[1])?;
+            write!(f, ", {lane} : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::ShuffleVector(mask) => {
+            write!(f, "shufflevector ")?;
+            op(f, ops[0])?;
+            write!(f, ", ")?;
+            op(f, ops[1])?;
+            write!(f, ", [")?;
+            for (i, m) in mask.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{m}")?;
+            }
+            write!(f, "] : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::Splat => {
+            write!(f, "splat ")?;
+            op(f, ops[0])?;
+            write!(f, " : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::Reduce(r) => {
+            write!(f, "reduce {}", r.name())?;
+            write_fastmath(f, data.flags.fast)?;
+            write!(f, " ")?;
+            op(f, ops[0])?;
+            write!(f, " : ")?;
+            write_type(f, module, data.ty)
+        }
         InstKind::Call => {
             write!(f, "call ")?;
             op(f, ops[0])?;
@@ -711,6 +766,11 @@ fn write_type<W: fmt::Write>(f: &mut W, module: &Module, ty: TypeId) -> fmt::Res
             write_type(f, module, *elem)?;
             write!(f, "]")
         }
+        Type::Vector(elem, n) => {
+            write!(f, "<{n} x ")?;
+            write_type(f, module, *elem)?;
+            write!(f, ">")
+        }
         Type::Struct(fields) => {
             write!(f, "{{")?;
             for (i, &fl) in fields.iter().enumerate() {
@@ -908,6 +968,8 @@ enum TokKind {
     At,
     Minus,
     Plus,
+    Lt,
+    Gt,
     Ident(String),
     Num(String),
     Str(String),
@@ -1014,6 +1076,14 @@ fn lex(src: &str, file: FileId) -> Result<Vec<Tok>, Diagnostic> {
             }
             b'+' => {
                 toks.push(Tok { kind: TokKind::Plus, span: sp(i, i + 1) });
+                i += 1;
+            }
+            b'<' => {
+                toks.push(Tok { kind: TokKind::Lt, span: sp(i, i + 1) });
+                i += 1;
+            }
+            b'>' => {
+                toks.push(Tok { kind: TokKind::Gt, span: sp(i, i + 1) });
                 i += 1;
             }
             b'-' => {
@@ -1150,6 +1220,8 @@ enum ConstAst {
     Float(TypeId, FloatBits),
     Null(TypeId),
     Poison(TypeId),
+    /// A vector constant: its type and one constant per lane.
+    Vector(TypeId, Vec<ConstAst>),
 }
 
 /// A parsed global initializer, resolved to a [`ConstId`] only after every
@@ -1194,6 +1266,11 @@ enum OpAst {
     Select(Operand, Operand, Operand),
     Freeze(Operand),
     Declassify(Operand),
+    ExtractElement(Operand, u32),
+    InsertElement(Operand, Operand, u32),
+    ShuffleVector(Operand, Operand, Vec<u32>, TypeId),
+    Splat(Operand, TypeId),
+    Reduce(ReduceOp, Flags, Operand),
     Call(Operand, Vec<Operand>, TypeId),
     Ret(Option<Operand>),
     Br(u32, Vec<Operand>),
@@ -1807,6 +1884,55 @@ impl Parser {
                 let _ty = self.parse_type(module)?;
                 Ok(OpAst::Declassify(v))
             }
+            "extractelement" => {
+                let v = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let lane = self.parse_u32()?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let _ty = self.parse_type(module)?;
+                Ok(OpAst::ExtractElement(v, lane))
+            }
+            "insertelement" => {
+                let v = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let x = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let lane = self.parse_u32()?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let _ty = self.parse_type(module)?;
+                Ok(OpAst::InsertElement(v, x, lane))
+            }
+            "shufflevector" => {
+                let a = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let c = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                self.expect(&TokKind::LBracket, "`[`")?;
+                let mut mask = vec![self.parse_u32()?];
+                while self.eat(&TokKind::Comma) {
+                    mask.push(self.parse_u32()?);
+                }
+                self.expect(&TokKind::RBracket, "`]`")?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let ty = self.parse_type(module)?;
+                Ok(OpAst::ShuffleVector(a, c, mask, ty))
+            }
+            "splat" => {
+                let v = self.parse_operand(module)?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let ty = self.parse_type(module)?;
+                Ok(OpAst::Splat(v, ty))
+            }
+            "reduce" => {
+                let (name, sp) = self.expect_any_ident()?;
+                let r = ReduceOp::from_name(&name)
+                    .ok_or_else(|| Diagnostic::error("unknown reduce operation").with_span(sp))?;
+                let flags = self.parse_fastmath();
+                let v = self.parse_operand(module)?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let _ty = self.parse_type(module)?;
+                Ok(OpAst::Reduce(r, flags, v))
+            }
             "call" => {
                 let callee = self.parse_operand(module)?;
                 self.expect(&TokKind::LParen, "`(`")?;
@@ -1966,6 +2092,37 @@ impl Parser {
             return Ok(ConstAst::Poison(ty));
         }
         if matches!(self.peek_kind(), TokKind::LParen) {
+            // A vector constant is a first-class operand: one constant per lane.
+            if let Some((elem, n)) = module.types().vector_parts(ty) {
+                self.bump();
+                let mut lanes = Vec::with_capacity(n as usize);
+                loop {
+                    let lane_sp = self.span();
+                    let c = self.parse_const_operand(module)?;
+                    let cty = match &c {
+                        ConstAst::Int(t, _)
+                        | ConstAst::Float(t, _)
+                        | ConstAst::Null(t)
+                        | ConstAst::Poison(t)
+                        | ConstAst::Vector(t, _) => *t,
+                    };
+                    if cty != elem {
+                        return self.err(lane_sp, "vector constant lane has the wrong type");
+                    }
+                    lanes.push(c);
+                    if !self.eat(&TokKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokKind::RParen, "`)`")?;
+                if lanes.len() != n as usize {
+                    return self.err(
+                        ty_sp.merge(self.prev_span()),
+                        format!("vector constant has {} lane(s) but its type has {n}", lanes.len()),
+                    );
+                }
+                return Ok(ConstAst::Vector(ty, lanes));
+            }
             return self.err(
                 self.span(),
                 "aggregate constants are only allowed as global initializers",
@@ -2152,6 +2309,14 @@ impl Parser {
                 let elem = self.parse_type(module)?;
                 self.expect(&TokKind::RBracket, "`]`")?;
                 Ok(module.types_mut().array(elem, len))
+            }
+            TokKind::Lt => {
+                self.bump();
+                let lanes = self.parse_u32()?;
+                self.expect_ident("x")?;
+                let elem = self.parse_type(module)?;
+                self.expect(&TokKind::Gt, "`>`")?;
+                Ok(module.types_mut().vector(elem, lanes))
             }
             TokKind::LBrace => {
                 self.bump();
@@ -2367,6 +2532,29 @@ fn emit_inst(
             let val = resolve_operand(b, v, names, func_names, global_names)?;
             Some(b.declassify(val))
         }
+        OpAst::ExtractElement(v, lane) => {
+            let val = resolve_operand(b, v, names, func_names, global_names)?;
+            Some(b.extract_element(val, *lane))
+        }
+        OpAst::InsertElement(v, x, lane) => {
+            let val = resolve_operand(b, v, names, func_names, global_names)?;
+            let xv = resolve_operand(b, x, names, func_names, global_names)?;
+            Some(b.insert_element(val, xv, *lane))
+        }
+        OpAst::ShuffleVector(a, c, mask, ty) => {
+            let av = resolve_operand(b, a, names, func_names, global_names)?;
+            let cv = resolve_operand(b, c, names, func_names, global_names)?;
+            let kind = InstKind::ShuffleVector(mask.clone().into_boxed_slice());
+            b.append_inst(kind, vec![av, cv], Flags::NONE, Some(*ty))
+        }
+        OpAst::Splat(v, ty) => {
+            let val = resolve_operand(b, v, names, func_names, global_names)?;
+            b.append_inst(InstKind::Splat, vec![val], Flags::NONE, Some(*ty))
+        }
+        OpAst::Reduce(r, flags, v) => {
+            let val = resolve_operand(b, v, names, func_names, global_names)?;
+            Some(b.reduce(*r, val, *flags))
+        }
         OpAst::Call(callee, args, ret) => {
             let cv = resolve_operand(b, callee, names, func_names, global_names)?;
             let mut avs = Vec::with_capacity(args.len());
@@ -2484,10 +2672,14 @@ fn resolve_operand(
             .copied()
             .ok_or_else(|| Diagnostic::error(format!("undefined value `%{name}`")).with_span(*sp)),
         Operand::Const(c) => Ok(match c {
-            ConstAst::Int(ty, v) => b.const_int(*ty, v.clone()),
-            ConstAst::Float(ty, bits) => b.const_float(*ty, *bits),
-            ConstAst::Null(ty) => b.null(*ty),
-            ConstAst::Poison(ty) => b.poison(*ty),
+            ConstAst::Vector(ty, lanes) => {
+                let ids = lanes.iter().map(|l| intern_const_ast(b, l)).collect();
+                b.const_vector(*ty, ids)
+            }
+            other => {
+                let id = intern_const_ast(b, other);
+                b.use_const(id)
+            }
         }),
         Operand::Ref(name, sp) => {
             if let Some(&f) = func_names.get(name) {
@@ -2497,6 +2689,20 @@ fn resolve_operand(
             } else {
                 Err(Diagnostic::error(format!("unknown reference `@{name}`")).with_span(*sp))
             }
+        }
+    }
+}
+
+/// Intern a parsed operand constant (recursively for a vector's lanes).
+fn intern_const_ast(b: &mut FunctionBuilder<'_>, c: &ConstAst) -> ConstId {
+    match c {
+        ConstAst::Int(ty, v) => b.intern_const(Const::Int { ty: *ty, value: v.clone() }),
+        ConstAst::Float(ty, bits) => b.intern_const(Const::Float { ty: *ty, bits: *bits }),
+        ConstAst::Null(ty) => b.intern_const(Const::Null(*ty)),
+        ConstAst::Poison(ty) => b.intern_const(Const::Poison(*ty)),
+        ConstAst::Vector(ty, lanes) => {
+            let elems = lanes.iter().map(|l| intern_const_ast(b, l)).collect();
+            b.intern_const(Const::Aggregate { ty: *ty, elems })
         }
     }
 }

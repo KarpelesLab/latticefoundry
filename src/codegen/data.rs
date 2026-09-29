@@ -299,6 +299,14 @@ fn serialize(module: &Module, syms: &StrInterner, cid: ConstId, at: u64, img: &m
                     serialize(module, syms, e, at + off, img);
                 }
             }
+            // Vector lanes are packed at the element's size (an `i1` lane is one
+            // byte holding 0 or 1), lane 0 first.
+            Type::Vector(elem, _) => {
+                let size = types.size_of(*elem);
+                for (i, &e) in elems.iter().enumerate() {
+                    serialize(module, syms, e, at + size * i as u64, img);
+                }
+            }
             // The verifier rejects an aggregate of scalar type; leave zeros.
             _ => {}
         },
