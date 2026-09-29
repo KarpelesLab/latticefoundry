@@ -31,6 +31,10 @@ the exit criteria are what "done" means for each phase.
 > - **shared-library output** on x86-64: position-independent code
 >   (`CodegenOptions::reloc_model`, GOT/PLT), symbol visibility
 >   (`hidden`/`protected`), `lf build --shared`/`--pie` linked by qld
+> - **PE/COFF and Mach-O** object writers (x86-64, AArch64), the **Microsoft
+>   x64 calling convention** for Windows targets, target triples
+>   (`lf build --target`, `-c`), PE executables via qld, and **raw binary /
+>   Intel HEX** firmware output
 > - **stack usage reports** (per-function frame sizes from the frame layout,
 >   worst-case depth over the call graph, `lf build --stack-usage`) and
 >   **stack probes** (on by default) on all three targets
@@ -343,7 +347,11 @@ Turn instructions into bytes and objects.
 *Exit:* `lf-as` assembles to `.lfo`/ELF; `lf-dis` round-trips encode∘decode on
 a fuzzed instruction corpus; objects are consumable by Phase 8.
 
-*Progress:* the encoder, `.lfo` and the ELF writer are done. `lf-as` assembles
+*Progress:* the encoder, `.lfo` and the ELF writer are done, and so are PE/COFF
+(`mc::coff`: AMD64 and ARM64) and Mach-O (`mc::macho`: x86-64 and arm64)
+object writers from their specifications, selected by `mc::write_object` from
+a `target::Triple`. They are checked with `llvm-readobj`/`llvm-objdump`/GNU
+`objdump` and linked by qld into PE and Mach-O executables. `lf-as` assembles
 real GNU-syntax assembly into ELF through our own `rsasm`. Still open: `lf-dis`
 (no disassembler yet).
 
@@ -414,7 +422,10 @@ the same in-page offset, so a hello world is 258 bytes rather than 4 KB of
 mostly padding; execution tests
 cover a `.rodata` string written by `syscall`, a `.data` counter, a 512 KiB
 `.bss` array, and a pointer table driving an indirect call, plus `lf build`
-end to end and the same objects linked by `qld`.
+end to end and the same objects linked by `qld`. `link::raw` turns a linked
+image into a raw binary or Intel HEX firmware file (`lf build --oformat
+binary|ihex --base <addr>`), and Windows targets link PE executables through
+qld's MinGW-flavor driver.
 
 ### Phase 9 — Certified tier: proof-carrying IR  *(is bet B3)*  ✅
 
@@ -460,8 +471,12 @@ runtime support ([docs/runtime-support.md](docs/runtime-support.md)):
 LF-emitted context save/restore/switch routines with a versioned context
 layout on all three targets, x86-64 signal preemption through the `ucontext`
 (`rt_sigaction` + restorer, execution-tested with a timer), and an opt-in
-yield-point pass whose loop selection uses a first B9 cost lattice ✅. Open: dynamic
-linking, PGO hooks, sanitizers, richer alias analysis.
+yield-point pass whose loop selection uses a first B9 cost lattice ✅, other output
+formats (PE/COFF and Mach-O objects, the Microsoft x64 convention on x86-64
+Windows — execution-tested on Linux against gcc's `ms_abi` and a
+callee-saved-register harness —, `target::Triple`, raw binary / Intel HEX) ✅.
+Open: dynamic linking, PGO hooks, sanitizers, richer alias analysis, Windows
+unwind tables (`.pdata`/`.xdata`), Mach-O executables.
 
 ## 5. Testing strategy
 
@@ -478,7 +493,6 @@ linking, PGO hooks, sanitizers, richer alias analysis.
   the one front end we build, `lf-cc`, is a separate crate (§8) that consumes
   the library like any other client.
 - A stable public API or ABI before the pipeline is end-to-end.
-- Windows/macOS object and executable formats before ELF is solid.
 - Matching the performance of a mature production compiler; correctness and a
   clean, well-tested design come first.
 

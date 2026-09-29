@@ -64,11 +64,12 @@ latticefoundry/
 │   │                    e-graph equality saturation, superoptimizer, -O pipeline
 │   ├── codegen/         machine IR, instruction selection, register allocation,
 │   │                    MIR interpreter
-│   ├── mc/              encoding + fixups, ELF64 objects, `.lfo`, DWARF,
-│   │                    assembly text → objects (rsasm)
-│   ├── target/          x86_64/, aarch64/, riscv/
-│   ├── link/            static linker core (ELF64 executables); bridge onto
-│   │                    qld for ELF objects, archives and libc
+│   ├── mc/              encoding + fixups, ELF64 / PE-COFF / Mach-O objects,
+│   │                    `.lfo`, DWARF, assembly text → objects (rsasm)
+│   ├── target/          x86_64/, aarch64/, riscv/; target triples
+│   ├── link/            static linker core (ELF64 executables, raw binary and
+│   │                    Intel HEX firmware); bridge onto qld for ELF objects,
+│   │                    archives, libc and PE executables
 │   ├── jit/             in-process JIT (the only `unsafe` in the tree)
 │   └── bin/
 │       ├── lf.rs        compiler driver (`lf build`)
@@ -113,6 +114,11 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
   functions (B2), proof-carrying certificates (B3), an equality-saturation
   optimizer (B4), a z3rs superoptimizer (B5), one lattice engine for all
   analyses (B8) and a cost model (B9).
+- `lf build --target <triple>` picks the OS as well as the architecture:
+  `-c` writes a relocatable **ELF, PE/COFF or Mach-O** object (x86-64 and
+  AArch64 for COFF/Mach-O), Windows targets use the **Microsoft x64 calling
+  convention** and link a PE executable through qld, and `--oformat
+  binary|ihex` writes a **raw binary or Intel HEX** firmware image.
 - An in-process JIT runs the same code without writing an executable.
 - `lf-as` assembles GNU-syntax assembly for x86-64, AArch64 and RISC-V using
   rsasm.
@@ -130,11 +136,12 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
 
 | Target  | Coverage | Validation |
 | ------- | -------- | ---------- |
-| x86-64  | Integer, SSE float, System V ABI (struct-by-value, variadics), dynamic `alloca` | Runs natively; golden bytes; linked with gcc |
+| x86-64  | Integer, SSE float, System V and Microsoft x64 ABIs (struct-by-value, variadics), dynamic `alloca` | Runs natively; golden bytes; linked with gcc (Win64 against gcc's `ms_abi`) |
 | AArch64 | Integer, scalar FP, AAPCS64 struct-by-value | Encodings checked against `llvm-mc`; A64-MIR interpreter |
 | RISC-V  | RV64IM integer | Encodings checked against `llvm-mc`; interpreter |
 
-Not done yet: position-independent code on AArch64/RISC-V, a disassembler
+Not done yet: position-independent code on AArch64/RISC-V, Windows unwind
+tables (`.pdata`/`.xdata`), Mach-O executables, a disassembler
 (`lf-dis`), sanitizers, RISC-V FP and
 relocations, dynamic `alloca` on AArch64/RISC-V, and the deferred bets (B6
 region form, B7 full content-addressing, B10 provenance types, B11 verified

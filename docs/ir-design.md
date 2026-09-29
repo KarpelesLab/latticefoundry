@@ -444,6 +444,30 @@ from the loaded word after the loop. Every loop is a *constrained* LR/SC loop
 accesses or backward branches inside), which is what the ISA's
 forward-progress guarantee requires.
 
+## 6c. Targets: triples, calling conventions, object formats  *(decided)*
+
+The IR does not name a calling convention or an object format: a module is
+the same whichever OS it runs on. The choice is made once per compilation by a
+**target triple** (`target::Triple` = architecture + OS), passed to codegen as
+`CodegenOptions::os` and to the object writers through `mc::write_object`.
+
+- **Calling convention** (`Triple::call_conv`): x86-64 uses the Microsoft x64
+  convention on Windows and System V elsewhere; AArch64 uses AAPCS64 (the Apple
+  and Microsoft variants differ only in variadic calls, which the AArch64
+  backend does not lower, and in reserving `x18`, which it never allocates).
+  Every function in a module follows the same convention; there is no
+  per-function `ms_abi`/`sysv_abi` attribute yet.
+- **Object format** (`Triple::object_format`): ELF on Linux and bare metal,
+  PE/COFF on Windows, Mach-O on Darwin. Each writer maps the generic
+  `RelocKind`s onto its format and rejects the ones it cannot express with an
+  error, never silently.
+- **Symbol names** stay the IR names everywhere; the Mach-O writer adds the
+  platform's leading underscore itself.
+- **Rejected: a convention per call site.** It would let two ABIs meet inside
+  one module, which no front end needs today and every backend would have to
+  support; a module-wide choice keeps the lowering one well-tested path per
+  target.
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than
