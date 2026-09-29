@@ -599,6 +599,232 @@ the same whichever OS it runs on. The choice is made once per compilation by a
   support; a module-wide choice keeps the lowering one well-tested path per
   target.
 
+## 6d. Secrets and constant-time preservation  *(decided; a first step of B10)*
+
+A front end with secret types (Lode's `secret[T]`) needs a guarantee that
+survives the optimizer and the backend: a secret value never decides a branch,
+never forms an address, and never feeds an instruction whose timing depends
+on its operands. The IR carries the secrecy the front end declared, one
+analysis derives where it flows, one verifier enforces the rules, and every
+pass and lowering is audited against them.
+
+### Representation
+
+Secrecy is declared at the sources and derived everywhere else:
+
+```text
+global internal secret @key : [32 x i8] = ...     ; the contents are secret
+func hidden @ladder(ptr, ptr, secret i64, i64) -> void ; parameter 2 is secret
+func @ct_eq(ptr, ptr, i64) -> secret i64          ; the result is secret
+  %x = load secret %p align 8 : i64               ; reads secret memory
+  store secret %v, %p align 8 : i64               ; writes secret memory
+  %b = declassify %v : i64                        ; the end of secrecy
+```
+
+- **Parameters and returns**: the function's `FuncAttrs` (§4b), which holds
+  linkage and visibility, also holds `secret_params` and `secret_ret`. They are
+  part of the function's interface. Every functional rebuild (`map_function`)
+  carries the attributes over to the fresh function; LTO merging keeps the
+  union of both sides' secrecy.
+- **Globals**: the `secret` bit of `GlobalAttrs`. The global's *address* is
+  public; loads based on it yield secrets.
+- **Memory**: a `secret` flag on `load` and `store` (orthogonal to
+  `volatile`). The front end sets it wherever the accessed type is secret.
+- **`declassify`**: the identity on values (poison included), whose result is
+  public. It is Lode's explicit escape hatch, and the only way out.
+
+In text, `secret` follows the other global attributes and precedes
+`addrspace(N)` (`global internal hidden constant secret addrspace(1) @k`), and
+precedes each secret parameter type and the return type in a function header.
+
+Builder: `Module::set_param_secret`/`set_ret_secret`/`set_func_attrs`,
+`FuncAttrs::set_param_secret`, `GlobalAttrs::secret`,
+`FunctionBuilder::load_secret`/`store_secret`/`declassify`.
+
+Binary (`.lfb` version 5): bit 7 of the global attribute byte and of the
+function attribute byte says an **extension varint** of further flags
+follows, after the address space for a global. This way the attribute bytes,
+whose low seven bits are all in use, never run out again. Global extension bit
+0 is `secret`. Function extension bit 0 is a secret return; bit 1 says a
+secret-parameter list follows (a count, then ascending indices, bounded by
+the signature's arity). Unknown extension bits are rejected. `load secret` and
+`store secret` use opcode tags 26/27 (with a trailing volatile byte), and
+`declassify` uses tag 28. A module without secrets encodes exactly as in
+version 4 apart from the version number, and version 1–4 streams still
+decode.
+
+- **Rejected: a `secret` qualifier on value types.** Every type-directed piece
+  of the compiler (interning, the verifier's type agreement, casts, isel's
+  register classes, the refinement encoder) would have to learn about it,
+  though no operation *computes* differently on a secret. Secrecy is a
+  property of data flow, not of representation, so it is declared at the few
+  places data enters and derived by an analysis (tenet T4).
+- **Rejected: a flag on every instruction.** It would have to be kept
+  consistent by every pass that creates an instruction, and one forgotten
+  flag is a silent leak. Derived taint cannot be forgotten.
+- **Rejected: `classify` as an instruction.** A front end marks its sources
+  (parameters, memory, globals, returns); an arbitrary mid-function
+  "becomes secret" point has no use a `secret` parameter or load does not
+  cover.
+
+### The secret-taint analysis
+
+`analysis::secret::SecretTaint` is a forward analysis on the one lattice
+engine (B8): the domain is `Bottom ⊑ Public ⊑ Secret`, a pure operation is the
+join of its operands, a block parameter joins its incoming arguments, and
+`declassify` is public. The module context the domain's pure transfer cannot
+see is supplied through the engine's new `SolveHooks`: which entry parameters
+are secret, which direct callees return a secret, and a memory summary.
+
+Memory is conservative and flow-insensitive. Each address is traced to a root:
+a stack slot whose address never escapes (it is only used, through
+`ptr_add`/`bitcast`/`freeze`, as the address of loads, stores and atomics), a
+directly named global, or unknown. A root may hold a secret once a
+secret-derived value, or a `store secret`, is stored to it, and a secret global
+holds one from the start. A call or syscall that receives a secret argument
+taints unknown memory. A load is secret when it is flagged or when its root may
+hold a secret. Unknown memory may also be reached through any global stored
+to. A global read by name, however, is secret only if it is `secret` or this
+function stores a secret to it by name. A write through an unknown pointer
+(a `store secret`, or a callee's) declares secret memory, and the modular
+contract below makes its readers use `load secret`. This keeps a public
+global, such as a green-thread preemption flag, public in a function that
+writes secrets through pointers. Value taint and the memory summary are
+iterated together to a joint fixpoint.
+
+Taint tracks data flow only. That is sound because the verifier forbids secret
+branch conditions: without secret-dependent control flow there is no implicit
+flow to track.
+
+Across functions, memory is modular. A secret that crosses a function boundary
+through memory is declared at both ends (`store secret`/`load secret`, or a
+secret global). Function-pointer types carry no secrecy, so an indirect call's
+arguments must be public and its result is public.
+
+### The constant-time verifier
+
+`verify::constant_time` rejects a function in which a secret-derived value
+reaches any of the following:
+
+| use | why |
+|---|---|
+| a `cond_br` condition or a `switch` scrutinee | control flow |
+| the address of a `load`, `store` or atomic; the base or offset of a `ptr_add` | cache timing |
+| a call target | control flow |
+| either operand of `udiv`/`sdiv`/`urem`/`srem` | early-exit dividers on every target |
+| any float arithmetic, `fcmp`, or float conversion | subnormal slow paths; x86-64's `u64`↔float conversions branch |
+| the size of a `dyn_alloca` | its stack-probe loop runs over the size |
+| an operand of a `syscall` | it leaves the program |
+| the value of an atomic store, rmw or cmpxchg; an rmw or cmpxchg on memory that may hold a secret | retry loops compare memory contents |
+| a public parameter of a direct call; an indirect or variadic argument | secrecy is part of the callee's interface |
+| the `ret` of a function whose return is not `secret` | the same |
+| an unflagged `store` to memory that is not a non-escaping stack slot or a secret global | secrets cross functions through memory only when declared |
+| a shift amount or a multiply operand, under `CtPolicy::STRICT` only | variable-latency shifters and multipliers on some small cores |
+
+Secrets may be used with integer `add`/`sub`/`and`/`or`/`xor`, shifts and `mul`
+(under `CtPolicy::DEFAULT`, the policy for x86-64, AArch64 and RV64, where
+they are constant-time), `icmp`, integer casts, `bitcast`, `fneg`, `freeze`,
+`select`, block arguments, stores to non-escaping slots and secret globals, and
+`declassify`. A secret `select` condition is fine because every backend lowers
+`select` without a branch (below).
+
+A diagnostic names the value by its `.lf` print name, the use, and the
+shortest chain back to the source:
+
+```text
+function #0: constant-time violation: secret-derived %7 is the condition of a
+`cond_br` (`cond_br` in block ^3); it derives from %3 <- %5 <- %0 <- secret
+parameter 0 (use `select`, or `declassify` a value that may be public)
+```
+
+`verify_module` runs the check on every module that declares a secret
+(`Module::has_secrets`); a module without one is trivially constant-time and
+costs nothing. So `lf`, `lf-opt`, and every test that re-verifies after a pass
+enforce it.
+
+### Passes preserve it
+
+The audit covered every transform:
+
+- **mem2reg, sccp, simplify_cfg, dce, licm, inline**: no change needed. None
+  of them creates a branch, an address or a division out of existing data
+  flow. They fold constant branches, straighten blocks, hoist pure operations
+  and promote slots. `declassify` is pure, so it can be hoisted or removed
+  when dead, but no pass replaces it by its operand. A pass may only lose
+  taint, and only where the value really is public: a folded constant, or a
+  promoted slot whose stored value was public.
+- **egraph** (B4): the rules introduce no branch, no division, and no variable
+  shift amount (`x*2^k → x<<k` shifts by a constant). Extraction also compares
+  `(tainted, cost)` lexicographically, so in every e-class a representative
+  that does not depend on a secret beats a cheaper one that does. A merge can
+  therefore never make a public value (a branch condition, an address)
+  secret-derived. This guards future synthesized rules; the built-in rules
+  never put such a pair in one class.
+- **superopt** (B5): `superoptimize_ct` makes the constant-time verifier a
+  second gate after `z3rs`. A candidate may not add violations under the
+  policy, which matters for synthesized variable shifts under
+  `CtPolicy::STRICT`.
+
+The tests run the verifier after every single pass: on a Montgomery-ladder
+conditional swap, a constant-time memcmp, and a mixed fixture; on 40 random
+constant-time modules through every pass; and on 25 through `-O1..-O3` and
+random pass orders.
+
+### Instruction selection
+
+Each target's MIR opcode set has `may_branch_on_data()`, the instructions
+that may take a conditional branch depending on a register value:
+
+- x86-64: the terminators, the `u64`↔float fix-ups, the `lock cmpxchg` loop,
+  and `dyn_alloca`'s probe loop;
+- AArch64 and RISC-V: the terminators and the atomic retry loops.
+
+Instruction selection creates no blocks of its own. The tests check, on all
+three targets, that every function's data-dependent MIR branches are exactly
+its IR `cond_br`/`switch` terminators. A straight-line function over every
+operation allowed on secrets, at widths 8 to 64 and at `-O0` and `-O2`,
+compiles to code with no conditional branch at all. The A64 and RISC-V words
+are decoded directly; x86-64 is disassembled with `llvm-mc` when it is
+installed.
+
+`select` is `cmov` on x86-64, `csel` on AArch64 and a mask blend on RISC-V,
+asserted at each lowering site. Every inherently branchy or variable-time
+lowering (the float conversions, atomics, `dyn_alloca`, division) has its
+secret operands rejected by the verifier.
+
+The same holds under position-independent code, where globals are reached
+through the GOT, and under the Win64 convention, where stack-passed
+arguments and `xmm` saves are added. The tests disassemble the whole
+`.text` of those builds.
+
+### Code generation passes
+
+- **Integer legalization** (§3b) splits wide integers without branching.
+  Carry and borrow chains and ordered compares are `icmp`/`select`, a
+  variable shift is a funnel shift plus a `select` ladder, and it mirrors the
+  CFG block for block. A split `load secret`/`store secret` keeps the flag on
+  every part. A wide `mul`/`div`/`rem` becomes a libgcc-style libcall of
+  unknown timing whose parameters are public. The verifier therefore rejects
+  it on secrets after legalization, which is correct until a runtime provides
+  constant-time helpers declared with `secret` parameters.
+- **Yield points** (green threads) branch on a volatile load of the public
+  preemption flag. The flag stays public even in a function that writes
+  secrets through pointers (see the memory model above), so a constant-time
+  loop keeps verifying after the pass.
+
+### Limitations
+
+- The guarantee covers code the compiler generates, not microarchitectural
+  side channels beyond control flow, addresses and operand-dependent latency
+  (speculation, frequency scaling).
+- Only the three current targets are covered. `CtPolicy::STRICT` exists for
+  cores with variable-time shifts or multiplies; drivers use the default
+  policy until such a target lands.
+- Memory tracking is flow-insensitive and per function. It can reject a load
+  as secret that, in program order, precedes the store that taints its root.
+- Floating point stays outside the constant-time subset, and so does a wide
+  `mul`/`div`/`rem` on a target that legalizes it into a libcall.
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than

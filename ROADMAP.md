@@ -38,8 +38,15 @@ the exit criteria are what "done" means for each phase.
 > - **stack usage reports** (per-function frame sizes from the frame layout,
 >   worst-case depth over the call graph, `lf build --stack-usage`) and
 >   **stack probes** (on by default) on all three targets
-- **green-thread runtime support**: LF-emitted context switching on all three
-  targets, x86-64 timer-signal preemption, and an opt-in yield-point pass
+> - **green-thread runtime support**: LF-emitted context switching on all three
+>   targets, x86-64 timer-signal preemption, and an opt-in yield-point pass
+> - **constant-time preservation for secret values**, a first step toward
+>   B10: `secret` parameters, returns, globals and loads/stores, plus
+>   `declassify`. A secret-taint analysis on the lattice engine feeds a
+>   constant-time verifier (no secret branch, address, division or other
+>   variable-time operation). Every pass and `-O` pipeline preserves it, and
+>   `select` is branchless on all three targets
+>   ([ir-design §6d](docs/ir-design.md)).
 > - three targets:
 >   - **x86-64** executes, with the full System V ABI including
 >     struct-by-value and variadics.
@@ -64,7 +71,8 @@ the exit criteria are what "done" means for each phase.
 > - RISC-V FP, C extension and relocations
 > - `DynAlloca` on AArch64 and RISC-V
 > - the deferred bets: B6 (region form), B7 (full content-addressing), B10
->   (provenance types) and B11 (verified lowering)
+>   (provenance types; only the constant-time step is done) and B11 (verified
+>   lowering)
 
 ---
 

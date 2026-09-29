@@ -104,6 +104,10 @@ Design consequences:
 - **Sound `unknown`.** `z3rs` is built to return a sound `unknown` under a work
   budget rather than a wrong answer or a hang. A `unknown` at `Refinement` tier
   is a review signal, not a silent pass.
+- **Constant time is structural.** A module that declares secrets
+  ([ir-design §6d](./ir-design.md)) is also checked by the constant-time
+  verifier at the `Structural` tier. It is a solver-free taint analysis, so it
+  is as cheap as the rest of the tier.
 - **The trusted base is small.** Under `Certified`, correctness rests on a small
   certificate checker plus `z3rs`, not on the (large, evolving) optimizer.
 - **Semantics don't fork.** `Off` is not "different, looser semantics"; it is
@@ -205,6 +209,18 @@ magic-number heuristics.
 Bake a principled pointer-provenance model (PNVI-style) and an effect discipline
 into IR types so alias analysis is partly by-construction and verifiable, rather
 than a pile of trusted attributes. High payoff, high design cost.
+
+*Progress: secrets and constant time.* The first, narrow step is an
+information-flow discipline, not yet a type. Front ends declare secrecy on
+parameters, returns, globals and memory accesses; `declassify` is the only
+way out. A secret-taint analysis on the B8 engine derives where secrets flow,
+and a constant-time verifier rejects any secret-dependent branch, address,
+division or other variable-time operation. Every pass and the `-O` pipelines
+are tested to preserve it. The e-graph (B4) prefers secret-free
+representatives, the superoptimizer (B5) gates candidates on it, and every
+backend's `select` is branchless (`cmov`/`csel`/mask). See
+[ir-design §6d](./ir-design.md). What remains is the moonshot itself:
+provenance and effects in the type system.
 
 ### B11 — Verified lowering to machine code *(Moonshot)*
 
