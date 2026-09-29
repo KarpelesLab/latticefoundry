@@ -93,6 +93,9 @@ What makes LatticeFoundry more than a re-implementation is written down:
   arguments over φ-nodes, poison + freeze with no `undef`, opaque pointers with
   explicit offset addressing, a unified flag model, machine-checkable opcode
   semantics).
+- [`docs/runtime-support.md`](docs/runtime-support.md) — green-thread runtime
+  support: the LF-emitted context-switching routines and their layouts, signal
+  preemption, and the yield-point pass.
 
 ## Status
 

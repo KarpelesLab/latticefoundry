@@ -34,6 +34,8 @@ the exit criteria are what "done" means for each phase.
 > - **stack usage reports** (per-function frame sizes from the frame layout,
 >   worst-case depth over the call graph, `lf build --stack-usage`) and
 >   **stack probes** (on by default) on all three targets
+- **green-thread runtime support**: LF-emitted context switching on all three
+  targets, x86-64 timer-signal preemption, and an opt-in yield-point pass
 > - three targets:
 >   - **x86-64** executes, with the full System V ABI including
 >     struct-by-value and variadics.
@@ -453,7 +455,12 @@ layout, callees / indirect calls / syscalls / `dyn_alloca`, and
 probes (`CodegenOptions::stack_probes`, default on: frames and x86-64
 `dyn_alloca` move `sp` one 4 KiB page at a time and touch each step, so an
 overflow faults on the guard; x86-64 execution-tested, AArch64/RISC-V
-emulated; AArch64 frames beyond 4 KiB now encode correctly) ✅. Open: dynamic
+emulated; AArch64 frames beyond 4 KiB now encode correctly) ✅, green-thread
+runtime support ([docs/runtime-support.md](docs/runtime-support.md)):
+LF-emitted context save/restore/switch routines with a versioned context
+layout on all three targets, x86-64 signal preemption through the `ucontext`
+(`rt_sigaction` + restorer, execution-tested with a timer), and an opt-in
+yield-point pass whose loop selection uses a first B9 cost lattice ✅. Open: dynamic
 linking, PGO hooks, sanitizers, richer alias analysis.
 
 ## 5. Testing strategy
