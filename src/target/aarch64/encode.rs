@@ -1420,6 +1420,9 @@ pub fn compile_module_with(
             });
         }
     }
+    // Every defined global's storage, as on x86-64 (the `adrp`+`add` above
+    // address these symbols).
+    crate::codegen::data::emit_globals(module, syms, &mut obj, crate::mc::object::RelocKind::Abs64);
     crate::codegen::linkage::apply_symbol_attrs(module, syms, &mut obj);
     CompiledModule { object: obj, stack }
 }

@@ -11,10 +11,13 @@
 //! writes an executable to disk with the execute bit set.
 //!
 //! Standard ELF objects, archives and shared libraries are linked by [`gnu`],
-//! a bridge onto our GNU-ld-compatible linker `qld`.
+//! a bridge onto our GNU-ld-compatible linker `qld` (which also links PE/COFF
+//! and Mach-O). [`raw`] turns a linked image into a raw binary or Intel HEX
+//! file for firmware.
 
 pub mod gnu;
 mod image;
+pub mod raw;
 
 pub use image::{ImageOptions, LinkError, link_executable};
 
