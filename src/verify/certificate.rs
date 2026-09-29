@@ -26,7 +26,7 @@
 //!
 //! ## Honesty about the supported subset
 //!
-//! The underlying [`check_refinement`](super::check_refinement) proves only the
+//! The underlying [`check_refinement`] proves only the
 //! single-block pure-integer subset; everything else (multi-block control flow,
 //! memory, calls, floats) comes back as [`RefinementResult::Unknown`]. Production
 //! records that faithfully as [`Verdict::Unproven`] — it **never** fabricates a
@@ -374,7 +374,7 @@ impl PipelineCertificate {
 
 /// Produce a [`RefinementCertificate`] for a before/after function pair by
 /// fingerprinting both and discharging `tgt ⊑ src` through
-/// [`check_refinement`](super::check_refinement). An out-of-subset pair yields an
+/// [`check_refinement`]. An out-of-subset pair yields an
 /// honest [`Verdict::Unproven`] — never a fabricated `Verified`.
 pub fn certify_pair(
     transform: &str,
@@ -477,7 +477,7 @@ pub enum CertRejection {
 /// 1. recomputes both structural fingerprints and rejects on any mismatch (the
 ///    certificate is not about *these* two functions);
 /// 2. requires the verdict to be [`Verdict::Verified`];
-/// 3. re-runs [`check_refinement`](super::check_refinement) and requires it to
+/// 3. re-runs [`check_refinement`] and requires it to
 ///    still return [`RefinementResult::Refines`].
 ///
 /// A forged `Verified` verdict (step 3 disagrees) or a mismatched/mislabelled

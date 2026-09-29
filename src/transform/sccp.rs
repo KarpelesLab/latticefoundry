@@ -38,7 +38,7 @@
 //! whole rebuild — so the read-only fixpoint (which needs `&TypeContext` /
 //! `&ConstPool`) cannot be computed *inside* [`Sccp::run`]. Instead
 //! [`Sccp::analyze`] runs the solver up front — on the very function that will be
-//! rebuilt — and distills it into a borrow-free [`Plan`] that `run` consumes.
+//! rebuilt — and distills it into a borrow-free `Plan` that `run` consumes.
 //! [`SccpPass`] wires this together as a module pass; the in-crate tests drive it
 //! the same way.
 
@@ -55,7 +55,7 @@ use crate::transform::{FunctionTransform, dom_preorder, rebuild_terminator, rema
 
 /// The SCCP constant-folding transform (see the module documentation).
 ///
-/// It carries the [`Plan`] distilled from a prior [`Sccp::analyze`]; without one,
+/// It carries the `Plan` distilled from a prior [`Sccp::analyze`]; without one,
 /// [`run`](FunctionTransform::run) is a no-op (there is nothing to consume).
 #[derive(Debug, Default)]
 pub struct Sccp {
@@ -70,7 +70,7 @@ impl Sccp {
 
     /// Run the constant-propagation fixpoint over `func` — which **must** be the
     /// same function this transform is subsequently handed as `old` — and store
-    /// the distilled rewrite [`Plan`]. The solver needs read access to the shared
+    /// the distilled rewrite `Plan`. The solver needs read access to the shared
     /// interning tables, which the rebuild's builder holds mutably, so the
     /// analysis is performed here, before the rebuild borrows begin.
     pub fn analyze(&mut self, func: &Function, types: &TypeContext, consts: &ConstPool) {

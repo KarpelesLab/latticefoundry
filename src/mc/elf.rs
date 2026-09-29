@@ -10,7 +10,7 @@
 //!
 //! # What it emits
 //!
-//! - an [`Elf64_Ehdr`](struct docs below) with class `ELFCLASS64`, data
+//! - an `Elf64_Ehdr` with class `ELFCLASS64`, data
 //!   `ELFDATA2LSB`, type `ET_REL`, machine `EM_X86_64`;
 //! - one section header per user [`Section`], plus `.symtab`, `.strtab`, a
 //!   `.rela.<name>` for every section that has relocations, and `.shstrtab`;

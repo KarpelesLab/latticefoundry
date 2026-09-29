@@ -20,7 +20,7 @@
 //!
 //! Submodules:
 //!
-//! - [`regs`] — the 31 GPRs (`x0`–`x30`) plus `sp`/`xzr`, the allocatable/scratch
+//! - `regs` — the 31 GPRs (`x0`–`x30`) plus `sp`/`xzr`, the allocatable/scratch
 //!   split, and the AAPCS64 calling convention;
 //! - [`isel`] — the [`A64Op`] opcode set and the lowering rules;
 //! - [`encode`] — the fixed-width bitfield encoder, frame layout +

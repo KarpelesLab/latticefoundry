@@ -20,7 +20,7 @@
 //!
 //! Submodules:
 //!
-//! - [`regs`] — the 16 GPRs as physical registers, the allocatable/scratch split,
+//! - `regs` — the 16 GPRs as physical registers, the allocatable/scratch split,
 //!   and the SysV calling convention;
 //! - [`isel`] — the [`X86Op`] opcode set and the lowering rules;
 //! - [`encode`] — the REX/ModRM/SIB encoder, frame layout + prologue/epilogue,

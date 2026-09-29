@@ -33,7 +33,7 @@
 //! ## How block arguments are threaded
 //!
 //! The whole transform is computed as a plan over the *old* function and emitted
-//! once. Each old terminator is first normalized to an [`Term`] with its outgoing
+//! once. Each old terminator is first normalized to an `Term` with its outgoing
 //! edges resolved through forwarding blocks (substituting parameters as it goes)
 //! and its constant branches folded. Reachability, predecessor counts, and merge
 //! eligibility are computed on this resolved graph, so folds and bypasses expose
@@ -46,7 +46,7 @@
 //! ## Note on constant reading
 //!
 //! A [`FunctionTransform`] receives only the old [`Function`] and a builder, not
-//! the module's [`ConstPool`], so a constant's numeric value cannot be decoded
+//! the module's `ConstPool`, so a constant's numeric value cannot be decoded
 //! directly. To fold a branch we instead round-trip through the builder's
 //! module-wide interning: `use_const(cid)` and `const_bool(true)` yield the *same*
 //! new value id iff `cid` is the canonical `i1` `true` constant. This is exact and

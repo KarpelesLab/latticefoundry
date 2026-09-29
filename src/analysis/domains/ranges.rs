@@ -61,7 +61,7 @@ pub enum Range {
     Bottom,
     /// A bounded signed interval `[lo, hi]` of a `width`-bit integer type.
     ///
-    /// Invariant (maintained by [`interval`]): `width ≥ 1`,
+    /// Invariant (maintained by `interval`): `width ≥ 1`,
     /// `INT_MIN(width) ≤ lo ≤ hi ≤ INT_MAX(width)`. An empty interval is never
     /// represented here — it canonicalizes to [`Range::Bottom`].
     Interval {

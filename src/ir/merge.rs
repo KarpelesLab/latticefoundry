@@ -10,12 +10,12 @@
 //! Merging one module `other` into `self` is four remappings applied in order:
 //!
 //! 1. **Types.** Every [`TypeId`] of `other` is re-interned into `self`'s
-//!    [`TypeContext`]. Because a composite type is always interned *after* the
+//!    `TypeContext`. Because a composite type is always interned *after* the
 //!    components it names, iterating `other`'s types in id order and remapping each
 //!    component through the partial old→new map builds the full `type_map`
 //!    left-to-right.
 //! 2. **Constants.** Likewise every [`ConstId`] is re-interned into `self`'s
-//!    [`ConstPool`], remapping each constant's type and (for aggregates) its child
+//!    `ConstPool`, remapping each constant's type and (for aggregates) its child
 //!    constant ids through the maps already built.
 //! 3. **Globals** and **functions** are matched by name for *cross-module symbol
 //!    resolution*: a body-less declaration in one module unifies with the
@@ -26,14 +26,14 @@
 //! 4. **Bodies.** Once the `func_map`/`global_map` are complete, each incoming
 //!    function *definition* is deep-copied into its resolved slot with all
 //!    interned references (types, constants, globals, functions) remapped. The
-//!    function-local ids ([`ValueId`](crate::ir::ValueId)/[`BlockId`]/
+//!    function-local ids ([`ValueId`](crate::ir::ValueId)/`BlockId`/
 //!    [`InstId`](crate::ir::InstId)) are preserved verbatim, since the whole value/
 //!    instruction/block arena is copied in order.
 //!
 //! ## Symbol identity and determinism
 //!
 //! Symbols are compared by their interned [`Sym`] name, so **all** modules being
-//! merged must have been parsed/decoded against the *same* [`StrInterner`]
+//! merged must have been parsed/decoded against the *same* `StrInterner`
 //! (`crate::support::StrInterner`) — the LTO driver threads one interner through
 //! every input. The merge is deterministic: types/constants/functions are
 //! processed in id order, resolved symbols keep `self`'s existing id, and new

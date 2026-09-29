@@ -137,7 +137,7 @@ pub enum A64Op {
     FNeg = 44,
     /// `[Def d, Use a, Use b, Imm packed, Imm width]` — `fcmp a,b` then
     /// `cset d,cond` (with an optional second `cset`+`and`/`orr` combine). `packed`
-    /// carries `cond | combine<<4 | cond2<<8` (see [`fcmp_plan`]).
+    /// carries `cond | combine<<4 | cond2<<8` (see `fcmp_plan`).
     Fcmp = 45,
     /// `[Def d, Imm bits, Imm width]` — materialize a float constant: the exact
     /// IEEE bit pattern via a scratch gpr (`movz/movk x9; fmov d, x9`).

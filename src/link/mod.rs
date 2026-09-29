@@ -1,6 +1,6 @@
 //! The linker core used by the `lf` and `lf-ld` drivers (ROADMAP Phase 8).
 //!
-//! The heart is [`link_executable`] (in [`image`]): it consumes in-memory
+//! The heart is [`link_executable`] (in `image`): it consumes in-memory
 //! relocatable [`ObjectModule`](crate::mc::object::ObjectModule)s and produces a
 //! **static ELF64 executable** — resolving symbols, laying out sections into
 //! `PT_LOAD` segments, applying relocations, and synthesizing a `_start` entry

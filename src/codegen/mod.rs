@@ -7,7 +7,7 @@
 //!
 //! - [`mir`] — the target-abstract MIR data model (registers, operands, blocks,
 //!   functions, stack frame);
-//! - [`target`] — the [`MachineTarget`](target::MachineTarget) interface a
+//! - [`target`] — the [`MachineTarget`] interface a
 //!   backend implements to describe its register file, calling convention, and
 //!   move/spill builders, *without* committing to encodings;
 //! - [`isel`] — the reusable instruction-selection framework (block-argument

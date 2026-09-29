@@ -32,7 +32,7 @@
 //! subexpressions land in one class on construction — free common-subexpression
 //! elimination. After merges we restore the **congruence** invariant (if two
 //! classes are equal, any two e-nodes that differ only by those two children are
-//! equal too) with a naive-to-fixpoint [`EGraph::rebuild`]: re-canonicalize every
+//! equal too) with a naive-to-fixpoint `EGraph::rebuild`: re-canonicalize every
 //! e-node and union any that collide. Cyclic classes (created by, e.g.,
 //! `x + 0 → x`, whose `add` node points back at its own class) are fine — the
 //! extractor's cost fixpoint simply never selects a self-referential node.
@@ -59,7 +59,7 @@
 //! ## Termination & determinism
 //!
 //! Saturation runs to a fixpoint but is bounded by a node budget
-//! ([`MAX_NODES`]) and an iteration cap ([`MAX_ITERS`]); associativity and
+//! (`MAX_NODES`) and an iteration cap (`MAX_ITERS`); associativity and
 //! commutativity can only add finitely many nodes before the budget halts
 //! growth, so the pass always terminates. All maps/sets are the deterministic
 //! [`DetHashMap`]/[`DetHashSet`] (fixed-seed hashing, tenet T5); classes and
@@ -96,7 +96,7 @@ const MAX_ITERS: usize = 60;
 ///
 /// Like [`Sccp`](crate::transform::Sccp), the read-only analysis (building and
 /// saturating the e-graph, which needs `&TypeContext`/`&ConstPool`) is done up
-/// front by [`EqSat::analyze`] and distilled into a borrow-free [`Plan`] that the
+/// front by [`EqSat::analyze`] and distilled into a borrow-free `Plan` that the
 /// rebuild in [`run`](FunctionTransform::run) consumes — the rebuild's builder
 /// holds the shared interning tables mutably, so the analysis cannot run inside
 /// `run`.
@@ -113,7 +113,7 @@ impl EqSat {
 
     /// Build and saturate the e-graph for `func` — which **must** be the same
     /// function subsequently handed to [`run`](FunctionTransform::run) as `old` —
-    /// and store the distilled extraction [`Plan`].
+    /// and store the distilled extraction `Plan`.
     pub fn analyze(&mut self, func: &Function, types: &TypeContext, consts: &ConstPool) {
         self.plan = Some(Plan::build(func, types, consts));
     }

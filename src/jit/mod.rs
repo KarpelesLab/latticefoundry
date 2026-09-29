@@ -2,7 +2,7 @@
 //!
 //! This is the in-process analogue of the M5 native-executable path: instead of
 //! writing a linked ELF file and running it as a separate process, we compile a
-//! LatticeFoundry IR [`Module`](crate::ir::Module) to an [`ObjectModule`] with
+//! LatticeFoundry IR [`Module`] to an [`ObjectModule`] with
 //! the same x86-64 backend, lay its sections into an executable memory mapping,
 //! resolve relocations against the mapping's real addresses, and call the
 //! resulting machine code directly.

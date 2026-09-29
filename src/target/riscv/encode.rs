@@ -25,7 +25,7 @@
 //! not copied from any assembler.
 //!
 //! **Deferred (relocations).** RISC-V direct calls and global addresses want the
-//! `R_RISCV_CALL` / `R_RISCV_PCREL_HI20`+`LO12` relocations, whose [`RelocKind`]s
+//! `R_RISCV_CALL` / `R_RISCV_PCREL_HI20`+`LO12` relocations, whose `RelocKind`s
 //! are not modeled by the machine-code layer this backend is allowed to touch. A
 //! `call` therefore emits a self-relative `auipc`+`jalr` placeholder and a global
 //! address an `auipc`+`addi` placeholder, without a relocation; this suffices for

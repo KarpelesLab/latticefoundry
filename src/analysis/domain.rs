@@ -138,7 +138,7 @@ pub trait AbstractDomain: Clone + PartialEq + std::fmt::Debug + Sized {
     ///
     /// Must be **monotone** in `operands` and **sound**: for any concrete
     /// operands `x_i ∈ γ(operands_i)` on which the concrete semantics
-    /// ([`eval`](crate::ir::eval)) is defined and yields `r`, the result must
+    /// ([`eval`]) is defined and yields `r`, the result must
     /// satisfy `r ∈ γ(transfer(..))`.
     fn transfer(ctx: DomainCtx<'_>, inst: &InstData, operands: &[Self]) -> Self;
 

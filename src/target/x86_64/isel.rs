@@ -47,7 +47,7 @@
 //!
 //! **Register save area** — the prologue of any function whose signature is
 //! variadic reserves a 176-byte area and spills the incoming argument registers
-//! into it ([`X86_64Target::spill_va_regs`]): the 6 integer regs
+//! into it (`X86_64Target::spill_va_regs`): the 6 integer regs
 //! `rdi, rsi, rdx, rcx, r8, r9` at offsets `0, 8, .., 40`, then `xmm0..7` at
 //! offsets `48, 64, .., 160` (16-byte stride). The SSE saves are unconditional
 //! (no `test al,al` guard): reading `xmm0..7` is always safe.
@@ -233,7 +233,7 @@ pub enum X86Op {
     /// keeps the outgoing area travelling at the bottom of the frame
     /// (`[rsp, rsp + outgoing)`) by relocating it below the carved block, so
     /// stack-argument `[rsp + k]` addressing stays valid; the rbp-relative
-    /// epilogue reclaims the whole dynamic region on return. See [`encode_inst`]
+    /// epilogue reclaims the whole dynamic region on return. See `encode_inst`
     /// (`super::encode`) for the exact expansion.
     DynAlloca = 54,
     /// `[Def rax, Def rcx, Def r11, Use rax, Use arg-regs...]` — the Linux

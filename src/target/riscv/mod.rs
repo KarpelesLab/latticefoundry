@@ -20,7 +20,7 @@
 //!
 //! Submodules:
 //!
-//! - [`regs`] — the 32 GPRs (`x0`–`x31`, `x0` hardwired zero), the
+//! - `regs` — the 32 GPRs (`x0`–`x31`, `x0` hardwired zero), the
 //!   allocatable/scratch split, and the LP64 calling convention;
 //! - [`isel`] — the [`RvOp`] opcode set and the lowering rules;
 //! - [`encode`] — the fixed-width bitfield encoder (R/I/S/B/U/J formats), frame

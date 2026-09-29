@@ -1,7 +1,7 @@
 //! Linking standard ELF objects, archives and shared libraries, via our own
 //! [`qld`] linker.
 //!
-//! The [static linker core](super::image) links LatticeFoundry's own objects
+//! The [static linker core](super::link_executable) links LatticeFoundry's own objects
 //! into a self-contained executable. Everything beyond that — ELF `.o` inputs
 //! from any compiler, `.a` archives, `libc.so` and other shared libraries,
 //! dynamic executables, PIE, linker scripts — is `qld`'s job: it accepts a GNU

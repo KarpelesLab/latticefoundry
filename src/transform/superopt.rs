@@ -3,7 +3,7 @@
 //! A Souper-style *bounded synthesizer* for the pure single-block integer
 //! subset. Given a small target function it enumerates candidate instruction
 //! sequences over the integer opcode set, **prunes** them hard, and accepts one
-//! only when [`check_refinement`](crate::verify::check_refinement) — the `z3rs`
+//! only when [`check_refinement`] — the `z3rs`
 //! refinement oracle (bet **B2**) — *proves* it a refinement. The cheapest such
 //! proven-equivalent, when strictly cheaper than the input, is the result. Every
 //! accepted rewrite carries a `z3rs` `Refines` verdict, so the synthesizer grows
@@ -24,21 +24,21 @@
 //!
 //! ## Synthesis & pruning
 //!
-//! The target is lifted to an [`Expr`] tree ([`Spec::from_function`]). Candidates
-//! are enumerated as [`Expr`] trees of increasing size over the target's integer
+//! The target is lifted to an `Expr` tree (`Spec::from_function`). Candidates
+//! are enumerated as `Expr` trees of increasing size over the target's integer
 //! parameters and a small deterministic set of constant templates, using the
-//! candidate opcode set [`CAND_OPS`] (all flag-free). Two prunes make the search
+//! candidate opcode set `CAND_OPS` (all flag-free). Two prunes make the search
 //! affordable:
 //!
 //! 1. **Cost bound.** Each candidate is scored with a small additive cost model
-//!    ([`cost_of`] over [`bin_own_cost`]) mirroring the e-graph's B9 cost
+//!    (`cost_of` over `bin_own_cost`) mirroring the e-graph's B9 cost
 //!    (constants/inputs cheapest, shifts cheaper than add, multiply dear,
 //!    divide/remainder dearest). Only candidates *strictly cheaper* than the best
 //!    so far are considered, and whole size classes are skipped once their
 //!    minimum possible cost cannot beat the best (`2·size + 1`).
 //! 2. **Concrete pre-filter.** Before ever calling the solver, the candidate and
 //!    the target are evaluated on a batch of edge-case + pseudo-random concrete
-//!    inputs with [`crate::ir::eval`] ([`concretely_refines`]). The check mirrors
+//!    inputs with [`crate::ir::eval`] (`concretely_refines`). The check mirrors
 //!    the *refinement* relation pointwise (poison source licenses any target;
 //!    a defined source pins the target; a target that introduces UB where the
 //!    source was UB-free is rejected), so it never rejects a true refinement but
@@ -81,7 +81,7 @@
 //! Every search runs under a hard [`Budget`]: `max_ops` (sequence length),
 //! `max_candidates` (candidates examined), `max_solver_calls` (solver calls), and
 //! `max_samples` (concrete inputs). Enumeration is strictly ordered — sizes
-//! ascending, opcodes in [`CAND_OPS`] order, parameters before constants — and
+//! ascending, opcodes in `CAND_OPS` order, parameters before constants — and
 //! never iterates a hash map, so the result is byte-for-byte reproducible across
 //! runs (asserted by `deterministic_across_runs`). A target with no cheaper
 //! proven equivalent returns `None`/no rule without blowing up.
