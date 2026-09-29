@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use latticefoundry::ir::builder::FunctionBuilder;
 use latticefoundry::ir::inst::{BinOp, CastOp, Flags, FloatPred, IntPred};
-use latticefoundry::ir::types::TypeId;
+use latticefoundry::ir::types::{Type, TypeContext, TypeId};
 use latticefoundry::ir::value::{FloatBits, ValueId};
 use latticefoundry::ir::{BlockId, Const, FuncId, GlobalId, Global, Module};
 use latticefoundry::support::StrInterner;
@@ -115,20 +115,25 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
     };
 
     // Declare every function signature in order so a sig index equals its FuncId.
-    // A struct/union return is lowered by hidden-pointer (`sret`) convention: the
-    // caller allocates the result and passes its address as a hidden leading
-    // pointer parameter, and the function returns `void`. A struct/union *value*
-    // parameter or argument is likewise passed by pointer to a caller-made copy
-    // (`tys.of` already maps a record to a pointer). This keeps every crossing of
-    // the ABI a scalar/pointer operation, which the IR verifier accepts.
+    // A struct/union parameter or return has its aggregate IR type, so the
+    // backend applies the System V AMD64 aggregate convention (eightbytes in
+    // integer/SSE registers, or memory: the stack for an argument, a hidden
+    // `sret` pointer for a result) — the ABI gcc and the C library use. An
+    // aggregate *value* is the address of its storage: a caller passes the
+    // address of a copy it made, bitcast to the struct type.
     let mut func_ids: Vec<FuncId> = Vec::with_capacity(program.sigs.len());
     for sig in &program.sigs {
-        let mut params: Vec<TypeId> = Vec::with_capacity(sig.params.len() + 1);
-        if sig.ret.is_record() {
-            params.push(tys.ptr); // hidden sret pointer
-        }
-        params.extend(sig.params.iter().map(|p| tys.of(p)));
-        let ret = if sig.ret.is_record() { tys.void } else { tys.of(&sig.ret) };
+        let cx = module.types_mut();
+        let params: Vec<TypeId> = sig
+            .params
+            .iter()
+            .map(|p| if p.is_record() { layout::ir_type(cx, &program.records, p) } else { tys.of(p) })
+            .collect();
+        let ret = if sig.ret.is_record() {
+            layout::ir_type(cx, &program.records, &sig.ret)
+        } else {
+            tys.of(&sig.ret)
+        };
         let ft = module.types_mut().func(params, ret, sig.variadic);
         let name = syms.intern(&sig.name);
         func_ids.push(module.declare_function(name, ft));
@@ -217,6 +222,14 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
         }
     }
 
+    // The System V eightbyte classes of every record passed or returned by
+    // value (for the `va_start` register counts; `None` = memory class).
+    let abi_classes: HashMap<CType, Option<Vec<bool>>> = agg_types
+        .iter()
+        .filter(|(ty, _)| ty.is_record())
+        .map(|(ty, &id)| (ty.clone(), sysv_eightbytes(module.types(), id)))
+        .collect();
+
     // Build each defined function's body.
     for f in &program.funcs {
         let fid = func_ids[f.sig_index];
@@ -239,7 +252,8 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             agg_types: &agg_types,
             blob_types: &blob_types,
             records: &program.records,
-            sret: None,
+            abi_classes: &abi_classes,
+            ret_ty: f.ret.clone(),
             va_gp: 0,
             va_fp: 0,
             va_reg_save,
@@ -346,9 +360,10 @@ struct FnLower<'a> {
     blob_types: &'a HashMap<u64, TypeId>,
     /// The struct/union registry, for layout queries during lowering.
     records: &'a Records,
-    /// The hidden `sret` pointer of the function being lowered, if it returns a
-    /// struct/union by value (the caller-allocated result storage).
-    sret: Option<ValueId>,
+    /// The System V eightbyte classes of by-value records (`None` = memory).
+    abi_classes: &'a HashMap<CType, Option<Vec<bool>>>,
+    /// The C return type of the function being lowered.
+    ret_ty: CType,
     /// `va_start` seeds: `gp_offset = 8 * va_gp`, `fp_offset = 48 + 16 * va_fp`,
     /// where the counts are the enclosing function's named GPR/SSE arguments.
     va_gp: u32,
@@ -387,31 +402,30 @@ impl FnLower<'_> {
             };
             self.slots.push(slot);
         }
-        // A struct/union return uses the hidden `sret` pointer (the first IR
-        // parameter); the real parameters follow it.
         let params: Vec<ValueId> = self.b.block_params(entry).to_vec();
-        let base = if f.ret.is_record() {
-            self.sret = Some(params[0]);
-            1
-        } else {
-            0
-        };
         // The `va_start` seed counts: how many named GPR/SSE argument registers
-        // the enclosing function consumes (an sret pointer takes one GPR).
-        let mut gp = base as u32;
+        // the enclosing function consumes (a memory-class struct return's hidden
+        // `sret` pointer takes one GPR).
+        let mut gp = u32::from(f.ret.is_record() && self.abi_classes.get(&f.ret) == Some(&None));
         let mut fp = 0u32;
         // Store the incoming parameter values into their slots. A struct/union
-        // value parameter arrives as a pointer to the caller's copy; copy it into
-        // the parameter object's own storage so the body owns a private copy.
+        // value parameter arrives as the address of storage the backend set up
+        // from the registers or stack the caller used; copy it into the
+        // parameter object's own storage.
         for (i, &obj) in f.params.iter().enumerate() {
             let pty = self.locals[obj].ty.clone();
-            let incoming = params[base + i];
+            let incoming = params[i];
             if pty.is_record() {
                 let size = layout::size_of(self.records, &pty);
                 let dst = self.slots[obj];
                 self.copy_bytes(dst, incoming, size);
-                if gp < 6 {
-                    gp += 1;
+                if let Some(Some(ebs)) = self.abi_classes.get(&pty) {
+                    let sse = ebs.iter().filter(|&&s| s).count() as u32;
+                    let int = ebs.len() as u32 - sse;
+                    if gp + int <= 6 && fp + sse <= 8 {
+                        gp += int;
+                        fp += sse;
+                    }
                 }
             } else if pty.is_float() {
                 let ty = self.tys.of(&pty);
@@ -438,7 +452,12 @@ impl FnLower<'_> {
             // Fall off the end: return 0 (or nothing for void / a struct return).
             match &f.ret {
                 CType::Void => self.b.ret(None),
-                r if r.is_record() => self.b.ret(None),
+                r if r.is_record() => {
+                    // No value was returned (using it is undefined): hand back
+                    // fresh storage of the right type.
+                    let slot = self.b.alloca(self.ir_of(r));
+                    self.b.ret(Some(slot));
+                }
                 other => {
                     let ty = self.tys.of(other);
                     let zero = if other.is_pointer() {
@@ -556,20 +575,25 @@ impl FnLower<'_> {
             }
             TStmt::Return(v) => {
                 match v {
-                    // A struct/union return copies the value into the caller's
-                    // `sret` storage and returns no register value.
+                    // A struct/union return hands the backend the address of the
+                    // value: it loads the eightbytes into the return registers, or
+                    // copies the value through the caller's `sret` pointer.
                     Some(e) if e.ty.is_record() => {
                         self.set_line(e.span);
-                        let sret = self.sret.expect("struct return has an sret pointer");
                         let src = self.lower_struct_addr(e);
-                        let size = layout::size_of(self.records, &e.ty);
-                        self.copy_bytes(sret, src, size);
-                        self.b.ret(None);
+                        self.b.ret(Some(src));
                     }
                     Some(e) => {
                         self.set_line(e.span);
                         let val = self.lower_rvalue(e);
                         self.b.ret(Some(val));
+                    }
+                    None if self.ret_ty.is_record() => {
+                        // `return;` in a struct function (using the value is
+                        // undefined): hand back fresh storage of the right type.
+                        let ty = self.ret_ty.clone();
+                        let slot = self.b.alloca(self.ir_of(&ty));
+                        self.b.ret(Some(slot));
                     }
                     None => self.b.ret(None),
                 }
@@ -1494,35 +1518,27 @@ impl FnLower<'_> {
             TExprKind::FuncPtr(idx) => self.b.func_ref(self.func_ids[*idx]),
             _ => self.lower_rvalue(callee),
         };
-        let ret_is_record = call.ty.is_record();
-        let mut arg_vals: Vec<ValueId> = Vec::with_capacity(args.len() + 1);
-        // A struct/union return: allocate the caller's result storage and pass its
-        // address as the hidden leading argument; the call's value is that address.
-        let ret_slot = if ret_is_record {
-            let ty = self.ir_of(&call.ty);
-            let slot = self.b.alloca(ty);
-            arg_vals.push(slot);
-            Some(slot)
-        } else {
-            None
-        };
+        let mut arg_vals: Vec<ValueId> = Vec::with_capacity(args.len());
         for a in args {
             if a.ty.is_record() {
-                // Pass a struct/union argument by pointer to a fresh copy, so the
-                // callee cannot mutate the caller's object (value semantics).
+                // A struct/union argument: a fresh copy (value semantics), passed
+                // as a value of the aggregate type — the backend classifies it
+                // and moves its eightbytes into registers or the stack.
                 let ty = self.ir_of(&a.ty);
                 let tmp = self.b.alloca(ty);
                 let src = self.lower_struct_addr(a);
                 let size = layout::size_of(self.records, &a.ty);
                 self.copy_bytes(tmp, src, size);
-                arg_vals.push(tmp);
+                arg_vals.push(self.b.cast(CastOp::Bitcast, tmp, ty));
             } else {
                 arg_vals.push(self.lower_rvalue(a));
             }
         }
-        let ret_ty = if ret_is_record { self.tys.void } else { self.tys.of(&call.ty) };
-        let res = self.b.call(callee_val, &arg_vals, ret_ty);
-        if ret_is_record { ret_slot } else { res }
+        // A struct/union result is a value of the aggregate type: the address of
+        // the storage the backend stored the returned eightbytes (or had the
+        // callee fill through `sret`) into.
+        let ret_ty = self.ir_of(&call.ty);
+        self.b.call(callee_val, &arg_vals, ret_ty)
     }
 
     /// Lower a `struct`/`union`-typed expression to a pointer to its storage. Used
@@ -1786,6 +1802,50 @@ fn bitfield_mask(width: u32, work_bits: u16) -> i64 {
     } else {
         ((1u64 << width) - 1) as i64
     }
+}
+
+/// The System V AMD64 classification of an aggregate IR type, as the backend
+/// computes it: `None` for the memory class (larger than 16 bytes), else one
+/// entry per eightbyte, `true` for SSE (only floating data) and `false` for
+/// INTEGER. Only the `va_start` register counts depend on it here.
+fn sysv_eightbytes(types: &TypeContext, ty: TypeId) -> Option<Vec<bool>> {
+    fn walk(types: &TypeContext, ty: TypeId, off: u64, ebs: &mut [Option<bool>]) {
+        let sse = match types.get(ty) {
+            Type::Int(_) | Type::Ptr | Type::Func(_) => false,
+            Type::Float(_) => true,
+            Type::Struct(fields) => {
+                for i in 0..fields.len() {
+                    let (foff, fty) = types.field_offset(ty, i as u32);
+                    walk(types, fty, off + foff, ebs);
+                }
+                return;
+            }
+            Type::Array(elem, len) => {
+                let (elem, len) = (*elem, *len);
+                let stride = types.stride(elem);
+                for k in 0..len {
+                    walk(types, elem, off + k * stride, ebs);
+                }
+                return;
+            }
+            Type::Void => return,
+        };
+        let size = types.size_of(ty).max(1);
+        for e in (off / 8) as usize..=((off + size - 1) / 8) as usize {
+            if let Some(slot) = ebs.get_mut(e) {
+                // INTEGER wins over SSE.
+                *slot = Some(slot.unwrap_or(true) && sse);
+            }
+        }
+    }
+    let size = types.size_of(ty);
+    if size > 16 {
+        return None;
+    }
+    let mut ebs = vec![None; size.div_ceil(8) as usize];
+    walk(types, ty, 0, &mut ebs);
+    // A never-classified eightbyte (padding only) counts as SSE.
+    Some(ebs.into_iter().map(|c| c.unwrap_or(true)).collect())
 }
 
 /// The width in bits of an integer/`_Bool` C type (`_Bool` = 8), else 0.

@@ -2590,8 +2590,13 @@ impl Checker {
             let conv = if i < ft.params.len() {
                 self.convert(ta, &ft.params[i])
             } else {
-                // Variadic argument: default argument promotions.
-                let pt = promote(&ta.ty);
+                // Variadic argument: the default argument promotions — the
+                // integer promotions, and `float` to `double`.
+                let pt = if ta.ty.float_ty() == Some(crate::ast::FloatTy::F32) {
+                    CType::double()
+                } else {
+                    promote(&ta.ty)
+                };
                 self.convert(ta, &pt)
             };
             targs.push(conv);

@@ -549,3 +549,136 @@ fn every_target_header_compiles_in_gcc_preprocessed_form() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Structs by value cross into the C library with the System V layout: the
+/// small-struct returns of `div`/`ldiv`/`lldiv`/`imaxdiv` come back in
+/// registers.
+#[test]
+fn struct_returns_from_the_c_library() {
+    if !prerequisites() {
+        return;
+    }
+    let s = Scratch::new("libc-structs");
+    let p = Prog {
+        name: "libc_structs",
+        src: r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+int main(void) {
+    div_t d = div(17, 5);
+    ldiv_t l = ldiv(100000000000L, 7);
+    lldiv_t q = lldiv(-9000000000000LL, 1000);
+    imaxdiv_t m = imaxdiv(INTMAX_C(123456789012345), 1000000);
+    printf("%d %d|%ld %ld|%lld %lld|%jd %jd\n", d.quot, d.rem, l.quot, l.rem, q.quot, q.rem,
+           m.quot, m.rem);
+    return 0;
+}
+"#,
+        stdout: "3 2|14285714285 5|-9000000000 0|123456789 12345\n",
+        stderr: "",
+        exit: 0,
+    };
+    std::fs::write(s.0.join("libc_structs.c"), p.src).expect("write source");
+    let mut failures = Vec::new();
+    for opt in ["-O0", "-O2"] {
+        if lf_cc(&s.0, &[opt, "libc_structs.c", "-o", "libc_structs"], opt, &mut failures) {
+            check(&p, opt, &run(&s.0.join("libc_structs")), &mut failures);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Struct-by-value calls in both directions between an lf-cc object and a
+/// gcc-compiled one (skipped without gcc): every System V class — one and two
+/// INTEGER eightbytes, SSE (including two `float`s sharing one eightbyte),
+/// mixed, and MEMORY — as arguments, as results, and through callbacks.
+#[test]
+fn struct_by_value_interoperates_with_gcc_objects() {
+    if !prerequisites() {
+        return;
+    }
+    let Some(gcc) = which("gcc") else {
+        eprintln!("skipping: gcc is not installed");
+        return;
+    };
+    let s = Scratch::new("gcc-structs");
+    let shared = r#"
+struct I2 { int a, b; };
+struct L2 { long a, b; };
+struct D2 { double x, y; };
+struct F3 { float x, y, z; };
+struct M { int i; double d; };
+struct Big { long a, b, c, d; };
+struct C3 { char c[3]; };
+"#;
+    let gcc_side = format!(
+        "{shared}
+struct I2 g_i2(struct I2 v) {{ v.a += 1; v.b *= 2; return v; }}
+struct L2 g_l2(struct L2 v, long k) {{ v.a += k; v.b -= k; return v; }}
+struct D2 g_d2(struct D2 v) {{ v.x *= 2; v.y += 0.5; return v; }}
+struct F3 g_f3(struct F3 v) {{ v.x += 1; v.y += 2; v.z += 3; return v; }}
+struct M g_m(int k, struct M v) {{ v.i += k; v.d *= k; return v; }}
+struct Big g_big(struct Big v) {{ v.a += 1; v.b += 2; v.c += 3; v.d += 4; return v; }}
+struct C3 g_c3(struct C3 v) {{ v.c[0]++; v.c[2]--; return v; }}
+long g_call(struct Big (*f)(struct M, struct F3), struct M m, struct F3 t) {{
+    struct Big r = f(m, t);
+    return r.a + r.b + r.c + r.d;
+}}
+"
+    );
+    let lf_side = format!(
+        "{shared}
+int printf(const char *, ...);
+struct I2 g_i2(struct I2);
+struct L2 g_l2(struct L2, long);
+struct D2 g_d2(struct D2);
+struct F3 g_f3(struct F3);
+struct M g_m(int, struct M);
+struct Big g_big(struct Big);
+struct C3 g_c3(struct C3);
+long g_call(struct Big (*)(struct M, struct F3), struct M, struct F3);
+static struct Big cb(struct M m, struct F3 t) {{
+    struct Big r = {{ m.i, (long)m.d, (long)(t.x + t.y), (long)t.z }};
+    return r;
+}}
+int main(void) {{
+    struct I2 i2 = g_i2((struct I2){{ 4, 5 }});
+    struct L2 l2 = g_l2((struct L2){{ 100, 200 }}, 7);
+    struct D2 d2 = g_d2((struct D2){{ 1.25, 2.5 }});
+    struct F3 f3 = g_f3((struct F3){{ 0.5f, 1.5f, 2.5f }});
+    struct M m = g_m(3, (struct M){{ 10, 1.5 }});
+    struct Big b = g_big((struct Big){{ 1, 2, 3, 4 }});
+    struct C3 c3 = g_c3((struct C3){{ {{ 'a', 'b', 'c' }} }});
+    long k = g_call(cb, (struct M){{ 6, 7.9 }}, (struct F3){{ 1.5f, 2.5f, 9.0f }});
+    printf(\"%d %d|%ld %ld|%g %g|%g %g %g|%d %g|%ld %ld %ld %ld|%c%c%c|%ld\\n\",
+           i2.a, i2.b, l2.a, l2.b, d2.x, d2.y, f3.x, f3.y, f3.z, m.i, m.d,
+           b.a, b.b, b.c, b.d, c3.c[0], c3.c[1], c3.c[2], k);
+    return 0;
+}}
+"
+    );
+    std::fs::write(s.0.join("gside.c"), gcc_side).expect("write gcc side");
+    std::fs::write(s.0.join("lfside.c"), lf_side).expect("write lf-cc side");
+    let ok = Command::new(&gcc)
+        .args(["-O1", "-c", "gside.c", "-o", "gside.o"])
+        .current_dir(&s.0)
+        .status()
+        .expect("run gcc")
+        .success();
+    assert!(ok, "gcc failed on the gcc-side object");
+    let p = Prog {
+        name: "struct_abi",
+        src: "",
+        stdout: "5 10|107 193|2.5 3|1.5 3.5 5.5|13 4.5|2 4 6 8|bbb|26\n",
+        stderr: "",
+        exit: 0,
+    };
+    let mut failures = Vec::new();
+    for opt in ["-O0", "-O2"] {
+        if lf_cc(&s.0, &[opt, "lfside.c", "gside.o", "-o", "struct_abi"], opt, &mut failures) {
+            check(&p, opt, &run(&s.0.join("struct_abi")), &mut failures);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

@@ -2,10 +2,10 @@
 //!
 //! Each program is compiled with `lf-cc` at -O0 and -O2 and, when `gcc` is
 //! available, with `gcc -O0`; the process exit codes (kept in `0..256`) are
-//! compared. lf-cc uses its own internally-consistent by-reference/`sret` struct
-//! ABI, so a whole self-contained program still observes the same result gcc's
-//! native ABI does. Variadic functions use the backend's System V register save
-//! area / overflow area (`va_start`/`va_arg`/`va_end`).
+//! compared. Structs cross calls with the System V AMD64 aggregate convention
+//! (the one gcc uses; `tests/real_headers.rs` mixes lf-cc and gcc objects).
+//! Variadic functions use the backend's System V register save area / overflow
+//! area (`va_start`/`va_arg`/`va_end`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
