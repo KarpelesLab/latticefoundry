@@ -77,19 +77,26 @@ pub enum AvrOp {
     LshrC = 9,
     /// `[Def d, Use a, Imm k, Imm cw]` — arithmetic shift right by `k`.
     AshrC = 10,
-    /// `[Def d, Use a, Use n, Imm cw]` — shift left by the low byte of `n` (a
-    /// counted loop).
+    /// `[Def d, Use a, Use n, Imm cw, Imm ct, (Def t)]` — shift left by the
+    /// low byte of `n`: a counted loop, or with `ct` (a secret operand) a
+    /// branch-free barrel shifter over the low 4 (3) bits of `n` that clobbers
+    /// the fixed pair `t`.
     ShlV = 11,
-    /// `[Def d, Use a, Use n, Imm cw]` — logical shift right by `n`.
+    /// `[Def d, Use a, Use n, Imm cw, Imm ct, (Def t)]` — logical shift right
+    /// by `n` (as [`AvrOp::ShlV`]).
     LshrV = 12,
-    /// `[Def d, Use a, Use n, Imm cw]` — arithmetic shift right by `n`.
+    /// `[Def d, Use a, Use n, Imm cw, Imm ct, (Def t)]` — arithmetic shift
+    /// right by `n` (as [`AvrOp::ShlV`]).
     AshrV = 13,
-    /// `[Def d, Use s, Imm from, Imm signed, Imm cw]` — `d` = the low `from`
-    /// bits of `s`, zero- or sign-extended to `cw` bits.
+    /// `[Def d, Use s, Imm from, Imm signed, Imm cw, Imm ct]` — `d` = the low
+    /// `from` bits of `s`, zero- or sign-extended to `cw` bits (a sub-byte
+    /// sign extension skips with `sbrc`, or with `ct` shifts instead).
     Ext = 14,
     /// `[Def d, Use c]` — `d = c ? 0xffff : 0` for a clean 0/1 `c`.
     Mask = 15,
-    /// `[Def d, Use a, Use b, Imm pred, Imm cw]` — `d` = 0 or 1 (whole pair).
+    /// `[Def d, Use a, Use b, Imm pred, Imm cw, Imm ct]` — `d` = 0 or 1
+    /// (whole pair): a skip over an `ldi`, or with `ct` the flag read out of
+    /// `SREG`.
     SetCmp = 16,
     /// `[Def d, Use ptr, Imm size, Imm space, Imm atomic]` — load 1 or 2
     /// bytes: `ld` (space 0) or `lpm` (space 1) through `Z`. `atomic` masks
@@ -157,6 +164,44 @@ impl AvrOp {
     #[inline]
     pub fn opcode(self) -> Opcode {
         Opcode(self as u32)
+    }
+
+    /// Whether an instruction of this opcode may execute a conditional branch
+    /// (or skip) whose direction depends on a register value — the
+    /// constant-time audit of the lowering (`docs/ir-design.md` §6d): the
+    /// terminators `BrCond`, `CmpBr` and `Switch`; the atomic
+    /// compare-and-exchange and `min`/`max` read-modify-writes (which store
+    /// conditionally; the verifier rejects secret atomics); and the
+    /// **compact** forms of `SetCmp` (a skip), the variable shifts (a counted
+    /// loop) and a sub-byte sign extension (`sbrc`). Isel picks those only for
+    /// public operands: on a secret-derived operand it emits their
+    /// constant-time forms (`ct` set) — the flag read out of `SREG`, a
+    /// branch-free barrel shifter, a shift pair — which do not branch.
+    /// `Select` is always a mask blend. Division and (without `mul`)
+    /// multiplication are calls to the runtime: division of a secret is
+    /// rejected by the verifier, and the runtime's 8/16-bit multiplies take a
+    /// fixed number of iterations.
+    pub fn may_branch_on_data(self, operands: &[MachineOperand]) -> bool {
+        let imm_at = |k: usize| match operands.get(k) {
+            Some(MachineOperand::Imm(c)) => c.to_u64(),
+            _ => None,
+        };
+        match self {
+            AvrOp::BrCond | AvrOp::CmpBr | AvrOp::Switch | AvrOp::CmpXchg => true,
+            AvrOp::AtomicRmw => match imm_at(4) {
+                Some(c) => matches!(RmwOp::from_code(c), Some(RmwOp::Max | RmwOp::Min | RmwOp::UMax | RmwOp::UMin)),
+                None => true,
+            },
+            // Compact unless `ct` is set (an unknown operand list counts as
+            // compact).
+            AvrOp::SetCmp => imm_at(5) != Some(1),
+            AvrOp::ShlV | AvrOp::LshrV | AvrOp::AshrV => imm_at(4) != Some(1),
+            AvrOp::Ext => {
+                let sub_byte_signed = imm_at(3) == Some(1) && imm_at(2).is_some_and(|f| f % 8 != 0);
+                sub_byte_signed && imm_at(5) != Some(1)
+            }
+            _ => false,
+        }
     }
 
     /// Decode a MIR [`Opcode`] back to an [`AvrOp`].
@@ -230,6 +275,9 @@ struct Side {
     zero: DetHashSet<VReg>,
     fused: DetHashSet<ValueId>,
     slots: DetHashMap<ValueId, StackSlot>,
+    /// Per value of the function: whether it is secret-derived (empty when
+    /// nothing is).
+    secret: Vec<bool>,
 }
 
 /// The AVR target: register file, ABI, and the isel rules.
@@ -268,12 +316,24 @@ impl AvrTarget {
 
     /// Lower function `func` of `module` (already prepared: see
     /// [`super::prepare`]) to MIR over this target.
+    ///
+    /// The secret-taint analysis ([`SecretTaint`](crate::analysis::secret::SecretTaint))
+    /// runs first: an operation on a secret-derived value gets the
+    /// constant-time (branch-free) form of the lowerings that have one, every
+    /// other operation the compact form.
     pub fn select(&self, module: &Module, func: crate::ir::FuncId) -> crate::codegen::mir::MachineFunction {
-        *self.side.borrow_mut() = Side::default();
+        let taint = crate::analysis::secret::SecretTaint::compute(module, func);
+        let secret = if taint.any_secret() { taint.secret_values() } else { Vec::new() };
+        *self.side.borrow_mut() = Side { secret, ..Side::default() };
         crate::codegen::isel::select(self, module, func)
     }
 
     // --- value helpers ------------------------------------------------------
+
+    /// Whether `v` is secret-derived (so its lowerings must be constant-time).
+    fn secret(&self, v: ValueId) -> bool {
+        self.side.borrow().secret.get(v.index()).copied().unwrap_or(false)
+    }
 
     /// The bit width of an integer or pointer value.
     fn bits(lo: &Lower<'_, Self>, v: ValueId) -> u32 {
@@ -406,14 +466,15 @@ impl AvrTarget {
         if bits >= cw || (!signed && Self::is_compare(lo, v)) {
             return r;
         }
-        self.ext_reg(lo, r, bits, signed, cw)
+        let ct = self.secret(v);
+        self.ext_reg(lo, r, bits, signed, cw, ct)
     }
 
-    fn ext_reg(&self, lo: &mut Lower<'_, Self>, r: VReg, from: u32, signed: bool, cw: u32) -> VReg {
+    fn ext_reg(&self, lo: &mut Lower<'_, Self>, r: VReg, from: u32, signed: bool, cw: u32, ct: bool) -> VReg {
         let d = lo.fresh_vreg(RegClass::Gpr);
         lo.emit(inst(
             AvrOp::Ext,
-            vec![def_v(d), use_v(r), imm(u64::from(from)), imm(u64::from(signed)), imm(u64::from(cw))],
+            vec![def_v(d), use_v(r), imm(u64::from(from)), imm(u64::from(signed)), imm(u64::from(cw)), imm(u64::from(ct))],
         ));
         d
     }
@@ -587,7 +648,14 @@ impl AvrTarget {
             lo.emit(inst(c_op, vec![def_v(d), use_v(ra), imm(k), imm(u64::from(cw))]));
         } else {
             let rb = if Self::bits(lo, b) < 8 { self.extend(lo, b, false, 8) } else { self.reg(lo, b) };
-            lo.emit(inst(v_op, vec![def_v(d), use_v(ra), use_v(rb), imm(u64::from(cw))]));
+            if self.secret(a) || self.secret(b) {
+                // The branch-free shifter needs a scratch pair: a fixed one,
+                // so the op keeps three vreg operands (the spill-scratch
+                // budget).
+                lo.emit(inst(v_op, vec![def_v(d), use_v(ra), use_v(rb), imm(u64::from(cw)), imm(1), def_p(pair(18))]));
+            } else {
+                lo.emit(inst(v_op, vec![def_v(d), use_v(ra), use_v(rb), imm(u64::from(cw)), imm(0)]));
+            }
         }
     }
 
@@ -853,7 +921,9 @@ impl AvrTarget {
                 let pv = v.div_2k_trunc(16 * j as u32).mod_2k(16).to_u64().unwrap_or(0);
                 let c = self.konst(lo, pv);
                 let e = lo.fresh_vreg(RegClass::Gpr);
-                lo.emit(inst(AvrOp::SetCmp, vec![def_v(e), use_v(p), use_v(c), imm(pred_code(IntPred::Eq)), imm(16)]));
+                // A switch condition is never secret (the verifier forbids
+                // it): the compact compare.
+                lo.emit(inst(AvrOp::SetCmp, vec![def_v(e), use_v(p), use_v(c), imm(pred_code(IntPred::Eq)), imm(16), imm(0)]));
                 all = Some(match all {
                     None => e,
                     Some(a) => {
@@ -1004,10 +1074,11 @@ impl TargetIsel for AvrTarget {
                     return;
                 }
                 let d = lo.result_reg(i);
+                let ct = self.secret(i.operands()[0]) || self.secret(i.operands()[1]);
                 let (a, b, cw) = self.cmp_operands(lo, *pred, i.operands()[0], i.operands()[1]);
                 lo.emit(inst(
                     AvrOp::SetCmp,
-                    vec![def_v(d), use_v(a), use_v(b), imm(pred_code(*pred)), imm(u64::from(cw))],
+                    vec![def_v(d), use_v(a), use_v(b), imm(pred_code(*pred)), imm(u64::from(cw)), imm(u64::from(ct))],
                 ));
             }
             InstKind::Cast(op) => self.lower_cast(lo, *op, i),

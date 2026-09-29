@@ -166,6 +166,15 @@ fn one(d: u8, op: u16) -> u16 {
 pub(crate) fn com(d: u8) -> u16 {
     one(d, 0x0)
 }
+pub(crate) fn dec(d: u8) -> u16 {
+    one(d, 0xa)
+}
+pub(crate) fn neg(d: u8) -> u16 {
+    one(d, 0x1)
+}
+pub(crate) fn swap(d: u8) -> u16 {
+    one(d, 0x2)
+}
 pub(crate) fn asr(d: u8) -> u16 {
     one(d, 0x5)
 }
@@ -174,9 +183,6 @@ pub(crate) fn lsr(d: u8) -> u16 {
 }
 pub(crate) fn ror(d: u8) -> u16 {
     one(d, 0x7)
-}
-pub(crate) fn dec(d: u8) -> u16 {
-    one(d, 0xa)
 }
 
 /// `movw d, r` (both even).
@@ -256,9 +262,17 @@ pub(crate) fn call(k: u32) -> [u16; 2] {
     let [a, b] = jmp(k);
     [a | 0x0002, b]
 }
-/// `sbrc r, b`.
+/// `sbrc r, b` (skip if bit `b` of `r` is clear).
 pub(crate) fn sbrc(r: u8, b: u8) -> u16 {
     0xfc00 | (u16::from(r) << 4) | u16::from(b)
+}
+/// `bst r, b` (the T flag = bit `b` of `r`).
+pub(crate) fn bst(r: u8, b: u8) -> u16 {
+    0xfa00 | (u16::from(r) << 4) | u16::from(b)
+}
+/// `bld d, b` (bit `b` of `d` = the T flag).
+pub(crate) fn bld(d: u8, b: u8) -> u16 {
+    0xf800 | (u16::from(d) << 4) | u16::from(b)
 }
 pub(crate) const ICALL: u16 = 0x9509;
 pub(crate) const RET: u16 = 0x9508;
@@ -604,26 +618,58 @@ impl Code<'_> {
             }
             op @ (AvrOp::ShlC | AvrOp::LshrC | AvrOp::AshrC) => self.shift_const(op, r(0), r(1), n(2), n(3)),
             op @ (AvrOp::ShlV | AvrOp::LshrV | AvrOp::AshrV) => {
+                // A secret operand: a branch-free barrel shifter (constant time
+                // in the count):
+                // stage k shifts a copy by 2^k and keeps it when bit k of the
+                // count is set, blending with a mask made from that bit.
+                // Scratch: Z (the value), r0 (the count), r1 (the mask,
+                // cleared again at the end) and the fixed pair `t` the isel
+                // reserved.
                 let (d, a, cnt, cw) = (r(0), r(1), r(2), n(3));
+                if n(4) == 0 {
+                    // Public operands: a compact counted loop (it branches on
+                    // the count).
+                    self.w(if cw == 16 { movw(Z, a) } else { mov(Z, a) });
+                    self.w(mov(TMP, cnt));
+                    let body: Vec<u16> = match (op, cw) {
+                        (AvrOp::ShlV, 16) => vec![lsl(Z), rol(Z + 1)],
+                        (AvrOp::LshrV, 16) => vec![lsr(Z + 1), ror(Z)],
+                        (AvrOp::AshrV, 16) => vec![asr(Z + 1), ror(Z)],
+                        (AvrOp::ShlV, _) => vec![lsl(Z)],
+                        (AvrOp::LshrV, _) => vec![lsr(Z)],
+                        _ => vec![asr(Z)],
+                    };
+                    let bl = body.len() as i32;
+                    self.w(rjmp(bl));
+                    self.ws(&body);
+                    self.w(dec(TMP));
+                    self.w(brbc(FLAG_N, -(bl + 2))); // brpl
+                    self.w(if cw == 16 { movw(d, Z) } else { mov(d, Z) });
+                    return;
+                }
+                let t = r(5);
+                let c_op = match op {
+                    AvrOp::ShlV => AvrOp::ShlC,
+                    AvrOp::LshrV => AvrOp::LshrC,
+                    _ => AvrOp::AshrC,
+                };
                 self.w(if cw == 16 { movw(Z, a) } else { mov(Z, a) });
                 self.w(mov(TMP, cnt));
-                let body: Vec<u16> = match (op, cw) {
-                    (AvrOp::ShlV, 16) => vec![lsl(Z), rol(Z + 1)],
-                    (AvrOp::LshrV, 16) => vec![lsr(Z + 1), ror(Z)],
-                    (AvrOp::AshrV, 16) => vec![asr(Z + 1), ror(Z)],
-                    (AvrOp::ShlV, _) => vec![lsl(Z)],
-                    (AvrOp::LshrV, _) => vec![lsr(Z)],
-                    _ => vec![asr(Z)],
-                };
-                let bl = body.len() as i32;
-                self.w(rjmp(bl));
-                self.ws(&body);
-                self.w(dec(TMP));
-                self.w(brbc(FLAG_N, -(bl + 2))); // brpl
+                let stages = if cw == 16 { 4 } else { 3 };
+                for k in 0..stages {
+                    self.ws(&[eor(ZERO, ZERO), movw(t, Z)]);
+                    self.shift_const(c_op, t, t, 1 << k, cw);
+                    self.ws(&[bst(TMP, k as u8), bld(ZERO, 0), neg(ZERO)]);
+                    self.ws(&[eor(t, Z), and(t, ZERO), eor(Z, t)]);
+                    if cw == 16 {
+                        self.ws(&[eor(t + 1, Z + 1), and(t + 1, ZERO), eor(Z + 1, t + 1)]);
+                    }
+                }
+                self.w(eor(ZERO, ZERO));
                 self.w(if cw == 16 { movw(d, Z) } else { mov(d, Z) });
             }
             AvrOp::Ext => {
-                let (d, s, from, signed, cw) = (r(0), r(1), n(2) as u8, n(3) != 0, n(4));
+                let (d, s, from, signed, cw, ct) = (r(0), r(1), n(2) as u8, n(3) != 0, n(4), n(5) != 0);
                 self.w(mov(Z, s));
                 if from > 8 {
                     self.w(mov(Z + 1, s + 1));
@@ -639,7 +685,8 @@ impl Code<'_> {
                     if cw == 16 && from <= 8 {
                         self.w(ldi(Z + 1, 0));
                     }
-                } else {
+                } else if !ct {
+                    // Public: mask, then fill the sign with a skip.
                     if from < 8 {
                         let m = mask(from);
                         self.ws(&[andi(Z, m), sbrc(Z, from - 1), ori(Z, !m)]);
@@ -651,6 +698,28 @@ impl Code<'_> {
                         let m = mask(from - 8);
                         self.ws(&[andi(Z + 1, m), sbrc(Z + 1, from - 9), ori(Z + 1, !m)]);
                     }
+                } else {
+                    // Secret: branch-free — move the sign bit to the top of
+                    // its byte, then shift it back arithmetically.
+                    if from < 8 {
+                        for _ in from..8 {
+                            self.w(lsl(Z));
+                        }
+                        for _ in from..8 {
+                            self.w(asr(Z));
+                        }
+                    }
+                    if cw == 16 && from <= 8 {
+                        self.ws(&[mov(Z + 1, Z), lsl(Z + 1), sbc(Z + 1, Z + 1)]);
+                    }
+                    if from > 8 && from < 16 {
+                        for _ in from..16 {
+                            self.w(lsl(Z + 1));
+                        }
+                        for _ in from..16 {
+                            self.w(asr(Z + 1));
+                        }
+                    }
                 }
                 self.w(if cw == 16 { movw(d, Z) } else { mov(d, Z) });
             }
@@ -660,9 +729,24 @@ impl Code<'_> {
             }
             AvrOp::SetCmp => {
                 let (d, a, b, pred, cw) = (r(0), r(1), r(2), n(3), n(4));
-                let (swap, flag, set) = pred_branch(pred);
-                self.compare(a, b, swap, cw);
-                self.ws(&[ldi(Z, 1), br(flag, set, 1), ldi(Z, 0), mov(d, Z), mov(d + 1, ZERO)]);
+                let (swapped, flag, set) = pred_branch(pred);
+                self.compare(a, b, swapped, cw);
+                if n(5) == 0 {
+                    // Public operands: skip over the `ldi` of 0.
+                    self.ws(&[ldi(Z, 1), br(flag, set, 1), ldi(Z, 0), mov(d, Z), mov(d + 1, ZERO)]);
+                    return;
+                }
+                // Secret operands: branch-free — read the flag out of SREG.
+                self.w(in_(Z, SREG));
+                match flag {
+                    FLAG_Z => self.w(lsr(Z)),
+                    FLAG_S => self.w(swap(Z)),
+                    _ => {}
+                }
+                if !set {
+                    self.w(com(Z));
+                }
+                self.ws(&[andi(Z, 1), mov(d, Z), mov(d + 1, ZERO)]);
             }
             AvrOp::Load => {
                 let (d, p, size, space, atomic) = (r(0), r(1), n(2), n(3), n(4) != 0);

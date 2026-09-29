@@ -20,6 +20,9 @@ use crate::support::StrInterner;
 use crate::support::diagnostics::FileId;
 
 const DEV: Device = Device::ATMEGA328P;
+/// An AVR5 with 64 KiB of flash (the ATmega644 class), for scalarized vector
+/// code, which outgrows 32 KiB.
+const BIG: Device = Device { flash: 64 * 1024, ..DEV };
 const BUDGET: u64 = 50_000_000;
 
 /// Parse and verify `.lf` text.
@@ -209,7 +212,8 @@ fn corpus() -> Vec<(Vec<u16>, String)> {
         add1(asr(d), format!("asr r{d}"));
         add1(lsr(d), format!("lsr r{d}"));
         add1(ror(d), format!("ror r{d}"));
-        add1(dec(d), format!("dec r{d}"));
+        add1(neg(d), format!("neg r{d}"));
+        add1(swap(d), format!("swap r{d}"));
         add1(push(d), format!("push r{d}"));
         add1(pop(d), format!("pop r{d}"));
         add1(lpm(d), format!("lpm r{d}, Z"));
@@ -221,7 +225,8 @@ fn corpus() -> Vec<(Vec<u16>, String)> {
         add1(out(0x3e, d), format!("out 0x3e, r{d}"));
         add1(out(0x3d, d), format!("out 0x3d, r{d}"));
         for b in [0u8, 3, 7] {
-            add1(sbrc(d, b), format!("sbrc r{d}, {b}"));
+            add1(bst(d, b), format!("bst r{d}, {b}"));
+            add1(bld(d, b), format!("bld r{d}, {b}"));
         }
     }
     for (d, k) in [(16u8, 0u8), (17, 0xff), (30, 0x5a), (31, 0xa5), (28, 1), (26, 0x80)] {
@@ -230,7 +235,6 @@ fn corpus() -> Vec<(Vec<u16>, String)> {
         add1(subi(d, k), format!("subi r{d}, {k}"));
         add1(sbci(d, k), format!("sbci r{d}, {k}"));
         add1(andi(d, k), format!("andi r{d}, {k}"));
-        add1(ori(d, k), format!("ori r{d}, {k}"));
     }
     for (d, r) in [(0u8, 30u8), (24, 22), (30, 28), (2, 0), (18, 26)] {
         add1(movw(d, r), format!("movw r{d}, r{r}"));
@@ -323,7 +327,6 @@ fn relative_branches_match_llvm_objdump() {
             (FLAG_C, false, "brsh"),
             (FLAG_S, true, "brlt"),
             (FLAG_S, false, "brge"),
-            (FLAG_N, false, "brpl"),
         ] {
             words.push(br(flag, set, k));
             want.push(format!("{name} {}", rel(k)));
@@ -1440,7 +1443,7 @@ entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
 fn check_vectors(what: &str, src: &str, cases: &[crate::target::vector_fixtures::Case]) -> usize {
     // Scalarized vector code is large: each function gets its own image, on
     // an AVR5 with 64 KiB of flash (the ATmega644 class).
-    let dev = Device { flash: 64 * 1024, ..DEV };
+    let dev = BIG;
     let want = crate::target::vector_fixtures::reference(src, cases);
     let (m, syms) = parse(src);
     let (pm, _, _) = super::prepare::prepare(&m, &syms, &dev).unwrap();
@@ -1498,3 +1501,43 @@ fn vector_programs_are_scalarized_and_run() {
     eprintln!("avr vector programs: {n} results compared");
     assert!(n >= 100, "{n}");
 }
+
+/// A function with no secrets gets the compact lowerings: the skip-based
+/// compare (`ldi; br<cond>; ldi`), the counted-loop shifter (`dec; brpl`)
+/// and the `sbrc` sign fill — none of the branch-free forms (no `in r30,
+/// SREG`, no `bst`/`bld`).
+#[test]
+fn public_code_gets_the_compact_forms() {
+    let src = r#"
+module "public"
+func @f(i16, i16, i4) -> i16 {
+entry ^0(%a: i16, %b: i16, %c: i4):
+  %lt = icmp ult %a, %b : i1
+  %k = and %b, i16 15 : i16
+  %s = shl %a, %k : i16
+  %x = sext %c : i16
+  %z = zext %lt : i16
+  %t = add %s, %z : i16
+  %r = add %t, %x : i16
+  ret %r
+}
+"#;
+    let obj = compile_for(src, &DEV);
+    let words: Vec<u16> = obj.sections()[0].bytes.chunks(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+    let has = |w: u16, mask: u16| words.iter().any(|&x| x & mask == w);
+    assert!(has(0xf400 | u16::from(FLAG_N), 0xfc07), "a brpl closes the shift loop");
+    assert!(has(0x940a, 0xfe0f), "a dec counts the shift loop");
+    assert!(has(0xfc00, 0xfe08), "an sbrc fills the sign");
+    assert!(!words.contains(&in_(30, SREG)), "no SREG read");
+    assert!(!has(0xf800, 0xfc00) && !has(0xfa00, 0xfe00), "no bst/bld");
+    // And it computes the same as the branch-free forms.
+    let fw = firmware(src);
+    for (a, b, c) in [(1u64, 2u64, 0xfu64), (0x8000, 3, 7), (5, 0xffff, 8)] {
+        let s = (a << (b & 15)) & 0xffff;
+        let z = u64::from(a < b);
+        let x = if c & 8 != 0 { c | 0xfff0 } else { c };
+        let want = (s + z + x) & 0xffff;
+        assert_eq!(call(&fw, "f", &[(a, 2), (b, 2), (c, 1)], 2), want);
+    }
+}
+

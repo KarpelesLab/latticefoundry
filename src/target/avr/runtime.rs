@@ -8,7 +8,13 @@
 //!   [`legalize_ints`](crate::codegen::legalize_int::legalize_ints) calls for 32
 //!   and 64 bits — shift-and-add and restoring shift-and-subtract loops, all
 //!   `T f(T, T)` under the normal calling convention (the signed forms are
-//!   written on the unsigned ones; division by zero returns all ones);
+//!   written on the unsigned ones; division by zero returns all ones). The 8-
+//!   and 16-bit multiplies run a fixed number of iterations over branch-free
+//!   steps, so they take the same time whatever the operands: a core without
+//!   `mul` calls them for multiplies the constant-time verifier allows on
+//!   secrets. The 32- and 64-bit ones stop once the multiplier is used up
+//!   (never on a secret: the verifier rejects that call in the prepared
+//!   module);
 //! - IEEE 754 binary32 soft float: `__addsf3`, `__subsf3`, `__mulsf3`,
 //!   `__divsf3` (round to nearest, ties to even; subnormals, infinities and
 //!   NaN handled; a NaN result is quiet), the comparisons `__eqsf2`, `__nesf2`,
@@ -28,6 +34,9 @@ use crate::ir::{FuncId, Function, Module};
 use crate::mc::object::ObjectModule;
 use crate::support::StrInterner;
 use crate::support::diagnostics::FileId;
+
+/// The widths whose multiply helper takes a fixed number of iterations.
+const FIXED_MUL_BITS: [u32; 2] = [8, 16];
 
 /// The integer helper names for a width: `(mul, udiv, div, umod, mod)`.
 fn int_names(bits: u32) -> [String; 5] {
@@ -92,20 +101,30 @@ entry ^0(%a: {t}, %b: {t}):
 "#
         )
     };
+    // The 8/16-bit multiplies (which a core without `mul` calls, also on
+    // secrets) run all `bits` iterations; the wider ones stop once the
+    // multiplier is used up (a secret operand never reaches them: the
+    // verifier rejects the call in the prepared module).
+    let done = if FIXED_MUL_BITS.contains(&bits) {
+        format!("icmp eq %i2, {t} {bits} : i1")
+    } else {
+        format!("icmp eq %y2, {t} 0 : i1")
+    };
     let mut s = format!(
         r#"
 func @{mul}({t}, {t}) -> {t} {{
 entry ^0(%a: {t}, %b: {t}):
-  br ^1(%a, %b, {t} 0)
-^1(%x: {t}, %y: {t}, %acc: {t}):
+  br ^1(%a, %b, {t} 0, {t} 0)
+^1(%x: {t}, %y: {t}, %acc: {t}, %i: {t}):
   %bit = and %y, {t} 1 : {t}
   %t = trunc %bit : i1
   %s = add %acc, %x : {t}
   %acc2 = select %t, %s, %acc : {t}
   %x2 = shl %x, {t} 1 : {t}
   %y2 = lshr %y, {t} 1 : {t}
-  %done = icmp eq %y2, {t} 0 : i1
-  cond_br %done, ^2(%acc2), ^1(%x2, %y2, %acc2)
+  %i2 = add %i, {t} 1 : {t}
+  %done = {done}
+  cond_br %done, ^2(%acc2), ^1(%x2, %y2, %acc2, %i2)
 ^2(%r: {t}):
   ret %r
 }}

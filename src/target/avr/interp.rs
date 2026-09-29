@@ -327,6 +327,17 @@ impl Avr {
                     if set == want {
                         next = (pc as i32 + 1 + i32::from(k)) as u32;
                     }
+                } else if op & 0x0c08 == 0x0800 {
+                    // bld / bst (the T flag)
+                    let b = 1u8 << (op & 7);
+                    if op & 0x0200 != 0 {
+                        let t = self.data[d5] & b != 0;
+                        self.set_flags(1 << 6, if t { 1 << 6 } else { 0 });
+                    } else if self.flag(1 << 6) {
+                        self.data[d5] |= b;
+                    } else {
+                        self.data[d5] &= !b;
+                    }
                 } else if op & 0x0c08 == 0x0c00 {
                     // sbrc / sbrs
                     let bit = self.data[d5] & (1 << (op & 7)) != 0;
