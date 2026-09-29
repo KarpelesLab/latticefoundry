@@ -124,16 +124,34 @@ pub fn load_segments(elf: &[u8]) -> Result<Vec<LoadSegment>, String> {
     Ok(out)
 }
 
-/// Link `objects` with the static linker core and return the loaded image's
-/// segments (see [`load_segments`]), placed so that the first byte of code
-/// (the start of the first input's `.text`, i.e. the entry stub or the
-/// program's own `_start`) is at `opts.base` rather than the ELF headers.
+/// A linked firmware image: its contents and its entry point.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Firmware {
+    /// The loaded contents, sorted by address.
+    pub segments: Vec<LoadSegment>,
+    /// The entry point (`_start`).
+    pub entry: u64,
+}
+
+/// The entry point (`e_entry`) of a little-endian ELF executable.
+fn elf_entry(elf: &[u8]) -> Option<u64> {
+    match elf.get(4)? {
+        1 => u32_at(elf, 24).map(u64::from),
+        2 => u64_at(elf, 24),
+        _ => None,
+    }
+}
+
+/// Link `objects` with the static linker core and return the loaded image
+/// (see [`load_segments`]), placed so that the first byte of code (the start
+/// of the first input's `.text`, i.e. the entry stub or the program's own
+/// `_start`) is at `opts.base` rather than the ELF headers.
 ///
 /// # Errors
 ///
 /// A link error, or a base address too low to hold the headers the image
 /// layout reserves in front of the code.
-pub fn link_firmware(objects: Vec<ObjectModule>, opts: &ImageOptions) -> Result<Vec<LoadSegment>, String> {
+pub fn link_firmware(objects: Vec<ObjectModule>, opts: &ImageOptions) -> Result<Firmware, String> {
     // The headers' size depends only on how many segments the image has, so
     // a first link measures it and a second one shifts the base down by it.
     let probe = link_executable(objects.clone(), opts).map_err(|e| e.to_string())?;
@@ -148,7 +166,8 @@ pub fn link_firmware(objects: Vec<ObjectModule>, opts: &ImageOptions) -> Result<
     })?;
     let shifted = ImageOptions { base, ..opts.clone() };
     let image = link_executable(objects, &shifted).map_err(|e| e.to_string())?;
-    load_segments(&image)
+    let entry = elf_entry(&image).ok_or("the linked image has no ELF header")?;
+    Ok(Firmware { segments: load_segments(&image)?, entry })
 }
 
 /// The raw memory image of `segments`: from the lowest address to the end of
@@ -334,7 +353,9 @@ mod tests {
     #[test]
     fn firmware_places_code_at_the_base() {
         let opts = ImageOptions { base: 0x0800_0000, ..ImageOptions::default() };
-        let segs = link_firmware(tiny_program(), &opts).unwrap();
+        let fw = link_firmware(tiny_program(), &opts).unwrap();
+        assert_eq!(fw.entry, 0x0800_0000, "the program's own _start is first");
+        let segs = fw.segments;
         assert_eq!(segs[0].addr, 0x0800_0000);
         assert_eq!(&segs[0].data[..6], &[0xb8, 42, 0, 0, 0, 0xc3]);
         let data = segs.iter().find(|s| s.data == [0xde, 0xad, 0xbe, 0xef]).expect(".data");
@@ -374,7 +395,7 @@ mod tests {
             return;
         }
         let opts = ImageOptions { base: 0x0002_0000, ..ImageOptions::default() };
-        let segs = link_firmware(tiny_program(), &opts).unwrap();
+        let segs = link_firmware(tiny_program(), &opts).unwrap().segments;
         let (_, bin) = to_binary(&segs, 0).unwrap();
         let hex = to_ihex(&segs, None).unwrap();
         let dir = std::env::temp_dir().join(format!("lf-raw-{}", std::process::id()));

@@ -6,18 +6,27 @@
 //! it into a **static native executable** with our own linker, and marks it
 //! executable — no system linker or libc involved.
 //!
-//! Other outputs: `--shared` builds a **shared library** of position-
+//! `--target <triple>` picks the architecture and OS (and so the calling
+//! convention and object format), `-c` stops at a relocatable object (ELF,
+//! PE/COFF or Mach-O; `--format` overrides the triple's), and `--oformat
+//! binary|ihex` writes a firmware image instead of an ELF executable. Windows
+//! executables are linked by qld's PE driver.
+//!
+//! For x86-64 Linux, `--shared` builds a **shared library** of position-
 //! independent code (linked by `qld`, optional `-soname`), `--pie` a
 //! position-independent executable against the host C library (its `main` is
-//! called by the C runtime), and `-c` stops at the relocatable ELF object
-//! (`--pic`/`--pie` pick its relocation model).
+//! called by the C runtime), and `-c --pic`/`-c --pie` pick an object's
+//! relocation model.
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use latticefoundry::codegen::{CodegenOptions, RelocModel, StackAssumptions, StackReport};
 use latticefoundry::ir::{Module, binary, merge_modules, text};
+use latticefoundry::link::raw::{self, RawFormat};
 use latticefoundry::link::{self, ImageOptions};
+use latticefoundry::mc::object::ObjectModule;
+use latticefoundry::target::{ObjectFormat, TargetArch, TargetOs, Triple};
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::{Diagnostic, FileId, Severity};
 use latticefoundry::transform::pipeline::{self, OptLevel};
@@ -54,7 +63,8 @@ fn print_usage() {
     println!(
         "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3] [--entry <name>] [-g] [--lto] [--no-verify]"
     );
-    println!("           [--stack-usage] [--no-stack-probes]");
+    println!("           [--stack-usage] [--no-stack-probes] [--target <triple>] [-c [--format <fmt>]]");
+    println!("           [--oformat elf|binary|ihex] [--base <addr>]");
     println!("           [--shared [-soname <name>] | --pie | -c [--pic|--pie]] [-L<dir>] [-l<lib>]");
     println!("  lf --version | --help\n");
     println!("  -O0..-O3       optimization level (default: -O0)");
@@ -62,13 +72,20 @@ fn print_usage() {
     println!("  --lto          link-time optimize across inputs (implied by 2+ inputs)");
     println!("  --stack-usage  print each function's stack frame and the worst-case depth");
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
+    println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
+    println!("                 aarch64-windows, aarch64-apple-darwin, ... (ABI + object format)");
+    println!("  -c             emit a relocatable object instead of linking");
+    println!("  --format F     object format for -c: elf, coff or macho (default: the target's)");
+    println!("  --oformat F    executable format: elf (default), binary or ihex (firmware)");
+    println!("  --base ADDR    image load address (default 0x400000); for binary/ihex, where");
+    println!("                 the first byte of code goes");
     println!("  --shared       build a shared library (position-independent; default lib<input>.so)");
     println!("  -soname <name> set the shared library's DT_SONAME");
     println!("  --pie          build a position-independent executable against the host C library");
-    println!("  -c             emit the relocatable ELF object only (default <input>.o)");
     println!("  --pic          with -c: position-independent code for a shared library");
     println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie)");
-    println!("`lf build` compiles one or more IR modules to a static native executable.");
+    println!("`lf build` compiles one or more IR modules to a static native executable");
+    println!("(for a Windows target, a PE executable whose entry point is `main`).");
     println!("With several inputs (or --lto), the modules are IR-linked into one, the");
     println!("-O pipeline runs over the whole program (cross-module inlining), then codegen.");
 }
@@ -83,6 +100,10 @@ struct BuildOptions {
     lto: bool,
     stack_usage: bool,
     stack_probes: bool,
+    target: Triple,
+    format: Option<ObjectFormat>,
+    oformat: Option<RawFormat>,
+    base: Option<u64>,
     output_kind: OutputKind,
     /// `-c --pic`: shared-library (PIC) object code.
     pic: bool,
@@ -96,13 +117,13 @@ struct BuildOptions {
 /// What `lf build` produces.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputKind {
-    /// A static executable linked by our own linker (the default).
-    Static,
+    /// An executable (or firmware image) for the target, the default.
+    Executable,
     /// A shared library (`--shared`), linked by qld.
     Shared,
     /// A PIE executable against the host C library (`--pie`), linked by qld.
     Pie,
-    /// A relocatable ELF object (`-c`).
+    /// A relocatable object (`-c`).
     Object,
 }
 
@@ -114,7 +135,7 @@ impl BuildOptions {
             OutputKind::Pie => RelocModel::Pie,
             OutputKind::Object if self.pic => RelocModel::Pic,
             OutputKind::Object if self.pie => RelocModel::Pie,
-            OutputKind::Static | OutputKind::Object => RelocModel::Static,
+            OutputKind::Executable | OutputKind::Object => RelocModel::Static,
         }
     }
 }
@@ -156,61 +177,87 @@ fn build(args: &[String]) -> Result<(), String> {
         verify_or_err(&module, "optimized")?;
     }
 
-    // Lower to a relocatable object, then link into a static executable. With
-    // `-g`, also emit DWARF debug info and a debuggable image (section headers +
-    // symbol table + `.debug_*`).
+    // Lower to a relocatable object for the target, then either write it
+    // (`-c`) or link an executable. With `-g`, also emit DWARF debug info and a
+    // debuggable image (section headers + symbol table + `.debug_*`).
+    let triple = opts.target;
     let cg = CodegenOptions::default()
         .with_stack_probes(opts.stack_probes)
+        .with_os(triple.os)
         .with_reloc_model(opts.reloc_model());
-    let compiled = if opts.debug {
-        let comp_dir = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_owned))
-            .unwrap_or_default();
-        let file_name = opts.inputs.first().cloned().unwrap_or_default();
-        let source = target::x86_64::DebugSource { file_name, comp_dir };
-        target::x86_64::compile_module_debug_with(&module, &syms, &source, &cg)
-    } else {
-        target::x86_64::compile_module_with(&module, &syms, &cg)
+    let compiled = match triple.arch {
+        TargetArch::X86_64 if opts.debug => {
+            let comp_dir = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_owned))
+                .unwrap_or_default();
+            let file_name = opts.inputs.first().cloned().unwrap_or_default();
+            let source = target::x86_64::DebugSource { file_name, comp_dir };
+            target::x86_64::compile_module_debug_with(&module, &syms, &source, &cg)
+        }
+        _ if opts.debug => return Err(format!("-g is supported for x86-64 only, not {triple}")),
+        arch => target::compile_module_for(arch, &module, &syms, &cg).map_err(|e| e.to_string())?,
     };
     let entry = opts.entry.clone().unwrap_or_else(|| ImageOptions::default().entry);
     if opts.stack_usage {
         print_stack_usage(&compiled.stack, &entry);
     }
     let obj = compiled.object;
-    if opts.output_kind != OutputKind::Static {
+    let stem = default_output(&opts.inputs[0]);
+    let output_or = |ext: &str| {
+        opts.output.clone().unwrap_or_else(|| if ext.is_empty() { stem.clone() } else { format!("{stem}.{ext}") })
+    };
+
+    if matches!(opts.output_kind, OutputKind::Shared | OutputKind::Pie) {
         return link_with_qld(&opts, &obj);
     }
-    let image_opts = ImageOptions {
-        debug: opts.debug,
-        entry,
-        ..ImageOptions::default()
-    };
-    let image =
-        link::link_executable(vec![obj], &image_opts).map_err(|e| format!("link error: {e}"))?;
+    if opts.output_kind == OutputKind::Object {
+        let format = opts.format.unwrap_or(triple.object_format());
+        let bytes = latticefoundry::mc::format::write_object_as(&obj, triple.arch, format)
+            .map_err(|e| format!("cannot write a {} object for {triple}: {e}", format.name()))?;
+        let output = output_or(if format == ObjectFormat::Coff { "obj" } else { "o" });
+        return std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"));
+    }
 
-    let output = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| default_output(&opts.inputs[0]));
-    link::write_executable(&output, &image)?;
-    Ok(())
+    match (triple.arch, triple.object_format(), opts.oformat) {
+        (TargetArch::X86_64, ObjectFormat::Elf, None) => {
+            let image = link::link_executable(vec![obj], &image_options(&opts, entry))
+                .map_err(|e| format!("link error: {e}"))?;
+            link::write_executable(&output_or(""), &image)
+        }
+        (TargetArch::X86_64, ObjectFormat::Elf, Some(format)) => {
+            let fw = raw::link_firmware(vec![obj], &image_options(&opts, entry))
+                .map_err(|e| format!("link error: {e}"))?;
+            let (bytes, ext) = match format {
+                RawFormat::Binary => (raw::to_binary(&fw.segments, 0)?.1, "bin"),
+                RawFormat::Ihex => (raw::to_ihex(&fw.segments, Some(fw.entry))?.into_bytes(), "hex"),
+            };
+            let output = output_or(ext);
+            std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"))
+        }
+        (TargetArch::X86_64 | TargetArch::AArch64, ObjectFormat::Coff, None) => {
+            let entry = opts.entry.as_deref().unwrap_or("main");
+            link_pe(&obj, triple, entry, &output_or("exe"), opts.base)
+        }
+        (_, _, Some(_)) => Err(format!(
+            "--oformat binary/ihex needs an x86-64 ELF target (Linux or bare metal), not {triple}"
+        )),
+        _ => Err(format!(
+            "cannot link a {triple} executable yet: emit an object with -c and link it with the platform's linker"
+        )),
+    }
 }
 
-/// Write `obj` as an ELF object and, unless `-c`, link it with qld into a
-/// shared library (`--shared`) or a PIE executable (`--pie`).
+/// Write `obj` as an ELF object and link it with qld into a shared library
+/// (`--shared`) or a PIE executable (`--pie`).
 fn link_with_qld(opts: &BuildOptions, obj: &latticefoundry::mc::object::ObjectModule) -> Result<(), String> {
     use latticefoundry::link::gnu::{self, HostCrt};
     let stem = default_output(&opts.inputs[0]);
     let output = opts.output.clone().unwrap_or_else(|| match opts.output_kind {
         OutputKind::Shared => format!("lib{stem}.so"),
-        OutputKind::Object => format!("{stem}.o"),
-        OutputKind::Pie | OutputKind::Static => stem.clone(),
+        _ => stem.clone(),
     });
     let elf = latticefoundry::mc::elf::write(obj);
-    if opts.output_kind == OutputKind::Object {
-        return std::fs::write(&output, elf).map_err(|e| format!("cannot write {output}: {e}"));
-    }
     // qld reads its inputs from files: stage the object in the temp directory.
     let tmp = std::env::temp_dir().join(format!("lf-{}-{stem}.o", std::process::id()));
     std::fs::write(&tmp, elf).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
@@ -229,6 +276,35 @@ fn link_with_qld(opts: &BuildOptions, obj: &latticefoundry::mc::object::ObjectMo
         }
     };
     let result = gnu::link_gnu("lf", &args).map_err(|e| format!("link error: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// The static linker core's options from the command line.
+fn image_options(opts: &BuildOptions, entry: String) -> ImageOptions {
+    let mut image = ImageOptions { debug: opts.debug, entry, ..ImageOptions::default() };
+    if let Some(base) = opts.base {
+        image.base = base;
+    }
+    image
+}
+
+/// Link a Windows executable with qld's PE driver (MinGW flavor). The image
+/// imports nothing: `entry` (by default `main`) is the process entry point,
+/// and the value it returns becomes the process exit code.
+fn link_pe(obj: &ObjectModule, triple: Triple, entry: &str, output: &str, base: Option<u64>) -> Result<(), String> {
+    let bytes = latticefoundry::mc::write_object(obj, triple).map_err(|e| e.to_string())?;
+    let emulation = if triple.arch == TargetArch::AArch64 { "arm64pe" } else { "i386pep" };
+    let tmp = format!("{output}.lf-tmp.obj");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {tmp}: {e}"))?;
+    let mut args: Vec<String> =
+        ["-m", emulation, "--entry", entry, "--subsystem", "console"].map(String::from).to_vec();
+    if let Some(b) = base {
+        args.push("--image-base".into());
+        args.push(format!("{b:#x}"));
+    }
+    args.extend(["-o".to_owned(), output.to_owned(), tmp.clone()]);
+    let result = link::gnu::link_gnu("lf", &args).map_err(|e| format!("link error: {e}"));
     let _ = std::fs::remove_file(&tmp);
     result
 }
@@ -270,7 +346,11 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut lto = false;
     let mut stack_usage = false;
     let mut stack_probes = true;
-    let mut output_kind = OutputKind::Static;
+    let mut target = Triple::default_target();
+    let mut format = None;
+    let mut oformat = None;
+    let mut base = None;
+    let mut output_kind = OutputKind::Executable;
     let mut pic = false;
     let mut pie = false;
     let mut soname: Option<String> = None;
@@ -286,9 +366,13 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "--lto" => lto = true,
             "--stack-usage" => stack_usage = true,
             "--no-stack-probes" => stack_probes = false,
+            "--target" => {
+                let t = it.next().ok_or("--target requires a triple")?;
+                target = Triple::parse(t).ok_or_else(|| format!("unknown target '{t}'"))?;
+            }
+            "-c" => output_kind = OutputKind::Object,
             "--shared" | "-shared" => output_kind = OutputKind::Shared,
             "--pie" | "-pie" => pie = true,
-            "-c" => output_kind = OutputKind::Object,
             "--pic" | "-fPIC" | "-fpic" => pic = true,
             "-soname" | "--soname" => {
                 soname = Some(it.next().ok_or("-soname requires a name")?.clone());
@@ -296,6 +380,21 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             flag if flag.starts_with("--soname=") => soname = Some(flag["--soname=".len()..].to_owned()),
             flag if (flag.starts_with("-L") || flag.starts_with("-l")) && flag.len() > 2 => {
                 link_extra.push(flag.to_owned());
+            }
+            "--format" => {
+                let f = it.next().ok_or("--format requires elf, coff or macho")?;
+                format = Some(ObjectFormat::parse(f).ok_or_else(|| format!("unknown object format '{f}'"))?);
+            }
+            "--oformat" => {
+                let f = it.next().ok_or("--oformat requires elf, binary or ihex")?;
+                oformat = match f.as_str() {
+                    "elf" => None,
+                    other => Some(RawFormat::parse(other).ok_or_else(|| format!("unknown output format '{other}'"))?),
+                };
+            }
+            "--base" => {
+                let b = it.next().ok_or("--base requires an address")?;
+                base = Some(parse_addr(b).ok_or_else(|| format!("bad address '{b}'"))?);
             }
             tok if OptLevel::parse_flag(tok).is_some() => {
                 opt = OptLevel::parse_flag(tok).expect("checked");
@@ -310,9 +409,10 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     if inputs.is_empty() {
         return Err("no input file (see `lf --help`)".to_owned());
     }
+
     match output_kind {
         OutputKind::Shared if pie => return Err("--shared and --pie are exclusive".to_owned()),
-        OutputKind::Static if pie => output_kind = OutputKind::Pie,
+        OutputKind::Executable if pie => output_kind = OutputKind::Pie,
         OutputKind::Object if pie && pic => return Err("--pic and --pie are exclusive".to_owned()),
         _ => {}
     }
@@ -325,9 +425,28 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     if !link_extra.is_empty() && !matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
         return Err("-L/-l only apply to --shared and --pie".to_owned());
     }
-    if entry.is_some() && output_kind != OutputKind::Static {
-        return Err("--entry only applies to static executables".to_owned());
+    if entry.is_some() && matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
+        return Err("--entry only applies to executables linked by lf (not --shared or --pie)".to_owned());
     }
+    if matches!(output_kind, OutputKind::Shared | OutputKind::Pie)
+        && (target.arch != TargetArch::X86_64 || target.object_format() != ObjectFormat::Elf)
+    {
+        return Err(format!("--shared and --pie need an x86-64 ELF target, not {target}"));
+    }
+    if (oformat.is_some() || base.is_some()) && matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
+        return Err("--oformat/--base do not apply to --shared or --pie".to_owned());
+    }
+    let object_only = output_kind == OutputKind::Object;
+    if format.is_some() && !object_only {
+        return Err("--format applies to objects: add -c".to_owned());
+    }
+    if object_only && oformat.is_some() {
+        return Err("--oformat applies to executables, not to -c".to_owned());
+    }
+    if target.os == TargetOs::Darwin && output_kind == OutputKind::Executable {
+        return Err(format!("cannot link a {target} executable yet: use -c"));
+    }
+
     Ok(BuildOptions {
         inputs,
         output,
@@ -338,12 +457,24 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         lto,
         stack_usage,
         stack_probes,
+        target,
+        format,
+        oformat,
+        base,
         output_kind,
         pic,
         pie,
         soname,
         link_extra,
     })
+}
+
+/// Parse a decimal or `0x`-prefixed hexadecimal address.
+fn parse_addr(s: &str) -> Option<u64> {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
 }
 
 /// The default output path: the input with any extension stripped, or `a.out`.
