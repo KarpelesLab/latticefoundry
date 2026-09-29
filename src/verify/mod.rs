@@ -35,6 +35,7 @@
 
 pub mod certificate;
 mod cfg;
+pub mod constant_time;
 pub mod refinement;
 mod structural;
 
@@ -50,6 +51,9 @@ pub use certificate::{
     is_certified, run_certified, run_pipeline_certified,
 };
 pub use refinement::{RefinementResult, RefinementTier, check_refinement};
+pub use constant_time::{
+    CtPolicy, CtRole, CtViolation, ct_violations, verify_function_ct, verify_module_ct,
+};
 pub use structural::{verify_function, verify_globals};
 
 /// Verify the structural + semantic invariants of every function in `module`,
@@ -57,10 +61,20 @@ pub use structural::{verify_function, verify_globals};
 ///
 /// Returns `Ok(())` if the module is well-formed at the `Structural` tier, or
 /// `Err` with every error [`Diagnostic`] found across all functions.
+///
+/// A module that declares a secret (`docs/ir-design.md` §6d) is also checked
+/// by the [constant-time verifier](constant_time) under [`CtPolicy::DEFAULT`],
+/// once it is structurally well-formed: secrecy is part of the IR, so a module
+/// that leaks a secret into a branch, an address or a divisor is ill-formed.
 pub fn verify_module(module: &Module) -> Result<(), Vec<Diagnostic>> {
     let mut diags = verify_globals(module);
     for i in 0..module.functions().count() {
         diags.extend(verify_function(module, FuncId::from_index(i)));
+    }
+    if !diags.iter().any(Diagnostic::is_error)
+        && let Err(ct) = verify_module_ct(module)
+    {
+        diags.extend(ct);
     }
     if diags.iter().any(Diagnostic::is_error) { Err(diags) } else { Ok(()) }
 }
@@ -77,6 +91,14 @@ pub fn structural_verify(module: &Module) -> Diagnostics {
     }
     for i in 0..module.functions().count() {
         for d in verify_function(module, FuncId::from_index(i)) {
+            sink.emit(d);
+        }
+    }
+    // The constant-time check, as in `verify_module`.
+    if !sink.has_errors()
+        && let Err(ct) = verify_module_ct(module)
+    {
+        for d in ct {
             sink.emit(d);
         }
     }

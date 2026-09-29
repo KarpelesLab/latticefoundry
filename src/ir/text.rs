@@ -309,6 +309,13 @@ fn write_function<W: fmt::Write>(
 /// print name, numbered in canonical walk order so the output is independent of
 /// internal `ValueId` allocation order.
 fn value_names(func: &Function) -> HashMap<ValueId, u32> {
+    value_print_names(func)
+}
+
+/// The number each named value (block parameter or instruction result) is
+/// printed as (`%N`) by [`print_module`], so diagnostics can name a value the
+/// way the `.lf` rendering of its function does.
+pub fn value_print_names(func: &Function) -> HashMap<ValueId, u32> {
     let mut map = HashMap::new();
     let mut n = 0u32;
     for (_bid, block) in func.blocks() {
