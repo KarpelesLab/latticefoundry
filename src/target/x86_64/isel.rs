@@ -1485,7 +1485,22 @@ impl TargetIsel for X86_64Target {
             InstKind::PtrAdd { .. } => {
                 let d = lo.result_reg(inst);
                 let base = self.oper(lo, inst.operands()[0]);
-                let off = self.oper(lo, inst.operands()[1]);
+                // The offset is a signed byte count of any integer width; a
+                // narrow one must be sign-extended before the 64-bit add (an
+                // i32 -4 may sit in its register as 0x0000_0000_FFFF_FFFC).
+                let off_v = inst.operands()[1];
+                let off_w = lo.int_width(off_v);
+                let off = self.oper(lo, off_v);
+                let off = if off_w >= 64 {
+                    off
+                } else {
+                    let x = lo.fresh_vreg(RegClass::Gpr);
+                    lo.emit(MachineInst::new(
+                        X86Op::Movsx.opcode(),
+                        vec![def_v(x), use_v(off), imm(u64::from(off_w)), imm(64)],
+                    ));
+                    x
+                };
                 lo.emit(MachineInst::new(
                     X86Op::Add.opcode(),
                     vec![def_v(d), use_v(base), use_v(off), imm(64)],

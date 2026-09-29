@@ -32,7 +32,7 @@
 //! bits (`add`, `mul`, `shl`, logic, stores) don't care; every op whose result
 //! depends on the upper bits (compares, right shifts, division, `zext`/`sext`,
 //! branch/select conditions, `switch`) first extends via
-//! [`RiscvTarget::extend64`] (`sext.w`, `andi`, or an `slli`+`srai`/`srli` pair).
+//! `RiscvTarget::extend64` (`sext.w`, `andi`, or an `slli`+`srai`/`srli` pair).
 //! At call boundaries the LP64 psABI's signedness-independent rules are
 //! honored: an `i32` argument/return is sign-extended (`sext.w`) and an `i1`
 //! zero-extended, so foreign callees see ABI-conformant registers.

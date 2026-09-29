@@ -567,6 +567,50 @@ entry ^0:
     }
 
     #[test]
+    fn native_ptr_add_sign_extends_narrow_offsets() {
+        // `ptr_add` offsets are signed byte counts of any integer width. An i32
+        // `0 - 4` sits in its register as 0x0000_0000_FFFF_FFFC after a 32-bit
+        // subtract; added unextended it moves the pointer 4 GiB forward. Same for
+        // an i8 offset whose register holds a wrapped value.
+        let src = "\
+module \"k\"
+func @off32(ptr, i32, i32) -> i64 {
+entry ^0(%p: ptr, %a: i32, %b: i32):
+  %o = sub %a, %b : i32
+  %q = ptr_add %p, %o : ptr
+  %pi = ptrtoint %p : i64
+  %qi = ptrtoint %q : i64
+  %d = sub %qi, %pi : i64
+  %c = icmp ne %d, i64 -4 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @off8(ptr, i8, i8) -> i64 {
+entry ^0(%p: ptr, %a: i8, %b: i8):
+  %o = add %a, %b : i8
+  %q = ptr_add %p, %o : ptr
+  %pi = ptrtoint %p : i64
+  %qi = ptrtoint %q : i64
+  %d = sub %qi, %pi : i64
+  %c = icmp ne %d, i64 -56 : i1
+  %z = zext %c : i64
+  ret %z
+}
+func @main() -> i64 {
+entry ^0:
+  %s = alloca i64 : ptr
+  %v0 = call @off32(%s, i32 0, i32 4) : i64
+  %v1 = call @off8(%s, i8 100, i8 100) : i64
+  %s1 = shl %v1, i64 1 : i64
+  %r = or %v0, %s1 : i64
+  ret %r
+}
+";
+        let code = run_lf(src, "ptr_add_narrow");
+        assert_eq!(code, 0, "narrow ptr_add offsets not sign-extended (bit0 = i32, bit1 = i8)");
+    }
+
+    #[test]
     fn lfo_file_link_runs() {
         // Exercise the same file-based path `lf-ld` uses: encode a real object
         // to `.lfo`, link it from disk with `link()`, then run the executable.
