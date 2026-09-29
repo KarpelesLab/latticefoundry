@@ -251,6 +251,33 @@ int main(void) {
             ((1 + 1) * 2 + 10) * 2 + 1 + 1,
         ),
         (
+            // Constructs SQLite's amalgamation relies on.
+            "sqlite_idioms",
+            r#"
+typedef unsigned long size_t;
+struct node { int a; struct { char tag; long v[4]; } in; int b; };
+struct pair { int x, y; };
+static int seven(void) { return 7; }
+/* A function returning a function pointer, defined through a grouped declarator. */
+static int (*pick(int which))(void) { return which ? seven : 0; }
+/* The classic offsetof, folded in an array bound and a global initializer. */
+#define OFFSETOF(T, m) ((size_t) &((T *) 0)->m)
+static char tail[sizeof(struct node) - OFFSETOF(struct node, in.v[2])];
+static const int flags = (1 == 1) + (2 > 3) * 10 + (sizeof(long) >= 8 && 1) * 100;
+int main(void) {
+    static const struct { const char *name; int n; } tbl[] = { { "a", 1 }, { "b", 2 }, { "c", 3 } };
+    int counts[sizeof(tbl) / sizeof(tbl[0])];
+    struct node *p = (struct node *) &counts[0] == 0 ? 0 : (struct node *) 0;
+    size_t need = sizeof(*p);                       /* p is in scope in its own initializer */
+    struct pair a = { 1, 2 }, b = { 3, 4 };
+    struct pair c = counts[0] >= 0 ? a : b;        /* a struct-valued conditional */
+    counts[0] = 0;
+    return pick(1)() + (int)sizeof(tail) + flags + (int)(need / 8) + c.y + (int)(sizeof counts / sizeof(int));
+}
+"#,
+            7 + 24 + 101 + 7 + 2 + 3,
+        ),
+        (
             "builtin_va_list_in_program",
             r#"
 typedef __builtin_va_list my_va;

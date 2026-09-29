@@ -1550,6 +1550,22 @@ impl FnLower<'_> {
                 self.ensure_live();
                 self.lower_struct_addr(value)
             }
+            // `c ? s1 : s2` of struct type: the address of the chosen operand.
+            TExprKind::Cond(c, t, f) => {
+                let cond = self.truth_of(c);
+                let then_bb = self.b.create_block(&[]);
+                let else_bb = self.b.create_block(&[]);
+                let join_bb = self.b.create_block(&[self.tys.ptr]);
+                self.b.cond_br(cond, then_bb, &[], else_bb, &[]);
+                self.switch(then_bb);
+                let tv = self.lower_struct_addr(t);
+                self.b.br(join_bb, &[tv]);
+                self.switch(else_bb);
+                let fv = self.lower_struct_addr(f);
+                self.b.br(join_bb, &[fv]);
+                self.switch(join_bb);
+                self.b.param(join_bb, 0)
+            }
             _ => unreachable!("not a struct-addressable expression: {:?}", e.kind),
         }
     }

@@ -1476,16 +1476,18 @@ impl Checker {
                 ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Static(idx));
                 continue;
             }
-            // Check the initializer *before* the name is in scope (C scoping).
-            let init_built = match &d.init {
-                Some(init) => self.build_init(ctx, &ty, init, d.span),
-                None => None,
-            };
+            // An identifier's scope begins right after its declarator (C11
+            // 6.2.1p7), so its own initializer already sees it — `T *p =
+            // malloc(sizeof *p);`.
             if ctx.scopes.last().unwrap().contains_key(&d.name) {
                 self.error(d.span, format!("redeclaration of '{}'", d.name));
             }
             let id = ctx.add_object_aligned(&d.name, ty.clone(), d.align);
             ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Local(id));
+            let init_built = match &d.init {
+                Some(init) => self.build_init(ctx, &ty, init, d.span),
+                None => None,
+            };
             match init_built {
                 Some(InitBuilt::Scalar(v)) => out.push(TStmt::InitLocal(id, v)),
                 Some(InitBuilt::Aggregate(stores)) => {
@@ -3202,6 +3204,14 @@ fn const_eval_with(
                 BinaryOp::BitXor => Some(a ^ b),
                 BinaryOp::Shl => Some(a << b),
                 BinaryOp::Shr => Some(a >> b),
+                BinaryOp::Eq => Some(i128::from(a == b)),
+                BinaryOp::Ne => Some(i128::from(a != b)),
+                BinaryOp::Lt => Some(i128::from(a < b)),
+                BinaryOp::Le => Some(i128::from(a <= b)),
+                BinaryOp::Gt => Some(i128::from(a > b)),
+                BinaryOp::Ge => Some(i128::from(a >= b)),
+                BinaryOp::LAnd => Some(i128::from(a != 0 && b != 0)),
+                BinaryOp::LOr => Some(i128::from(a != 0 || b != 0)),
                 _ => None,
             }
         }

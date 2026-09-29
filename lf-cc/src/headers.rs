@@ -120,7 +120,7 @@ typedef struct { long long __lf_ll; double __lf_d; } max_align_t;
 
 #ifdef __need_offsetof
 # undef offsetof
-# define offsetof(t, m) ((__SIZE_TYPE__)&((t *)0)->m)
+# define offsetof(t, m) __builtin_offsetof(t, m)
 # undef __need_offsetof
 #endif
 "##;

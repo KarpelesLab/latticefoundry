@@ -48,6 +48,7 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         in_params: 0,
         transparent_params: Vec::new(),
         extension: 0,
+        named_fn_params: None,
     };
     match parser.parse_unit() {
         Ok(items) => Ok(TranslationUnit {
@@ -127,6 +128,9 @@ struct Parser {
     /// Nonzero while parsing a declaration or expression marked with GNU
     /// `__extension__`, which lifts the pedantic C-standard gates.
     extension: u32,
+    /// The named parameters of the function declarator parsed last (for a
+    /// definition through a grouped declarator: `void (*f(int x))(void) {`).
+    named_fn_params: Option<Vec<Param>>,
 }
 
 /// The GNU `__attribute__((...))` properties lf-cc gives meaning to. Every other
@@ -532,10 +536,43 @@ impl Parser {
         let ty0 = self.parse_pointers(base.clone())?;
 
         if self.is_punct(Punct::LParen) {
-            // A grouped declarator (`ret (*name)(...)`, `ret (*name[N])(...)`, or
-            // `ret (*f(args))(args)`) is never a function definition here.
+            // A grouped declarator: an object (`ret (*name)(...)`, `ret
+            // (*name[N])(...)`), a prototype (`ret (*f(args))(args);`), or the
+            // definition of a function returning a function pointer (`void
+            // (*f(int x))(void) { ... }`, SQLite's xDlSym methods).
+            self.named_fn_params = None;
             let (name, ty, span) = self.parse_named_declarator(ty0)?;
-            items.push(self.file_scope_declarator(name, ty, span, &decl)?);
+            let (asm_label, ty, attrs) = self.finish_declarator(ty, span, &decl.sattrs)?;
+            if let CType::Func(ft) = &ty
+                && self.is_punct(Punct::LBrace)
+            {
+                let params = match self.named_fn_params.take() {
+                    Some(ps) => ps,
+                    None => ft.params.iter().map(|t| Param { name: None, ty: t.clone(), span }).collect(),
+                };
+                self.declare_ordinary(&name, Some(ty.clone()));
+                self.cur_func = Some(name.clone());
+                self.push_scope();
+                for p in &params {
+                    if let Some(n) = &p.name {
+                        self.declare_ordinary(n, Some(p.ty.clone()));
+                    }
+                }
+                let body = self.parse_block_stmts();
+                self.pop_scope();
+                return Ok(vec![TopLevel::Func(FuncDef {
+                    name,
+                    ret: ft.ret.clone(),
+                    params,
+                    variadic: ft.variadic,
+                    is_static: decl.storage == Storage::Static,
+                    is_inline: self.spec_inline,
+                    body: body?,
+                    asm_label,
+                    span,
+                })]);
+            }
+            items.push(self.file_scope_finished_declarator(name, ty, span, &decl, asm_label, &attrs)?);
         } else {
             let (name, name_span) = self.expect_ident()?;
             self.declare_ordinary(&name, None);
@@ -677,6 +714,19 @@ impl Parser {
         decl: &DeclCtx,
     ) -> PResult<TopLevel> {
         let (asm_label, ty, attrs) = self.finish_declarator(ty, span, &decl.sattrs)?;
+        self.file_scope_finished_declarator(name, ty, span, decl, asm_label, &attrs)
+    }
+
+    /// [`Self::file_scope_declarator`] once the trailing extensions are parsed.
+    fn file_scope_finished_declarator(
+        &mut self,
+        name: String,
+        ty: CType,
+        span: Span,
+        decl: &DeclCtx,
+        asm_label: Option<String>,
+        attrs: &Attrs,
+    ) -> PResult<TopLevel> {
         self.declare_ordinary(&name, Some(ty.clone()));
         if let CType::Func(ft) = &ty {
             let params =
@@ -2015,7 +2065,16 @@ impl Parser {
             // Attributes between the name and its suffixes (`int x
             // __attribute__((unused))[4]` is rare; `name attrs (params)` rarer).
             let pre = self.parse_attributes()?;
-            let ty = self.declarator_suffixes(base)?;
+            let ty = if name.is_some() && self.is_punct(Punct::LParen) {
+                // The name's own parameter list: keep the parameter names, which
+                // a function definition through a grouped declarator needs.
+                let (params, variadic) = self.parse_param_list()?;
+                let param_tys = params.iter().map(|p| p.ty.clone()).collect();
+                self.named_fn_params = Some(params);
+                CType::Func(Box::new(FuncType { ret: base, params: param_tys, variadic }))
+            } else {
+                self.declarator_suffixes(base)?
+            };
             // The declarator's own trailing attributes (`int x
             // __attribute__((aligned(8)))`, `typedef int T __attribute__((mode(DI)))`).
             // They replace whatever a nested parameter declarator left behind.
@@ -2381,6 +2440,9 @@ impl Parser {
         match &e.kind {
             ExprKind::IntLit(v, _) => Some(*v),
             ExprKind::Ident(name) => self.enum_map.get(name).copied(),
+            // The classic `offsetof`: `(size_t) &((T *) 0)->m` — the address of
+            // a member reached from a constant pointer is a constant.
+            ExprKind::Unary(UnaryOp::AddrOf, inner) => self.const_lvalue_addr(inner),
             ExprKind::Unary(op, inner) => {
                 let v = self.eval_const_expr(inner)?;
                 match op {
@@ -2410,6 +2472,34 @@ impl Parser {
                 Some(layout::size_of(&self.records, &ty) as i128)
             }
             ExprKind::AlignofType(ty) => Some(layout::align_of(&self.records, ty) as i128),
+            _ => None,
+        }
+    }
+
+    /// The constant address of an lvalue reached from a constant pointer through
+    /// member access and subscripts (`((T *) 0)->a.b[2]`), or `None`.
+    fn const_lvalue_addr(&self, e: &Expr) -> Option<i128> {
+        match &e.kind {
+            ExprKind::Member(base, name, arrow) => {
+                let (addr, rec) = if *arrow {
+                    (self.eval_const_expr(base)?, self.expr_type(base)?.pointee()?.clone())
+                } else {
+                    (self.const_lvalue_addr(base)?, self.expr_type(base)?)
+                };
+                let CType::Record(id) = rec else { return None };
+                let (off, _) = layout::resolve_member(&self.records, id, name)?;
+                Some(addr + i128::from(off))
+            }
+            ExprKind::Index(base, idx) => {
+                let i = self.eval_const_expr(idx)?;
+                let (addr, elem) = match self.expr_type(base)? {
+                    CType::Pointer(elem) => (self.eval_const_expr(base)?, *elem),
+                    CType::Array(elem, _) => (self.const_lvalue_addr(base)?, *elem),
+                    _ => return None,
+                };
+                Some(addr + i * i128::from(layout::stride_of(&self.records, &elem)))
+            }
+            ExprKind::Unary(UnaryOp::Deref, p) => self.eval_const_expr(p),
             _ => None,
         }
     }
@@ -2592,6 +2682,10 @@ impl Parser {
             self.declare_ordinary(&name, Some(ty.clone()));
             let init =
                 if self.eat_punct(Punct::Assign) { Some(self.parse_initializer()?) } else { None };
+            if let Some(i) = &init {
+                // `static const T tbl[] = {...}; char a[sizeof tbl / sizeof tbl[0]];`
+                self.declare_ordinary(&name, Some(self.deduce_array_symbol_type(&ty, i)));
+            }
             let align = max_align(align, attrs.aligned);
             decls.push(VarDecl {
                 name,
