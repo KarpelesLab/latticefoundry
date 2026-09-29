@@ -45,4 +45,4 @@ mod runtime_tests;
 mod vector_tests;
 
 pub use encode::{compile_function, compile_module, compile_module_with};
-pub use isel::{A64Op, AArch64Target};
+pub use isel::{A64Op, AArch64Target, NeonLegality};

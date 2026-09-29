@@ -14,6 +14,7 @@ use crate::ir::{FuncId, Module};
 use crate::link::{ImageOptions, link_executable, write_executable};
 use crate::support::StrInterner;
 use crate::target::vector_fixtures::{
+    FLOAT_SRC, INPUTS, INT_OPS, cases, compare_src, int_arith_src, lanes_src,
     Case, Rng, assert_matches, parse, random_inputs, random_program, reference, with_stdout_main,
 };
 use crate::transform::pipeline::{OptLevel, optimize};
@@ -57,90 +58,6 @@ fn check_native(src: &str, cases: &[Case], tag: &str) {
     }
 }
 
-fn cases(names: &[&str], inputs: &[[i64; 4]]) -> Vec<Case> {
-    names
-        .iter()
-        .flat_map(|n| inputs.iter().map(move |a| (n.to_string(), a.to_vec())))
-        .collect()
-}
-
-const INPUTS: [[i64; 4]; 5] = [
-    [0, 0, 0, 0],
-    [1, 2, 3, 4],
-    [-1, i64::MIN, i64::MAX, 0x0123_4567_89ab_cdef],
-    [0x7f80_0001_ff00_8000, -0x5555_5555_5555_5556, 0x0102_0304_0506_0708, -42],
-    [0x4000_0000_3f80_0000, 0x4059_0000_0000_0000u64 as i64, 0xc000_0000_bf80_0000u64 as i64, 0x7ff8_0000_0000_0000],
-];
-
-/// Builds the two `<2 x i64>` seeds from the four arguments.
-const SEEDS: &str = "  %p0 = insertelement <2 x i64> poison, %a, 0 : <2 x i64>
-  %x0 = insertelement %p0, %b, 1 : <2 x i64>
-  %p1 = insertelement <2 x i64> poison, %c, 0 : <2 x i64>
-  %y0 = insertelement %p1, %d, 1 : <2 x i64>
-";
-
-/// Fold a `<2 x i64>` `%out` into the `i64` result.
-const FOLD: &str = "  %l = extractelement %out, 0 : i64
-  %h = extractelement %out, 1 : i64
-  %m = mul %h, i64 1000003 : i64
-  %r = xor %l, %m : i64
-  ret %r
-";
-
-fn func(name: &str, body: &str) -> String {
-    // A `bitcast` to the same type is not a conversion: use `freeze` (the
-    // identity on these defined values) for the `<2 x i64>` cases.
-    let body = body
-        .lines()
-        .map(|l| match l.split_once(" = bitcast ") {
-            Some((lhs, rhs)) if rhs.ends_with(": <2 x i64>") && is_q(lhs, rhs, body) => {
-                format!("{lhs} = freeze {rhs}\n")
-            }
-            _ => format!("{l}\n"),
-        })
-        .collect::<String>();
-    format!("func @{name}(i64, i64, i64, i64) -> i64 {{\nentry ^0(%a: i64, %b: i64, %c: i64, %d: i64):\n{SEEDS}{body}{FOLD}}}\n")
-}
-
-/// Whether the source of `lhs = bitcast rhs` in `body` is already `<2 x i64>`.
-fn is_q(_lhs: &str, rhs: &str, body: &str) -> bool {
-    let src = rhs.split(" : ").next().unwrap_or("").trim();
-    if src == "%x0" || src == "%y0" {
-        return true;
-    }
-    body.lines().any(|l| l.trim_start().starts_with(&format!("{src} = ")) && l.ends_with(": <2 x i64>"))
-}
-
-const INT_OPS: [&str; 18] = [
-    "add", "sub", "mul", "and", "or", "xor", "udiv", "shl", "lshr", "ashr", "smin", "smax", "umin", "umax",
-    "sadd_sat", "uadd_sat", "ssub_sat", "usub_sat",
-];
-
-/// Integer arithmetic on every SSE2 integer lane width.
-fn int_arith_src() -> String {
-    let mut s = String::from("module \"vint\"\n");
-    for (t, n) in [("i8", 16), ("i16", 8), ("i32", 4), ("i64", 2)] {
-        let ty = format!("<{n} x {t}>");
-        for op in INT_OPS {
-            let body = if op == "udiv" {
-                // A divisor forced odd (nonzero): scalarized on SSE2.
-                format!(
-                    "  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %one = splat {t} 1 : {ty}\n  %yy = or %y, %one : {ty}\n  %v = udiv %x, %yy : {ty}\n  %out = bitcast %v : <2 x i64>\n"
-                )
-            } else if matches!(op, "shl" | "lshr" | "ashr") {
-                // A uniform constant amount (SSE2 psll/psrl/psra where they exist).
-                let k = match t { "i8" => 3, "i16" => 5, "i32" => 13, _ => 37 };
-                let amt = format!("{ty} ({})", vec![format!("{t} {k}"); n].join(", "));
-                format!("  %x = bitcast %x0 : {ty}\n  %v = {op} %x, {amt} : {ty}\n  %out = bitcast %v : <2 x i64>\n")
-            } else {
-                format!("  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %v = {op} %x, %y : {ty}\n  %out = bitcast %v : <2 x i64>\n")
-            };
-            s += &func(&format!("{op}_{t}"), &body);
-        }
-    }
-    s
-}
-
 #[test]
 fn integer_vector_arithmetic_matches_the_reference() {
     let src = int_arith_src();
@@ -154,40 +71,6 @@ fn integer_vector_arithmetic_matches_the_reference() {
 
 /// Every integer and float compare predicate, blended by `select`, plus mask
 /// logic and mask <-> integer casts.
-fn compare_src() -> String {
-    let mut s = String::from("module \"vcmp\"\n");
-    for (t, n) in [("i8", 16), ("i16", 8), ("i32", 4), ("i64", 2)] {
-        let ty = format!("<{n} x {t}>");
-        let mt = format!("<{n} x i1>");
-        for p in ["eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge", "slt", "sle"] {
-            s += &func(
-                &format!("icmp_{p}_{t}"),
-                &format!("  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %z = shufflevector %x, %y, [{}] : {ty}\n  %m = icmp {p} %x, %z : {mt}\n  %v = select %m, %x, %y : {ty}\n  %w = sext %m : {ty}\n  %u = xor %v, %w : {ty}\n  %out = bitcast %u : <2 x i64>\n",
-                    (0..n).map(|i| if i % 3 == 0 { (i + n).to_string() } else { i.to_string() }).collect::<Vec<_>>().join(", ")
-                ),
-            );
-        }
-        s += &func(
-            &format!("masks_{t}"),
-            &format!("  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %m = trunc %x : {mt}\n  %k = trunc %y : {mt}\n  %a1 = and %m, %k : {mt}\n  %o1 = or %m, %k : {mt}\n  %x1 = xor %a1, %o1 : {mt}\n  %z = zext %x1 : {ty}\n  %s = sext %a1 : {ty}\n  %u = sub %z, %s : {ty}\n  %out = bitcast %u : <2 x i64>\n"),
-        );
-    }
-    for (t, n) in [("f32", 4), ("f64", 2)] {
-        let ty = format!("<{n} x {t}>");
-        let mt = format!("<{n} x i1>");
-        for p in ["false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord", "ueq", "ugt", "uge", "ult", "ule", "une", "uno", "true"] {
-            s += &func(
-                &format!("fcmp_{p}_{t}"),
-                &format!("  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %z = shufflevector %x, %y, [{}] : {ty}\n  %m = fcmp {p} %x, %z : {mt}\n  %w = sext %m : <{n} x i{}>\n  %out = bitcast %w : <2 x i64>\n",
-                    (0..n).map(|i| if i % 2 == 0 { i.to_string() } else { (i + n).to_string() }).collect::<Vec<_>>().join(", "),
-                    128 / n
-                ),
-            );
-        }
-    }
-    s
-}
-
 #[test]
 fn vector_compares_and_masks_match_the_reference() {
     let src = compare_src();
@@ -197,83 +80,9 @@ fn vector_compares_and_masks_match_the_reference() {
     check_native(&src, &cases(&refs, &INPUTS), "cmp");
 }
 
-const FLOAT_SRC: &str = r#"
-module "vflt"
-func @farith(i64, i64, i64, i64) -> i64 {
-entry ^0(%a: i64, %b: i64, %c: i64, %d: i64):
-  %p0 = insertelement <2 x i64> poison, %a, 0 : <2 x i64>
-  %x0 = insertelement %p0, %b, 1 : <2 x i64>
-  %p1 = insertelement <2 x i64> poison, %c, 0 : <2 x i64>
-  %y0 = insertelement %p1, %d, 1 : <2 x i64>
-  %i = bitcast %x0 : <4 x i32>
-  %j = bitcast %y0 : <4 x i32>
-  %small = and %i, <4 x i32> (i32 65535, i32 65535, i32 65535, i32 65535) : <4 x i32>
-  %f = sitofp %small : <4 x f32>
-  %g = sitofp %j : <4 x f32>
-  %s = fadd %f, %g : <4 x f32>
-  %t = fsub %s, %f : <4 x f32>
-  %u = fmul %t, <4 x f32> (f32 0x3fc00000, f32 0xc0000000, f32 0x3f000000, f32 0x41200000) : <4 x f32>
-  %v = fdiv %u, <4 x f32> (f32 0x40400000, f32 0x3f800000, f32 0xc0800000, f32 0x3e800000) : <4 x f32>
-  %n = fneg %v : <4 x f32>
-  %back = fptosi %f : <4 x i32>
-  %d64 = bitcast %y0 : <2 x f64>
-  %e = fadd %d64, <2 x f64> (f64 0x3ff0000000000000, f64 0xc000000000000000) : <2 x f64>
-  %e2 = fmul %e, %e : <2 x f64>
-  %e3 = fdiv %e2, <2 x f64> (f64 0x4008000000000000, f64 0x4010000000000000) : <2 x f64>
-  %e4 = fneg %e3 : <2 x f64>
-  %e5 = fsub %e4, %e : <2 x f64>
-  %nan = fcmp uno %e5, %e5 : <2 x i1>
-  %e6 = select %nan, <2 x f64> (f64 0x0, f64 0x0), %e5 : <2 x f64>
-  %ni = bitcast %n : <2 x i64>
-  %bi = bitcast %back : <2 x i64>
-  %ei = bitcast %e6 : <2 x i64>
-  %o1 = xor %ni, %bi : <2 x i64>
-  %out = add %o1, %ei : <2 x i64>
-  %l = extractelement %out, 0 : i64
-  %h = extractelement %out, 1 : i64
-  %m = mul %h, i64 1000003 : i64
-  %r = xor %l, %m : i64
-  ret %r
-}
-"#;
-
 #[test]
 fn float_vector_arithmetic_matches_the_reference() {
     check_native(FLOAT_SRC, &cases(&["farith"], &INPUTS), "flt");
-}
-
-/// Every lane of every legal type through extract, insert and splat, and the
-/// direct shuffle patterns plus scalarized ones (byte/word lanes).
-fn lanes_src() -> String {
-    let mut s = String::from("module \"vlane\"\n");
-    for (t, n) in [("i8", 16u32), ("i16", 8), ("i32", 4), ("i64", 2), ("f32", 4), ("f64", 2)] {
-        let ty = format!("<{n} x {t}>");
-        for lane in 0..n {
-            let other = (lane * 5 + 3) % n;
-            s += &func(
-                &format!("lane_{t}_{lane}"),
-                &format!("  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %e = extractelement %x, {lane} : {t}\n  %i = insertelement %y, %e, {other} : {ty}\n  %sp = splat %e : {ty}\n  %sh = shufflevector %i, %sp, [{}] : {ty}\n  %out = bitcast %sh : <2 x i64>\n",
-                    (0..n).map(|k| ((k * 7 + lane) % (2 * n)).to_string()).collect::<Vec<_>>().join(", ")
-                ),
-            );
-        }
-    }
-    // Direct SSE2 shuffle forms: pshufd (one source), shufps (0-1 / 2-3), shufpd.
-    for (name, ty, mask) in [
-        ("pshufd_a", "<4 x i32>", "[3, 2, 1, 0]"),
-        ("pshufd_b", "<4 x i32>", "[4, 4, 7, 5]"),
-        ("shufps_ab", "<4 x f32>", "[1, 3, 4, 6]"),
-        ("shufps_ba", "<4 x i32>", "[7, 5, 2, 0]"),
-        ("q_swap", "<2 x i64>", "[1, 0]"),
-        ("q_ab", "<2 x f64>", "[1, 2]"),
-        ("q_ba", "<2 x i64>", "[3, 0]"),
-    ] {
-        s += &func(
-            name,
-            &format!("  %x = bitcast %x0 : {ty}\n  %y = bitcast %y0 : {ty}\n  %sh = shufflevector %x, %y, {mask} : {ty}\n  %out = bitcast %sh : <2 x i64>\n"),
-        );
-    }
-    s
 }
 
 #[test]

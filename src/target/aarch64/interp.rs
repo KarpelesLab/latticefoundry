@@ -45,6 +45,7 @@ use crate::support::DetHashMap;
 
 use puremp::Int;
 
+use super::isel::neon::NeonOp;
 use super::isel::{A64Op, AArch64Target};
 use super::regs::{fp, gpr};
 
@@ -140,6 +141,8 @@ struct Frame {
     /// The most recent value moved into a physical return register (`x0` or `v0`),
     /// the primary scalar return.
     ret_val: Option<Int>,
+    /// The function this activation runs (for its virtual registers' classes).
+    fidx: usize,
 }
 
 /// What a completed call hands back: the primary scalar return and a snapshot of
@@ -209,6 +212,7 @@ impl Machine<'_> {
             slot_base,
             slot_val: DetHashMap::default(),
             ret_val: None,
+            fidx,
         };
         for (p, v) in inputs {
             fr.regs.insert(Reg::Physical(*p), v.clone());
@@ -537,6 +541,82 @@ impl Machine<'_> {
                 }
                 fr.regs.insert(d, old);
             }
+            // --- NEON -----------------------------------------------------
+            A64Op::NeonOp3 => {
+                let d = def(ops, 0)?;
+                let a = self.rd(fr, use_reg(ops, 1)?);
+                let bb = self.rd(fr, use_reg(ops, 2)?);
+                let nop = NeonOp::from_code(imm(ops, 3)?.to_u64().unwrap_or(0));
+                fr.regs.insert(d, neon3_eval(nop, imm_u32(ops, 4)?, &a, &bb));
+            }
+            A64Op::NeonOp2 => {
+                let d = def(ops, 0)?;
+                let a = self.rd(fr, use_reg(ops, 1)?);
+                let nop = NeonOp::from_code(imm(ops, 2)?.to_u64().unwrap_or(0));
+                fr.regs.insert(d, neon2_eval(nop, imm_u32(ops, 3)?, &a));
+            }
+            A64Op::NeonShift => {
+                let d = def(ops, 0)?;
+                let a = self.rd(fr, use_reg(ops, 1)?);
+                let nop = NeonOp::from_code(imm(ops, 2)?.to_u64().unwrap_or(0));
+                let es = imm_u32(ops, 3)?;
+                let amt = imm_u32(ops, 4)?;
+                let m = all_ones(es);
+                let out: Vec<u64> = vlanes(&a, es)
+                    .into_iter()
+                    .map(|x| match nop {
+                        NeonOp::Shl => (x << amt) & m,
+                        NeonOp::Ushr => if amt >= es { 0 } else { x >> amt },
+                        _ => (sx(x, es) >> amt.min(es - 1)) as u64 & m,
+                    })
+                    .collect();
+                fr.regs.insert(d, vpack(&out, es));
+            }
+            A64Op::NeonDup => {
+                let d = def(ops, 0)?;
+                let g = self.rd(fr, use_reg(ops, 1)?);
+                let es = imm_u32(ops, 2)?;
+                let x = mask(&g, es).to_u64().unwrap_or(0);
+                fr.regs.insert(d, vpack(&vec![x; (128 / es) as usize], es));
+            }
+            A64Op::NeonDupLane => {
+                let d = def(ops, 0)?;
+                let v = self.rd(fr, use_reg(ops, 1)?);
+                let es = imm_u32(ops, 2)?;
+                let x = vlanes(&v, es)[imm_u32(ops, 3)? as usize];
+                fr.regs.insert(d, vpack(&vec![x; (128 / es) as usize], es));
+            }
+            A64Op::NeonUmov => {
+                let d = def(ops, 0)?;
+                let v = self.rd(fr, use_reg(ops, 1)?);
+                let es = imm_u32(ops, 2)?;
+                fr.regs.insert(d, Int::from_u64(vlanes(&v, es)[imm_u32(ops, 3)? as usize]));
+            }
+            A64Op::NeonInsGpr | A64Op::NeonInsElem => {
+                let d = def(ops, 0)?;
+                let v = self.rd(fr, use_reg(ops, 1)?);
+                let s = self.rd(fr, use_reg(ops, 2)?);
+                let es = imm_u32(ops, 3)?;
+                let mut l = vlanes(&v, es);
+                l[imm_u32(ops, 4)? as usize] = mask(&s, es).to_u64().unwrap_or(0);
+                fr.regs.insert(d, vpack(&l, es));
+            }
+            A64Op::NeonLoad => {
+                let d = def(ops, 0)?;
+                let p = self.rd(fr, use_reg(ops, 1)?);
+                fr.regs.insert(d, load_mem(&self.mem, addr(&p)?, 16));
+            }
+            A64Op::NeonStore => {
+                let p = self.rd(fr, use_reg(ops, 0)?);
+                let v = self.rd(fr, use_reg(ops, 1)?);
+                store_mem(&mut self.mem, addr(&p)?, 16, &v);
+            }
+            A64Op::NeonConst => {
+                let d = def(ops, 0)?;
+                let lo = imm(ops, 1)?.to_u64().unwrap_or(0);
+                let hi = imm(ops, 2)?.to_u64().unwrap_or(0);
+                fr.regs.insert(d, vpack(&[lo, hi], 64));
+            }
             // Prologue/epilogue pseudo-ops never appear in pre-regalloc MIR.
             A64Op::StpFpLr
             | A64Op::LdpFpLr
@@ -603,8 +683,15 @@ impl Machine<'_> {
 
     /// A register's 64-bit pattern (inputs handed in as negative `Int`s are
     /// normalized to their two's-complement bits).
+    /// A register's value: 64 bits for a GPR, all 128 bits of a `v` register
+    /// (which may hold a vector).
     fn rd(&self, fr: &Frame, r: Reg) -> Int {
-        fr.regs.get(&r).map(|v| mask(v, 64)).unwrap_or(Int::ZERO)
+        let class = match r {
+            Reg::Physical(p) => p.class,
+            Reg::Virtual(v) => self.funcs[fr.fidx].vreg_class(v),
+        };
+        let width = if class == RegClass::Fp { 128 } else { 64 };
+        fr.regs.get(&r).map(|v| mask(v, width)).unwrap_or(Int::ZERO)
     }
 }
 
@@ -625,7 +712,9 @@ fn shift(op: A64Op, a: &Int, k: u32, w: u32) -> Int {
 
 /// The raw IEEE bit pattern a register holds (masked to the float width).
 fn fbits(v: &Int, width: u32) -> u64 {
-    let raw = v.to_u64().unwrap_or(0);
+    // A `v` register may hold more than 64 bits (a vector, or a float taken
+    // from a lane): a scalar op reads the low lane only.
+    let raw = mask(v, 64).to_u64().unwrap_or(0);
     if width >= 64 { raw } else { raw & 0xFFFF_FFFF }
 }
 
@@ -775,6 +864,185 @@ fn frame_slot(ops: &[MachineOperand], i: usize) -> Result<StackSlot, String> {
     match ops.get(i) {
         Some(MachineOperand::Frame(s)) => Ok(*s),
         _ => Err(format!("operand {i} is not a frame slot")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD (NEON): a `v` register holds 128 bits as an `Int`.
+// ---------------------------------------------------------------------------
+
+/// The `esize`-bit lanes of a 128-bit register value, lane 0 first.
+fn vlanes(v: &Int, es: u32) -> Vec<u64> {
+    let v = mask(v, 128);
+    (0..128 / es).map(|i| v.div_2k_trunc(i * es).mod_2k(es).to_u64().unwrap_or(0)).collect()
+}
+
+/// Pack `esize`-bit lanes (lane 0 lowest) into a 128-bit register value.
+fn vpack(lanes: &[u64], es: u32) -> Int {
+    let lm = if es == 64 { u64::MAX } else { (1u64 << es) - 1 };
+    lanes
+        .iter()
+        .enumerate()
+        .fold(Int::ZERO, |acc, (i, &l)| acc.bitor(&Int::from_u64(l & lm).mul_2k(i as u32 * es)))
+}
+
+/// A lane's value sign-extended from `es` bits.
+fn sx(x: u64, es: u32) -> i64 {
+    ((x << (64 - es)) as i64) >> (64 - es)
+}
+
+fn all_ones(es: u32) -> u64 {
+    if es == 64 { u64::MAX } else { (1u64 << es) - 1 }
+}
+
+/// A lane of `es` float bits as `f64` (exact for f32 lanes).
+fn flane(x: u64, es: u32) -> f64 {
+    if es == 64 { f64::from_bits(x) } else { f64::from(f32::from_bits(x as u32)) }
+}
+
+/// An `f64` result as `es` float bits (rounded once for f32 lanes).
+fn fto(x: f64, es: u32) -> u64 {
+    if es == 64 { x.to_bits() } else { u64::from((x as f32).to_bits()) }
+}
+
+/// A lane-wise float op computed in the lanes' own precision.
+fn fop(op: NeonOp, a: u64, b: u64, es: u32) -> u64 {
+    if es == 64 {
+        let (x, y) = (f64::from_bits(a), f64::from_bits(b));
+        match op {
+            NeonOp::Fadd => (x + y).to_bits(),
+            NeonOp::Fsub => (x - y).to_bits(),
+            NeonOp::Fmul => (x * y).to_bits(),
+            _ => (x / y).to_bits(),
+        }
+    } else {
+        let (x, y) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
+        u64::from(
+            match op {
+                NeonOp::Fadd => x + y,
+                NeonOp::Fsub => x - y,
+                NeonOp::Fmul => x * y,
+                _ => x / y,
+            }
+            .to_bits(),
+        )
+    }
+}
+
+/// `ushl`/`sshl` of one lane by the signed byte count in `b`'s low byte.
+fn vshl(a: u64, b: u64, es: u32, signed: bool) -> u64 {
+    let sh = i64::from(b as u8 as i8);
+    let m = all_ones(es);
+    if sh >= 0 {
+        if sh >= i64::from(es) { 0 } else { (a << sh) & m }
+    } else {
+        let r = -sh;
+        if signed {
+            let v = sx(a, es);
+            (if r >= i64::from(es) { v >> (es - 1) } else { v >> r }) as u64 & m
+        } else if r >= i64::from(es) {
+            0
+        } else {
+            (a & m) >> r
+        }
+    }
+}
+
+/// The result of a three-register NEON op.
+fn neon3_eval(op: NeonOp, es: u32, a: &Int, b: &Int) -> Int {
+    use NeonOp::*;
+    match op {
+        And => return mask(a, 128).bitand(&mask(b, 128)),
+        Orr => return mask(a, 128).bitor(&mask(b, 128)),
+        Eor => return mask(a, 128).bitxor(&mask(b, 128)),
+        Bic => {
+            let nb = mask(b, 128).bitxor(&mask(&Int::MINUS_ONE, 128));
+            return mask(a, 128).bitand(&nb);
+        }
+        Tbl => {
+            let (t, idx) = (vlanes(a, 8), vlanes(b, 8));
+            let out: Vec<u64> = idx.iter().map(|&i| if i < 16 { t[i as usize] } else { 0 }).collect();
+            return vpack(&out, 8);
+        }
+        _ => {}
+    }
+    let m = all_ones(es);
+    let (la, lb) = (vlanes(a, es), vlanes(b, es));
+    let (smax, smin) = (i128::from(sx(m >> 1, es)), -i128::from(sx(m >> 1, es)) - 1);
+    let bit = |c: bool| if c { m } else { 0 };
+    let out: Vec<u64> = la
+        .iter()
+        .zip(&lb)
+        .map(|(&x, &y)| match op {
+            Add => x.wrapping_add(y) & m,
+            Sub => x.wrapping_sub(y) & m,
+            Mul => x.wrapping_mul(y) & m,
+            Cmeq => bit(x == y),
+            Cmgt => bit(sx(x, es) > sx(y, es)),
+            Cmge => bit(sx(x, es) >= sx(y, es)),
+            Cmhi => bit(x > y),
+            Cmhs => bit(x >= y),
+            Sshl => vshl(x, y, es, true),
+            Ushl => vshl(x, y, es, false),
+            Smax => if sx(x, es) >= sx(y, es) { x } else { y },
+            Smin => if sx(x, es) <= sx(y, es) { x } else { y },
+            Umax => x.max(y),
+            Umin => x.min(y),
+            Sqadd | Sqsub => {
+                let (p, q) = (i128::from(sx(x, es)), i128::from(sx(y, es)));
+                let r = if op == Sqadd { p + q } else { p - q };
+                (r.clamp(smin, smax) as i64 as u64) & m
+            }
+            Uqadd => (u128::from(x) + u128::from(y)).min(u128::from(m)) as u64,
+            Uqsub => x.saturating_sub(y),
+            Fadd | Fsub | Fmul | Fdiv => fop(op, x, y, es),
+            Fcmeq => bit(flane(x, es) == flane(y, es)),
+            Fcmge => bit(flane(x, es) >= flane(y, es)),
+            Fcmgt => bit(flane(x, es) > flane(y, es)),
+            other => unreachable!("{other:?} is not a three-register op"),
+        })
+        .collect();
+    vpack(&out, es)
+}
+
+/// The result of a two-register (or across-lane) NEON op.
+fn neon2_eval(op: NeonOp, es: u32, a: &Int) -> Int {
+    use NeonOp::*;
+    let m = all_ones(es);
+    let la = vlanes(a, es);
+    // Across-lane results land in lane 0; the rest of the register is zeroed.
+    let scalar = |v: u64| vpack(&[v & m], es);
+    match op {
+        Not => mask(a, 128).bitxor(&mask(&Int::MINUS_ONE, 128)),
+        Addv => scalar(la.iter().fold(0u64, |s, &x| s.wrapping_add(x))),
+        Smaxv => scalar(*la.iter().max_by_key(|&&x| sx(x, es)).expect("lanes")),
+        Sminv => scalar(*la.iter().min_by_key(|&&x| sx(x, es)).expect("lanes")),
+        Umaxv => scalar(*la.iter().max().expect("lanes")),
+        Uminv => scalar(*la.iter().min().expect("lanes")),
+        Addp => {
+            let q = vlanes(a, 64);
+            vpack(&[q[0].wrapping_add(q[1])], 64)
+        }
+        _ => {
+            let out: Vec<u64> = la
+                .iter()
+                .map(|&x| match op {
+                    Neg => x.wrapping_neg() & m,
+                    Fneg => x ^ (1u64 << (es - 1)),
+                    Scvtf => fto(sx(x, es) as f64, es),
+                    Ucvtf => fto(x as f64, es),
+                    // Round toward zero, saturating; NaN converts to 0.
+                    Fcvtzs => {
+                        if es == 64 { flane(x, es) as i64 as u64 } else { flane(x, es) as i32 as u32 as u64 }
+                    }
+                    Fcvtzu => {
+                        if es == 64 { flane(x, es) as u64 } else { u64::from(flane(x, es) as u32) }
+                    }
+                    other => unreachable!("{other:?} is not a two-register op"),
+                })
+                .collect();
+            vpack(&out, es)
+        }
     }
 }
 

@@ -942,13 +942,13 @@ the target to make that type legal.
 | target | legal vector types | lowering |
 |---|---|---|
 | x86-64 (SSE2, the baseline) | `<16 x i8>`, `<8 x i16>`, `<4 x i32>`, `<2 x i64>`, `<4 x f32>`, `<2 x f64>`, masks `<16/8/4/2 x i1>` | see below; System V passes them in `xmm0..7` and returns in `xmm0` (`__m128`); Win64 passes them by reference (a 16-byte-aligned caller copy) and returns in `xmm0` (§6c) |
-| AArch64 | none (NEON is a follow-up) | fully scalarized |
+| AArch64 (NEON) | the same ten | see below; passed in `v0..v7`, returned in `v0` (AAPCS64 short vectors) |
 | RISC-V | none (the V extension is out of scope) | fully scalarized |
 
-On x86-64 a mask `<N x i1>` lives in an xmm register as `N` lanes of
-`128 / N` bits, each all-ones or all-zeros — what `pcmpeq`/`pcmpgt`/`cmpps`
-produce and `pand`/`pandn`/`por` blend with. No instruction beyond SSE2 is
-used:
+On both SIMD targets a mask `<N x i1>` lives in a vector register as `N`
+lanes of `128 / N` bits, each all-ones or all-zeros — what their compares
+produce and their bitwise blends consume (`codegen::simd128`). On x86-64 no
+instruction beyond SSE2 is used:
 
 | IR | SSE2 |
 |---|---|
@@ -973,6 +973,27 @@ used:
 Everything else (division, `frem`, byte shifts, variable shifts, `mul` on
 bytes and quadwords, ordered i64 compares, other casts and shuffles,
 reductions, mask loads/stores) is scalarized. xmm spills are 16 bytes.
+
+NEON is far more regular, so AArch64 scalarizes much less:
+
+| IR | NEON |
+|---|---|
+| `add`/`sub`/`and`/`or`/`xor`, `mul` i8–i32 | `add`/`sub`/`and`/`orr`/`eor`, `mul` |
+| shifts, uniform constant / per lane | `shl`/`ushr`/`sshr #imm` / `ushl`, `ushl`/`sshl` by `neg` |
+| min/max i8–i32, saturating add/sub (all widths) | `smin`/`smax`/`umin`/`umax`, `sqadd`/`uqadd`/`sqsub`/`uqsub` |
+| float arithmetic, `fneg` | `fadd`/`fsub`/`fmul`/`fdiv`, `fneg` |
+| `icmp` (all widths), `fcmp` | `cmeq`/`cmgt`/`cmge`/`cmhi`/`cmhs`, `fcmeq`/`fcmgt`/`fcmge` (+ `mvn`/`orr` for the unordered forms) |
+| `select` | `and` + `bic` + `orr` |
+| int ↔ float of the lane width | `scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu` |
+| lane moves | `umov`, `dup`, `ins`; any same-length shuffle via `tbl` (+ `orr` for two sources) |
+| `reduce add`/min/max | `addv`/`sminv`/…, `addp` for i64 |
+| `load`/`store` | `ldr q`/`str q` |
+
+A function holding vectors treats `v8..v15` as clobbered by calls (AAPCS64
+preserves only their low halves), and `v` spills are 16-byte `str q`.
+Scalarized on AArch64: division, `frem`, i64 `mul` (i64 min/max expand to a
+vector compare and blend), other casts, lane-count-changing shuffles, and the
+other reductions.
 
 ### Constant time
 

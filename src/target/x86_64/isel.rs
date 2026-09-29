@@ -1685,7 +1685,7 @@ impl TargetIsel for X86_64Target {
     }
 
     fn vector_const(&self, dst: VReg, types: &TypeContext, consts: &crate::ir::ConstPool, c: &Const) -> MachineInst {
-        let (lo64, hi64) = vector::const_bits(types, consts, c);
+        let (lo64, hi64) = crate::codegen::simd128::const_bits(types, consts, c);
         MachineInst::new(X86Op::LoadVConst.opcode(), vec![def_v(dst), imm(lo64), imm(hi64)])
     }
 

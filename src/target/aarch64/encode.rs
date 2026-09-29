@@ -56,7 +56,8 @@ use crate::mc::object::{
 };
 use crate::support::StrInterner;
 
-use super::isel::{A64Op, AArch64Target};
+use super::isel::neon::NeonOp;
+use super::isel::{A64Op, AArch64Target, NeonLegality};
 use super::regs::{FP, LR, SP, XZR};
 
 // ===========================================================================
@@ -458,7 +459,9 @@ pub(crate) fn fdiv(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
 pub(crate) fn fp_dp1(ptype: u32, opcode: u32, rd: u32, rn: u32) -> u32 {
     0x1E20_4000 | ptype_bits(ptype) | (opcode << 15) | (rn << 5) | rd
 }
-/// `fmov Vd, Vn` (register move within the FP file).
+/// `fmov Vd, Vn` (register move within the FP file). Register copies now use
+/// the full-width `mov Vd.16b` ([`simd_mov`]); kept for the encoding tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fmov_reg(ptype: u32, rd: u32, rn: u32) -> u32 {
     fp_dp1(ptype, 0b000000, rd, rn)
 }
@@ -842,6 +845,233 @@ fn ldst_size(bytes: u64) -> u32 {
     }
 }
 
+
+// ===========================================================================
+// Advanced SIMD (NEON), 128-bit (`Q = 1`) forms
+// ===========================================================================
+
+/// The `size` field for `esize`-bit lanes (8→0, 16→1, 32→2, 64→3).
+fn simd_size(esize: u32) -> u32 {
+    match esize {
+        8 => 0,
+        16 => 1,
+        32 => 2,
+        _ => 3,
+    }
+}
+
+/// AdvSIMD three-same: `0 1 U 01110 size 1 Rm opcode 1 Rn Rd`.
+fn simd3(u: u32, size: u32, opcode: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    0x4E20_0400 | (u << 29) | (size << 22) | (rm << 16) | (opcode << 11) | (rn << 5) | rd
+}
+
+/// AdvSIMD two-register miscellaneous: `0 1 U 01110 size 10000 opcode 10 Rn Rd`.
+fn simd2(u: u32, size: u32, opcode: u32, rd: u32, rn: u32) -> u32 {
+    0x4E20_0800 | (u << 29) | (size << 22) | (opcode << 12) | (rn << 5) | rd
+}
+
+/// AdvSIMD across lanes: `0 1 U 01110 size 11000 opcode 10 Rn Rd`.
+fn simd_across(u: u32, size: u32, opcode: u32, rd: u32, rn: u32) -> u32 {
+    0x4E30_0800 | (u << 29) | (size << 22) | (opcode << 12) | (rn << 5) | rd
+}
+
+/// The `imm5` of the copy instructions (`dup`/`umov`/`ins`) for lane `lane`
+/// of `esize`-bit lanes: the lowest set bit marks the size, the index above it.
+fn simd_imm5(esize: u32, lane: u32) -> u32 {
+    match esize {
+        8 => (lane << 1) | 1,
+        16 => (lane << 2) | 2,
+        32 => (lane << 3) | 4,
+        _ => (lane << 4) | 8,
+    }
+}
+
+/// `mov Vd.16b, Vn.16b` (`orr Vd.16b, Vn.16b, Vn.16b`): a full 128-bit copy.
+pub(crate) fn simd_mov(rd: u32, rn: u32) -> u32 {
+    0x4EA0_1C00 | (rn << 16) | (rn << 5) | rd
+}
+
+/// The word of a three-register NEON op on `esize`-bit lanes.
+pub(crate) fn neon3(op: NeonOp, esize: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    let sz = simd_size(esize);
+    let fsz = u32::from(esize == 64); // the float `sz` bit
+    match op {
+        NeonOp::Add => simd3(0, sz, 0b10000, rd, rn, rm),
+        NeonOp::Sub => simd3(1, sz, 0b10000, rd, rn, rm),
+        NeonOp::Mul => simd3(0, sz, 0b10011, rd, rn, rm),
+        NeonOp::And => simd3(0, 0b00, 0b00011, rd, rn, rm),
+        NeonOp::Bic => simd3(0, 0b01, 0b00011, rd, rn, rm),
+        NeonOp::Orr => simd3(0, 0b10, 0b00011, rd, rn, rm),
+        NeonOp::Eor => simd3(1, 0b00, 0b00011, rd, rn, rm),
+        NeonOp::Cmeq => simd3(1, sz, 0b10001, rd, rn, rm),
+        NeonOp::Cmgt => simd3(0, sz, 0b00110, rd, rn, rm),
+        NeonOp::Cmge => simd3(0, sz, 0b00111, rd, rn, rm),
+        NeonOp::Cmhi => simd3(1, sz, 0b00110, rd, rn, rm),
+        NeonOp::Cmhs => simd3(1, sz, 0b00111, rd, rn, rm),
+        NeonOp::Sshl => simd3(0, sz, 0b01000, rd, rn, rm),
+        NeonOp::Ushl => simd3(1, sz, 0b01000, rd, rn, rm),
+        NeonOp::Smax => simd3(0, sz, 0b01100, rd, rn, rm),
+        NeonOp::Smin => simd3(0, sz, 0b01101, rd, rn, rm),
+        NeonOp::Umax => simd3(1, sz, 0b01100, rd, rn, rm),
+        NeonOp::Umin => simd3(1, sz, 0b01101, rd, rn, rm),
+        NeonOp::Sqadd => simd3(0, sz, 0b00001, rd, rn, rm),
+        NeonOp::Uqadd => simd3(1, sz, 0b00001, rd, rn, rm),
+        NeonOp::Sqsub => simd3(0, sz, 0b00101, rd, rn, rm),
+        NeonOp::Uqsub => simd3(1, sz, 0b00101, rd, rn, rm),
+        NeonOp::Fadd => simd3(0, fsz, 0b11010, rd, rn, rm),
+        NeonOp::Fsub => simd3(0, 0b10 | fsz, 0b11010, rd, rn, rm),
+        NeonOp::Fmul => simd3(1, fsz, 0b11011, rd, rn, rm),
+        NeonOp::Fdiv => simd3(1, fsz, 0b11111, rd, rn, rm),
+        NeonOp::Fcmeq => simd3(0, fsz, 0b11100, rd, rn, rm),
+        NeonOp::Fcmge => simd3(1, fsz, 0b11100, rd, rn, rm),
+        NeonOp::Fcmgt => simd3(1, 0b10 | fsz, 0b11100, rd, rn, rm),
+        // tbl Vd.16b, {Vn.16b}, Vm.16b: 0 1 001110 000 Rm 0 00 0 00 Rn Rd.
+        NeonOp::Tbl => 0x4E00_0000 | (rm << 16) | (rn << 5) | rd,
+        other => panic!("{other:?} is not a three-register NEON op"),
+    }
+}
+
+/// The word of a two-register (or across-lane) NEON op on `esize`-bit lanes.
+pub(crate) fn neon2(op: NeonOp, esize: u32, rd: u32, rn: u32) -> u32 {
+    let sz = simd_size(esize);
+    let fsz = u32::from(esize == 64);
+    match op {
+        NeonOp::Neg => simd2(1, sz, 0b01011, rd, rn),
+        NeonOp::Not => simd2(1, 0b00, 0b00101, rd, rn),
+        NeonOp::Fneg => simd2(1, 0b10 | fsz, 0b01111, rd, rn),
+        NeonOp::Scvtf => simd2(0, fsz, 0b11101, rd, rn),
+        NeonOp::Ucvtf => simd2(1, fsz, 0b11101, rd, rn),
+        NeonOp::Fcvtzs => simd2(0, 0b10 | fsz, 0b11011, rd, rn),
+        NeonOp::Fcvtzu => simd2(1, 0b10 | fsz, 0b11011, rd, rn),
+        NeonOp::Addv => simd_across(0, sz, 0b11011, rd, rn),
+        NeonOp::Smaxv => simd_across(0, sz, 0b01010, rd, rn),
+        NeonOp::Sminv => simd_across(0, sz, 0b11010, rd, rn),
+        NeonOp::Umaxv => simd_across(1, sz, 0b01010, rd, rn),
+        NeonOp::Uminv => simd_across(1, sz, 0b11010, rd, rn),
+        // addp Dd, Vn.2d.
+        NeonOp::Addp => 0x5EF1_B800 | (rn << 5) | rd,
+        other => panic!("{other:?} is not a two-register NEON op"),
+    }
+}
+
+/// The word of a NEON shift by immediate: `shl` (`immh:immb = esize + amt`),
+/// `ushr`/`sshr` (`immh:immb = 2*esize - amt`, `amt` in `1..=esize`).
+pub(crate) fn neon_shift(op: NeonOp, esize: u32, rd: u32, rn: u32, amt: u32) -> u32 {
+    let (u, opcode, immhb) = match op {
+        NeonOp::Shl => (0, 0b01010, esize + amt),
+        NeonOp::Ushr => (1, 0b00000, 2 * esize - amt),
+        NeonOp::Sshr => (0, 0b00000, 2 * esize - amt),
+        other => panic!("{other:?} is not a NEON immediate shift"),
+    };
+    0x4F00_0400 | (u << 29) | (immhb << 16) | (opcode << 11) | (rn << 5) | rd
+}
+
+/// `dup Vd.T, Rn` (general).
+pub(crate) fn neon_dup(esize: u32, rd: u32, rn: u32) -> u32 {
+    0x4E00_0C00 | (simd_imm5(esize, 0) << 16) | (rn << 5) | rd
+}
+
+/// `dup Vd.T, Vn.T[lane]` (element).
+pub(crate) fn neon_dup_lane(esize: u32, lane: u32, rd: u32, rn: u32) -> u32 {
+    0x4E00_0400 | (simd_imm5(esize, lane) << 16) | (rn << 5) | rd
+}
+
+/// `umov Wd/Xd, Vn.T[lane]` (the `X` form for 64-bit lanes).
+pub(crate) fn neon_umov(esize: u32, lane: u32, rd: u32, rn: u32) -> u32 {
+    0x0E00_3C00 | (u32::from(esize == 64) << 30) | (simd_imm5(esize, lane) << 16) | (rn << 5) | rd
+}
+
+/// `ins Vd.T[lane], Rn` (general).
+pub(crate) fn neon_ins_gpr(esize: u32, lane: u32, rd: u32, rn: u32) -> u32 {
+    0x4E00_1C00 | (simd_imm5(esize, lane) << 16) | (rn << 5) | rd
+}
+
+/// `ins Vd.T[lane], Vn.T[0]` (element).
+pub(crate) fn neon_ins_elem(esize: u32, lane: u32, rd: u32, rn: u32) -> u32 {
+    0x6E00_0400 | (simd_imm5(esize, lane) << 16) | (rn << 5) | rd
+}
+
+/// `ldr Qt, [Rn, #imm12*16]` / `str Qt, [Rn, #imm12*16]`.
+pub(crate) fn q_ldst_uimm(load: bool, rt: u32, rn: u32, imm12: u32) -> u32 {
+    let base = if load { 0x3DC0_0000 } else { 0x3D80_0000 };
+    base | ((imm12 & 0xFFF) << 10) | (rn << 5) | rt
+}
+
+/// A spill/reload of a whole `q` register at `[sp, #off]` (`off` 16-aligned).
+fn frame_q_ldst(b: &mut A64Buf, load: bool, rt: u32, off: u32) {
+    if off / 16 < 4096 {
+        b.word(q_ldst_uimm(load, rt, SP.into(), off / 16));
+        return;
+    }
+    addsub_any(b, false, IP0, SP.into(), u64::from(off & !0xFFF));
+    b.word(q_ldst_uimm(load, rt, IP0, (off & 0xFFF) / 16));
+}
+
+/// A free FP scratch (`v29..v31`, never allocated) not named in `avoid`.
+fn free_fp_scratch(avoid: &[u32]) -> u32 {
+    [31u32, 30, 29].into_iter().find(|r| !avoid.contains(r)).expect("three FP scratches")
+}
+
+/// Encode the NEON MIR ops.
+fn encode_neon(b: &mut A64Buf, op: A64Op, ops: &[MachineOperand]) {
+    match op {
+        A64Op::NeonOp3 => {
+            let nop = NeonOp::from_code(uimm(&ops[3]));
+            b.word(neon3(nop, uimm(&ops[4]) as u32, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2])));
+        }
+        A64Op::NeonOp2 => {
+            let nop = NeonOp::from_code(uimm(&ops[2]));
+            b.word(neon2(nop, uimm(&ops[3]) as u32, rnum(&ops[0]), rnum(&ops[1])));
+        }
+        A64Op::NeonShift => {
+            let nop = NeonOp::from_code(uimm(&ops[2]));
+            let (d, n) = (rnum(&ops[0]), rnum(&ops[1]));
+            b.word(neon_shift(nop, uimm(&ops[3]) as u32, d, n, uimm(&ops[4]) as u32));
+        }
+        A64Op::NeonDup => b.word(neon_dup(uimm(&ops[2]) as u32, rnum(&ops[0]), rnum(&ops[1]))),
+        A64Op::NeonDupLane => {
+            b.word(neon_dup_lane(uimm(&ops[2]) as u32, uimm(&ops[3]) as u32, rnum(&ops[0]), rnum(&ops[1])));
+        }
+        A64Op::NeonUmov => {
+            b.word(neon_umov(uimm(&ops[2]) as u32, uimm(&ops[3]) as u32, rnum(&ops[0]), rnum(&ops[1])));
+        }
+        A64Op::NeonInsGpr => {
+            let (d, v, g) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+            if d != v {
+                b.word(simd_mov(d, v));
+            }
+            b.word(neon_ins_gpr(uimm(&ops[3]) as u32, uimm(&ops[4]) as u32, d, g));
+        }
+        A64Op::NeonInsElem => {
+            let (d, v, mut s) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+            if d != v {
+                if s == d {
+                    // Save the element before the copy overwrites it.
+                    let t = free_fp_scratch(&[d, v, s]);
+                    b.word(simd_mov(t, s));
+                    s = t;
+                }
+                b.word(simd_mov(d, v));
+            }
+            b.word(neon_ins_elem(uimm(&ops[3]) as u32, uimm(&ops[4]) as u32, d, s));
+        }
+        A64Op::NeonLoad => b.word(q_ldst_uimm(true, rnum(&ops[0]), rnum(&ops[1]), 0)),
+        A64Op::NeonStore => b.word(q_ldst_uimm(false, rnum(&ops[1]), rnum(&ops[0]), 0)),
+        A64Op::NeonConst => {
+            let d = rnum(&ops[0]);
+            let (lo, hi) = (uimm(&ops[1]), uimm(&ops[2]));
+            // fmov Dd, x16 zeroes the upper half; ins fills it when needed.
+            encode_movri(b, IP0, lo);
+            b.word(fmov_from_gpr(1, 1, d, IP0));
+            if hi != 0 {
+                encode_movri(b, IP0, hi);
+                b.word(neon_ins_gpr(64, 1, d, IP0));
+            }
+        }
+        other => unreachable!("not a NEON op: {other:?}"),
+    }
+}
+
 /// Encode one machine instruction into `b`.
 fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
     let ops = &inst.operands;
@@ -851,14 +1081,25 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let s = rnum(&ops[1]);
             if d != s {
                 match rclass(&ops[0]) {
-                    // A GPR copy is `orr d, xzr, s`; an FP copy is `fmov d, s`
-                    // (the double form copies the whole 64-bit lane, which holds an
-                    // f32 too).
+                    // A GPR copy is `orr d, xzr, s`; an FP/SIMD copy is `mov
+                    // Vd.16b, Vs.16b`, all 128 bits (a register may hold a
+                    // vector; a scalar float lives in the low lane).
                     RegClass::Gpr => b.word(mov_reg(1, d, s)),
-                    RegClass::Fp => b.word(fmov_reg(1, d, s)),
+                    RegClass::Fp => b.word(simd_mov(d, s)),
                 }
             }
         }
+        op @ (A64Op::NeonOp3
+        | A64Op::NeonOp2
+        | A64Op::NeonShift
+        | A64Op::NeonDup
+        | A64Op::NeonDupLane
+        | A64Op::NeonUmov
+        | A64Op::NeonInsGpr
+        | A64Op::NeonInsElem
+        | A64Op::NeonLoad
+        | A64Op::NeonStore
+        | A64Op::NeonConst) => encode_neon(b, op, ops),
         A64Op::MovRI => encode_movri(b, rnum(&ops[0]), uimm(&ops[1])),
         A64Op::Add => {
             let sf = sf_of(uimm(&ops[3]) as u32);
@@ -980,15 +1221,23 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
             addsub_any(b, false, d, SP.into(), u64::from(off));
         }
+        // A spilled FP/SIMD register may hold a vector: the whole `q` register
+        // goes to its 16-byte, 16-aligned slot.
         A64Op::StoreFrame => {
             let src = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            frame_ldst_any(b, rclass(&ops[0]), false, src, off);
+            match rclass(&ops[0]) {
+                RegClass::Fp => frame_q_ldst(b, false, src, off),
+                RegClass::Gpr => frame_ldst_any(b, RegClass::Gpr, false, src, off),
+            }
         }
         A64Op::LoadFrame => {
             let dst = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            frame_ldst_any(b, rclass(&ops[0]), true, dst, off);
+            match rclass(&ops[0]) {
+                RegClass::Fp => frame_q_ldst(b, true, dst, off),
+                RegClass::Gpr => frame_ldst_any(b, RegClass::Gpr, true, dst, off),
+            }
         }
         A64Op::GlobalAddr => {
             let d = rnum(&ops[0]);
@@ -1349,7 +1598,7 @@ fn compile_function_full(
 /// Compile one function of `module` to its encoded bytes and relocations. Runs
 /// isel → register allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
-    let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
+    let legal = crate::codegen::legalize::legalized(module, &NeonLegality);
     compile_function_full(&legal, func, syms, &CodegenOptions::default()).0
 }
 
@@ -1379,9 +1628,8 @@ pub fn compile_module_with(
     if let Err(e) = crate::target::check_options(crate::target::TargetArch::AArch64, opts) {
         panic!("{e}");
     }
-    // Vectors are scalarized for this target (no SIMD lowering yet; the
-    // generic legalizer keeps any vector code correct).
-    let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
+    // Vector code NEON cannot hold or select is scalarized first.
+    let legal = crate::codegen::legalize::legalized(module, &NeonLegality);
     let module: &Module = &legal;
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));

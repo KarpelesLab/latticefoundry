@@ -36,6 +36,9 @@ use puremp::Int;
 
 use super::regs::{self, RegFile};
 
+pub(crate) mod neon;
+pub use neon::NeonLegality;
+
 /// The A64 MIR opcode vocabulary. Operand layouts are documented per variant;
 /// `Def`/`Use` are register operands, the rest are immediates, frame slots,
 /// branch labels, or symbol references. `Imm width` is the operation's integer
@@ -204,6 +207,36 @@ pub enum A64Op {
     /// st{l}xr w17, new, [ptr]; cbnz w17, L; done:` (the compare at the access
     /// width). `acqrel` as for [`A64Op::AtomicRmw`]; `x17` is clobbered.
     CmpXchg = 61,
+
+    // --- Advanced SIMD (NEON) 128-bit vectors (see `neon`) -----------------
+    /// `[Def d, Use n, Use m, Imm op, Imm esize]` — a three-register NEON op
+    /// (`neon::NeonOp` code) on `esize`-bit lanes of the full `q` register.
+    NeonOp3 = 62,
+    /// `[Def d, Use n, Imm op, Imm esize]` — a two-register NEON op (incl. the
+    /// across-lane reductions, whose result is lane 0).
+    NeonOp2 = 63,
+    /// `[Def d, Use n, Imm op, Imm esize, Imm amount]` — `shl`/`ushr`/`sshr`
+    /// by an immediate.
+    NeonShift = 64,
+    /// `[Def d, Use g, Imm esize]` — `dup Vd.T, Rn`: broadcast a GPR.
+    NeonDup = 65,
+    /// `[Def d, Use v, Imm esize, Imm lane]` — `dup Vd.T, Vn.T[lane]`.
+    NeonDupLane = 66,
+    /// `[Def g, Use v, Imm esize, Imm lane]` — `umov Rd, Vn.T[lane]`.
+    NeonUmov = 67,
+    /// `[Def d, Use v, Use g, Imm esize, Imm lane]` — `mov d, v; ins
+    /// Vd.T[lane], Rn`.
+    NeonInsGpr = 68,
+    /// `[Def d, Use v, Use s, Imm esize, Imm lane]` — `mov d, v; ins
+    /// Vd.T[lane], Vs.T[0]`.
+    NeonInsElem = 69,
+    /// `[Def d, Use ptr]` — `ldr Qd, [ptr]`.
+    NeonLoad = 70,
+    /// `[Use ptr, Use v]` — `str Qv, [ptr]`.
+    NeonStore = 71,
+    /// `[Def d, Imm lo, Imm hi]` — a 128-bit constant through `x16`:
+    /// `movz/movk x16, lo; fmov Dd, x16; movz/movk x16, hi; ins Vd.d[1], x16`.
+    NeonConst = 72,
 }
 
 impl A64Op {
@@ -219,8 +252,10 @@ impl A64Op {
     /// `BrCond`/`Switch` and the exclusive-monitor retry loops of `AtomicRmw`
     /// and `CmpXchg` (which also compares the loaded value). Everything else
     /// — in particular `Csel` (a `select`), `CmpCset`, the variable shifts,
-    /// `Mul`, `Sbfx`/`Ubfx` and the float conversions — is straight-line code.
-    /// (The prologue's probe loop counts a constant frame size.)
+    /// `Mul`, `Sbfx`/`Ubfx`, the float conversions, and every NEON op
+    /// (`NeonOp3` … `NeonConst`: a vector `select` is an `and`/`bic`/`orr`
+    /// blend) — is straight-line code. (The prologue's probe loop counts a
+    /// constant frame size.)
     pub fn may_branch_on_data(self, _operands: &[MachineOperand]) -> bool {
         matches!(self, A64Op::BrCond | A64Op::Switch | A64Op::AtomicRmw | A64Op::CmpXchg)
     }
@@ -228,13 +263,14 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 62] = [
+        const TABLE: [A64Op; 73] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
             AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
             Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc, Sbfx, Ubfx, LoadAcq, StoreRel,
-            Dmb, AtomicRmw, CmpXchg,
+            Dmb, AtomicRmw, CmpXchg, NeonOp3, NeonOp2, NeonShift, NeonDup, NeonDupLane, NeonUmov,
+            NeonInsGpr, NeonInsElem, NeonLoad, NeonStore, NeonConst,
         ];
         TABLE[op.0 as usize]
     }
@@ -1063,13 +1099,20 @@ impl AArch64Target {
                     };
                     reg_moves.push((areg, v));
                 } else {
+                    // A 16-byte vector takes a 16-aligned 16-byte slot.
                     let sz = lo.byte_size(ty);
-                    let dp = self.lea_sp(lo, stack_off);
-                    lo.emit(MachineInst::new(
-                        A64Op::Store.opcode(),
-                        vec![use_v(dp), use_v(v), imm(sz)],
-                    ));
-                    stack_off += 8;
+                    if sz == 16 {
+                        stack_off = align_up_u64(stack_off, 16);
+                        let dp = self.lea_sp(lo, stack_off);
+                        lo.emit(MachineInst::new(A64Op::NeonStore.opcode(), vec![use_v(dp), use_v(v)]));
+                    } else {
+                        let dp = self.lea_sp(lo, stack_off);
+                        lo.emit(MachineInst::new(
+                            A64Op::Store.opcode(),
+                            vec![use_v(dp), use_v(v), imm(sz)],
+                        ));
+                    }
+                    stack_off += sz.max(8);
                 }
             }
         }
@@ -1084,7 +1127,7 @@ impl AArch64Target {
 
         // The primary return register (`x0`/`v0`); struct results reclaim their
         // registers (`x0`/`x1` or `v0..v3`), all covered by the clobber set.
-        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float());
+        let ret_is_fp = ret_ty.is_some_and(|t| lo.types().get(t).is_float() || lo.types().is_vector(t));
         let ret_reg = if ret_is_fp { cc.fp_ret_reg } else { cc.ret_reg };
 
         let mut operands = Vec::new();
@@ -1099,6 +1142,14 @@ impl AArch64Target {
         for &cs in &self.rf.caller_saved {
             if cs != ret_reg {
                 operands.push(def(cs));
+            }
+        }
+        // AAPCS64 preserves only the low 64 bits of v8..v15, so a vector must
+        // not live across a call in one: in a function holding vectors, calls
+        // clobber them too.
+        if Self::holds_vectors(lo) {
+            for n in 8u16..=15 {
+                operands.push(def(regs::fp(n)));
             }
         }
         for &areg in &used_arg_regs {
@@ -1289,15 +1340,27 @@ impl AArch64Target {
                     lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(pv), use_p(areg)]));
                 } else {
                     let sz = lo.byte_size(ty);
-                    let p = self.lea_fp(lo, stack_in);
-                    lo.emit(MachineInst::new(
-                        A64Op::Load.opcode(),
-                        vec![def_v(pv), use_v(p), imm(sz)],
-                    ));
-                    stack_in += 8;
+                    if sz == 16 {
+                        stack_in = align_up_u64(stack_in, 16);
+                        let p = self.lea_fp(lo, stack_in);
+                        lo.emit(MachineInst::new(A64Op::NeonLoad.opcode(), vec![def_v(pv), use_v(p)]));
+                    } else {
+                        let p = self.lea_fp(lo, stack_in);
+                        lo.emit(MachineInst::new(
+                            A64Op::Load.opcode(),
+                            vec![def_v(pv), use_v(p), imm(sz)],
+                        ));
+                    }
+                    stack_in += sz.max(8);
                 }
             }
         }
+    }
+
+    /// Whether the function being lowered holds any vector value.
+    fn holds_vectors(lo: &Lower<'_, Self>) -> bool {
+        let f = lo.func();
+        (0..f.value_count()).any(|i| lo.types().is_vector(f.value_type(ValueId::from_index(i))))
     }
 
     /// A stack-passed aggregate parameter: address the caller-placed copy in place
@@ -1367,6 +1430,15 @@ impl MachineTarget for AArch64Target {
         MachineInst::new(A64Op::StoreFrame.opcode(), vec![use_p(src), MachineOperand::Frame(slot)])
     }
 
+    /// A `v` register may hold a whole 128-bit vector, so its spill slot is 16
+    /// bytes, 16-aligned (spilled with `str q`).
+    fn spill_slot(&self, class: RegClass) -> (u64, u64) {
+        match class {
+            RegClass::Gpr => (8, 8),
+            RegClass::Fp => (16, 16),
+        }
+    }
+
     fn emit_reload(&self, dst: PReg, slot: StackSlot) -> MachineInst {
         MachineInst::new(A64Op::LoadFrame.opcode(), vec![def(dst), MachineOperand::Frame(slot)])
     }
@@ -1396,11 +1468,20 @@ impl TargetIsel for AArch64Target {
         )
     }
 
+    fn vector_const(&self, dst: VReg, types: &TypeContext, consts: &crate::ir::ConstPool, c: &Const) -> MachineInst {
+        let (lo64, hi64) = crate::codegen::simd128::const_bits(types, consts, c);
+        MachineInst::new(A64Op::NeonConst.opcode(), vec![def_v(dst), imm(lo64), imm(hi64)])
+    }
+
     fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
         self.lower_prologue_aarch64(lo);
     }
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        // NEON vector code (legalized for `NeonLegality` beforehand).
+        if self.lower_neon(lo, inst) {
+            return;
+        }
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
             InstKind::ICmp(pred) => {
