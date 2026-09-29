@@ -157,6 +157,10 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
         let ty = layout::ir_type(module.types_mut(), &program.records, &g.ty);
         let init = if g.ty.is_pointer() {
             module.intern_const(Const::Null(ty))
+        } else if g.ty.unsupported_value().is_some() {
+            // A declaration-only `_Float128`/complex/`__int128` object (sema
+            // allows only `extern` ones): no IR constant models it.
+            module.intern_const(Const::Poison(ty))
         } else if let Some(fty) = g.ty.float_ty() {
             // A float global's storage bytes (its IEEE image) are emitted by the
             // driver's `emit_globals`; this IR init only has to be well-typed.
