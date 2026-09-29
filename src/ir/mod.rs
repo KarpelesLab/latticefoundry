@@ -558,6 +558,13 @@ impl Module {
     pub fn replace_function(&mut self, id: FuncId, func: Function) {
         self.functions[id.index()] = func;
     }
+
+    /// Install `func` as the body of function `id` and return the body it
+    /// replaces — so a candidate rebuild can be checked in place (e.g. by the
+    /// constant-time verifier) and then swapped back out.
+    pub fn swap_function(&mut self, id: FuncId, func: Function) -> Function {
+        std::mem::replace(&mut self.functions[id.index()], func)
+    }
 }
 
 /// A function definition or declaration.

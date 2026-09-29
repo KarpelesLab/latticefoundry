@@ -92,7 +92,7 @@ use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ConstPool, ValueDef, ValueId};
 use crate::ir::{EvalOutcome, FuncId, Function, Module, SemValue, eval};
 use crate::support::StrInterner;
-use crate::verify::{RefinementResult, check_refinement};
+use crate::verify::{CtPolicy, RefinementResult, check_refinement, ct_violations};
 
 use puremp::Int;
 
@@ -703,6 +703,35 @@ pub fn superoptimize(module: &mut Module, func: FuncId) -> Option<Function> {
 
 /// [`superoptimize`] under an explicit [`Budget`].
 pub fn superoptimize_with(module: &mut Module, func: FuncId, budget: &Budget) -> Option<Function> {
+    superoptimize_ct(module, func, budget, CtPolicy::DEFAULT)
+}
+
+/// [`superoptimize_with`] with the constant-time rules of `policy` as a
+/// second gate after `z3rs` (`docs/ir-design.md` §6d): in a module with
+/// secrets, a candidate is accepted only if it has no more constant-time
+/// violations than the original. The candidate opcode set has no division,
+/// branch or memory access, so this can only bite on a variable shift amount
+/// or a multiply under [`CtPolicy::STRICT`], or a candidate that makes a
+/// public return depend on a secret parameter.
+pub fn superoptimize_ct(
+    module: &mut Module,
+    func: FuncId,
+    budget: &Budget,
+    policy: CtPolicy,
+) -> Option<Function> {
+    let fresh = superoptimize_unchecked(module, func, budget)?;
+    if !module.has_secrets() {
+        return Some(fresh);
+    }
+    let before = ct_violations(module, func, policy).len();
+    let old = module.swap_function(func, fresh);
+    let after = ct_violations(module, func, policy).len();
+    let fresh = module.swap_function(func, old);
+    (after <= before).then_some(fresh)
+}
+
+/// The synthesis proper, without the constant-time gate.
+fn superoptimize_unchecked(module: &mut Module, func: FuncId, budget: &Budget) -> Option<Function> {
     let spec = Spec::from_function(module.types(), module.consts(), module.function(func))?;
     let found = synthesize(&spec, budget, true)?;
     if !found.proof.is_refines() {

@@ -33,6 +33,8 @@ pub mod superopt;
 pub mod yield_points;
 
 #[cfg(test)]
+pub(crate) mod ct_tests;
+#[cfg(test)]
 mod tests;
 
 pub use dce::Dce;

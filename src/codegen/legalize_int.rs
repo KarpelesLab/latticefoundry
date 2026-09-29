@@ -647,23 +647,31 @@ impl Lz<'_, '_> {
                 let p = self.parts(ops[0]).into_iter().map(|x| self.b.freeze(x)).collect();
                 self.set(res, Mapped::Parts(p));
             }
-            (InstKind::Load { align, volatile: false, .. }, Some(n)) => {
+            // Each part keeps the access's `secret` flag, so secret memory
+            // stays secret after the split (constant time, §6d).
+            (InstKind::Load { align, volatile: false, secret, .. }, Some(n)) => {
                 let ptr = self.one(ops[0]);
+                let secret = *secret;
                 let p = (0..n)
                     .map(|k| {
                         let (addr, a) = self.part_addr(ptr, k, n, *align);
-                        self.b.load(self.part_ty, addr, a)
+                        let kind = InstKind::Load { ty: self.part_ty, align: a, volatile: false, secret };
+                        self.b
+                            .append_inst(kind, vec![addr], Flags::NONE, Some(self.part_ty))
+                            .expect("a load has a result")
                     })
                     .collect();
                 self.set(res, Mapped::Parts(p));
             }
-            (InstKind::Store { align, volatile: false, .. }, None) if self.is_wide(ops[1]) => {
+            (InstKind::Store { align, volatile: false, secret, .. }, None) if self.is_wide(ops[1]) => {
                 let ptr = self.one(ops[0]);
                 let vals = self.parts(ops[1]);
                 let n = vals.len();
+                let secret = *secret;
                 for (k, &v) in vals.iter().enumerate() {
                     let (addr, a) = self.part_addr(ptr, k, n, *align);
-                    self.b.store(self.part_ty, addr, v, a);
+                    let kind = InstKind::Store { ty: self.part_ty, align: a, volatile: false, secret };
+                    self.b.append_inst(kind, vec![addr, v], Flags::NONE, None);
                 }
             }
             // Everything else is a boundary: operate on whole values, joining

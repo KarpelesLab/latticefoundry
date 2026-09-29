@@ -115,7 +115,25 @@ impl EqSat {
     /// function subsequently handed to [`run`](FunctionTransform::run) as `old` —
     /// and store the distilled extraction `Plan`.
     pub fn analyze(&mut self, func: &Function, types: &TypeContext, consts: &ConstPool) {
-        self.plan = Some(Plan::build(func, types, consts));
+        self.plan = Some(Plan::build(func, types, consts, None));
+    }
+
+    /// [`EqSat::analyze`] for a function with secret-derived values
+    /// (`secret[v]`, from [`SecretTaint`](crate::analysis::SecretTaint)):
+    /// extraction then prefers, in every e-class, a representative that does
+    /// not depend on a secret over a cheaper one that does, so a rewrite never
+    /// makes a public value (a branch condition, an address, a divisor)
+    /// secret-derived. The rules themselves introduce no branch, no division
+    /// and no variable shift amount (`x*2^k → x<<k` shifts by a constant), so
+    /// with this preference the pass preserves constant-time code.
+    pub fn analyze_with_secrets(
+        &mut self,
+        func: &Function,
+        types: &TypeContext,
+        consts: &ConstPool,
+        secret: &[bool],
+    ) {
+        self.plan = Some(Plan::build(func, types, consts, Some(secret)));
     }
 }
 
@@ -155,7 +173,16 @@ impl ModulePass for EqSatPass {
                 continue;
             }
             let mut t = EqSat::new();
-            t.analyze(module.function(id), module.types(), module.consts());
+            let secret = if module.has_secrets() {
+                let taint = crate::analysis::SecretTaint::compute(module, id);
+                taint.any_secret().then(|| taint.secret_values())
+            } else {
+                None
+            };
+            match &secret {
+                Some(s) => t.analyze_with_secrets(module.function(id), module.types(), module.consts(), s),
+                None => t.analyze(module.function(id), module.types(), module.consts()),
+            }
             let (fresh, c) = module.map_function(id, |old, b| t.run(old, b));
             if c == Changed::Yes {
                 module.replace_function(id, fresh);
@@ -210,7 +237,12 @@ struct Plan {
 }
 
 impl Plan {
-    fn build(func: &Function, types: &TypeContext, consts: &ConstPool) -> Plan {
+    fn build(
+        func: &Function,
+        types: &TypeContext,
+        consts: &ConstPool,
+        secret: Option<&[bool]>,
+    ) -> Plan {
         let nv = func.value_count();
         if func.entry().is_none() {
             return Plan { nodes: Vec::new(), value_node: vec![None; nv], changed: false };
@@ -225,7 +257,7 @@ impl Plan {
         eg.rebuild();
         eg.saturate();
 
-        eg.extract(func, types)
+        eg.extract(func, types, secret)
     }
 }
 
@@ -714,7 +746,7 @@ impl<'a> EGraph<'a> {
 
     /// Pick the cheapest e-node per class (a bottom-up cost fixpoint), build the
     /// extraction DAG, and decide whether the function actually changed.
-    fn extract(&mut self, func: &Function, types: &TypeContext) -> Plan {
+    fn extract(&mut self, func: &Function, types: &TypeContext, secret: Option<&[bool]>) -> Plan {
         let ncls = self.classes.len();
         let mut root = vec![0usize; ncls];
         for (i, r) in root.iter_mut().enumerate() {
@@ -725,7 +757,19 @@ impl<'a> EGraph<'a> {
         // Cost fixpoint: cost(class) = min over its nodes of own + Σ children.
         // Self-referential (cyclic) nodes keep an infinite cost and are never
         // selected, so extraction always terminates on an acyclic DAG.
+        //
+        // With secrets, the key is `(tainted, cost)` compared
+        // lexicographically: a node is tainted if it is a secret-derived leaf
+        // or any chosen child is, and an untainted representative always beats
+        // a tainted one. Both components only decrease, so the fixpoint still
+        // terminates; without secrets every node is untainted and this is the
+        // plain cost fixpoint.
+        let leaf_secret = |op: &NodeOp| match (op, secret) {
+            (NodeOp::Leaf(v), Some(s)) => s.get(v.index()).copied().unwrap_or(false),
+            _ => false,
+        };
         let mut best_cost = vec![u64::MAX; ncls];
+        let mut best_taint = vec![true; ncls];
         let mut best_node: Vec<Option<ENode>> = vec![None; ncls];
         loop {
             let mut improved = false;
@@ -735,6 +779,7 @@ impl<'a> EGraph<'a> {
                 }
                 for node in &self.classes[ci].nodes {
                     let mut cost = own_cost(&node.op);
+                    let mut tainted = leaf_secret(&node.op);
                     let mut finite = true;
                     for &ch in &node.children {
                         let cc = best_cost[root[ch]];
@@ -743,9 +788,11 @@ impl<'a> EGraph<'a> {
                             break;
                         }
                         cost = cost.saturating_add(cc);
+                        tainted |= best_taint[root[ch]];
                     }
-                    if finite && cost < best_cost[ci] {
+                    if finite && cost < u64::MAX && (tainted, cost) < (best_taint[ci], best_cost[ci]) {
                         best_cost[ci] = cost;
+                        best_taint[ci] = tainted;
                         best_node[ci] = Some(node.clone());
                         improved = true;
                     }
@@ -1630,5 +1677,51 @@ mod tests {
     fn ci(b: &mut FunctionBuilder<'_>, p: &[ValueId], v: i64) -> ValueId {
         let ty = b.value_type(p[0]);
         b.const_i64(ty, v)
+    }
+
+    /// With secrets, extraction prefers a representative that does not depend
+    /// on a secret over a cheaper one that does. The current rules never put
+    /// such a pair in one class, so the class is merged by hand here to
+    /// exercise the preference that guards future (e.g. synthesized) rules.
+    #[test]
+    fn extraction_prefers_public_representatives() {
+        use super::{EGraph, ExtNode};
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("ct");
+        let i64t = m.types_mut().int(64);
+        let f = build_fn(&mut m, &mut syms, "f", &[i64t, i64t], i64t, |b, p| {
+            let three = ci(b, p, 3);
+            let one = ci(b, p, 1);
+            let a = b.mul(p[1], three, Flags::NONE); // public, cost 8
+            let s = b.add(p[0], one, Flags::NONE); // secret-derived, cost 4
+            b.add(a, s, Flags::NONE)
+        });
+        let func = m.function(f);
+        let entry = func.entry().unwrap();
+        let (x, y) = (func.block(entry).params()[0], func.block(entry).params()[1]);
+        let insts: Vec<ValueId> =
+            func.block(entry).insts().iter().filter_map(|&i| func.inst(i).result()).collect();
+        let (a, s) = (insts[0], insts[1]);
+        let mut secret = vec![false; func.value_count()];
+        secret[x.index()] = true;
+        secret[s.index()] = true;
+        let _ = y;
+
+        let pick = |secret: Option<&[bool]>| {
+            let mut eg = EGraph::new(m.types(), m.consts(), func.value_count());
+            for i in 0..func.value_count() {
+                eg.class_of(func, ValueId::from_index(i));
+            }
+            let (ca, cs) = (eg.value_class[a.index()].unwrap(), eg.value_class[s.index()].unwrap());
+            eg.union(ca, cs);
+            eg.rebuild();
+            let plan = eg.extract(func, m.types(), secret);
+            match &plan.nodes[plan.value_node[a.index()].unwrap()] {
+                ExtNode::Op { kind, .. } => kind.clone(),
+                other => panic!("unexpected extraction {other:?}"),
+            }
+        };
+        assert_eq!(pick(None), InstKind::Bin(BinOp::Add), "cost alone picks the cheaper add");
+        assert_eq!(pick(Some(&secret)), InstKind::Bin(BinOp::Mul), "the public mul wins with secrets");
     }
 }
