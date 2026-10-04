@@ -641,6 +641,10 @@ impl Parser {
             let (name, name_span) = self.expect_ident()?;
             self.declare_ordinary(&name, None);
             if self.is_punct(Punct::LParen) {
+                if self.spec_thread {
+                    return Err(Diagnostic::error(format!("function '{name}' declared thread-local"))
+                        .with_span(name_span));
+                }
                 match self.parse_function_declarator(name, name_span, ty0, &decl)? {
                     FnDecl::Def(f) => return Ok(vec![TopLevel::Func(f)]),
                     FnDecl::InlineOnly(p) => return Ok(vec![TopLevel::Proto(p)]),
@@ -805,6 +809,9 @@ impl Parser {
     ) -> PResult<TopLevel> {
         self.declare_ordinary(&name, Some(ty.clone()));
         if let CType::Func(ft) = &ty {
+            if self.spec_thread {
+                return Err(Diagnostic::error(format!("function '{name}' declared thread-local")).with_span(span));
+            }
             let params =
                 ft.params.iter().map(|t| Param { name: None, ty: t.clone(), span }).collect();
             return Ok(TopLevel::Proto(FuncProto {
@@ -842,6 +849,9 @@ impl Parser {
     /// consumed), registering each name as a typedef in the current scope.
     fn parse_typedef(&mut self) -> PResult<Vec<TopLevel>> {
         let base = self.parse_decl_specs()?;
+        if self.spec_thread {
+            return self.err("a typedef cannot be thread-local");
+        }
         let sattrs = self.spec_attrs.clone();
         loop {
             let (name, ty, span) = self.parse_named_declarator(base.clone())?;
@@ -1325,7 +1335,7 @@ impl Parser {
                 TokenKind::Keyword(Keyword::Inline) => self.spec_inline = true,
                 TokenKind::Keyword(Keyword::Register | Keyword::Auto | Keyword::Noreturn) => {}
                 TokenKind::Ident(n) if n == "__extension__" => {}
-                TokenKind::Ident(n) if n == "_Thread_local" || n == "__thread" => {
+                TokenKind::Ident(n) if self.is_thread_spec(n) => {
                     self.spec_thread = true;
                 }
                 _ => break,
@@ -1461,11 +1471,15 @@ impl Parser {
     /// thread-storage specifier, or a GNU `__attribute__`.
     fn ident_starts_decl(&self, name: &str) -> bool {
         is_builtin_type_ident(name)
-            || matches!(
-                name,
-                "constexpr" | "_Thread_local" | "__thread" | "__attribute__" | "__attribute"
-            )
+            || matches!(name, "constexpr" | "__attribute__" | "__attribute")
+            || self.is_thread_spec(name)
             || self.is_typedef_name(name)
+    }
+
+    /// Whether `name` is the thread storage-class specifier: C11
+    /// `_Thread_local`, GNU `__thread`, or (a keyword from C23) `thread_local`.
+    fn is_thread_spec(&self, name: &str) -> bool {
+        matches!(name, "_Thread_local" | "__thread") || (name == "thread_local" && self.std.is_c23())
     }
 
     /// Parse the parameters of an old-style (K&R) function definition: the
@@ -1663,7 +1677,7 @@ impl Parser {
             if let TokenKind::Ident(name) = self.peek().clone() {
                 let sp = self.peek_span();
                 match name.as_str() {
-                    "_Thread_local" | "__thread" => {
+                    n if self.is_thread_spec(n) => {
                         self.bump();
                         self.spec_thread = true;
                         saw_any = true;

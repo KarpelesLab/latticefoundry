@@ -363,19 +363,37 @@ fn verify_or(module: &Module, stage: &str) -> Result<(), BuildError> {
     })
 }
 
+/// The sections [`emit_globals`] fills, in the order of [`GlobalSection`].
+const GLOBAL_SECTIONS: [(&str, SectionKind); 4] = [
+    (".data", SectionKind::Data),
+    (".rodata", SectionKind::Rodata),
+    (".tdata", SectionKind::TData),
+    (".tbss", SectionKind::TBss),
+];
+
+/// Which of [`GLOBAL_SECTIONS`] a global goes to.
+#[derive(Clone, Copy)]
+enum GlobalSection {
+    Data,
+    Rodata,
+    TData,
+    TBss,
+}
+
 /// Emit the module's global variables into the object, defining a symbol for
 /// each (the backend's `compile_module` emits only code, so global storage is
 /// contributed here). Writable globals go in `.data`; read-only objects (string
-/// literals) in `.rodata`. Each global's fully-materialized initializer image is
-/// copied verbatim.
+/// literals) in `.rodata`; thread-local ones in `.tdata`, or `.tbss` when
+/// all zero, with `STT_TLS` symbols. Each global's fully-materialized
+/// initializer image is copied verbatim.
 fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal], records: &ast::Records, cfg: &CodegenConfig) {
     if globals.is_empty() {
         return;
     }
-    let mut data: Option<SectionId> = None;
-    let mut rodata: Option<SectionId> = None;
-    let mut data_bytes: Vec<u8> = Vec::new();
-    let mut rodata_bytes: Vec<u8> = Vec::new();
+    let mut sections: [Option<SectionId>; 4] = [None; 4];
+    let mut contents: [Vec<u8>; 4] = Default::default();
+    // `.tbss` holds no bytes: its running size.
+    let mut tbss_size = 0u64;
     // Address-valued fields inside globals become relocations, recorded here and
     // added after the sections exist. Each entry is `(section, field-offset,
     // target-symbol-name, addend)`.
@@ -393,20 +411,35 @@ fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal], records: &ast::Reco
         // record) gets it, up to the sections' 16.
         let natural = (layout::align_of(records, &g.ty) as usize).min(16);
         let align = size.next_power_of_two().clamp(1, 8).max(natural);
-        let (sec, bytes) = if g.readonly {
-            let sec = *rodata
-                .get_or_insert_with(|| obj.add_section(Section::new(".rodata", SectionKind::Rodata, 16)));
-            (sec, &mut rodata_bytes)
+        let which = if g.thread_local {
+            if g.relocs.is_empty() && g.bytes.iter().all(|&b| b == 0) {
+                GlobalSection::TBss
+            } else {
+                GlobalSection::TData
+            }
+        } else if g.readonly {
+            GlobalSection::Rodata
         } else {
-            let sec = *data
-                .get_or_insert_with(|| obj.add_section(Section::new(".data", SectionKind::Data, 16)));
-            (sec, &mut data_bytes)
+            GlobalSection::Data
         };
-        while !bytes.len().is_multiple_of(align) {
-            bytes.push(0);
-        }
-        let off = bytes.len() as u64;
-        bytes.extend_from_slice(&g.bytes);
+        let sec = *sections[which as usize].get_or_insert_with(|| {
+            let (name, kind) = GLOBAL_SECTIONS[which as usize];
+            obj.add_section(Section::new(name, kind, 16))
+        });
+        let off = if let GlobalSection::TBss = which {
+            tbss_size = tbss_size.next_multiple_of(align as u64);
+            let off = tbss_size;
+            tbss_size += size as u64;
+            off
+        } else {
+            let bytes = &mut contents[which as usize];
+            while !bytes.len().is_multiple_of(align) {
+                bytes.push(0);
+            }
+            let off = bytes.len() as u64;
+            bytes.extend_from_slice(&g.bytes);
+            off
+        };
         // A `static` object has internal linkage: its symbol is local. A
         // *tentative* definition (`T x;` with no initializer) may be emitted by
         // several translation units — classically through a shared header — so it
@@ -421,19 +454,21 @@ fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal], records: &ast::Reco
         } else {
             SymbolBinding::Global
         };
-        let mut sym =
-            Symbol::defined(g.name.clone(), binding, SymbolType::Object, sec, off, g.bytes.len() as u64);
+        let kind = if g.thread_local { SymbolType::Tls } else { SymbolType::Object };
+        let mut sym = Symbol::defined(g.name.clone(), binding, kind, sec, off, g.bytes.len() as u64);
         sym.visibility = lower::global_visibility(g, cfg).into();
         obj.add_symbol(sym);
         for r in &g.relocs {
             pending.push((sec, off + r.offset, r.symbol.clone(), r.addend));
         }
     }
-    if let Some(sec) = data {
-        obj.section_mut(sec).bytes = data_bytes;
+    for (sec, bytes) in sections.into_iter().zip(contents) {
+        if let Some(sec) = sec {
+            obj.section_mut(sec).bytes = bytes;
+        }
     }
-    if let Some(sec) = rodata {
-        obj.section_mut(sec).bytes = rodata_bytes;
+    if let Some(sec) = sections[GlobalSection::TBss as usize] {
+        obj.section_mut(sec).bss_size = tbss_size;
     }
     // Now that every defined global symbol exists, turn each recorded pointer
     // field into an absolute 64-bit relocation against its target symbol

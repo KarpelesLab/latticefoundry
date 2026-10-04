@@ -49,10 +49,6 @@ pub struct Program {
 /// The diagnostic for an `_Atomic` aggregate object.
 const ATOMIC_SCALARS_ONLY: &str = "_Atomic is only supported on scalar (integer, floating or pointer) types";
 
-/// The diagnostic for a thread-local object: the backends have no TLS
-/// relocations or thread-pointer addressing yet.
-const THREAD_LOCAL_UNSUPPORTED: &str =
-    "thread-local storage (_Thread_local / __thread) is not supported";
 
 /// The plain `char` type on this target (signed 8-bit), used for string data.
 pub fn char_ty() -> CType {
@@ -146,6 +142,9 @@ pub struct TGlobal {
     /// (e.g. a pointer initialized with a string-literal or another object's
     /// address). Each entry patches 8 bytes at `offset` to `symbol + addend`.
     pub relocs: Vec<GlobalReloc>,
+    /// Whether the object is thread-local (`_Thread_local`, `__thread`, C23
+    /// `thread_local`): one instance per thread, in the TLS sections.
+    pub thread_local: bool,
 }
 
 /// A relocation within a global's initializer image: the 8-byte field at
@@ -668,6 +667,7 @@ impl Checker {
             weak: false,
             tentative: false,
             relocs: Vec::new(),
+            thread_local: false,
         });
         idx
     }
@@ -824,10 +824,6 @@ impl Checker {
             self.error(g.span, "global cannot have type 'void'");
             return;
         }
-        if g.thread_local {
-            self.error(g.span, THREAD_LOCAL_UNSUPPORTED);
-            return;
-        }
         // An object of a type whose values cannot be computed with may be
         // declared `extern`, but not given storage here.
         if g.storage != Storage::Extern
@@ -863,7 +859,7 @@ impl Checker {
             self.global_index.get(&g.name).or_else(|| self.global_by_symbol.get(symbol)).copied();
         if let Some(idx) = prior {
             self.global_index.insert(g.name.clone(), idx);
-            if !self.relabel_global(idx, g) {
+            if !self.relabel_global(idx, g) || !self.same_thread_storage(idx, g) {
                 return;
             }
             // A second full definition (both with initializers) is an error.
@@ -917,7 +913,23 @@ impl Checker {
             weak: g.attrs.weak,
             tentative: !has_init && !is_decl_only,
             relocs,
+            thread_local: g.thread_local,
         });
+    }
+
+    /// Check that redeclaration `g` of global `idx` agrees on thread storage
+    /// (C11 6.7.1p3: every declaration of a thread-local object says so).
+    fn same_thread_storage(&mut self, idx: usize, g: &VarDecl) -> bool {
+        if self.globals[idx].thread_local == g.thread_local {
+            return true;
+        }
+        let msg = if g.thread_local {
+            format!("thread-local declaration of '{}' follows a non-thread-local declaration", g.name)
+        } else {
+            format!("non-thread-local declaration of '{}' follows a thread-local declaration", g.name)
+        };
+        self.error(g.span, msg);
+        false
     }
 
     /// Apply the asm label of redeclaration `g` to the existing global `idx`.
@@ -1155,7 +1167,7 @@ impl Checker {
                 if let Some(&idx) = self.global_index.get(name)
                     && matches!(self.globals[idx].ty, CType::Array(..))
                 {
-                    return Some((Some(self.globals[idx].name.clone()), 0));
+                    return self.static_address_of(idx, e.span).map(|sym| (Some(sym), 0));
                 }
                 None
             }
@@ -1169,6 +1181,22 @@ impl Checker {
         }
     }
 
+    /// The symbol of global `idx` for an address constant, or `None` (after
+    /// reporting) for a thread-local object, whose address differs per thread
+    /// and so is not a link-time constant.
+    fn static_address_of(&mut self, idx: usize, span: Span) -> Option<String> {
+        let g = &self.globals[idx];
+        if g.thread_local {
+            let msg = format!(
+                "the address of thread-local variable '{}' is not a constant (it differs per thread)",
+                g.name
+            );
+            self.error(span, msg);
+            return None;
+        }
+        Some(g.name.clone())
+    }
+
     /// Resolve a constant lvalue designating part of a named object to its
     /// `(symbol, byte-offset, type)`. Descends through constant array subscripts
     /// and struct/union members from a root global identifier.
@@ -1176,7 +1204,8 @@ impl Checker {
         match &e.kind {
             ExprKind::Ident(name) => {
                 let &idx = self.global_index.get(name)?;
-                Some((self.globals[idx].name.clone(), 0, self.globals[idx].ty.clone()))
+                let sym = self.static_address_of(idx, e.span)?;
+                Some((sym, 0, self.globals[idx].ty.clone()))
             }
             ExprKind::Index(base, idx) => {
                 let (sym, off, bty) = self.const_lvalue(base)?;
@@ -1582,8 +1611,17 @@ impl Checker {
                 self.error(d.span, "variable cannot have type 'void'");
                 continue;
             }
-            if d.thread_local {
-                self.error(d.span, THREAD_LOCAL_UNSUPPORTED);
+            // A thread-local object has static (per-thread) storage duration,
+            // so at block scope it must be `static` or `extern` (C11 6.7.1p3).
+            if d.thread_local && matches!(d.ty.unqual(), CType::Func(_)) {
+                self.error(d.span, format!("function '{}' declared thread-local", d.name));
+                continue;
+            }
+            if d.thread_local && d.storage == Storage::None {
+                self.error(
+                    d.span,
+                    format!("block-scope thread-local variable '{}' must be 'static' or 'extern'", d.name),
+                );
                 continue;
             }
             if let Some(name) = d.ty.unsupported_value() {
@@ -1631,7 +1669,7 @@ impl Checker {
                     .or_else(|| self.global_by_symbol.get(symbol))
                     .copied();
                 let idx = if let Some(i) = prior {
-                    if !self.relabel_global(i, d) {
+                    if !self.relabel_global(i, d) || !self.same_thread_storage(i, d) {
                         continue;
                     }
                     if ty_is_more_complete(&ty, &self.globals[i].ty) {
@@ -1659,6 +1697,7 @@ impl Checker {
                         weak: d.attrs.weak,
                         tentative: false,
                         relocs: Vec::new(),
+                        thread_local: d.thread_local,
                     });
                     i
                 };
@@ -1756,6 +1795,7 @@ impl Checker {
             weak: false,
             tentative: false,
             relocs,
+            thread_local: d.thread_local,
         });
         idx
     }

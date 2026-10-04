@@ -253,8 +253,14 @@ pub fn lower_with(
         } else {
             Linkage::External
         };
-        let attrs =
-            GlobalAttrs { linkage, visibility: global_visibility(g, cfg), ..GlobalAttrs::DETACHED };
+        // A thread-local object is addressed through the thread pointer, by the
+        // access model its linkage and the relocation model select.
+        let attrs = GlobalAttrs {
+            linkage,
+            visibility: global_visibility(g, cfg),
+            thread_local: g.thread_local,
+            ..GlobalAttrs::DETACHED
+        };
         global_ids.push(module.define_global(Global { name, ty, init: Some(init) }, attrs));
     }
 
