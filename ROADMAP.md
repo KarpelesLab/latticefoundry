@@ -57,6 +57,11 @@ the exit criteria are what "done" means for each phase.
 >   ([ir-design §6d](docs/ir-design.md)).
 > - **SIMD vectors** `<N x T>` (per-lane poison, a generic scalarizing
 >   legalizer, SSE2 lowering on x86-64, NEON on AArch64; RISC-V scalarizes)
+> - an **undefined-behavior sanitizer**: checks derived from the reference
+>   semantics (overflow, shifts, division, float casts, object bounds, null,
+>   alignment, `unreachable`), reported by a freestanding runtime written in
+>   LF IR or trapping; `lf build --sanitize=…` and `lf-cc -fsanitize=…`
+>   ([ir-design §6i](docs/ir-design.md))
 > - three targets:
 >   - **x86-64** executes, with the full System V ABI including
 >     struct-by-value and variadics.
@@ -84,7 +89,8 @@ the exit criteria are what "done" means for each phase.
 >
 > Still open in Phase 10:
 >
-> - sanitizers
+> - the address sanitizer (shadow memory; designed in
+>   [ir-design §6i](docs/ir-design.md))
 > - the deferred bets: B6 (region form), B7 (full content-addressing), B10
 >   (provenance types; only the constant-time step is done) and B11 (verified
 >   lowering)
@@ -653,8 +659,10 @@ Windows x64 `.pdata`/`.xdata` whose codes `llvm-readobj --unwind` decodes to
 exactly the prologue, Mach-O compact unwind (`RBP_FRAME` on x86-64, `FRAME`
 on arm64 for frames without callee-saved registers), and DWARF `.eh_frame`
 for x86-64 ELF (`--unwind-tables`, default with `-g`/`--shared`/`--pie`;
-`llvm-dwarfdump` and a `gdb` backtrace) ✅.
-Open: dynamic linking, PGO hooks, sanitizers, richer alias analysis, unwind
+`llvm-dwarfdump` and a `gdb` backtrace) ✅,
+the undefined-behavior sanitizer (`transform::sanitize`, a weak LF IR runtime,
+trap mode; `lf build --sanitize`, `lf-cc -fsanitize`) ✅.
+Open: dynamic linking, PGO hooks, the address sanitizer, richer alias analysis, unwind
 tables for AArch64 beyond Mach-O compact unwind (Windows ARM64 `.xdata` and
 ELF `.eh_frame`; see ir-design §6c).
 
@@ -687,7 +695,7 @@ ELF `.eh_frame`; see ir-design §6c).
 | M4        | Emit assembled objects for x86-64                        | 5–7   | ✅ done |
 | **M5**    | **Compile `.lf` → native executable that runs**          | 8     | ✅ **done** |
 | M6        | Certified tier: proof-carrying pipeline                  | 9     | ✅ done |
-| M7        | JIT, debug info, LTO                                     | 10    | ✅ done (dynamic linking, sanitizers still open) |
+| M7        | JIT, debug info, LTO                                     | 10    | ✅ done (dynamic linking, ASan still open) |
 | **M8**    | **`lf-cc` builds gzip from source → byte-identical to GNU gzip** | lf-cc | ✅ **done** |
 | **M9**    | **`lf-cc` compiles against the real `/usr/include`**     | lf-cc | ✅ **done** (Lua, SQLite, gzip, bzip2 against real glibc) |
 

@@ -1389,6 +1389,134 @@ pipeline, clean-room from the RISC-V ISA manual and the RISC-V ELF psABI:
   loop over block layout (their ranges are short); branches are a small part
   of the code.
 
+## 6i. Undefined-behavior sanitizer  *(decided)*
+
+The opcode table already says exactly when each operation is undefined or
+poison (§5, §7, `ir::semantics`). `transform::sanitize` turns those
+conditions into run-time checks, so a sanitized build reports undefined
+behavior where it happens instead of letting it reach the optimizer.
+
+### What is checked
+
+Before each operation the pass computes the condition from the operation's
+own operands (each formula is tested against `semantics::eval`, exhaustively
+on `i8` and on every `f16` pattern):
+
+| kind | operation | condition |
+|---|---|---|
+| `signed-integer-overflow` | `add`/`sub`/`mul nsw` | `(a^r)&(b^r) < 0` (add), `(a^b)&(a^r) < 0` (sub); `mul` widened to `2n` bits, or divided back (`r / a != b`) when `2n` is not native |
+| `unsigned-integer-overflow` | `… nuw` | `r <u a` (add), `a <u b` (sub), as `mul` above |
+| `shift-exponent` | shifts | `amount ≥u n` |
+| `shift-base` | `shl nsw`/`nuw` | `(a << s) >> s != a` (arithmetic / logical) |
+| `integer-divide-by-zero` | div / rem | `b == 0` |
+| `division-overflow` | `sdiv`/`srem` | `a == MIN && b == -1` |
+| `exact` | `udiv`/`sdiv`/`lshr`/`ashr exact` | nonzero remainder / low bits |
+| `float-cast-overflow` | `fptosi`/`fptoui` | `x ≤ L` or `x ≥ 2ᵏ`, unordered (NaN fails): `L` is `-2ⁿ⁻¹-1` when exact in the format, else `-2ⁿ⁻¹` with `<`, `-1` for unsigned |
+| `pointer-bounds` | `ptr_add inbounds` | offset from the object `∉ [0, size]` |
+| `object-size` | loads, stores, atomics | `[offset, offset+access) ⊄ [0, size)` |
+| `null` | loads, stores, atomics | `address == null` |
+| `alignment` | loads, stores, atomics | `address & (align-1) != 0` |
+| `unreachable` | `unreachable` | always |
+
+Shifts inside a condition use `select(s <u n, s, 0)` so the check itself is
+never poison, and the condition is `freeze`d before the branch, so a check
+adds no undefined behavior: a program without UB computes the same results.
+The flag a check covers (`nsw`, `nuw`, `exact`, `inbounds`) is dropped from
+the operation, a refinement, so a program that continues after a report gets
+the wrapped value rather than poison.
+
+The bounds checks need the object: the address must trace through
+`ptr_add`s to an `alloca`, a `dyn_alloca` (checked against its run-time
+size) or a defined, non-weak global whose type has no flexible tail. Anything
+else is unchecked. Checks known statically are elided: an operation folding
+to a non-poison constant, a constant in-range shift amount, a nonzero
+constant divisor (other than `-1` for signed division), a stack slot or
+global address (never null), an access at a constant offset inside its
+object with its alignment implied by the object's.
+
+Not checked: vector operations, a `mul` wider than the widest native integer
+(its check would need a division the target lacks), fast-math `nnan`/`ninf`,
+branching on poison (poison is not observable at run time; the checks above
+stop it at its sources).
+
+### The handler and the runtime
+
+A failed check calls `void __lf_ub_report(i32 code, ptr loc, i64 a, i64 b)`:
+`code` is `kind | detail << 8 | width << 16` (the detail byte is the operator
+character, or `l`/`s`/`a` for a load, store or atomic), `loc` points at a
+mutable record `{ ptr file, ptr function, i32 line, i32 reported }` (one per
+function, line and kind), and `a`/`b` are the operands extended to 64 bits
+(for bounds: offset and size; for alignment: address and alignment). The line
+comes from the instruction's line table entry; the `.lf` parser always
+records lines, and `lf-cc` records them when sanitizing.
+
+The runtime is written in LF IR (`transform::sanitize::runtime`) and linked
+into the module weakly, so a program can supply its own handler and several
+sanitized objects share one copy. It formats `file:line: runtime error:
+<message>` into a stack buffer, writes it to fd 2 with the `write` syscall,
+marks the location reported, and continues — or exits with status 1 when the
+module was built without recovery (`--sanitize-halt`) or the kind cannot
+continue (division faults, null accesses, `unreachable`). It needs no libc;
+its syscall numbers are the target's (x86-64, or the generic table of AArch64
+and RISC-V). Elsewhere (bare metal, Windows, Darwin, wasm32) only the
+declaration is emitted and the program supplies the handler.
+
+**Trap mode** (`--sanitize-trap`) needs no runtime: the failure path is
+`store volatile i32 code, @__lf_ub_trap_kind` then `unreachable`, which every
+backend lowers to its trap (`ud2`, so `SIGILL`, on x86-64). The volatile store
+is an observable event, so no pass may delete the path in front of it; the
+optimizer cannot use the `unreachable` to remove the check.
+
+### Composition
+
+The pass runs on the verified module **before** the `-O` pipeline (`lf
+build --sanitize=…`, `lf-cc -fsanitize=…`): checking `nsw` after the
+optimizer has exploited it would be too late. It is not a refinement (it adds
+observable behavior), so it is never part of a pipeline. Its output verifies
+and the optimizer cleans it up: the checks survive `-O3`.
+
+C's signed overflow is undefined; `lf-cc` normally wraps (as `-fwrapv`), and
+with signed-overflow checks on it lowers signed `int`-or-wider `+ - *`, unary
+minus, `++`/`--` and compound assignments with `nsw` (narrower operands are
+promoted first, so they cannot overflow), and signed `<<` with `nsw` for
+`shift-base`. Its `-fsanitize=undefined` follows GCC's grouping (everything
+but `float-cast-overflow`). The tests compile C programs with each kind of UB
+with `lf-cc` and with `gcc -fsanitize=…` and compare the reported (line, kind)
+sets.
+
+**Secrets.** A check branches on data, which §6d forbids for secret-derived
+values. The pass skips every check whose condition reads a secret-derived
+value (by the `SecretTaint` analysis), so a constant-time function stays
+constant-time after the pass, and its public operations are still checked.
+The tests run the constant-time verifier on a sanitized secret function.
+
+- **Rejected: marking sanitized functions incompatible with secrets.** It
+  would make `--sanitize` unusable on any program with one constant-time
+  routine; skipping the few secret checks loses nothing the discipline does
+  not already guarantee (no secret reaches a division, an address or a
+  branch).
+- **Rejected: a `trap` opcode.** `store volatile` + `unreachable` already
+  lowers to the target's trap everywhere and survives every pass; a new opcode
+  would touch every backend for no gain.
+
+### Address sanitizer (designed, not built)
+
+The bounds checks above cover accesses whose object is known statically. A
+shadow-memory **ASan-lite** would cover the rest (pointers through memory,
+heap objects): one shadow byte per 8 application bytes at `(addr >> 3) +
+SHADOW_BASE`, mapped `MAP_NORESERVE` at startup (a reserved region below the
+program, `0x7fff8000` as the classic x86-64 offset), holding 0 (all 8 bytes
+addressable), `k` (the first `k`), or a negative poison code. The pass would
+give each `alloca` and defined global a 32-byte redzone (an alloca becomes a
+`[size + 32]` slot whose redzone shadow is poisoned at entry and cleared at
+every `ret`; globals get a padded copy and a constructor that poisons their
+redzones), and precede each load and store with a shadow load and compare
+(the access is bad when the shadow byte is nonzero and `(addr & 7) + size - 1
+≥ shadow`). The runtime would add the mmap of the shadow, the report (reusing
+`__lf_ub_report` with a new kind) and, for heap coverage, `malloc`/`free`
+interposition with quarantine. Use-after-return and the dynamic stack need
+the frame-layout cooperation that `dyn_alloca` already has.
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than
