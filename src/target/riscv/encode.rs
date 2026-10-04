@@ -1946,7 +1946,8 @@ pub fn compile_module_riscv(
         None => (&legal, syms),
     };
     let mut obj = ObjectModule::new(module.name.clone());
-    let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
+    let align = opts.function_alignment_for(4, 4) as usize;
+    let text = obj.add_section(Section::new(".text", SectionKind::Text, align as u64));
     let mut stack = StackReport::new();
     let func_name = |idx: u32| -> String {
         syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
@@ -1965,11 +1966,11 @@ pub fn compile_module_riscv(
         let (bytes, relocs, usage) =
             compile_function_full(module, syms, fid, opts, &func_name, &global_name, ropts);
         stack.push(usage);
-        // 4-align this function's start within .text (after compressed code,
-        // with a `c.nop`).
+        // Align this function's start within .text (at least 4, after
+        // compressed code with a `c.nop`).
         {
             let sec = obj.section_mut(text);
-            while !sec.bytes.len().is_multiple_of(4) {
+            while !sec.bytes.len().is_multiple_of(align) {
                 sec.bytes.extend_from_slice(&0x0001u16.to_le_bytes());
             }
         }

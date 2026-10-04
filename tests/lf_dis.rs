@@ -159,5 +159,17 @@ fn section_less_executable_starts_at_code_not_headers() {
     assert!(out.contains("<entry>:"), "entry label missing:\n{out}");
     // The ELF magic (7f 45 4c 46) is header data, never a listed instruction.
     assert!(!out.contains("7f 45 4c 46") && !out.contains("7f 45 "), "headers decoded as code:\n{out}");
+    // Laid out for size (no padding after the headers, `.rodata` in the code
+    // segment) or not, the listing starts at the entry stub, right after the
+    // program headers.
+    for args in [&[][..], &["--merge-rodata"], &["-Os"], &["-Os", "--merge-rodata=never"], &["--function-alignment=1"]] {
+        let o = Command::new(env!("CARGO_BIN_EXE_lf")).arg("build").arg(dir.join("dis.lf")).args(args).arg("-o").arg(&exe).output().unwrap();
+        assert!(o.status.success(), "lf build {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        let image = std::fs::read(&exe).unwrap();
+        let phnum = u64::from(u16::from_le_bytes([image[56], image[57]]));
+        let out = dis_ok(&["-d", exe.to_str().unwrap()]);
+        let first = out.lines().find(|l| l.contains(">:")).unwrap_or_else(|| panic!("no label:\n{out}"));
+        assert_eq!(first, format!("{:016x} <entry>:", 0x40_0000 + 64 + 56 * phnum), "{args:?}:\n{out}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

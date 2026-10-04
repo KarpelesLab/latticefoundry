@@ -1881,7 +1881,8 @@ fn build_module(
     let legal = crate::codegen::legalize::legalized(module, &NeonLegality);
     let module: &Module = &legal;
     let mut obj = ObjectModule::new(module.name.clone());
-    let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
+    let align = opts.function_alignment_for(4, 4) as usize;
+    let text = obj.add_section(Section::new(".text", SectionKind::Text, align as u64));
     let mut stack = StackReport::new();
     let mut funcs: Vec<FuncDebug> = Vec::new();
     // Mach-O compact unwind records (function symbol, size, encoding).
@@ -1895,10 +1896,11 @@ fn build_module(
         let out = compile_function_full(module, fid, syms, opts, debug.is_some());
         let emitted = out.emitted;
         stack.push(out.stack);
-        // 4-align this function's start within .text (A64 instructions are words).
+        // Align this function's start within .text (A64 instructions are
+        // words, so at least 4).
         {
             let sec = obj.section_mut(text);
-            while !sec.bytes.len().is_multiple_of(4) {
+            while !sec.bytes.len().is_multiple_of(align) {
                 sec.bytes.push(0);
             }
         }

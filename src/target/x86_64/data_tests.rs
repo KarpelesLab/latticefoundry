@@ -12,8 +12,9 @@
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 
+use crate::codegen::CodegenOptions;
 use crate::ir::Module;
-use crate::link::{ImageOptions, link_executable, write_executable};
+use crate::link::{ImageOptions, MergeRodata, link_executable, write_executable};
 use crate::mc::object::{RelocKind, SectionKind};
 use crate::support::StrInterner;
 use crate::support::diagnostics::FileId;
@@ -58,9 +59,20 @@ fn run(path: &PathBuf) -> (Vec<u8>, std::process::ExitStatus) {
 /// Compile + link `src` at `level` with our own linker, run it, and return
 /// `(stdout, status, image size)`.
 fn build_and_run(src: &str, level: OptLevel, tag: &str) -> (Vec<u8>, std::process::ExitStatus, usize) {
+    build_and_run_with(src, level, tag, &CodegenOptions::default(), &ImageOptions::default())
+}
+
+/// [`build_and_run`] under the given code-generation and image options.
+fn build_and_run_with(
+    src: &str,
+    level: OptLevel,
+    tag: &str,
+    cg: &CodegenOptions,
+    opts: &ImageOptions,
+) -> (Vec<u8>, std::process::ExitStatus, usize) {
     let (m, syms) = prepare(src, level);
-    let obj = super::compile_module(&m, &syms);
-    let image = link_executable(vec![obj], &ImageOptions::default()).expect("link should succeed");
+    let obj = super::compile_module_with(&m, &syms, cg).object;
+    let image = link_executable(vec![obj], opts).expect("link should succeed");
     let path = temp_path(tag);
     write_executable(path.to_str().unwrap(), &image).expect("write executable");
     let (out, status) = run(&path);
@@ -97,7 +109,8 @@ fn rodata_string_written_by_syscall() {
     assert!(obj.sections().iter().all(|s| s.name != ".data" && s.name != ".bss"));
 }
 
-/// A store to a `constant` global faults: `.rodata` is mapped without `W`.
+/// A store to a `constant` global faults: `.rodata` is mapped without `W`,
+/// whether in its own read-only segment or merged into the read+execute one.
 #[test]
 fn store_to_constant_global_faults() {
     let src = r#"
@@ -109,8 +122,11 @@ entry ^0:
   ret i64 0
 }
 "#;
-    let (_, status, _) = build_and_run(src, OptLevel::O0, "rostore");
-    assert_eq!(status.signal(), Some(11), "expected SIGSEGV, got {status:?}");
+    for merge in [MergeRodata::Never, MergeRodata::Always, MergeRodata::Auto] {
+        let opts = ImageOptions { merge_rodata: merge, ..ImageOptions::default() };
+        let (_, status, _) = build_and_run_with(src, OptLevel::O0, "rostore", &CodegenOptions::default(), &opts);
+        assert_eq!(status.signal(), Some(11), "expected SIGSEGV with {merge:?}, got {status:?}");
+    }
 }
 
 /// A mutable `.data` counter (initialized to 5) incremented in a loop by an
@@ -415,12 +431,9 @@ fn assert_packed_layout(image: &[u8], expect_flags: &[u32]) {
     }
 }
 
-/// A hello world with its string in `.rodata` is a few hundred bytes: the
-/// `.rodata` segment is packed right after `.text` in the file instead of being
-/// pushed to the next page boundary (issue #2).
-#[test]
-fn hello_world_image_is_small() {
-    const HELLO: &str = r#"
+/// The Lode-like hello world: a string in `.rodata` written with the
+/// `syscall` op, then exit.
+const HELLO: &str = r#"
 module "hello"
 global constant @msg : [12 x i8] = [12 x i8] "Hello world\n"
 
@@ -431,22 +444,176 @@ entry ^0:
   ret %rc
 }
 "#;
+
+/// The size-layout options: functions packed back to back, `.rodata` merged.
+fn size_options() -> (CodegenOptions, ImageOptions) {
+    let cg = CodegenOptions::default().with_function_alignment(1);
+    (cg, ImageOptions { merge_rodata: MergeRodata::Always, ..ImageOptions::default() })
+}
+
+/// A hello world with its string in `.rodata` is a few hundred bytes: the
+/// `.rodata` segment is packed right after `.text` in the file instead of being
+/// pushed to the next page boundary (issue #2). Merged on request, its 12
+/// bytes join the code segment, saving the second program header (issue #11),
+/// and with functions packed back to back nothing pads the image at all.
+#[test]
+fn hello_world_image_is_small() {
+    let separate = ImageOptions::default();
+    let merged = ImageOptions { merge_rodata: MergeRodata::Auto, ..ImageOptions::default() };
+    let (small_cg, small_image) = size_options();
+    let default_cg = CodegenOptions::default();
     for level in [OptLevel::O0, OptLevel::O2] {
-        let (out, status, image_len) = build_and_run(HELLO, level, "small");
-        assert_eq!(out, b"Hello world\n", "stdout at {level:?}");
-        assert_eq!(status.code(), Some(0), "exit status at {level:?}");
-        assert!(image_len < 2048, "hello world is {image_len} bytes at {level:?}");
+        let mut sizes = Vec::new();
+        for (cg, opts, tag) in [
+            (&default_cg, &separate, "separate"),
+            (&default_cg, &merged, "merged"),
+            (&small_cg, &small_image, "small"),
+        ] {
+            let (out, status, image_len) = build_and_run_with(HELLO, level, tag, cg, opts);
+            assert_eq!(out, b"Hello world\n", "stdout at {level:?}, {tag}");
+            assert_eq!(status.code(), Some(0), "exit status at {level:?}, {tag}");
+            sizes.push(image_len);
+        }
+        let [separate_len, merged_len, small_len] = sizes[..] else { unreachable!() };
+        assert!(separate_len < 512, "hello world is {separate_len} bytes at {level:?}");
+        // Merging drops a 56-byte program header; at most 15 bytes of it go
+        // back to aligning `main` to 16.
+        assert!(merged_len + 41 <= separate_len, "merged {merged_len} vs separate {separate_len} at {level:?}");
+        assert!(small_len < 256, "size-optimized hello world is {small_len} bytes at {level:?}");
+        assert!(small_len <= merged_len, "{small_len} > {merged_len} at {level:?}");
     }
+
     let (m, syms) = prepare(HELLO, OptLevel::O2);
-    let image = link_executable(vec![super::compile_module(&m, &syms)], &ImageOptions::default())
-        .expect("link should succeed");
-    assert_packed_layout(&image, &[PF_R | PF_X, PF_R]);
+    let link = |cg: &CodegenOptions, opts: &ImageOptions| {
+        let obj = super::compile_module_with(&m, &syms, cg).object;
+        link_executable(vec![obj], opts).expect("link should succeed")
+    };
+    assert_packed_layout(&link(&default_cg, &separate), &[PF_R | PF_X, PF_R]);
+    assert_packed_layout(&link(&default_cg, &merged), &[PF_R | PF_X]);
+    let image = link(&small_cg, &small_image);
+    assert_packed_layout(&image, &[PF_R | PF_X]);
+    // Not one byte of padding: the 64-byte ELF header, one 56-byte program
+    // header, the 16-byte entry stub, `main` and the string, back to back.
+    let obj = super::compile_module_with(&m, &syms, &small_cg).object;
+    let text = obj.sections().iter().find(|s| s.name == ".text").expect(".text");
+    assert_eq!(text.align, 1);
+    assert_eq!(image.len(), 64 + 56 + 16 + text.bytes.len() + 12, "padding in the size-optimized image");
+    assert_eq!(&image[image.len() - 12..], b"Hello world\n");
+}
+
+/// Several functions, each a different size, calling one another.
+const CALLS: &str = r#"
+module "calls"
+global constant @msg : [3 x i8] = [3 x i8] "ok\n"
+
+func @one(i64) -> i64 {
+entry ^0(%x: i64):
+  %y = add %x, i64 1 : i64
+  ret %y
+}
+
+func @two(i64, i64) -> i64 {
+entry ^0(%a: i64, %b: i64):
+  %p = mul %a, %b : i64
+  %q = sub %p, i64 3 : i64
+  %r = call @one(%q) : i64
+  ret %r
+}
+
+func @say() -> i64 {
+entry ^0:
+  %n = syscall i64 1, i64 1, @msg, i64 3 : i64
+  ret %n
+}
+
+func @main() -> i64 {
+entry ^0:
+  %a = call @two(i64 6, i64 7) : i64
+  %n = call @say() : i64
+  %s = add %a, %n : i64
+  ret %s
+}
+"#;
+
+/// `CodegenOptions::function_alignment` puts every function on that boundary
+/// (1: back to back), raises `.text`'s own alignment to it so the linker keeps
+/// it, and the program runs the same.
+#[test]
+fn function_alignment_is_honored() {
+    let (m, syms) = prepare(CALLS, OptLevel::O0);
+    for align in [None, Some(1), Some(2), Some(8), Some(16), Some(64)] {
+        let cg = match align {
+            Some(a) => CodegenOptions::default().with_function_alignment(a),
+            None => CodegenOptions::default(),
+        };
+        let want = align.unwrap_or(16);
+        let obj = super::compile_module_with(&m, &syms, &cg).object;
+        let (tid, text) = obj.sections().iter().enumerate().find(|(_, s)| s.name == ".text").expect(".text");
+        assert_eq!(text.align, want, "{align:?}");
+        let mut funcs: Vec<(u64, u64)> = obj
+            .symbols()
+            .iter()
+            .filter(|s| s.kind == crate::mc::object::SymbolType::Func)
+            .filter_map(|s| match s.value {
+                crate::mc::object::SymbolValue::Defined { section, offset } if section.index() == tid => {
+                    Some((offset, s.size))
+                }
+                _ => None,
+            })
+            .collect();
+        funcs.sort();
+        assert_eq!(funcs.len(), 4);
+        for (i, &(off, size)) in funcs.iter().enumerate() {
+            assert_eq!(off % want, 0, "function {i} at {off:#x} with alignment {want}");
+            if let Some(&(next, _)) = funcs.get(i + 1) {
+                // Only the padding the alignment asks for, never more.
+                assert_eq!(next, (off + size).next_multiple_of(want), "{align:?}");
+            }
+        }
+        // In the image the functions keep that alignment (the linker honors
+        // `.text`'s), and the program still works: two(6, 7) = 40, + 3.
+        let opts = ImageOptions { debug: true, ..ImageOptions::default() };
+        let image = link_executable(vec![obj], &opts).expect("link should succeed");
+        for (name, addr) in symtab_funcs(&image) {
+            if name != "_start" {
+                assert_eq!(addr % want, 0, "{name} at {addr:#x} with alignment {want}");
+            }
+        }
+        let (out, status, _) =
+            build_and_run_with(CALLS, OptLevel::O0, "falign", &cg, &ImageOptions::default());
+        assert_eq!(out, b"ok\n");
+        assert_eq!(status.code(), Some(43), "{align:?}");
+    }
+}
+
+/// The `STT_FUNC` symbols of a `-g` image's `.symtab`: `(name, address)`.
+fn symtab_funcs(image: &[u8]) -> Vec<(String, u64)> {
+    let u16_at = |o: usize| u16::from_le_bytes([image[o], image[o + 1]]) as usize;
+    let u32_at = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap()) as usize;
+    let (shoff, shnum) = (u64_at(40), u16_at(60));
+    let shdr = |i: usize| shoff + i * 64;
+    let symtab = (0..shnum).map(shdr).find(|&h| u32_at(h + 4) == 2).expect(".symtab");
+    let strtab = shdr(u32_at(symtab + 40) as usize);
+    let (sym_off, sym_size, str_off) = (u64_at(symtab + 24), u64_at(symtab + 32), u64_at(strtab + 24));
+    let mut out = Vec::new();
+    for s in (sym_off..sym_off + sym_size).step_by(24) {
+        if image[s + 4] & 0xf != 2 {
+            continue;
+        }
+        let name_at = str_off + u32_at(s) as usize;
+        let len = image[name_at..].iter().position(|&b| b == 0).unwrap();
+        out.push((String::from_utf8_lossy(&image[name_at..name_at + len]).into_owned(), u64_at(s + 8) as u64));
+    }
+    assert!(out.len() >= 4, "{out:?}");
+    out
 }
 
 /// `.bss` that shares a memory page with the end of `.data` reads as zero even
 /// though the file bytes past `.data` on that page are not zero: the loader
 /// clears the rest of the page past `p_filesz`. With `-g` the page's tail is
-/// DWARF, which is exactly that case. Also checks the `R+X`/`R`/`R+W` flags;
+/// DWARF, which is exactly that case. Also checks the `R+X`/`R`/`R+W` flags
+/// (`R+X`/`R+W` with `.rodata` merged into the code segment);
 /// [`store_to_constant_global_faults`] checks `.rodata` stays unwritable now
 /// that it shares a file page with `.text`.
 #[test]
@@ -486,15 +653,20 @@ entry ^0:
     for level in [OptLevel::O0, OptLevel::O2] {
         let (m, syms) = prepare(SRC, level);
         let source = super::DebugSource { file_name: "t.lf".to_owned(), comp_dir: "/tmp".to_owned() };
-        for debug in [false, true] {
+        let modes = [MergeRodata::Never, MergeRodata::Auto];
+        for (debug, merge) in modes.into_iter().flat_map(|merge| [(false, merge), (true, merge)]) {
             let obj = if debug {
                 super::compile_module_debug(&m, &syms, &source)
             } else {
                 super::compile_module(&m, &syms)
             };
-            let opts = ImageOptions { debug, ..ImageOptions::default() };
+            let opts = ImageOptions { debug, merge_rodata: merge, ..ImageOptions::default() };
             let image = link_executable(vec![obj], &opts).expect("link should succeed");
-            assert_packed_layout(&image, &[PF_R | PF_X, PF_R, PF_R | PF_W]);
+            if merge == MergeRodata::Never {
+                assert_packed_layout(&image, &[PF_R | PF_X, PF_R, PF_R | PF_W]);
+            } else {
+                assert_packed_layout(&image, &[PF_R | PF_X, PF_R | PF_W]);
+            }
             let data = loads(&image).pop().unwrap();
             assert!(data.memsz > data.filesz, "no .bss tail");
             // .bss starts mid-page, on the page holding the end of .data.
@@ -511,7 +683,7 @@ entry ^0:
             write_executable(path.to_str().unwrap(), &image).expect("write executable");
             let (_, status) = run(&path);
             let _ = std::fs::remove_file(&path);
-            assert_eq!(status.code(), Some(42), "exit status at {level:?}, debug={debug}");
+            assert_eq!(status.code(), Some(42), "exit status at {level:?}, debug={debug}, {merge:?}");
         }
     }
 }
@@ -524,17 +696,52 @@ fn readelf_accepts_packed_segments() {
         return;
     }
     let (m, syms) = prepare(TABLE, OptLevel::O0);
-    let image = link_executable(vec![super::compile_module(&m, &syms)], &ImageOptions::default())
-        .expect("link should succeed");
-    let path = temp_path("readelf_l");
+    for (merge, loads, flags) in [
+        (MergeRodata::Never, 3, &["R E", "R  ", "RW "][..]),
+        (MergeRodata::Always, 2, &["R E", "RW "][..]),
+    ] {
+        let opts = ImageOptions { merge_rodata: merge, ..ImageOptions::default() };
+        let image = link_executable(vec![super::compile_module(&m, &syms)], &opts).expect("link should succeed");
+        let path = temp_path("readelf_l");
+        std::fs::write(&path, &image).unwrap();
+        let out = std::process::Command::new("readelf").args(["-lW"]).arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && err.trim().is_empty(), "readelf -lW complained:\n{err}");
+        assert_eq!(text.matches("LOAD").count(), loads, "{merge:?}: readelf output:\n{text}");
+        for flags in flags {
+            assert!(text.contains(flags), "{merge:?}: readelf lacks a `{flags}` segment:\n{text}");
+        }
+    }
+}
+
+/// With `-g` and `.rodata` merged into the code segment, `readelf` reads the
+/// section headers and symbols: `.rodata` is its own allocated, non-executable
+/// section, and the string constant's symbol lies in it.
+#[test]
+fn readelf_reads_merged_rodata_sections() {
+    if !tool_available("readelf") {
+        eprintln!("skipping: readelf not installed");
+        return;
+    }
+    let (m, syms) = prepare(HELLO, OptLevel::O0);
+    let source = super::DebugSource { file_name: "t.lf".to_owned(), comp_dir: "/tmp".to_owned() };
+    let obj = super::compile_module_debug(&m, &syms, &source);
+    let opts = ImageOptions { debug: true, merge_rodata: MergeRodata::Always, ..ImageOptions::default() };
+    let image = link_executable(vec![obj], &opts).expect("link should succeed");
+    let path = temp_path("readelf_s");
     std::fs::write(&path, &image).unwrap();
-    let out = std::process::Command::new("readelf").args(["-lW"]).arg(&path).output().unwrap();
+    let out = std::process::Command::new("readelf").args(["-SsW"]).arg(&path).output().unwrap();
     let _ = std::fs::remove_file(&path);
     let text = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success() && err.trim().is_empty(), "readelf -lW complained:\n{err}");
-    assert_eq!(text.matches("LOAD").count(), 3, "readelf output:\n{text}");
-    for flags in ["R E", "R  ", "RW "] {
-        assert!(text.contains(flags), "readelf lacks a `{flags}` segment:\n{text}");
-    }
+    assert!(out.status.success() && err.trim().is_empty(), "readelf -SsW complained:\n{err}");
+    // `[ 2] .rodata PROGBITS <addr> <off> <size> 00 A 0 0 <align>`.
+    let ro = text.lines().find(|l| l.contains(" .rodata ")).unwrap_or_else(|| panic!("no .rodata:\n{text}"));
+    let cols: Vec<&str> = ro.split(['[', ']']).nth(2).unwrap().split_whitespace().collect();
+    assert_eq!(cols[0], ".rodata");
+    assert_eq!(cols[6], "A", "{ro}");
+    let msg = text.lines().find(|l| l.ends_with(" msg")).unwrap_or_else(|| panic!("no msg symbol:\n{text}"));
+    assert_eq!(msg.split_whitespace().nth(6), Some("2"), "msg is not in .rodata (section 2): {msg}");
 }

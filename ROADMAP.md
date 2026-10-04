@@ -591,7 +591,11 @@ segment, `.data`+`.bss` into one `RW` segment (`.bss` zero-filled through
 `memsz > filesz`), and data relocations are applied in place. Segments are
 packed back to back in the file and each starts on a fresh page in memory at
 the same in-page offset, so a hello world is 258 bytes rather than 4 KB of
-mostly padding; execution tests
+mostly padding. On request (`--merge-rodata`, or `ImageOptions::merge_rodata`
+for a library user) `.rodata` joins the `R+X` segment instead, saving its
+program header at the cost of executable read-only data, so merging is
+opt-in; `--function-alignment=1` packs functions back to back. With both
+(`-Os`) the hello world is 202 bytes with no padding at all. Execution tests
 cover a `.rodata` string written by `syscall`, a `.data` counter, a 512 KiB
 `.bss` array, and a pointer table driving an indirect call, plus `lf build`
 end to end and the same objects linked by `qld`. `link::raw` turns a linked

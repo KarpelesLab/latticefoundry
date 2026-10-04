@@ -21,7 +21,7 @@ pub mod gnu;
 mod image;
 pub mod raw;
 
-pub use image::{ImageOptions, LinkError, link_executable};
+pub use image::{ImageOptions, LinkError, MERGE_RODATA_AUTO_MAX, MergeRodata, link_executable};
 
 /// Options controlling a file-based link (used by the `lf-ld` driver).
 #[derive(Debug, Default)]

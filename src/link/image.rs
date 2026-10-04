@@ -13,7 +13,8 @@
 //! 2. **Section layout**: same-kind sections (`.text`/`.rodata`/`.data`/`.bss`)
 //!    are concatenated across objects with alignment, assigned virtual
 //!    addresses, and grouped into `PT_LOAD` segments with the right permission
-//!    flags (`R+X` text, `R` rodata, `R+W` data+bss, in that order). Segments
+//!    flags (`R+X` text, `R` rodata, `R+W` data+bss, in that order). On
+//!    request, `.rodata` joins the `R+X` segment instead ([`MergeRodata`]). Segments
 //!    are packed back to back in the file, so a small program pays no page of
 //!    padding per segment; in memory each segment starts on a fresh page at the
 //!    same in-page offset as in the file, which is all the ELF rule
@@ -101,6 +102,59 @@ const STT_OBJECT: u8 = 1;
 const STT_NOTYPE: u8 = 0;
 const SHN_UNDEF: u16 = 0;
 
+/// The largest `.rodata` (in bytes, alignment padding included) that
+/// [`MergeRodata::Auto`] places in the code segment.
+pub const MERGE_RODATA_AUTO_MAX: u64 = 512;
+
+/// Whether `.rodata` gets its own read-only `PT_LOAD` segment or joins the
+/// read+execute code segment, right after `.text`.
+///
+/// Merging saves one 56-byte program header and the alignment padding in
+/// front of the `.rodata` segment, and maps one page fewer when `.text` and
+/// `.rodata` share a page; for a small program that is a sizeable part of the
+/// file. The price is that read-only data becomes **executable**: its bytes
+/// can serve as gadgets for code-reuse attacks, which a separate `R` segment
+/// rules out. The data stays unwritable either way (a store to it still
+/// faults). This is the layout of GNU ld's `-z noseparate-code`.
+///
+/// Merging is therefore **opt-in**: the default is [`MergeRodata::Never`],
+/// matching GNU ld's `-z separate-code` default on x86-64 Linux. A program
+/// that wants the smaller image asks for it (`lf build -Os` or
+/// `--merge-rodata`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum MergeRodata {
+    /// Merge when the `.rodata` is at most [`MERGE_RODATA_AUTO_MAX`] bytes:
+    /// a few strings or constants, whose header would cost more than the
+    /// data; a larger `.rodata` (tables, say) keeps its own segment.
+    Auto,
+    /// Always place `.rodata` in the code segment.
+    Always,
+    /// Always give `.rodata` its own read-only segment. The default.
+    #[default]
+    Never,
+}
+
+impl MergeRodata {
+    /// Parse a command-line spelling: `auto`, `always` or `never`.
+    pub fn parse(s: &str) -> Option<MergeRodata> {
+        match s {
+            "auto" => Some(MergeRodata::Auto),
+            "always" => Some(MergeRodata::Always),
+            "never" => Some(MergeRodata::Never),
+            _ => None,
+        }
+    }
+
+    /// Whether a `.rodata` of `size` bytes is merged under this setting.
+    pub fn merges(self, size: u64) -> bool {
+        match self {
+            MergeRodata::Auto => size <= MERGE_RODATA_AUTO_MAX,
+            MergeRodata::Always => true,
+            MergeRodata::Never => false,
+        }
+    }
+}
+
 /// Options controlling how an executable image is built.
 #[derive(Clone, Debug)]
 pub struct ImageOptions {
@@ -114,11 +168,15 @@ pub struct ImageOptions {
     /// image. Off by default — a plain runnable image omits all of this. Enabling
     /// it never changes the loadable layout, `e_entry`, or the program headers.
     pub debug: bool,
+    /// Whether `.rodata` joins the read+execute code segment (default
+    /// [`MergeRodata::Never`]: merging is opt-in). See [`MergeRodata`] for
+    /// the tradeoff.
+    pub merge_rodata: MergeRodata,
 }
 
 impl Default for ImageOptions {
     fn default() -> Self {
-        ImageOptions { entry: "main".to_owned(), base: BASE_DEFAULT, debug: false }
+        ImageOptions { entry: "main".to_owned(), base: BASE_DEFAULT, debug: false, merge_rodata: MergeRodata::Never }
     }
 }
 
@@ -333,6 +391,9 @@ impl TlsTemplate {
 /// address, so `entry` is reached with `rsp ≡ 8 (mod 16)` exactly as the SysV
 /// ABI requires of a callee.
 ///
+/// The stub runs once, so its `.text` asks for no alignment: it starts right
+/// after the program headers instead of at the next 16-byte boundary.
+///
 /// With `tls = Some((block_size, align))` the stub starts with the
 /// thread-pointer set-up of a static image with a TLS template (see the
 /// module docs):
@@ -392,7 +453,7 @@ fn synth_start(entry: &str, tls: Option<(u64, u64)>) -> (ObjectModule, Option<Tl
     let len = emitted.bytes.len() as u64;
 
     let mut obj = ObjectModule::new("<crt0>");
-    let text = obj.add_emitted_section(".text", SectionKind::Text, 16, emitted);
+    let text = obj.add_emitted_section(".text", SectionKind::Text, 1, emitted);
     obj.add_symbol(Symbol::defined(
         "_start",
         SymbolBinding::Global,
@@ -501,7 +562,13 @@ pub fn link_executable(
     let size_of = |g: &[(usize, usize)]| -> u64 {
         g.iter().map(|&(o, s)| objects[o].sections()[s].size()).sum()
     };
-    let rodata_present = size_of(&g_rodata) > 0;
+    // The `.rodata` size with the padding its sections' alignment adds.
+    let rodata_size = g_rodata.iter().fold(0, |end, &(o, s)| {
+        let sec = &objects[o].sections()[s];
+        align_up(end, sec.align.max(1)) + sec.size()
+    });
+    let rodata_merged = rodata_size > 0 && opts.merge_rodata.merges(rodata_size);
+    let rodata_present = rodata_size > 0 && !rodata_merged;
     let data_present = size_of(&g_data) > 0 || size_of(&g_bss) > 0 || tls.is_present();
 
     let phnum = 1 + u64::from(rodata_present) + u64::from(data_present) + u64::from(tls.is_present());
@@ -542,8 +609,16 @@ pub fn link_executable(
         (off, align_up(prev_vend, align) + off % align)
     };
 
-    // --- TEXT segment (R+X): headers + all .text, starting at file offset 0. ---
+    // --- TEXT segment (R+X): headers + all .text, starting at file offset 0,
+    //     then a merged .rodata. ---
     place_filebacked(&mut buf, &mut placement, &g_text, base);
+    let mut merged_rodata = None;
+    if rodata_merged {
+        let first_align = g_rodata.first().map_or(1, |&(o, s)| objects[o].sections()[s].align.max(1));
+        let start = align_up(buf.len() as u64, first_align);
+        place_filebacked(&mut buf, &mut placement, &g_rodata, base);
+        merged_rodata = Some((start, buf.len() as u64 - start));
+    }
     let text_end = buf.len() as u64;
     segments.push(Segment {
         offset: 0,
@@ -772,7 +847,7 @@ pub fn link_executable(
     //    segments, so the runnable layout, entry point, and program headers are
     //    untouched (the kernel ignores section headers when it execs the image).
     let sections = if opts.debug {
-        Some(emit_debug_and_sections(&mut buf, &objects, &placement, &globals, &segments)?)
+        Some(emit_debug_and_sections(&mut buf, &objects, &placement, &globals, &segments, merged_rodata)?)
     } else {
         None
     };
@@ -799,13 +874,15 @@ struct SectionTable {
 
 /// Append the non-loadable debug sections, apply their relocations, and build a
 /// section-header table (with `.symtab`/`.strtab`/`.shstrtab`). Returns where the
-/// table lives so the ELF header can point at it.
+/// table lives so the ELF header can point at it. `merged_rodata` is the file
+/// offset and size of a `.rodata` placed at the end of the code segment.
 fn emit_debug_and_sections(
     buf: &mut Vec<u8>,
     objects: &[ObjectModule],
     placement: &Placement,
     globals: &DetHashMap<String, GlobalDef>,
     segments: &[Segment],
+    merged_rodata: Option<(u64, u64)>,
 ) -> Result<SectionTable, LinkError> {
     // --- 6a. Place each debug section in the file, recording its offset. ---
     let debug_group = group(objects, SectionKind::Debug);
@@ -882,6 +959,9 @@ fn emit_debug_and_sections(
     for seg in segments {
         let idx = (shdrs.len() + 1) as u16; // +1 for the null header at 0
         if seg.flags & PF_X != 0 {
+            // A merged `.rodata` ends the segment: `.text` stops where it
+            // starts, and it gets its own header.
+            let text_size = merged_rodata.map_or(seg.filesz, |(off, _)| off - seg.offset);
             let n = add_shstr(".text", &mut shstrtab);
             shdrs.push(ShdrRec {
                 name_off: n,
@@ -889,13 +969,30 @@ fn emit_debug_and_sections(
                 flags: SHF_ALLOC | SHF_EXECINSTR,
                 addr: seg.vaddr,
                 offset: seg.offset,
-                size: seg.filesz,
+                size: text_size,
                 link: 0,
                 info: 0,
                 align: shdr_align(seg.vaddr),
                 entsize: 0,
             });
             text_shndx = idx;
+            if let Some((off, size)) = merged_rodata {
+                let vaddr = seg.vaddr + (off - seg.offset);
+                let n = add_shstr(".rodata", &mut shstrtab);
+                rodata_shndx = (shdrs.len() + 1) as u16;
+                shdrs.push(ShdrRec {
+                    name_off: n,
+                    kind: SHT_PROGBITS,
+                    flags: SHF_ALLOC,
+                    addr: vaddr,
+                    offset: off,
+                    size,
+                    link: 0,
+                    info: 0,
+                    align: shdr_align(vaddr),
+                    entsize: 0,
+                });
+            }
         } else if seg.flags & PF_W != 0 {
             let n = add_shstr(".data", &mut shstrtab);
             shdrs.push(ShdrRec {
@@ -1333,6 +1430,121 @@ mod tests {
         m
     }
 
+    /// The image options that keep `.rodata` in its own read-only segment
+    /// (the default, spelled out where a test depends on it).
+    fn separate_rodata() -> ImageOptions {
+        ImageOptions { merge_rodata: MergeRodata::Never, ..ImageOptions::default() }
+    }
+
+    /// `ret_object` plus a `.rodata` of `size` bytes holding a local `msg`
+    /// whose address `main` stores (an `Abs64` field at the end of `.text`).
+    fn rodata_object(size: usize) -> ObjectModule {
+        let mut m = ObjectModule::new("t");
+        let mut text = Section::new(".text", SectionKind::Text, 16);
+        text.bytes = vec![0xc3, 0, 0, 0, 0, 0, 0, 0, 0]; // ret; .quad msg
+        let tid = m.add_section(text);
+        m.add_symbol(Symbol::defined("main", SymbolBinding::Global, SymbolType::Func, tid, 0, 1));
+        let mut ro = Section::new(".rodata", SectionKind::Rodata, 8);
+        ro.bytes = (0..size).map(|i| i as u8).collect();
+        let rid = m.add_section(ro);
+        let msg = m.add_symbol(Symbol::defined("msg", SymbolBinding::Local, SymbolType::Object, rid, 0, size as u64));
+        m.add_relocation(Relocation { section: tid, offset: 1, symbol: msg, kind: RelocKind::Abs64, addend: 0 });
+        m
+    }
+
+    /// `(p_type, p_flags, p_offset, p_vaddr, p_filesz)` of each program header.
+    fn phdrs(img: &[u8]) -> Vec<(u32, u32, u64, u64, u64)> {
+        (0..rd_u16(img, 56) as usize)
+            .map(|i| {
+                let o = EHDR_SIZE as usize + i * PHDR_SIZE as usize;
+                (rd_u32(img, o), rd_u32(img, o + 4), rd_u64(img, o + 8), rd_u64(img, o + 16), rd_u64(img, o + 32))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_rodata_is_opt_in() {
+        assert_eq!(MergeRodata::default(), MergeRodata::Never);
+        assert_eq!(ImageOptions::default().merge_rodata, MergeRodata::Never);
+        let img = link_executable(vec![rodata_object(12)], &ImageOptions::default()).unwrap();
+        let flags: Vec<u32> = phdrs(&img).iter().map(|p| p.1).collect();
+        assert_eq!(flags, [PF_R | PF_X, PF_R], "a default image keeps .rodata non-executable");
+    }
+
+    #[test]
+    fn merge_rodata_modes_pick_the_segments() {
+        let small = MERGE_RODATA_AUTO_MAX as usize;
+        for (mode, size, merged) in [
+            (MergeRodata::Auto, 12, true),
+            (MergeRodata::Auto, small, true),
+            (MergeRodata::Auto, small + 1, false),
+            (MergeRodata::Always, 3 * small, true),
+            (MergeRodata::Never, 12, false),
+        ] {
+            let opts = ImageOptions { merge_rodata: mode, ..ImageOptions::default() };
+            let img = link_executable(vec![rodata_object(size)], &opts).unwrap();
+            let ph = phdrs(&img);
+            let flags: Vec<u32> = ph.iter().map(|p| p.1).collect();
+            let want = if merged { vec![PF_R | PF_X] } else { vec![PF_R | PF_X, PF_R] };
+            assert_eq!(flags, want, "{mode:?} with {size} bytes of .rodata");
+            // `msg` (8-aligned) is where the Abs64 field says, holding its bytes.
+            let ro_seg = *ph.last().unwrap();
+            // `main` follows the headers and crt0's 16 bytes, 16-aligned.
+            let text_off = (EHDR_SIZE + PHDR_SIZE * ph.len() as u64 + 16).next_multiple_of(16);
+            let addr = rd_u64(&img, text_off as usize + 1);
+            assert_eq!(addr % 8, 0, "{mode:?}: .rodata keeps its alignment");
+            let off = (ro_seg.2 + (addr - ro_seg.3)) as usize;
+            assert!(addr - ro_seg.3 + size as u64 <= ro_seg.4, "{mode:?}: msg outside its segment");
+            assert_eq!(img[off..off + size].to_vec(), (0..size).map(|i| i as u8).collect::<Vec<_>>());
+            if merged {
+                // Packed right after `.text`, with only alignment padding.
+                assert_eq!(off as u64, (text_off + 9).next_multiple_of(8), "{mode:?}");
+                assert_eq!(img.len(), off + size);
+            }
+        }
+    }
+
+    #[test]
+    fn entry_stub_follows_the_headers_unpadded() {
+        // The crt0 stub needs no alignment: with one program header it starts
+        // at 0x78, not at the next 16-byte boundary.
+        let mut m = ObjectModule::new("t");
+        let mut text = Section::new(".text", SectionKind::Text, 1);
+        text.bytes = vec![0xc3];
+        let tid = m.add_section(text);
+        m.add_symbol(Symbol::defined("main", SymbolBinding::Global, SymbolType::Func, tid, 0, 1));
+        let img = link_executable(vec![m], &ImageOptions::default()).unwrap();
+        assert_eq!(rd_u16(&img, 56), 1);
+        assert_eq!(rd_u64(&img, 24), BASE_DEFAULT + EHDR_SIZE + PHDR_SIZE, "e_entry right after the headers");
+        // Headers, the 16-byte stub, then `main` with no padding anywhere.
+        assert_eq!(img.len() as u64, EHDR_SIZE + PHDR_SIZE + 16 + 1);
+    }
+
+    #[test]
+    fn merged_rodata_gets_its_own_section_header_with_debug() {
+        let opts = ImageOptions { debug: true, merge_rodata: MergeRodata::Always, ..ImageOptions::default() };
+        let img = link_executable(vec![rodata_object(12)], &opts).unwrap();
+        let shoff = rd_u64(&img, 40) as usize;
+        let shnum = rd_u16(&img, 60) as usize;
+        let shdr = |i: usize| -> (u32, u64, u64, u64, u64) {
+            let o = shoff + i * SHDR_SIZE as usize;
+            // (sh_type, sh_flags, sh_addr, sh_offset, sh_size)
+            (rd_u32(&img, o + 4), rd_u64(&img, o + 8), rd_u64(&img, o + 16), rd_u64(&img, o + 24), rd_u64(&img, o + 32))
+        };
+        let (text, ro) = (shdr(1), shdr(2));
+        assert_eq!(text.1, SHF_ALLOC | SHF_EXECINSTR);
+        assert_eq!(ro.0, SHT_PROGBITS);
+        assert_eq!(ro.1, SHF_ALLOC, ".rodata is not marked executable");
+        assert_eq!(text.3 + text.4, ro.3, ".text stops where .rodata starts");
+        assert_eq!(ro.2 - BASE_DEFAULT, ro.3, "both in the code segment");
+        assert_eq!(ro.4, 12);
+        // `msg` in `.symtab` refers to the `.rodata` header (index 2).
+        let symtab = (1..shnum).map(shdr).find(|s| s.0 == SHT_SYMTAB).expect(".symtab");
+        let syms = &img[symtab.3 as usize..(symtab.3 + symtab.4) as usize];
+        let found = syms.chunks(SYM_SIZE as usize).any(|s| rd_u16(s, 6) == 2 && rd_u64(s, 8) == ro.2);
+        assert!(found, "no symbol at .rodata's address in section 2");
+    }
+
     #[test]
     fn resolves_and_builds_valid_header() {
         let img = link_executable(vec![ret_object()], &ImageOptions::default()).unwrap();
@@ -1367,7 +1579,7 @@ mod tests {
         m.add_section(da);
         m.add_section(Section::bss(".bss", 16, 256));
 
-        let img = link_executable(vec![m], &ImageOptions::default()).unwrap();
+        let img = link_executable(vec![m], &separate_rodata()).unwrap();
         let phnum = rd_u16(&img, 56) as usize;
         assert_eq!(phnum, 3);
         for i in 0..phnum {
@@ -1468,7 +1680,7 @@ mod tests {
             addend: -4,
         });
 
-        let img = link_executable(vec![m], &ImageOptions::default()).unwrap();
+        let img = link_executable(vec![m], &separate_rodata()).unwrap();
 
         // Deterministic layout.
         let headers = EHDR_SIZE + 2 * PHDR_SIZE; // 176, already 16-aligned

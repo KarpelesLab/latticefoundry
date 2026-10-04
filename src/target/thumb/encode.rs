@@ -1302,7 +1302,8 @@ pub fn compile_module_thumb(
     }
     let (m, s) = super::prepare_module(module, syms, topts).unwrap_or_else(|e| panic!("thumb backend: {e}"));
     let mut obj = ObjectModule::new(module.name.clone());
-    let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
+    let align = opts.function_alignment_for(4, 4) as usize;
+    let text = obj.add_section(Section::new(".text", SectionKind::Text, align as u64));
     let mut stack = StackReport::new();
     let mut any = false;
     for (i, f) in m.functions().enumerate() {
@@ -1318,9 +1319,10 @@ pub fn compile_module_thumb(
         let (emitted, usage) = compile_prepared_function(&m, fid, &s, opts, topts);
         stack.push(usage);
         {
-            // Functions start 4-aligned (padded with a 16-bit `nop`).
+            // Functions start `align`-aligned, at least 4 (padded with a
+            // 16-bit `nop`).
             let sec = obj.section_mut(text);
-            while !sec.bytes.len().is_multiple_of(4) {
+            while !sec.bytes.len().is_multiple_of(align) {
                 sec.bytes.extend_from_slice(&0xbf00u16.to_le_bytes());
             }
         }

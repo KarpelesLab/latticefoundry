@@ -54,6 +54,12 @@
 //! (`transform::sanitize`) into the verified module before the `-O` pipeline;
 //! failures are reported on stderr by a freestanding runtime linked into the
 //! program, or trap with `--sanitize-trap`.
+//!
+//! For a small image, `--function-alignment=1` packs functions back to back
+//! instead of on the target's boundary (16 bytes on x86-64), and
+//! `--merge-rodata` places `.rodata` in the code segment of an image lf links
+//! itself (one program header fewer, but executable read-only data, so it is
+//! opt-in). `-Os` is the `-O2` pipeline with both.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -61,7 +67,7 @@ use std::process::ExitCode;
 use latticefoundry::codegen::{CodegenOptions, RelocModel, StackAssumptions, StackReport, UnwindTables};
 use latticefoundry::ir::{Module, binary, merge_modules, text};
 use latticefoundry::link::raw::{self, RawFormat};
-use latticefoundry::link::{self, ImageOptions};
+use latticefoundry::link::{self, ImageOptions, MergeRodata};
 use latticefoundry::mc::object::ObjectModule;
 use latticefoundry::target::{ObjectFormat, TargetArch, TargetOs, Triple};
 use latticefoundry::support::StrInterner;
@@ -99,8 +105,9 @@ fn print_usage() {
     println!("lf — LatticeFoundry compiler driver\n");
     println!("usage:");
     println!(
-        "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3] [--entry <name>] [-g] [--lto] [--no-verify]"
+        "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--entry <name>] [-g] [--lto] [--no-verify]"
     );
+    println!("           [--function-alignment=<n>] [--merge-rodata[=auto|always|never]]");
     println!("           [--stack-usage[=all]] [--no-stack-probes] [--[no-]unwind-tables] [--target <triple>]");
     println!("           [-c [--format <fmt>]]");
     println!("           [--oformat elf|binary|ihex] [--base <addr>]");
@@ -108,6 +115,14 @@ fn print_usage() {
     println!("           [--sanitize=<checks>] [--sanitize-trap[=<checks>]] [--sanitize-halt]");
     println!("  lf --version | --help\n");
     println!("  -O0..-O3       optimization level (default: -O0)");
+    println!("  -Os            optimize for size: the -O2 passes, --function-alignment=1 and");
+    println!("                 --merge-rodata=always (an explicit option overrides either)");
+    println!("  --function-alignment=N  start each function on an N-byte boundary (a power of two;");
+    println!("                 default: the target's, 16 on x86-64; 1 packs functions back to back)");
+    println!("  --merge-rodata[=W]  place .rodata in the read+execute code segment, saving a program");
+    println!("                 header and its padding, at the cost of executable read-only data:");
+    println!("                 always (the bare flag), auto (when .rodata is at most 512 bytes) or");
+    println!("                 never (the default: its own read-only segment); for images lf links itself");
     println!("  -g / --debug   emit DWARF debug info (source lines, symbols)");
     println!("  --lto          link-time optimize across inputs (implied by 2+ inputs)");
     println!("  --stack-usage  print the frame of each function reachable from the entry and the");
@@ -188,6 +203,10 @@ struct BuildOptions {
     /// Whether a sanitized program continues after a report
     /// (`--sanitize-halt` turns it off).
     sanitize_recover: bool,
+    /// `--function-alignment=` (or `-Os`'s 1), if given.
+    function_alignment: Option<u64>,
+    /// `--merge-rodata[=]` (or `-Os`'s `always`), if given.
+    merge_rodata: Option<MergeRodata>,
 }
 
 /// What `lf build` produces.
@@ -318,6 +337,10 @@ fn build(args: &[String]) -> Result<(), String> {
         .with_os(triple.os)
         .with_reloc_model(opts.reloc_model())
         .with_unwind_tables(opts.unwind_tables());
+    let cg = match opts.function_alignment {
+        Some(align) => cg.with_function_alignment(align),
+        None => cg,
+    };
     // Inline asm the target cannot assemble is a clean error, not a panic.
     target::check_module(triple.arch, &module, &syms).map_err(|e| e.to_string())?;
     if triple.arch == TargetArch::Wasm32 {
@@ -568,6 +591,9 @@ fn link_cortex_m(
 /// The static linker core's options from the command line.
 fn image_options(opts: &BuildOptions, entry: String) -> ImageOptions {
     let mut image = ImageOptions { debug: opts.debug, entry, ..ImageOptions::default() };
+    if let Some(merge) = opts.merge_rodata {
+        image.merge_rodata = merge;
+    }
     if let Some(base) = opts.base {
         image.base = base;
     }
@@ -653,6 +679,9 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut sanitize = SanitizeKinds::NONE;
     let mut sanitize_trap = SanitizeKinds::NONE;
     let mut sanitize_recover = true;
+    let mut size_preset = false;
+    let mut function_alignment = None;
+    let mut merge_rodata = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -709,6 +738,20 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
                 let b = it.next().ok_or("--base requires an address")?;
                 base = Some(parse_addr(b).ok_or_else(|| format!("bad address '{b}'"))?);
             }
+            "-Os" => (opt, size_preset) = (OptLevel::O2, true),
+            flag if flag.starts_with("--function-alignment=") => {
+                let n = &flag["--function-alignment=".len()..];
+                match n.parse::<u64>() {
+                    Ok(a) if a.is_power_of_two() && a <= 4096 => function_alignment = Some(a),
+                    _ => return Err(format!("--function-alignment: '{n}' is not a power of two from 1 to 4096")),
+                }
+            }
+            "--merge-rodata" => merge_rodata = Some(MergeRodata::Always),
+            flag if flag.starts_with("--merge-rodata=") => {
+                let w = &flag["--merge-rodata=".len()..];
+                let merge = MergeRodata::parse(w);
+                merge_rodata = Some(merge.ok_or_else(|| format!("--merge-rodata: expected auto, always or never, not '{w}'"))?);
+            }
             tok if OptLevel::parse_flag(tok).is_some() => {
                 opt = OptLevel::parse_flag(tok).expect("checked");
             }
@@ -721,6 +764,11 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
 
     if inputs.is_empty() {
         return Err("no input file (see `lf --help`)".to_owned());
+    }
+    // `-Os` lays the image out for size unless an explicit option says otherwise.
+    if size_preset {
+        function_alignment = function_alignment.or(Some(1));
+        merge_rodata = merge_rodata.or(Some(MergeRodata::Always));
     }
 
     match output_kind {
@@ -808,6 +856,8 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         sanitize,
         sanitize_trap,
         sanitize_recover,
+        function_alignment,
+        merge_rodata,
     })
 }
 

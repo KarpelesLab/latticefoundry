@@ -52,6 +52,21 @@ pub struct CodegenOptions {
     /// [`crate::codegen::unwind`]; x86-64 emits every kind, AArch64 the
     /// compact unwind of frames it can encode.
     pub unwind: Option<UnwindTables>,
+    /// The **function alignment** in bytes (default `None`: the target's own,
+    /// 16 on x86-64 and 4 on AArch64, RISC-V and Thumb; AVR and WebAssembly
+    /// do not align functions). Each function's first instruction is placed
+    /// at a multiple of it within `.text`, the gap before it filled with the
+    /// target's no-op, and the `.text` section asks for that alignment too so
+    /// a linker keeps it. The value is rounded up to a power of two, and up to
+    /// the target's instruction alignment where it has one (4 on AArch64,
+    /// RISC-V and Thumb): see [`CodegenOptions::function_alignment_for`].
+    ///
+    /// The tradeoff is size against speed. `1` on x86-64 packs functions back
+    /// to back, saving up to 15 bytes of `nop`s per function, which matters
+    /// for small programs; the 16-byte default keeps each function's entry on
+    /// a fetch block, so a hot function or loop head is not split across two
+    /// 16-byte fetch windows (or two cache lines) for want of padding.
+    pub function_alignment: Option<u64>,
 }
 
 /// How position-dependent the generated code may be, and so how it addresses
@@ -87,7 +102,13 @@ impl RelocModel {
 
 impl Default for CodegenOptions {
     fn default() -> CodegenOptions {
-        CodegenOptions { stack_probes: true, reloc_model: RelocModel::Static, os: TargetOs::Linux, unwind: None }
+        CodegenOptions {
+            stack_probes: true,
+            reloc_model: RelocModel::Static,
+            os: TargetOs::Linux,
+            unwind: None,
+            function_alignment: None,
+        }
     }
 }
 
@@ -122,6 +143,22 @@ impl CodegenOptions {
         self
     }
 
+    /// Align every function to `align` bytes (see
+    /// [`CodegenOptions::function_alignment`]); `1` packs them back to back.
+    pub fn with_function_alignment(mut self, align: u64) -> CodegenOptions {
+        self.function_alignment = Some(align);
+        self
+    }
+
+    /// The function alignment a backend uses: the explicit
+    /// [`CodegenOptions::function_alignment`] rounded up to a power of two, or
+    /// the target's `default`, and never below the target's instruction
+    /// alignment `min`.
+    pub fn function_alignment_for(&self, default: u64, min: u64) -> u64 {
+        let a = self.function_alignment.map_or(default, |a| a.max(1).checked_next_power_of_two().unwrap_or(default));
+        a.max(min.max(1))
+    }
+
     /// The unwind tables this compilation emits: the explicit choice, or the
     /// OS's default.
     pub fn unwind_tables(&self) -> UnwindTables {
@@ -138,4 +175,71 @@ pub struct CompiledModule {
     pub object: ObjectModule,
     /// Per-function stack usage, in definition order.
     pub stack: StackReport,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mc::object::{SymbolType, SymbolValue};
+    use crate::target::TargetArch;
+
+    #[test]
+    fn function_alignment_for_rounds_and_clamps() {
+        let o = CodegenOptions::default();
+        assert_eq!(o.function_alignment_for(16, 1), 16);
+        assert_eq!(o.function_alignment_for(4, 4), 4);
+        let a = |n| CodegenOptions::default().with_function_alignment(n);
+        assert_eq!(a(1).function_alignment_for(16, 1), 1);
+        assert_eq!(a(0).function_alignment_for(16, 1), 1);
+        assert_eq!(a(3).function_alignment_for(16, 1), 4);
+        assert_eq!(a(1).function_alignment_for(4, 4), 4);
+        assert_eq!(a(32).function_alignment_for(4, 4), 32);
+    }
+
+    /// Every backend that aligns functions honors the option, down to its
+    /// instruction alignment.
+    #[test]
+    fn backends_align_functions_as_asked() {
+        const SRC: &str = "module \"a\"\n\
+            func @f(i64) -> i64 {\nentry ^0(%x: i64):\n  %y = add %x, i64 1 : i64\n  ret %y\n}\n\
+            func @g(i64) -> i64 {\nentry ^0(%x: i64):\n  %y = call @f(%x) : i64\n  %z = mul %y, %x : i64\n  ret %z\n}\n\
+            func @h() -> i64 {\nentry ^0:\n  %r = call @g(i64 3) : i64\n  ret %r\n}\n";
+        let mut syms = crate::support::StrInterner::new();
+        let m = crate::ir::text::parse_module(SRC, crate::support::diagnostics::FileId::new(0), &mut syms).unwrap();
+        for (arch, default, min) in [
+            (TargetArch::X86_64, 16, 1),
+            (TargetArch::AArch64, 4, 4),
+            (TargetArch::Riscv64, 4, 4),
+            (TargetArch::Thumb, 4, 4),
+        ] {
+            for asked in [None, Some(1), Some(8), Some(32)] {
+                let opts = match asked {
+                    Some(a) => CodegenOptions::default().with_function_alignment(a),
+                    None => CodegenOptions::default(),
+                };
+                let want = asked.unwrap_or(default).max(min);
+                let obj = crate::target::compile_module_for(arch, &m, &syms, &opts).unwrap().object;
+                let text = obj.sections().iter().position(|s| s.name == ".text").unwrap();
+                assert_eq!(obj.sections()[text].align, want, "{arch:?} {asked:?}");
+                let mut offs: Vec<(u64, u64)> = obj
+                    .symbols()
+                    .iter()
+                    .filter(|s| s.kind == SymbolType::Func)
+                    .filter_map(|s| match s.value {
+                        // Thumb function symbols carry the Thumb bit.
+                        SymbolValue::Defined { section, offset } if section.index() == text => {
+                            Some((if arch == TargetArch::Thumb { offset & !1 } else { offset }, s.size))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                offs.sort();
+                assert_eq!(offs.len(), 3, "{arch:?}");
+                for w in offs.windows(2) {
+                    assert_eq!(w[0].0 % want, 0, "{arch:?} {asked:?}: {offs:?}");
+                    assert_eq!(w[1].0, (w[0].0 + w[0].1).next_multiple_of(want), "{arch:?} {asked:?}: {offs:?}");
+                }
+            }
+        }
+    }
 }

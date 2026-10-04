@@ -2071,7 +2071,10 @@ fn build_module(
     let (module, syms): (&Module, &StrInterner) = wide.as_ref().map_or((&*legal, syms), |(m, s)| (m, s));
 
     let mut obj = ObjectModule::new(module.name.clone());
-    let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));
+    // Functions start on `align`-byte boundaries (16 unless the options
+    // say otherwise), and `.text` asks for that much so a linker keeps it.
+    let align = opts.function_alignment_for(16, 1) as usize;
+    let text = obj.add_section(Section::new(".text", SectionKind::Text, align as u64));
     let mut funcs: Vec<FuncDebug> = Vec::new();
     let mut stack = StackReport::new();
     // Each function's unwind description and symbol.
@@ -2085,10 +2088,10 @@ fn build_module(
         let out = compile_function_full(module, fid, syms, opts, debug.is_some());
         let emitted = out.emitted;
         stack.push(out.stack);
-        // 16-align this function's start within .text.
+        // Align this function's start within .text.
         {
             let sec = obj.section_mut(text);
-            while !sec.bytes.len().is_multiple_of(16) {
+            while !sec.bytes.len().is_multiple_of(align) {
                 sec.bytes.push(0x90); // nop padding
             }
         }
