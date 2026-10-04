@@ -122,6 +122,11 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
 - An in-process JIT runs the same code without writing an executable.
 - `lf-as` assembles GNU-syntax assembly for x86-64, AArch64 and RISC-V using
   rsasm.
+- `lf-dis` disassembles objects, executables and wasm modules (ELF, `.lfo`,
+  COFF/PE, Mach-O, wasm) and flat binaries (`--raw --arch`) for every target:
+  x86-64 (AT&T or `--syntax intel`), AArch64, RISC-V RV64GC, Thumb-2, AVR and
+  wasm32. The output has symbol labels and inline relocation notes, and
+  matches `llvm-objdump` on LF's own objects.
 - `lf-ld` has two modes. With only `.lfo` inputs it uses our own static linker
   core. For anything else it accepts a full GNU `ld` command line and links
   with qld: ELF objects, archives, shared libraries, dynamic executables.
@@ -141,8 +146,7 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
 | RISC-V  | RV64IM integer | Encodings checked against `llvm-mc`; interpreter |
 
 Not done yet: position-independent code on AArch64/RISC-V, Windows unwind
-tables (`.pdata`/`.xdata`), Mach-O executables, a disassembler
-(`lf-dis`), sanitizers, RISC-V FP and
+tables (`.pdata`/`.xdata`), Mach-O executables, sanitizers, RISC-V FP and
 relocations, dynamic `alloca` on AArch64/RISC-V, and the deferred bets (B6
 region form, B7 full content-addressing, B10 provenance types, B11 verified
 lowering).

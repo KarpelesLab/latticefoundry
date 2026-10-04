@@ -511,3 +511,53 @@ entry ^0(%a: <4 x f32>, %b: <2 x f64>):
 /// The common-ISA corpus (AT&T, one instruction per line).
 const COMMON_ISA: &str = include_str!("x86_isa.s");
 
+/// Thread-local accesses (local-exec `%fs:0` loads, initial-exec GOT loads,
+/// the padded general-dynamic `__tls_get_addr` sequence) and i128 code, in
+/// static and position-independent objects.
+const TLS: &str = r#"module "tls"
+global thread_local @big : i64 = i64 7
+global internal thread_local @tiny : i16 = i16 0
+global thread_local @ext : i32
+
+func @get() -> i64 {
+entry ^0:
+  %a = load @big align 8 : i64
+  %t = load @tiny align 2 : i16
+  %tx = zext %t : i64
+  %e = load @ext align 4 : i32
+  %ex = sext %e : i64
+  store i16 3, @tiny align 2 : i16
+  %s = add %a, %tx : i64
+  %r = add %s, %ex : i64
+  ret %r
+}
+
+func @wide(i128, i128) -> i128 {
+entry ^0(%a: i128, %b: i128):
+  %m = mul %a, %b : i128
+  %s = add %m, %a : i128
+  %x = lshr %s, i128 3 : i128
+  ret %x
+}
+"#;
+
+#[test]
+fn llvm_objdump_on_tls_and_i128() {
+    let (m, syms) = super::parse_for(TargetArch::X86_64, TLS);
+    for pic in [false, true] {
+        let cg = crate::codegen::CodegenOptions::default().with_pic(pic);
+        let obj = crate::target::compile_module_for(TargetArch::X86_64, &m, &syms, &cg).expect("compile").object;
+        let file = object_file(TargetArch::X86_64, &obj, ObjectFormat::Elf);
+        let bin = objfile::read(&file).unwrap();
+        let code = bin.sections.iter().find(|s| s.executable).unwrap();
+        assert!(code.relocs.iter().any(|r| r.kind.contains("TPOFF") || r.kind.contains("TLSGD")), "{:?}", code.relocs);
+        for (opts, args) in [(ATT, &[][..]), (INTEL, &["-M", "intel"][..])] {
+            let Some(report) = differential(TargetArch::X86_64, &file, args, &opts, &|s| s) else {
+                eprintln!("skipping llvm_objdump_on_tls_and_i128: no llvm-objdump");
+                return;
+            };
+            assert_clean(&format!("x86-64 TLS/i128 pic={pic} {:?}", opts.syntax), &report);
+        }
+    }
+}
+

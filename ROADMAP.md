@@ -210,7 +210,7 @@ ecosystem. It does **not** reinvent them:
 | -------------------------------------------------------- | ---------------------------------------------------------- |
 | [`puremp`](https://github.com/KarpelesLab/puremp)        | arbitrary-precision integers/rationals/floats for IR constants and codegen constant math |
 | [`z3rs`](https://github.com/KarpelesLab/z3rs)            | SMT solving for the verifier and correctness-guarded rewrites (Phase 9) |
-| [`rsasm`](https://github.com/KarpelesLab/rsasm)          | assembling textual assembly into ELF objects (`mc::asm`, `lf-as`); only the x86, AArch64 and RISC-V backends are enabled |
+| [`rsasm`](https://github.com/KarpelesLab/rsasm)          | assembling textual assembly into ELF objects (`mc::asm`, `lf-as`); only the x86, AArch64 and RISC-V backends are enabled (the tests also use its Arm backend to re-assemble the Thumb disassembler's output) |
 | [`qld`](https://github.com/KarpelesLab/qld)              | GNU-ld-compatible linking of ELF objects, archives and shared libraries (`link::gnu`, `lf-ld`), including against the host libc |
 
 Every **direct** dependency is one of our own crates. Third-party crates may
@@ -349,7 +349,7 @@ Lower optimized IR toward machine instructions.
 
 *Exit:* MIR for a target verifies and, once Phase 6/7 land, assembles and runs.
 
-### **Phase 6 — Machine-code layer**  🔶
+### **Phase 6 — Machine-code layer**  ✅
 
 Turn instructions into bytes and objects.
 
@@ -371,8 +371,34 @@ real GNU-syntax assembly into ELF through our own `rsasm`. The ELF writer is
 generic over an `ElfTarget` (ELF32 or ELF64, either byte order, `REL` or
 `RELA`, the machine's relocation numbering), so the 32-bit targets get ELF32
 relocatable objects (validated with `readelf`); relocation kinds include
-`Abs16`, and DWARF can use 4- or 2-byte addresses. Still open: `lf-dis` (no
-disassembler yet).
+`Abs16`, and DWARF can use 4- or 2-byte addresses.
+
+`lf-dis` is done (`mc::disasm`): one decoder per target, each written from
+its manual, giving bytes → a typed instruction → text. x86-64 prints AT&T
+(default) or Intel, with the general-purpose ISA, x87, SSE–SSE4.2 and VEX
+AVX/AVX2/FMA3/BMI. AArch64 covers the A64 base ISA, LSE, FP and Advanced
+SIMD, with the Arm ARM's preferred aliases. RISC-V covers RV64GC with
+Zicsr/Zifencei/Zba/Zbb and its pseudoinstructions. Thumb-2 covers ARMv7-M,
+including IT-block state. AVR covers the whole AVRe+ set, and the AVR test
+interpreter now executes the decoder's typed instructions. wasm covers MVP
+through threads and fixed-width SIMD, and the wasm backend's test decoder
+wraps it.
+
+An unknown encoding prints as `.byte`/`.short`/`.word` and never panics,
+which a random-byte test checks for every target. Readers for ELF32/64
+(objects and linked images), `.lfo`, COFF/PE, Mach-O and wasm feed an
+objdump-style listing with symbol labels, branch targets as `<sym+off>`,
+`$d` data, and inline relocation notes (`callq ext  # R_X86_64_PLT32
+ext-0x4`). The CLI flags are `--arch`, `--syntax att|intel`, `-d`/`-D`,
+`--raw --base` and `--start`/`--stop`.
+
+The exit criterion is met. Per target, a fuzzed corpus of LF's own encoder
+helpers is decoded and re-encoded byte for byte: through rsasm for x86-64,
+AArch64, RISC-V and Thumb (llvm-mc arbitrating where rsasm picks another
+encoding), and through each decoder's typed form for AVR and wasm.
+Separately, llvm-objdump agrees exactly with our text on the objects LF
+compiles for every target and format, and on llvm-mc-assembled corpora of
+the common ISA.
 
 ### **Phase 7 — Targets**
 

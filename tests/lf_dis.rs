@@ -94,6 +94,13 @@ fn raw_binaries_and_ranges() {
     let out = dis_ok(&["--raw", "--arch", "x86_64", "--base", "0x1000", p]);
     assert!(out.contains("    1000: 55"), "{out}");
     assert!(out.contains("    1006: c3"), "{out}");
+    assert!(out.contains("pushq\t%rbp") && out.contains("movq\t%rsp, %rbp") && out.contains("retq"), "{out}");
+    let intel = dis_ok(&["--raw", "--arch", "x86_64", "-M", "intel", p]);
+    assert!(intel.contains("push\trbp") && intel.contains("mov\trbp, rsp"), "{intel}");
+    // AArch64: `ret` as a flat binary.
+    let a64 = dir.join("a64.bin");
+    std::fs::write(&a64, [0xc0, 0x03, 0x5f, 0xd6]).unwrap();
+    assert!(dis_ok(&["--raw", "--arch", "aarch64", a64.to_str().unwrap()]).contains("ret"));
     let insts = |s: &str| s.lines().filter(|l| l.starts_with(' ') && l.contains(": ")).count();
     let ranged = dis_ok(&["--raw", "--arch=x86_64", "--base=0x1000", "--start", "0x1004", "--stop=0x1006", p]);
     assert!(ranged.contains("    1004: 90") && !ranged.contains("1006:") && !ranged.contains("1000:"), "{ranged}");

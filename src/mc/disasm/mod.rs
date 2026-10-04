@@ -6,12 +6,12 @@
 //!
 //! | Module | Architecture | Syntax |
 //! | --- | --- | --- |
-//! | [`x86`] | x86-64 (integer, x87-free SSE/SSE2 scalar and packed subsets) | AT&T (default) or Intel |
-//! | [`aarch64`] | AArch64 (A64 integer, FP and the Advanced SIMD subset) | the Arm ARM's, with its preferred aliases |
-//! | [`riscv`] | RISC-V RV64GC (I, M, A, F, D, C, Zicsr, Zifencei) | the ISA manual's, with its pseudoinstructions |
-//! | [`thumb`] | Thumb-2 (ARMv7-M) | Arm unified assembler language |
-//! | [`avr`] | AVR (the AVRe+ instruction set) | the AVR Instruction Set Manual's |
-//! | [`wasm`] | WebAssembly (MVP, sign-extension, saturating truncation, bulk memory, threads) | the text format's instruction names |
+//! | [`x86`] | x86-64: the general-purpose ISA, x87, SSE–SSE4.2, VEX (AVX/AVX2, FMA3, BMI1/2) | AT&T (default) or Intel |
+//! | [`aarch64`] | AArch64: the A64 base ISA, LSE atomics, scalar FP, Advanced SIMD | the Arm ARM's, with its preferred aliases |
+//! | [`riscv`] | RISC-V RV64GC (I, M, A, F, D, C, Zicsr, Zifencei) plus Zba/Zbb | the ISA manual's, with its pseudoinstructions |
+//! | [`thumb`] | Thumb-2 (ARMv7-M), with IT blocks | Arm unified assembler language |
+//! | [`avr`] | AVR (AVRe+, plus the XMEGA additions) | the AVR Instruction Set Manual's |
+//! | [`wasm`] | WebAssembly (MVP, sign extension, saturating truncation, bulk memory, reference types, threads, fixed-width SIMD) | the text format's instruction names |
 //!
 //! Every decoder turns bytes into a uniform [`Inst`]: how many bytes the
 //! instruction takes, its mnemonic, its operands already rendered in the
