@@ -33,7 +33,8 @@
 //! item        ::= global | func
 //!
 //! global      ::= "global" [ linkage ] [ visibility ] [ "constant" ] [ "detached" ]
-//!                 [ "secret" ] [ "addrspace" "(" INT ")" ] "@" name ":" type [ "=" init ]
+//!                 [ "secret" ] [ "thread_local" ] [ "addrspace" "(" INT ")" ] "@" name ":" type
+//!                 [ "=" init ]
 //! func        ::= "func" [ linkage ] [ visibility ] "@" name funcsig [ body ]
 //! funcsig     ::= "(" [ [ "secret" ] type { "," [ "secret" ] type } [ "," "..." ]
 //!                 | "..." ] ")" "->" [ "secret" ] type
@@ -235,6 +236,9 @@ fn write_global<W: fmt::Write>(
     }
     if attrs.secret {
         write!(f, "secret ")?;
+    }
+    if attrs.thread_local {
+        write!(f, "thread_local ")?;
     }
     let space = module.global_addr_space(GlobalId::from_index(gi));
     if space != 0 {
@@ -1581,6 +1585,7 @@ impl Parser {
         attrs.constant = self.eat_ident("constant");
         attrs.detached = self.eat_ident("detached");
         attrs.secret = self.eat_ident("secret");
+        attrs.thread_local = self.eat_ident("thread_local");
         let space = if self.eat_ident("addrspace") {
             self.expect(&TokKind::LParen, "`(`")?;
             let space = self.parse_u32()?;

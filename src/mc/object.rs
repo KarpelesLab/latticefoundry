@@ -80,6 +80,23 @@ pub enum SectionKind {
     /// memory at run time (e.g. the `.debug_*` DWARF sections). Occupies file
     /// space like a content section, but is never part of a `PT_LOAD` segment.
     Debug,
+    /// The initialization image of thread-local data (`.tdata`, ELF
+    /// `SHF_TLS`): copied into every thread's TLS block. Symbols defined in it
+    /// are [`SymbolType::Tls`], and their value is an offset in the TLS
+    /// template, not an address.
+    TData,
+    /// Zero-initialized thread-local data (`.tbss`, `SHT_NOBITS` + `SHF_TLS`):
+    /// the tail of the TLS template, occupying no file space (its size is
+    /// `bss_size`, as for [`SectionKind::Bss`]).
+    TBss,
+}
+
+impl SectionKind {
+    /// Whether sections of this kind hold thread-local storage (`SHF_TLS`).
+    #[inline]
+    pub fn is_tls(self) -> bool {
+        matches!(self, SectionKind::TData | SectionKind::TBss)
+    }
 }
 
 /// A named region of an object: code or data bytes (or, for [`SectionKind::Bss`],
@@ -114,19 +131,26 @@ impl Section {
         Section { name: name.into(), kind: SectionKind::Bss, align, bytes: Vec::new(), bss_size: size }
     }
 
+    /// Create a `.tbss`-style section reserving `size` zero bytes of
+    /// thread-local storage.
+    pub fn tbss(name: impl Into<String>, align: u64, size: u64) -> Section {
+        Section { name: name.into(), kind: SectionKind::TBss, align, bytes: Vec::new(), bss_size: size }
+    }
+
     /// The in-memory size of the section in bytes.
     #[inline]
     pub fn size(&self) -> u64 {
         match self.kind {
-            SectionKind::Bss => self.bss_size,
+            SectionKind::Bss | SectionKind::TBss => self.bss_size,
             _ => self.bytes.len() as u64,
         }
     }
 
-    /// Whether this section occupies no space in a file image (`.bss`).
+    /// Whether this section occupies no space in a file image (`.bss`,
+    /// `.tbss`).
     #[inline]
     pub fn is_nobits(&self) -> bool {
-        matches!(self.kind, SectionKind::Bss)
+        matches!(self.kind, SectionKind::Bss | SectionKind::TBss)
     }
 }
 
@@ -177,6 +201,9 @@ pub enum SymbolType {
     Func,
     /// A section (used as an anchor for section-relative relocations).
     Section,
+    /// A thread-local variable (ELF `STT_TLS`), defined in a
+    /// [`SectionKind::TData`] / [`SectionKind::TBss`] section.
+    Tls,
 }
 
 /// Where a [`Symbol`] lives.
@@ -324,6 +351,18 @@ pub enum RelocKind {
     AvrLo8LdiPm,
     /// AVR `R_AVR_HI8_LDI_PM`: bits 8–15 of the word address `(S + A) / 2`.
     AvrHi8LdiPm,
+    /// x86-64 `R_X86_64_TPOFF32` (local-exec TLS): the signed 32-bit offset
+    /// of thread-local symbol `S + A` from the thread pointer (`%fs:0`),
+    /// negative under TLS variant II.
+    TpOff32,
+    /// x86-64 `R_X86_64_GOTTPOFF` (initial-exec TLS): PC-relative 32-bit
+    /// reference to a GOT entry holding the symbol's thread-pointer offset
+    /// (`G + GOT + A - P`).
+    GotTpOff,
+    /// x86-64 `R_X86_64_TLSGD` (general-dynamic TLS): PC-relative 32-bit
+    /// reference to a GOT pair (module id, offset) that `__tls_get_addr`
+    /// takes, in the canonical `lea rdi, [rip + x@tlsgd]` sequence.
+    TlsGd,
 }
 
 impl RelocKind {
@@ -345,6 +384,9 @@ impl RelocKind {
             | RelocKind::Pc32
             | RelocKind::Plt32
             | RelocKind::GotPcRel
+            | RelocKind::TpOff32
+            | RelocKind::GotTpOff
+            | RelocKind::TlsGd
             // The AArch64 and Thumb kinds patch a bitfield inside a 4-byte
             // instruction (one word, or two halfwords).
             | RelocKind::Aarch64Call26
@@ -378,6 +420,8 @@ impl RelocKind {
                 | RelocKind::Pc64
                 | RelocKind::Plt32
                 | RelocKind::GotPcRel
+                | RelocKind::GotTpOff
+                | RelocKind::TlsGd
                 | RelocKind::Aarch64Call26
                 | RelocKind::Aarch64AdrPrelPgHi21
                 | RelocKind::ThumbCall

@@ -96,6 +96,12 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 ///   encodes exactly as in version 4 apart from the version number;
 ///   version-1..4 streams still decode, with nothing secret.
 ///
+///
+/// Thread-local storage (`docs/ir-design.md` §4c) is global extension bit 1
+/// (`thread_local`), carried by the version-5 extension varint: no bump, and a
+/// module without thread-locals encodes exactly as before. A reader that
+/// predates the bit rejects it as an unknown extension flag.
+///
 /// SIMD vectors (`docs/ir-design.md` §6e) only add tag *values* — type tag 16,
 /// opcode tags 40–44 — so no stream without vectors changes and there was no
 /// bump: a reader that predates them rejects such a stream with
@@ -108,6 +114,9 @@ const ATTR_EXT_BIT: u8 = 0x80;
 
 /// Global extension flag: the global is `secret`.
 const GLOBAL_EXT_SECRET: u64 = 1;
+
+/// Global extension flag: the global is `thread_local`.
+const GLOBAL_EXT_THREAD_LOCAL: u64 = 2;
 
 /// Function extension flag: the return value is `secret`.
 const FUNC_EXT_SECRET_RET: u64 = 1;
@@ -688,15 +697,17 @@ pub fn encode(module: &Module, names: &StrInterner) -> Vec<u8> {
         if space != 0 {
             byte |= ADDR_SPACE_BIT;
         }
-        if gattrs.secret {
+        let ext = if gattrs.secret { GLOBAL_EXT_SECRET } else { 0 }
+            | if gattrs.thread_local { GLOBAL_EXT_THREAD_LOCAL } else { 0 };
+        if ext != 0 {
             byte |= ATTR_EXT_BIT;
         }
         w.u8(byte);
         if space != 0 {
             w.uvarint(u64::from(space));
         }
-        if gattrs.secret {
-            w.uvarint(GLOBAL_EXT_SECRET);
+        if ext != 0 {
+            w.uvarint(ext);
         }
     }
 
@@ -873,7 +884,7 @@ fn attrs_from_bits(b: u8) -> Result<GlobalAttrs, DecodeError> {
     if b & !0b11_1111 != 0 {
         return Err(bad());
     }
-    Ok(GlobalAttrs { linkage, visibility, constant: b & 4 != 0, detached: b & 8 != 0, secret: false })
+    Ok(GlobalAttrs { linkage, visibility, constant: b & 4 != 0, detached: b & 8 != 0, ..GlobalAttrs::DEFAULT })
 }
 
 /// Pack a function's attributes into one byte: linkage in bits 0–1, visibility
@@ -1255,13 +1266,14 @@ pub fn decode(bytes: &[u8], names: &mut StrInterner) -> Result<Module, DecodeErr
             let mut attrs = attrs_from_bits(if version >= 4 { low & !ADDR_SPACE_BIT } else { low })?;
             if has_ext {
                 let ext = r.uvarint()?;
-                if ext & !GLOBAL_EXT_SECRET != 0 {
+                if ext & !(GLOBAL_EXT_SECRET | GLOBAL_EXT_THREAD_LOCAL) != 0 {
                     return Err(DecodeError::InvalidTag {
                         what: "global-attrs extension",
                         tag: u32::try_from(ext).unwrap_or(u32::MAX),
                     });
                 }
                 attrs.secret = ext & GLOBAL_EXT_SECRET != 0;
+                attrs.thread_local = ext & GLOBAL_EXT_THREAD_LOCAL != 0;
             }
             (attrs, space)
         } else {
@@ -2287,7 +2299,7 @@ mod tests {
         let gbyte = super::attrs_bits(gattrs) | super::ADDR_SPACE_BIT | super::ATTR_EXT_BIT;
         let at = bytes.windows(3).position(|w| w == [gbyte, 3, 1]).expect("global attributes");
         let mut bad = bytes.clone();
-        bad[at + 2] = 2; // an unknown global extension bit
+        bad[at + 2] = 4; // an unknown global extension bit
         assert!(decode(&bad, &mut interner).is_err());
 
         // Without secrets, v5 is v4 with a new version number; v4 still decodes.
@@ -2304,6 +2316,34 @@ mod tests {
         let at = bad.iter().rposition(|&b| b == super::func_attrs_bits(&fattrs)).expect("byte");
         bad[at] |= super::ATTR_EXT_BIT;
         assert!(decode(&bad, &mut interner).is_err());
+    }
+
+    /// `thread_local` is global extension bit 1: it round-trips (alone and with
+    /// `secret`), and a module without thread-locals keeps its bytes.
+    #[test]
+    fn thread_local_extension_bit() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("tls");
+        let i32t = m.types_mut().int(32);
+        let c = m.intern_const(Const::Int { ty: i32t, value: Int::from_i64(5) });
+        let plain = encode(&m, &interner);
+        let tl = GlobalAttrs { thread_local: true, ..GlobalAttrs::DEFAULT };
+        let g = m.define_global(Global { name: interner.intern("t"), ty: i32t, init: Some(c) }, tl);
+        let bytes = encode(&m, &interner);
+        assert_ne!(plain, bytes);
+        let m2 = decode(&bytes, &mut interner).expect("decode");
+        assert_eq!(m2.global_attrs(GlobalId::from_index(0)), tl);
+        assert_eq!(encode(&m2, &interner), bytes);
+        let gbyte = super::attrs_bits(tl) | super::ATTR_EXT_BIT;
+        assert!(bytes.windows(2).any(|w| w == [gbyte, 2]), "attribute byte + extension 2");
+        let both = GlobalAttrs { secret: true, ..tl };
+        m.set_global_attrs(g, both);
+        let m3 = decode(&encode(&m, &interner), &mut interner).expect("decode");
+        assert_eq!(m3.global_attrs(GlobalId::from_index(0)), both);
+        // Without the attribute the global's byte has no extension.
+        m.set_global_attrs(g, GlobalAttrs::DEFAULT);
+        let bytes = encode(&m, &interner);
+        assert!(!bytes.contains(&(super::attrs_bits(GlobalAttrs::DEFAULT) | super::ATTR_EXT_BIT)));
     }
 
     /// Version-2 and version-3 streams (no target/layout header, no

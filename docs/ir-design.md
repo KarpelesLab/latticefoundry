@@ -225,7 +225,8 @@ address. With an initializer the module **defines** it; without one it is an
 external reference. Each global carries attributes:
 
 ```text
-global [internal | weak] [hidden | protected] [constant] [detached] @x : T [= init]
+global [internal | weak] [hidden | protected] [constant] [detached] [secret]
+       [thread_local] [addrspace(N)] @x : T [= init]
 ```
 
 - **Linkage** picks the object symbol binding of a definition: external
@@ -236,6 +237,7 @@ global [internal | weak] [hidden | protected] [constant] [detached] @x : T [= in
 - **`constant`** promises the program never stores to it. The backend places it
   in read-only `.rodata` (a store faults at run time) and optimizations may rely
   on its initial contents.
+- **`thread_local`** gives each thread its own instance (§4c).
 - **`detached`** says the global's storage is supplied *outside the IR* — e.g. a
   front end that serializes its own data section. The backend emits no storage
   and no symbol definition for it, exactly as for a declaration; its
@@ -315,6 +317,95 @@ their canonical address may be the executable's. Address constants in data stay
 `R_X86_64_64` for the linker to turn into dynamic relocations, and `constant`
 globals holding an address move from `.rodata` to `.data.rel.ro` (made read-only
 after relocation), so a shared object never needs text relocations.
+
+## 4c. Thread-local storage  *(decided)*
+
+A global marked `thread_local` has **one instance per thread**:
+
+```text
+global thread_local @x : i32 = i32 0
+global internal hidden thread_local @y : i64
+```
+
+**Semantics.** Every thread starts with its own copy of the global, holding the
+initializer (zero-filled where it is `poison` or all zero); the copy lives as
+long as the thread. `@x` as an operand evaluates to the address of the
+**current thread's** copy: the same pointer every time it is evaluated in one
+thread, a different one in every other thread that is running at the same time.
+A load or store through it touches only that thread's copy, and the address
+may be handed to another thread, which then reaches the first thread's copy
+(as C allows) for as long as that thread lives. The reference evaluator has a
+single thread, so there a thread-local global behaves like an ordinary one.
+
+Optimizations may treat `@x` as a pure, thread-invariant value: CSE, hoisting
+and rematerialization *within one function invocation* are sound, because a
+function never changes threads mid-execution. (The green-thread runtime
+switches contexts on one OS thread, so this holds for it too; a runtime that
+migrated a suspended context to another OS thread would have to reload
+thread-local addresses after resuming.)
+
+**Rules** (checked by the verifier):
+
+- the address is not a link-time constant, so **no address constant** (`ptr
+  @x` in an initializer) may name a thread-local global;
+- a thread-local global lives in address space 0;
+- `thread_local` composes with the other attributes: linkage and visibility
+  mean what they always do, `constant` still promises no stores (the storage
+  is still per-thread, so it is not placed in `.rodata`), `secret` still marks
+  the contents (its *address* is public, and addressing it is constant-time),
+  and `detached` still suppresses emission.
+
+IR linking ORs the attribute across a declaration and its definition. The
+`.lfb` form carries it as bit 1 of the version-5 global extension varint, so a
+module without thread-locals encodes exactly as before (no version bump).
+
+**Emission.** A defined thread-local goes to `.tdata` (`SHF_TLS`, `PROGBITS`)
+or, when all zero, `.tbss` (`SHF_TLS`, `NOBITS`); its symbol, definition or
+reference, is `STT_TLS`. Those sections form the **TLS template** a thread's
+block is initialized from.
+
+**Access models** (x86-64; `codegen::linkage::tls_model`). The model follows
+from the relocation model and whether the symbol is known to be in the module
+being built (defined here, `internal` or `hidden`):
+
+| model | used for | sequence | relocation |
+|---|---|---|---|
+| local-exec | an executable's own variables (`Static`/`Pie`, local) | `mov r, fs:[0]` ; `lea r, [r + x@tpoff]` | `R_X86_64_TPOFF32` |
+| initial-exec | other variables from an executable (`Static`/`Pie`) | `mov r, fs:[0]` ; `add r, [rip + x@gottpoff]` | `R_X86_64_GOTTPOFF` |
+| general-dynamic | everything in a shared library (`Pic`) | `data16 lea rdi, [rip + x@tlsgd]` ; `data16 data16 rex.w call __tls_get_addr@plt` | `R_X86_64_TLSGD` + `R_X86_64_PLT32` |
+
+`fs:[0]` is the thread pointer itself: under the x86-64 TLS ABI (variant II)
+the thread control block starts with a pointer to itself and the TLS blocks
+of the initially loaded modules sit just below it, so a local-exec offset is
+negative. General-dynamic is a real call (every caller-saved register is
+clobbered), written in the exact padded form the ELF TLS ABI specifies so a
+linker can relax it; local-dynamic is not used. None of the sequences branches,
+so thread-local addressing adds nothing to the constant-time audit (§6d).
+
+**Linking.** qld handles TLS for hosted links (executables, PIE, shared
+libraries). The static linker (`link::image`) adds a `PT_TLS` program header
+over the template, relaxes initial-exec and general-dynamic accesses to
+local-exec in place (an executable is the only module, so every offset is
+known), and its synthesized `_start` sets up the thread pointer without libc:
+it copies `.tdata` into a block in `.bss`, writes the TCB's self pointer just
+past it, and calls `arch_prctl(ARCH_SET_FS)`. A program with its own `_start`
+sets up `%fs` itself.
+
+**Other targets.** Every backend built on the shared instruction-selection
+framework rejects a thread-local global with a clear error (the default
+`TargetIsel::lower_global_addr`), as do wasm32 and x86-64 on Windows; the
+PE/COFF and Mach-O writers reject TLS sections. AArch64 (`TPIDR_EL0`) and
+RISC-V (`tp`) local-exec are natural follow-ups.
+
+- **Rejected:** TLS as an address space (`ptr addrspace(tls)`). The address of
+  a thread-local *is* an ordinary pointer — C passes it around freely and
+  dereferences it from any thread — so giving it a different pointer type
+  would force casts at every use and make it unrepresentable in ordinary
+  memory.
+- **Rejected:** an explicit `thread_pointer()` op plus offsets in the IR. The
+  offset is only known per access model, at link or load time, and
+  general-dynamic is not an offset at all; keeping `@x` as the operand leaves
+  the choice to the backend and the IR target-independent.
 
 ## 5. Value semantics: poison + freeze, **no `undef`**  *(decided)*
 

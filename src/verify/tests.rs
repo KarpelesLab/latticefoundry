@@ -474,6 +474,39 @@ fn global_initializers_are_checked() {
     assert_one_error(&verify_globals(&bad), "element #0 has type i32");
 }
 
+/// A `thread_local` global parses, prints and verifies; its address is
+/// per-thread, so no address constant may name it, and it lives in space 0.
+#[test]
+fn thread_local_globals_are_checked() {
+    use super::verify_globals;
+    use crate::support::diagnostics::FileId;
+
+    let mut syms = StrInterner::new();
+    let src = "module \"t\"\n\
+        global thread_local @x : i32 = i32 0\n\
+        global internal hidden thread_local @y : i64\n\
+        func @get() -> ptr {\nentry ^0:\n  ret @x\n}\n";
+    let m = crate::ir::text::parse_module(src, FileId::new(0), &mut syms).unwrap();
+    assert!(m.global_attrs(crate::ir::GlobalId::from_index(0)).thread_local);
+    assert!(m.global_attrs(crate::ir::GlobalId::from_index(1)).thread_local);
+    assert_clean(&m);
+    let printed = crate::ir::text::print_module(&m, &syms);
+    assert!(printed.contains("global thread_local @x : i32"), "{printed}");
+    assert!(printed.contains("global internal hidden thread_local @y : i64"), "{printed}");
+
+    let bad = "module \"t\"\n\
+        global thread_local @x : i32 = i32 0\n\
+        global @p : ptr = ptr @x\n";
+    let m = crate::ir::text::parse_module(bad, FileId::new(0), &mut syms).unwrap();
+    assert_one_error(&verify_globals(&m), "per-thread");
+
+    let bad = "module \"t\"\n\
+        datalayout \"e-p1:16:8\"\n\
+        global thread_local addrspace(1) @x : i32 = i32 0\n";
+    let m = crate::ir::text::parse_module(bad, FileId::new(0), &mut syms).unwrap();
+    assert_one_error(&verify_globals(&m), "must be 0");
+}
+
 /// An address constant used as an instruction operand is rejected: it is only
 /// meaningful inside a global initializer.
 #[test]

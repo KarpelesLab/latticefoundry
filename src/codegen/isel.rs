@@ -74,6 +74,23 @@ pub trait TargetIsel: MachineTarget + Sized {
     /// Build "materialize the address of global `g` into `dst`".
     fn global_addr(&self, dst: VReg, g: u32) -> MachineInst;
 
+    /// Emit the materialization of global `g`'s address into `dst`. The default
+    /// emits [`TargetIsel::global_addr`] and rejects a
+    /// [`thread_local`](crate::ir::GlobalAttrs::thread_local) global, whose
+    /// address is per-thread: a target that supports thread-local storage
+    /// overrides this to go through its thread pointer (`docs/ir-design.md`
+    /// §4c).
+    ///
+    /// # Panics
+    ///
+    /// On a thread-local global (the default implementation).
+    fn lower_global_addr(&self, lo: &mut Lower<'_, Self>, dst: VReg, g: u32) {
+        if lo.module().global_attrs(crate::ir::GlobalId::from_index(g as usize)).thread_local {
+            panic!("{} backend: thread-local storage (global #{g}) is not supported", self.name());
+        }
+        lo.emit(self.global_addr(dst, g));
+    }
+
     /// Build "materialize the floating-point constant with raw IEEE bit pattern
     /// `bits` (a `width`-bit value) into the floating-point register `dst`".
     ///
@@ -392,6 +409,11 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
         let cls = class_of(self.types(), ty);
         let d = self.mf.new_vreg(cls);
         let target = self.target;
+        if let ValueDef::Global(g) = self.func.value(v).def {
+            target.lower_global_addr(self, d, g.index() as u32);
+            self.materialized.insert(key, d);
+            return d;
+        }
         let inst = match self.func.value(v).def.clone() {
             ValueDef::Const(c) => match self.module.consts().get(c).clone() {
                 Const::Int { value, .. } => target.li(d, value),
@@ -424,7 +446,7 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
                 // rejects them as operands); a zero placeholder likewise.
                 Const::Addr { .. } => target.li(d, Int::ZERO),
             },
-            ValueDef::Global(g) => target.global_addr(d, g.index() as u32),
+            ValueDef::Global(_) => unreachable!("handled above"),
             // A function used as a plain value (not a direct call target): a zero
             // placeholder address (real symbol handling is Phase 6/7).
             ValueDef::Func(_) => target.li(d, Int::ZERO),

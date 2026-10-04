@@ -254,6 +254,8 @@ fn section_kind_code(k: SectionKind) -> u8 {
         SectionKind::Rodata => 2,
         SectionKind::Bss => 3,
         SectionKind::Debug => 4,
+        SectionKind::TData => 16,
+        SectionKind::TBss => 17,
     }
 }
 
@@ -264,6 +266,8 @@ fn section_kind_from(c: u8) -> Result<SectionKind, DecodeError> {
         2 => SectionKind::Rodata,
         3 => SectionKind::Bss,
         4 => SectionKind::Debug,
+        16 => SectionKind::TData,
+        17 => SectionKind::TBss,
         _ => return Err(DecodeError::InvalidTag { what: "section-kind", tag: u32::from(c) }),
     })
 }
@@ -310,6 +314,7 @@ fn symtype_code(t: SymbolType) -> u8 {
         SymbolType::Object => 1,
         SymbolType::Func => 2,
         SymbolType::Section => 3,
+        SymbolType::Tls => 6,
     }
 }
 
@@ -319,6 +324,7 @@ fn symtype_from(c: u8) -> Result<SymbolType, DecodeError> {
         1 => SymbolType::Object,
         2 => SymbolType::Func,
         3 => SymbolType::Section,
+        6 => SymbolType::Tls,
         _ => return Err(DecodeError::InvalidTag { what: "symbol-type", tag: u32::from(c) }),
     })
 }
@@ -346,6 +352,10 @@ fn reloc_kind_code(k: RelocKind) -> u8 {
         RelocKind::AvrHi8Ldi => 18,
         RelocKind::AvrLo8LdiPm => 19,
         RelocKind::AvrHi8LdiPm => 20,
+        // TLS kinds take high codes, clear of the next per-target additions.
+        RelocKind::TpOff32 => 96,
+        RelocKind::GotTpOff => 97,
+        RelocKind::TlsGd => 98,
     }
 }
 
@@ -372,6 +382,9 @@ fn reloc_kind_from(c: u8) -> Result<RelocKind, DecodeError> {
         18 => RelocKind::AvrHi8Ldi,
         19 => RelocKind::AvrLo8LdiPm,
         20 => RelocKind::AvrHi8LdiPm,
+        96 => RelocKind::TpOff32,
+        97 => RelocKind::GotTpOff,
+        98 => RelocKind::TlsGd,
         _ => return Err(DecodeError::InvalidTag { what: "reloc-kind", tag: u32::from(c) }),
     })
 }

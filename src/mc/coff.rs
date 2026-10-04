@@ -144,6 +144,11 @@ fn section_characteristics(kind: SectionKind, align: u64) -> u32 {
         SectionKind::Debug => {
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE
         }
+        // Rejected by `write` before this is reached (PE/COFF thread-local
+        // storage goes through the TLS directory, not section flags).
+        SectionKind::TData | SectionKind::TBss => {
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE
+        }
     };
     let k = log2_align(align).min(MAX_ALIGN_LOG2);
     flags | ((k + 1) << IMAGE_SCN_ALIGN_SHIFT)
@@ -480,6 +485,12 @@ pub fn write(obj: &ObjectModule, machine: CoffMachine) -> Result<Vec<u8>, Object
     for s in sections {
         if s.size() > u64::from(u32::MAX) {
             return Err(ObjectWriteError::new(format!("section {} is larger than 4 GiB", s.name)));
+        }
+        if s.kind.is_tls() {
+            return Err(ObjectWriteError::new(format!(
+                "section {} holds thread-local storage, which this COFF writer does not support",
+                s.name
+            )));
         }
     }
 

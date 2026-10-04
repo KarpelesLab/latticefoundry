@@ -415,6 +415,46 @@ entry ^0(%s: i64):
     }
 }
 
+/// Thread-local addressing (`docs/ir-design.md` §4c) is straight-line under
+/// every x86-64 TLS model — local-exec, initial-exec and the general-dynamic
+/// `__tls_get_addr` call — so secret thread-locals stay constant-time.
+#[test]
+fn tls_addressing_adds_no_branches() {
+    use crate::codegen::{CodegenOptions, RelocModel};
+    let src = "module \"tls\"
+global secret thread_local @key : i64 = i64 42
+global secret thread_local @ext : i64
+
+func @mix(secret i64) -> secret i64 {
+entry ^0(%s: i64):
+  %k = load @key align 8 : i64
+  %e = load @ext align 8 : i64
+  %m = xor %k, %e : i64
+  %x = add %m, %s : i64
+  %lt = icmp ult %x, %k : i1
+  %r = select %lt, %x, %k : i64
+  store %r, @key align 8 : i64
+  ret %r
+}
+";
+    let (m, syms) = parse(src);
+    let f = FuncId::from_index(0);
+    assert!(ct_violations(&m, f, CtPolicy::DEFAULT).is_empty());
+    for model in [RelocModel::Static, RelocModel::Pie, RelocModel::Pic] {
+        let mf = X86_64Target::new().with_reloc_model(model).select_with_syms(&m, f, &syms);
+        let n = mir_branches(&mf, |mi| X86Op::decode(mi.opcode).may_branch_on_data(&mi.operands));
+        assert_eq!(n, 0, "{model:?}");
+        let opts = CodegenOptions::default().with_reloc_model(model);
+        let obj = super::x86_64::compile_module_with(&m, &syms, &opts).object;
+        let text = &obj.sections().iter().find(|s| s.name == ".text").unwrap().bytes;
+        if let Some(asm) = x86_disasm(text) {
+            let jcc: Vec<&str> =
+                asm.lines().map(str::trim).filter(|l| l.starts_with('j') && !l.starts_with("jmp")).collect();
+            assert!(jcc.is_empty(), "{model:?}: conditional jumps {jcc:?}:\n{asm}");
+        }
+    }
+}
+
 #[test]
 fn select_lowers_branchless_on_every_target() {
     let src = r#"module "sel"

@@ -73,6 +73,7 @@ const SHT_REL: u32 = 9;
 const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
+const SHF_TLS: u64 = 0x400;
 
 const STB_LOCAL: u8 = 0;
 const STB_GLOBAL: u8 = 1;
@@ -85,6 +86,7 @@ const STT_NOTYPE: u8 = 0;
 const STT_OBJECT: u8 = 1;
 const STT_FUNC: u8 = 2;
 const STT_SECTION: u8 = 3;
+const STT_TLS: u8 = 6;
 
 const SHN_UNDEF: u16 = 0;
 
@@ -97,6 +99,9 @@ const R_X86_64_32: u32 = 10;
 const R_X86_64_32S: u32 = 11;
 const R_X86_64_PC64: u32 = 24;
 const R_X86_64_16: u32 = 12;
+const R_X86_64_TLSGD: u32 = 19;
+const R_X86_64_GOTTPOFF: u32 = 22;
+const R_X86_64_TPOFF32: u32 = 23;
 
 /// The size in bytes of an `Elf64_Ehdr`.
 const EHDR_SIZE: u64 = 64;
@@ -118,6 +123,9 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         RelocKind::Pc64 => R_X86_64_PC64,
         RelocKind::Plt32 => R_X86_64_PLT32,
         RelocKind::GotPcRel => R_X86_64_GOTPCREL,
+        RelocKind::TpOff32 => R_X86_64_TPOFF32,
+        RelocKind::GotTpOff => R_X86_64_GOTTPOFF,
+        RelocKind::TlsGd => R_X86_64_TLSGD,
         // AArch64, Thumb and AVR relocation kinds never appear in an x86-64 ELF
         // object (those backends do not emit through this mapping).
         RelocKind::Aarch64Call26
@@ -146,6 +154,8 @@ fn section_flags_type(kind: SectionKind) -> (u64, u32) {
         SectionKind::Bss => (SHF_ALLOC | SHF_WRITE, SHT_NOBITS),
         // Debug sections are present in the file but not allocated at run time.
         SectionKind::Debug => (0, SHT_PROGBITS),
+        SectionKind::TData => (SHF_ALLOC | SHF_WRITE | SHF_TLS, SHT_PROGBITS),
+        SectionKind::TBss => (SHF_ALLOC | SHF_WRITE | SHF_TLS, SHT_NOBITS),
     }
 }
 
@@ -171,6 +181,7 @@ fn symtype_code(t: SymbolType) -> u8 {
         SymbolType::Object => STT_OBJECT,
         SymbolType::Func => STT_FUNC,
         SymbolType::Section => STT_SECTION,
+        SymbolType::Tls => STT_TLS,
     }
 }
 

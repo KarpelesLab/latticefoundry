@@ -234,6 +234,9 @@ impl CompiledModule {
                         mem[field_off..field_off + 4].copy_from_slice(&(v as i32).to_le_bytes());
                     }
                     RelocKind::GotPcRel
+                    | RelocKind::TpOff32
+                    | RelocKind::GotTpOff
+                    | RelocKind::TlsGd
                     | RelocKind::Aarch64Call26
                     | RelocKind::Aarch64AdrPrelPgHi21
                     | RelocKind::Aarch64AddAbsLo12Nc

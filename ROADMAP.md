@@ -407,6 +407,15 @@ functions take `internal`/`weak` linkage. AArch64 and RISC-V reject the PIC
 models with a clear error (`target::compile_module_for`); they need GOT
 sequences (`adrp`+`ldr` `R_AARCH64_ADR_GOT_PAGE`/`LD64_GOT_LO12_NC`, `auipc`+`ld`
 `R_RISCV_GOT_HI20`).
+**Thread-local storage** on x86-64 ([ir-design §4c](docs/ir-design.md)):
+`global thread_local @x` lives in `.tdata`/`.tbss` (`STT_TLS`) and is reached
+through `%fs` with the model the relocation model and locality pick —
+local-exec (`R_X86_64_TPOFF32`), initial-exec (`R_X86_64_GOTTPOFF`) or
+general-dynamic (`R_X86_64_TLSGD` + `__tls_get_addr`). The static linker
+emits `PT_TLS`, relaxes initial-exec/general-dynamic to local-exec, and its
+`_start` builds the TLS block and sets `%fs` without libc; execution-tested
+statically, with two pthreads against glibc (qld, non-PIE and PIE), and in a
+`dlopen`ed shared library. Other targets reject `thread_local` clearly.
 
 *Non-64-bit foundation* ✅ (for wasm32, Arm Cortex-M and AVR; see
 [ir-design §3a/§3b](docs/ir-design.md)): modules carry a per-target
@@ -642,7 +651,8 @@ correct; the gap is only in mixing `lf-cc` objects with gcc-compiled ones.
 the ~120 glibc headers tested (the 28 core ones plus ~95 more) all compile.
 gzip, bzip2, Lua and SQLite build against them with output byte-identical
 to gcc's. Remaining, each with a clear error today:
-- GCC vector types, `_Atomic`, `__thread`/TLS;
+- GCC vector types, `_Atomic`, `__thread`/TLS (the root backend has x86-64
+  thread-locals, ir-design §4c; lf-cc does not emit them yet);
 - `__int128`/`_Float128`/`_Complex` *values* (declarations work);
 - a true 80-bit `long double`;
 - `__label__`, `__auto_type` and range designators;

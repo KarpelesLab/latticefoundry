@@ -25,11 +25,29 @@
 //!    each IR function's linkage onto its definition's binding (functions are
 //!    emitted `STB_GLOBAL` by the backends' drivers) and every IR symbol's
 //!    visibility onto the object symbol of the same name, definition or
-//!    reference.
+//!    reference. A thread-local global's symbol (definition or reference)
+//!    is `STT_TLS`.
+//!
+//! 3. **How is a thread-local global reached?** [`tls_model`] picks the TLS
+//!    access model (`docs/ir-design.md` §4c) from the same locality:
+//!
+//!    | model    | locally bound | otherwise        |
+//!    |----------|---------------|------------------|
+//!    | `Static` | local-exec    | initial-exec     |
+//!    | `Pie`    | local-exec    | initial-exec     |
+//!    | `Pic`    | general-dynamic | general-dynamic |
+//!
+//!    where, unlike for addresses, `Static` counts only definitions (and
+//!    `internal`/`hidden` symbols) as local: an executable's own variables sit
+//!    at a link-time offset from the thread pointer, while one defined by a
+//!    shared library is placed at load time (initial-exec reads that offset
+//!    from the GOT). A shared library cannot know its offset at all, so it
+//!    asks `__tls_get_addr` for every variable (local-dynamic, the optional
+//!    refinement for its own variables, is not used).
 
 use crate::codegen::options::RelocModel;
 use crate::ir::{FuncId, GlobalId, Linkage, Module, Visibility};
-use crate::mc::object::{ObjectModule, SymbolBinding};
+use crate::mc::object::{ObjectModule, SymbolBinding, SymbolType};
 use crate::support::StrInterner;
 
 /// Whether a reference to function `f` binds inside the component being built,
@@ -46,6 +64,34 @@ pub fn global_binds_locally(module: &Module, g: GlobalId, model: RelocModel) -> 
     let attrs = module.global_attrs(g);
     let defined = module.global(g).init.is_some() && !attrs.detached;
     binds_locally(attrs.linkage, attrs.visibility, defined, model)
+}
+
+/// How code reaches a thread-local variable (the ELF TLS access models).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum TlsModel {
+    /// A fixed offset from the thread pointer, resolved at static link time
+    /// (an executable's own variables).
+    LocalExec,
+    /// The offset from the thread pointer, loaded from a GOT entry the dynamic
+    /// loader fills (a variable of the initially loaded modules, referenced
+    /// from an executable).
+    InitialExec,
+    /// A call to `__tls_get_addr` with the variable's (module, offset) GOT
+    /// pair: works from any module, including a `dlopen`ed one.
+    GeneralDynamic,
+}
+
+/// The TLS access model for thread-local global `g` under `model` (see the
+/// [module docs](self)).
+pub fn tls_model(module: &Module, g: GlobalId, model: RelocModel) -> TlsModel {
+    let attrs = module.global_attrs(g);
+    let defined = module.global(g).init.is_some() && !attrs.detached;
+    let local = defined || attrs.linkage == Linkage::Internal || attrs.visibility == Visibility::Hidden;
+    match model {
+        RelocModel::Pic => TlsModel::GeneralDynamic,
+        RelocModel::Static | RelocModel::Pie if local => TlsModel::LocalExec,
+        RelocModel::Static | RelocModel::Pie => TlsModel::InitialExec,
+    }
 }
 
 fn binds_locally(linkage: Linkage, visibility: Visibility, defined: bool, model: RelocModel) -> bool {
@@ -75,7 +121,13 @@ pub fn apply_symbol_attrs(module: &Module, syms: &StrInterner, obj: &mut ObjectM
     for (i, g) in module.globals().enumerate() {
         let Some(id) = obj.symbol_id(syms.resolve(g.name)) else { continue };
         let mut sym = obj.symbol(id).clone();
-        sym.visibility = module.global_attrs(GlobalId::from_index(i)).visibility.into();
+        let attrs = module.global_attrs(GlobalId::from_index(i));
+        sym.visibility = attrs.visibility.into();
+        if attrs.thread_local {
+            // References too: a linker matches a TLS access to an `STT_TLS`
+            // symbol.
+            sym.kind = SymbolType::Tls;
+        }
         obj.add_symbol(sym);
     }
 }

@@ -159,6 +159,11 @@ impl Visibility {
 ///   load whose address is based on it yields a secret-derived value for the
 ///   constant-time discipline (`docs/ir-design.md` §6d). Its *address* is
 ///   public. No effect on layout or emission.
+/// - `thread_local` gives every thread its own instance of the global
+///   (`docs/ir-design.md` §4c): `@x` is the address of the *current thread's*
+///   copy, so it is not a link-time constant (no address constant may name a
+///   thread-local global) and it lives in address space 0. The backend places
+///   it in `.tdata`/`.tbss` and addresses it through the thread pointer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct GlobalAttrs {
     /// The symbol binding of a definition.
@@ -171,6 +176,8 @@ pub struct GlobalAttrs {
     pub detached: bool,
     /// The contents are secret (constant-time discipline).
     pub secret: bool,
+    /// One instance per thread (thread-local storage).
+    pub thread_local: bool,
 }
 
 impl GlobalAttrs {
@@ -182,6 +189,7 @@ impl GlobalAttrs {
         constant: false,
         detached: false,
         secret: false,
+        thread_local: false,
     };
 
     /// The attributes [`Module::add_global`] records: external, mutable, and
@@ -192,6 +200,7 @@ impl GlobalAttrs {
         constant: false,
         detached: true,
         secret: false,
+        thread_local: false,
     };
 }
 

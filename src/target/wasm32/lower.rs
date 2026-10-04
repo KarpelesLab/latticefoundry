@@ -331,6 +331,9 @@ pub(crate) fn lower_module(module: &Module, syms: &StrInterner) -> R<Lowered> {
     if dl.program_addr_space() != 0 {
         return fail("functions must live in address space 0 on wasm32");
     }
+    if let Some(i) = (0..module.global_count()).find(|&i| module.global_attrs(GlobalId::from_index(i)).thread_local) {
+        return fail(format!("global #{i} is thread_local: thread-local storage is not supported on wasm32"));
+    }
     let types = module.types();
     let nfuncs = module.function_count();
 

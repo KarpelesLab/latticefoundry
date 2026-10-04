@@ -179,6 +179,10 @@ fn section_names(name: &str, kind: SectionKind, has_relocs: bool) -> (String, &'
             let base = name.trim_start_matches('.');
             (format!("__{base}"), "__DWARF", S_REGULAR | S_ATTR_DEBUG)
         }
+        // Rejected by `write_with` before this is reached (Mach-O thread-local
+        // variables use `__thread_vars` descriptors, not implemented).
+        SectionKind::TData => ("__thread_data".to_owned(), "__DATA", S_REGULAR),
+        SectionKind::TBss => ("__thread_bss".to_owned(), "__DATA", S_ZEROFILL),
     }
 }
 
@@ -328,6 +332,12 @@ pub fn write_with(obj: &ObjectModule, opts: &MachOOptions) -> Result<Vec<u8>, Ob
     let n = sections.len();
     if n > 255 {
         return Err(ObjectWriteError::new("a Mach-O object holds at most 255 sections"));
+    }
+    if let Some(s) = sections.iter().find(|s| s.kind.is_tls()) {
+        return Err(ObjectWriteError::new(format!(
+            "section {} holds thread-local storage, which this Mach-O writer does not support",
+            s.name
+        )));
     }
 
     // --- section order: everything with contents, then the zero-fill ones ---

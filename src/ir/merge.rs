@@ -166,6 +166,7 @@ impl Module {
                     a.visibility = a.visibility.most_constraining(vis);
                     // So does secrecy: either side's `secret` sticks.
                     a.secret |= other.global_attrs[gi].secret;
+                    a.thread_local |= other.global_attrs[gi].thread_local;
                     existing
                 }
                 None => {
@@ -255,6 +256,7 @@ impl Module {
             attrs.visibility = attrs.visibility.most_constraining(prev.visibility);
             // A global either side declares secret stays secret.
             attrs.secret |= prev.secret;
+            attrs.thread_local |= prev.thread_local;
             self.global_attrs[target.index()] = attrs;
             self.global_addr_space[target.index()] = other.global_addr_space[gi];
         }

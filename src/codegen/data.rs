@@ -27,6 +27,12 @@
 //! (`Abs64` on the 64-bit targets, which each ELF writer maps to its `R_*_64`),
 //! falling back to the generic [`RelocKind::abs_for_width`] for other widths.
 //!
+//! A [`thread_local`](crate::ir::GlobalAttrs::thread_local) global goes to
+//! **`.tdata`** (`PROGBITS`, `WAT`), or to **`.tbss`** (`NOBITS`, `WAT`) when
+//! all zero, whatever its constness: those sections are the TLS template every
+//! thread's block is initialized from (`docs/ir-design.md` §4c). Its symbol is
+//! an `STT_TLS` one.
+//!
 //! For position-independent output ([`emit_globals_with`] with `relro`), a
 //! `constant` global whose initializer holds an address goes to
 //! **`.data.rel.ro`** (`PROGBITS`, `WA`) instead of `.rodata`: its pointer fields
@@ -44,7 +50,7 @@
 //!
 //! Emission is deterministic (tenet T5): globals are visited in module order and
 //! the sections are appended in the fixed order `.rodata`, `.data`, `.bss`,
-//! `.data.rel.ro`, each only when non-empty.
+//! `.data.rel.ro`, `.tdata`, `.tbss`, each only when non-empty.
 
 use crate::ir::{AddrTarget, Const, ConstId, Endian, FloatBits, GlobalId, Linkage, Module, Type};
 use crate::mc::object::{
@@ -106,10 +112,14 @@ impl Acc {
         self.align = self.align.max(align);
         let off = self.size.div_ceil(align) * align;
         self.size = off + size;
-        if self.kind != SectionKind::Bss {
+        if !self.is_nobits() {
             self.bytes.resize(self.size as usize, 0);
         }
         off
+    }
+
+    fn is_nobits(&self) -> bool {
+        matches!(self.kind, SectionKind::Bss | SectionKind::TBss)
     }
 }
 
@@ -177,6 +187,8 @@ pub fn emit_globals_per_space(
         Acc::new(SectionKind::Data, ".data"),
         Acc::new(SectionKind::Bss, ".bss"),
         Acc::new(SectionKind::Data, ".data.rel.ro"),
+        Acc::new(SectionKind::TData, ".tdata"),
+        Acc::new(SectionKind::TBss, ".tbss"),
     ];
     let mut placed: Vec<Placed> = Vec::new();
 
@@ -190,18 +202,21 @@ pub fn emit_globals_per_space(
         let mut img = Image { bytes: vec![0u8; layout.size as usize], relocs: Vec::new() };
         serialize(module, syms, init, 0, &mut img);
 
-        let which = if attrs.constant && relro && !img.relocs.is_empty() {
+        let zero = img.relocs.is_empty() && img.bytes.iter().all(|&b| b == 0);
+        let which = if attrs.thread_local {
+            if zero { 5 } else { 4 }
+        } else if attrs.constant && relro && !img.relocs.is_empty() {
             3
         } else if attrs.constant {
             0
-        } else if img.relocs.is_empty() && img.bytes.iter().all(|&b| b == 0) {
+        } else if zero {
             2
         } else {
             1
         };
         let acc = &mut accs[which];
         let off = acc.place(layout.size.max(1), layout.align.max(1));
-        if acc.kind != SectionKind::Bss {
+        if !acc.is_nobits() {
             acc.bytes[off as usize..(off + layout.size) as usize].copy_from_slice(&img.bytes);
         }
         let binding = match attrs.linkage {
@@ -220,13 +235,15 @@ pub fn emit_globals_per_space(
     }
 
     // Materialize the non-empty sections in fixed order.
-    let mut ids: [Option<SectionId>; 4] = [None; 4];
+    let mut ids: [Option<SectionId>; 6] = [None; 6];
     for (i, acc) in accs.into_iter().enumerate() {
         if acc.size == 0 {
             continue;
         }
         let section = if acc.kind == SectionKind::Bss {
             Section::bss(acc.name, acc.align, acc.size)
+        } else if acc.kind == SectionKind::TBss {
+            Section::tbss(acc.name, acc.align, acc.size)
         } else {
             let mut s = Section::new(acc.name, acc.kind, acc.align);
             s.bytes = acc.bytes;
@@ -239,7 +256,7 @@ pub fn emit_globals_per_space(
     // (including internal ones) rather than to fresh undefined references.
     for p in &placed {
         let sec = ids[p.which].expect("a placed global's section exists");
-        let kind = SymbolType::Object;
+        let kind = if p.which >= 4 { SymbolType::Tls } else { SymbolType::Object };
         obj.add_symbol(Symbol::defined(p.name.clone(), p.binding, kind, sec, p.offset, p.size));
     }
     for p in placed {

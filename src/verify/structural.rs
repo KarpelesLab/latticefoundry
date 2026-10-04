@@ -114,6 +114,9 @@ pub fn verify_globals(module: &Module) -> Vec<Diagnostic> {
                 format!("lives in address space {space}, which the data layout does not declare"),
             ));
         }
+        if space != 0 && module.global_attrs(GlobalId::from_index(gi)).thread_local {
+            diags.push(global_err(gi, format!("is thread_local but lives in address space {space} (must be 0)")));
+        }
         if let Some(s) = undeclared_space(module, g.ty) {
             diags.push(global_err(
                 gi,
@@ -174,6 +177,15 @@ fn check_init_const(m: &Module, gi: usize, cid: ConstId, diags: &mut Vec<Diagnos
                 diags.push(global_err(
                     gi,
                     format!("address constant names a nonexistent symbol ({target:?})"),
+                ));
+            } else if let AddrTarget::Global(g) = target
+                && m.global_attrs(*g).thread_local
+            {
+                // Each thread has its own instance: there is no single address
+                // for the linker to write.
+                diags.push(global_err(
+                    gi,
+                    format!("address constant names thread_local global #{} (its address is per-thread)", g.index()),
                 ));
             } else if let Some(space) = m.types().addr_space(*ty) {
                 // The address of a symbol is a pointer into the symbol's space.

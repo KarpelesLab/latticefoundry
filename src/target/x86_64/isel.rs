@@ -87,6 +87,8 @@
 //! submodule's documentation.
 
 use crate::codegen::isel::{Lower, TargetIsel};
+use crate::codegen::linkage::TlsModel;
+use crate::codegen::options::RelocModel;
 use crate::codegen::mir::{
     MBlockId, MachineInst, MachineOperand, Opcode, PReg, Reg, RegClass, StackSlot, VReg,
 };
@@ -326,6 +328,20 @@ pub enum X86Op {
     Pinsrw = 71,
     /// `[Def g, Use v, Imm idx]` — `pextrw g, v, idx` (zero-extended word).
     Pextrw = 72,
+
+    // --- thread-local storage (see `lower_global_addr`) ----------------------
+    /// `[Def d, Global g, Imm initial_exec]` — the address of thread-local
+    /// global `g` in the current thread: `mov d, fs:[0]` (the TCB's self
+    /// pointer, i.e. the thread pointer), then `lea d, [d + g@tpoff]`
+    /// (local-exec, `R_X86_64_TPOFF32`) or, with `initial_exec`,
+    /// `add d, [rip + g@gottpoff]` (`R_X86_64_GOTTPOFF`).
+    TlsAddr = 73,
+    /// `[Global g, Def rax, Def clobbers..]` — general-dynamic TLS: the
+    /// canonical `data16 lea rdi, [rip + g@tlsgd]; data16 data16 rex.w call
+    /// __tls_get_addr@plt` sequence (`R_X86_64_TLSGD` + `R_X86_64_PLT32`, in
+    /// the exact form a linker may relax), leaving the address in `rax`. A
+    /// call: every caller-saved register is a def.
+    TlsGd = 74,
 }
 
 impl X86Op {
@@ -374,7 +390,7 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 73] = [
+        const TABLE: [X86Op; 75] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
@@ -382,6 +398,7 @@ impl X86Op {
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
             Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm, VOp,
             VUnary, VShiftI, VLoad, VStore, LoadVConst, MovGprToX, MovXToGpr, Pinsrw, Pextrw,
+            TlsAddr, TlsGd,
         ];
         TABLE[op.0 as usize]
     }
@@ -602,6 +619,9 @@ impl VaIntrinsic {
 pub struct X86_64Target {
     rf: RegFile,
     win64: bool,
+    /// The relocation model, which picks the TLS access model
+    /// ([`crate::codegen::linkage::tls_model`]).
+    reloc_model: RelocModel,
 }
 
 impl Default for X86_64Target {
@@ -613,7 +633,7 @@ impl Default for X86_64Target {
 impl X86_64Target {
     /// Construct the x86-64 target with its fixed register file and SysV ABI.
     pub fn new() -> X86_64Target {
-        X86_64Target { rf: RegFile::new(), win64: false }
+        X86_64Target { rf: RegFile::new(), win64: false, reloc_model: RelocModel::Static }
     }
 
     /// Construct the x86-64 target for the calling convention `cc`:
@@ -621,7 +641,7 @@ impl X86_64Target {
     /// [`isel`](self) module docs); anything else is System V.
     pub fn with_call_conv(cc: CallConvKind) -> X86_64Target {
         if cc == CallConvKind::Win64 {
-            X86_64Target { rf: RegFile::win64(), win64: true }
+            X86_64Target { rf: RegFile::win64(), win64: true, reloc_model: RelocModel::Static }
         } else {
             X86_64Target::new()
         }
@@ -631,6 +651,13 @@ impl X86_64Target {
     /// (Win64 on Windows, System V elsewhere).
     pub fn for_os(os: TargetOs) -> X86_64Target {
         X86_64Target::with_call_conv(Triple::new(crate::target::TargetArch::X86_64, os).call_conv())
+    }
+
+    /// Lower for relocation model `model` (default [`RelocModel::Static`]),
+    /// which decides how thread-local variables are reached.
+    pub fn with_reloc_model(mut self, model: RelocModel) -> X86_64Target {
+        self.reloc_model = model;
+        self
     }
 
     /// The calling convention this target lowers calls with.
@@ -1675,6 +1702,43 @@ impl TargetIsel for X86_64Target {
 
     fn frame_addr(&self, dst: VReg, slot: StackSlot) -> MachineInst {
         MachineInst::new(X86Op::LeaFrame.opcode(), vec![def_v(dst), MachineOperand::Frame(slot)])
+    }
+
+    /// A thread-local global's address goes through the thread pointer, by the
+    /// access model [`crate::codegen::linkage::tls_model`] picks for this
+    /// target's relocation model: local-exec and initial-exec are one
+    /// [`X86Op::TlsAddr`], general-dynamic a [`X86Op::TlsGd`] call whose
+    /// result is copied out of `rax`. Nothing here depends on data, so TLS
+    /// addressing is constant-time.
+    fn lower_global_addr(&self, lo: &mut Lower<'_, Self>, dst: VReg, g: u32) {
+        let gid = crate::ir::GlobalId::from_index(g as usize);
+        if !lo.module().global_attrs(gid).thread_local {
+            lo.emit(self.global_addr(dst, g));
+            return;
+        }
+        if self.win64 {
+            panic!("x86-64 backend: thread-local storage (global #{g}) is not supported on Windows");
+        }
+        match crate::codegen::linkage::tls_model(lo.module(), gid, self.reloc_model) {
+            model @ (TlsModel::LocalExec | TlsModel::InitialExec) => {
+                let ie = u64::from(model == TlsModel::InitialExec);
+                lo.emit(MachineInst::new(
+                    X86Op::TlsAddr.opcode(),
+                    vec![def_v(dst), MachineOperand::Global(g), imm(ie)],
+                ));
+            }
+            TlsModel::GeneralDynamic => {
+                let rax = self.rf.cc.ret_reg;
+                let mut operands = vec![MachineOperand::Global(g), def(rax)];
+                for &cs in &self.rf.caller_saved {
+                    if cs != rax {
+                        operands.push(def(cs));
+                    }
+                }
+                lo.emit(MachineInst::new(X86Op::TlsGd.opcode(), operands));
+                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(dst), use_p(rax)]));
+            }
+        }
     }
 
     fn global_addr(&self, dst: VReg, g: u32) -> MachineInst {

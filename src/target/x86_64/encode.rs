@@ -868,6 +868,18 @@ fn symbol_addr(e: &mut Emitter, d: u8, sym: String, via_got: bool) {
     e.reference(kind, Ref::Symbol(sym), 0);
 }
 
+/// `mov d, fs:[0]` (`64 REX.W 8B /r` with an absolute `disp32` of 0): the
+/// thread pointer, read from the self pointer at the start of the thread
+/// control block (x86-64 TLS ABI).
+fn tls_thread_pointer(e: &mut Emitter, d: u8) {
+    e.u8(0x64);
+    e.u8(rex(true, d >= 8, false, false));
+    e.u8(0x8B);
+    e.u8(modrm(0, d, 4));
+    e.u8(sib(0, 4, 5));
+    e.u32(0);
+}
+
 /// The two-address expansion of a commutative ALU op `d = a OP b`.
 fn bin_commutative(e: &mut Emitter, opcode: u8, d: u8, a: u8, b: u8, w: bool) {
     if d == a {
@@ -1187,6 +1199,45 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             // lea d, [rip + disp32]  with a PC32 relocation to the global, or
             // under PIC a GOT load for a preemptible/external one.
             symbol_addr(e, d, (ctx.global_name)(g), (ctx.got.global)(g));
+        }
+        X86Op::TlsAddr => {
+            let d = rnum(&ops[0]);
+            let MachineOperand::Global(g) = ops[1] else { panic!("TlsAddr expects a global operand") };
+            let sym = (ctx.global_name)(g);
+            tls_thread_pointer(e, d);
+            if uimm(&ops[2]) != 0 {
+                // add d, [rip + g@gottpoff]  (initial-exec)
+                e.u8(rex(true, d >= 8, false, false));
+                e.u8(0x03);
+                e.u8(modrm(0, d, 5));
+                e.reference(RelocKind::GotTpOff, Ref::Symbol(sym), 0);
+            } else {
+                // lea d, [d + g@tpoff]  (local-exec)
+                e.u8(rex(true, d >= 8, false, d >= 8));
+                e.u8(0x8D);
+                e.u8(modrm(2, d, d));
+                if d & 7 == 4 {
+                    e.u8(sib(0, 4, 4)); // r12 as a base needs a SIB
+                }
+                e.reference(RelocKind::TpOff32, Ref::Symbol(sym), 0);
+            }
+        }
+        X86Op::TlsGd => {
+            let MachineOperand::Global(g) = ops[0] else { panic!("TlsGd expects a global operand") };
+            // The canonical general-dynamic sequence (padded with prefixes to
+            // 16 bytes so a linker can rewrite it into another model):
+            // data16 lea rdi, [rip + g@tlsgd]; data16 data16 rex.w call
+            // __tls_get_addr@plt.
+            e.u8(0x66);
+            e.u8(0x48);
+            e.u8(0x8D);
+            e.u8(0x3D);
+            e.reference(RelocKind::TlsGd, Ref::Symbol((ctx.global_name)(g)), 0);
+            e.u8(0x66);
+            e.u8(0x66);
+            e.u8(0x48);
+            e.u8(0xE8);
+            e.plt32(Ref::Symbol("__tls_get_addr".to_owned()), 0);
         }
         X86Op::FuncAddr => {
             let d = rnum(&ops[0]);
@@ -1692,7 +1743,7 @@ fn compile_function_full(
     opts: &CodegenOptions,
     lines: bool,
 ) -> FunctionOutput {
-    let target = X86_64Target::for_os(opts.os);
+    let target = X86_64Target::for_os(opts.os).with_reloc_model(opts.reloc_model);
     let mut mf = target.select_with_syms(module, func, syms);
     regalloc::allocate(&mut mf, &target);
     let layout = layout_frame_with(&mf, &target, opts);

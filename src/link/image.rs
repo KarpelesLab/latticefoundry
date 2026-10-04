@@ -28,6 +28,23 @@
 //! x86-64 bytes) that calls the entry symbol — `main` by default — and passes
 //! its return value to the `exit` syscall. `e_entry` is set to `_start`.
 //!
+//! **Thread-local storage** (`docs/ir-design.md` §4c): the `.tdata` sections
+//! (the initialization image) open the `R+W` segment and the `.tbss` sections
+//! follow them in the TLS *template* only; a `PT_TLS` program header
+//! describes the template (`p_filesz` = `.tdata`, `p_memsz` = `.tdata` +
+//! `.tbss`). With no libc to build the thread's TLS block, the synthesized
+//! `_start` does it, per the x86-64 TLS ABI (variant II): it copies the image
+//! into a static block in `.bss`, stores the address of the thread control
+//! block — right after the block, at the thread pointer — into the TCB's first
+//! word (the self pointer `%fs:0` loads), and points `%fs` at it with
+//! `arch_prctl(ARCH_SET_FS)`. A variable at template offset `o` then lives at
+//! `tp - round(p_memsz, p_align) + o`, which is what the local-exec relocation
+//! `R_X86_64_TPOFF32` resolves to. Initial-exec (`R_X86_64_GOTTPOFF`) and
+//! general-dynamic (`R_X86_64_TLSGD`) accesses are relaxed to local-exec in
+//! place, as the TLS ABI allows an executable's linker to do, so a static
+//! image needs neither a GOT nor `__tls_get_addr`. A program that brings its
+//! own `_start` sets up the thread pointer itself.
+//!
 //! The ELF64 executable is written from the published specification (tenet T1):
 //! an `Elf64_Ehdr`, a program-header table, then the segment contents. Section
 //! headers are omitted — they are optional for an executable and a static image
@@ -58,6 +75,10 @@ const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 62;
 
 const PT_LOAD: u32 = 1;
+const PT_TLS: u32 = 7;
+/// The `arch_prctl` system call number and its "set the `%fs` base" code.
+const SYS_ARCH_PRCTL: u32 = 158;
+const ARCH_SET_FS: u32 = 0x1002;
 const PF_X: u32 = 0x1;
 const PF_W: u32 = 0x2;
 const PF_R: u32 = 0x4;
@@ -115,6 +136,14 @@ pub enum LinkError {
     /// A relocation kind that a static link cannot lower (e.g. one needing a
     /// GOT/PLT that this static linker does not synthesize).
     UnsupportedReloc(RelocKind),
+    /// A thread-local relocation whose code sequence is not one the linker can
+    /// relax to local-exec (or whose symbol is not thread-local).
+    BadTlsAccess {
+        /// The symbol being accessed.
+        symbol: String,
+        /// The image virtual address of the relocated field.
+        at: u64,
+    },
     /// A relocated value did not fit its field.
     RelocOverflow {
         /// The symbol whose address was being applied.
@@ -133,6 +162,9 @@ impl std::fmt::Display for LinkError {
             LinkError::MissingEntry(n) => write!(f, "no entry symbol: '{n}' is undefined"),
             LinkError::UnsupportedReloc(k) => {
                 write!(f, "unsupported relocation in static link: {k:?}")
+            }
+            LinkError::BadTlsAccess { symbol, at } => {
+                write!(f, "thread-local access to '{symbol}' at {at:#x} cannot be relaxed to local-exec")
             }
             LinkError::RelocOverflow { symbol, at } => {
                 write!(f, "relocation of '{symbol}' at {at:#x} does not fit its field")
@@ -230,6 +262,63 @@ fn defines_start(objects: &[ObjectModule]) -> bool {
     })
 }
 
+/// Where the TLS set-up code of a synthesized `_start` keeps the four 64-bit
+/// immediates the linker patches once the layout is known (offsets into the
+/// stub's `.text`), and which section of the stub object is its TLS block.
+#[derive(Clone, Copy, Debug)]
+struct TlsStartFields {
+    block: u64,
+    image: u64,
+    image_size: u64,
+    tcb: u64,
+    /// The stub object's `.bss` section index holding the TLS block + TCB.
+    bss: usize,
+}
+
+/// The TLS template of an image: the `.tdata`/`.tbss` sections at their
+/// offsets in the template, its sizes and alignment (see the module docs).
+#[derive(Clone, Debug, Default)]
+struct TlsTemplate {
+    /// `((object, section), offset in the template)`, `.tdata` first.
+    sections: Vec<((usize, usize), u64)>,
+    /// The size of the initialization image (end of the last `.tdata`).
+    filesz: u64,
+    /// The size of the whole template.
+    memsz: u64,
+    /// The template's alignment.
+    align: u64,
+}
+
+impl TlsTemplate {
+    fn new(objects: &[ObjectModule]) -> TlsTemplate {
+        let mut t = TlsTemplate { align: 1, ..TlsTemplate::default() };
+        for kind in [SectionKind::TData, SectionKind::TBss] {
+            for (oi, si) in group(objects, kind) {
+                let s = &objects[oi].sections()[si];
+                let a = s.align.max(1);
+                t.align = t.align.max(a);
+                let off = align_up(t.memsz, a);
+                t.sections.push(((oi, si), off));
+                t.memsz = off + s.size();
+                if kind == SectionKind::TData {
+                    t.filesz = t.memsz;
+                }
+            }
+        }
+        t
+    }
+
+    fn is_present(&self) -> bool {
+        !self.sections.is_empty()
+    }
+
+    /// The template size rounded to its alignment: the distance from the start
+    /// of a thread's TLS block to its thread pointer (variant II).
+    fn block_size(&self) -> u64 {
+        align_up(self.memsz, self.align)
+    }
+}
+
 /// Synthesize a minimal `crt0` object defining `_start`:
 ///
 /// ```text
@@ -243,10 +332,54 @@ fn defines_start(objects: &[ObjectModule]) -> bool {
 /// At process entry `rsp` is 16-aligned; the `call` pushes the (unused) return
 /// address, so `entry` is reached with `rsp ≡ 8 (mod 16)` exactly as the SysV
 /// ABI requires of a callee.
-fn synth_start(entry: &str) -> ObjectModule {
+///
+/// With `tls = Some((block_size, align))` the stub starts with the
+/// thread-pointer set-up of a static image with a TLS template (see the
+/// module docs):
+///
+/// ```text
+///   xor  ebp, ebp
+///   movabs rdi, <block> ; movabs rsi, <image> ; movabs rcx, <image size>
+///   rep movsb                     ; f3 a4 — copy the .tdata image
+///   movabs rdi, <tcb>             ; the thread pointer, right past the block
+///   mov  [rdi], rdi               ; 48 89 3f — TCB self pointer (%fs:0)
+///   mov  rsi, rdi                 ; 48 89 fe
+///   mov  edi, ARCH_SET_FS ; mov eax, SYS_arch_prctl ; syscall
+///   call <entry> ; ...exit as above
+/// ```
+///
+/// The block and TCB live in a `.bss` section of the stub (zero-filled, so
+/// `.tbss` needs no clearing); the four immediates are patched after layout.
+fn synth_start(entry: &str, tls: Option<(u64, u64)>) -> (ObjectModule, Option<TlsStartFields>) {
     let mut e = Emitter::new();
     e.u8(0x31);
     e.u8(0xed); // xor ebp, ebp
+    let mut fields = None;
+    if tls.is_some() {
+        let movabs = |e: &mut Emitter, reg: u8| -> u64 {
+            e.u8(0x48);
+            e.u8(0xb8 + reg); // movabs reg, imm64
+            let at = e.offset();
+            e.u64(0);
+            at
+        };
+        let block = movabs(&mut e, 7); // rdi
+        let image = movabs(&mut e, 6); // rsi
+        let image_size = movabs(&mut e, 1); // rcx
+        e.u8(0xf3);
+        e.u8(0xa4); // rep movsb
+        let tcb = movabs(&mut e, 7); // rdi
+        for b in [0x48, 0x89, 0x3f, 0x48, 0x89, 0xfe] {
+            e.u8(b); // mov [rdi], rdi ; mov rsi, rdi
+        }
+        e.u8(0xbf);
+        e.u32(ARCH_SET_FS); // mov edi, ARCH_SET_FS
+        e.u8(0xb8);
+        e.u32(SYS_ARCH_PRCTL); // mov eax, SYS_arch_prctl
+        e.u8(0x0f);
+        e.u8(0x05); // syscall
+        fields = Some(TlsStartFields { block, image, image_size, tcb, bss: 0 });
+    }
     e.u8(0xe8); // call rel32
     e.reference_symbol(RelocKind::Plt32, entry.to_owned(), 0);
     e.u8(0x89);
@@ -268,7 +401,13 @@ fn synth_start(entry: &str) -> ObjectModule {
         0,
         len,
     ));
-    obj
+    if let (Some((block_size, align)), Some(f)) = (tls, fields.as_mut()) {
+        // The TLS block, then the 8-byte TCB (its self pointer) at the
+        // `align`-aligned thread pointer.
+        let bss = obj.add_section(crate::mc::object::Section::bss(".bss", align.max(16), block_size + 8));
+        f.bss = bss.index();
+    }
+    (obj, fields)
 }
 
 /// The address of a resolved global/weak definition.
@@ -338,10 +477,17 @@ pub fn link_executable(
         return Err(LinkError::NoInput);
     }
 
-    // 1. Provide an entry stub unless the program brings its own.
+    // 1. Provide an entry stub unless the program brings its own; with a TLS
+    //    template, the stub also sets up the thread pointer.
+    let mut start_tls = None;
     if !defines_start(&objects) {
-        objects.insert(0, synth_start(&opts.entry));
+        let pre = TlsTemplate::new(&objects);
+        let tls = pre.is_present().then(|| (pre.block_size(), pre.align));
+        let (crt0, fields) = synth_start(&opts.entry, tls);
+        objects.insert(0, crt0);
+        start_tls = fields;
     }
+    let tls = TlsTemplate::new(&objects);
 
     // 2. Resolve global symbols across all objects.
     let globals = resolve_globals(&objects)?;
@@ -356,9 +502,9 @@ pub fn link_executable(
         g.iter().map(|&(o, s)| objects[o].sections()[s].size()).sum()
     };
     let rodata_present = size_of(&g_rodata) > 0;
-    let data_present = size_of(&g_data) > 0 || size_of(&g_bss) > 0;
+    let data_present = size_of(&g_data) > 0 || size_of(&g_bss) > 0 || tls.is_present();
 
-    let phnum = 1 + u64::from(rodata_present) + u64::from(data_present);
+    let phnum = 1 + u64::from(rodata_present) + u64::from(data_present) + u64::from(tls.is_present());
     let headers_size = EHDR_SIZE + phnum * PHDR_SIZE;
 
     let base = opts.base;
@@ -434,9 +580,36 @@ pub fn link_executable(
     // segment's private writable mapping, so the file is untouched) and maps
     // anonymous zero pages for the remainder of `p_memsz`. No other segment
     // maps memory at or past this segment's pages, so nothing refills them.
+    let mut tls_vaddr = 0;
+    let mut tls_offset = 0;
     if data_present {
-        let (seg_off, seg_vaddr) = segment_start(&buf, &g_data, vend);
+        // The TLS initialization image comes first, aligned to the template.
+        let tdata = group(&objects, SectionKind::TData);
+        let lead: Vec<(usize, usize)> = tdata.iter().chain(&g_data).copied().collect();
+        let (seg_off, seg_vaddr) = segment_start(&buf, &lead, vend);
+        let (seg_off, seg_vaddr) = if tls.is_present() {
+            // Align both, keeping the congruence `vaddr ≡ offset`.
+            let pad = align_up(seg_vaddr, tls.align) - seg_vaddr;
+            (seg_off + pad, seg_vaddr + pad)
+        } else {
+            (seg_off, seg_vaddr)
+        };
         buf.resize(seg_off as usize, 0);
+        if tls.is_present() {
+            tls_vaddr = seg_vaddr;
+            tls_offset = seg_off;
+            // `.tdata` at its template offset (file-backed); `.tbss` gets a
+            // template "address" past it that only TLS offsets ever use.
+            for &((oi, si), off) in &tls.sections {
+                placement.insert((oi, si), tls_vaddr + off);
+                let s = &objects[oi].sections()[si];
+                if s.kind == SectionKind::TData {
+                    buf.resize((seg_off + off) as usize, 0);
+                    buf.extend_from_slice(&s.bytes);
+                }
+            }
+            buf.resize((seg_off + tls.filesz) as usize, 0);
+        }
         place_filebacked(&mut buf, &mut placement, &g_data, seg_vaddr - seg_off);
         let filesz = buf.len() as u64 - seg_off;
 
@@ -462,9 +635,26 @@ pub fn link_executable(
     // 4. Apply relocations now that every section has an address. Relocations
     //    inside non-loadable debug sections are handled later (their sections
     //    have no virtual address / placement).
+    //
+    //    A general-dynamic TLS access is relaxed to local-exec, which drops
+    //    its call to `__tls_get_addr`: find those calls first, by the
+    //    `PLT32` that follows each `TLSGD` field by 8 bytes.
+    let mut dropped_calls: std::collections::BTreeSet<(usize, usize, u64)> = std::collections::BTreeSet::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for r in obj.relocations() {
+            if r.kind == RelocKind::TlsGd {
+                dropped_calls.insert((oi, r.section.index(), r.offset + 8));
+            }
+        }
+    }
+    // The thread-pointer offset of a TLS symbol at template address `s`.
+    let tp_offset = |s: u64| -> i64 { (s as i64) - (tls_vaddr as i64) - (tls.block_size() as i64) };
     for (oi, obj) in objects.iter().enumerate() {
         for r in obj.relocations() {
             if obj.sections()[r.section.index()].kind == SectionKind::Debug {
+                continue;
+            }
+            if r.kind == RelocKind::Plt32 && dropped_calls.contains(&(oi, r.section.index(), r.offset)) {
                 continue;
             }
             let sec_vaddr = placement[&(oi, r.section.index())];
@@ -474,6 +664,28 @@ pub fn link_executable(
             let a = r.addend;
             let name = || obj.symbol(r.symbol).name.clone();
             match r.kind {
+                RelocKind::TpOff32 | RelocKind::GotTpOff | RelocKind::TlsGd => {
+                    if !symbol_is_tls(&objects, &globals, oi, r.symbol) {
+                        return Err(LinkError::BadTlsAccess { symbol: name(), at: p });
+                    }
+                    // A PC-relative form's addend accounts for the field's
+                    // distance to the end of the instruction; the offset
+                    // itself takes no part of it.
+                    let extra = if r.kind == RelocKind::TpOff32 { a } else { a + 4 };
+                    let v = tp_offset(s) + extra;
+                    if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                        return Err(LinkError::RelocOverflow { symbol: name(), at: p });
+                    }
+                    let field = match r.kind {
+                        RelocKind::TpOff32 => Some(file_off),
+                        RelocKind::GotTpOff => relax_ie_to_le(&mut buf, file_off).then_some(file_off),
+                        _ => relax_gd_to_le(&mut buf, file_off).then_some(file_off + 8),
+                    };
+                    let Some(field) = field else {
+                        return Err(LinkError::BadTlsAccess { symbol: name(), at: p });
+                    };
+                    put(&mut buf, field, &(v as i32).to_le_bytes());
+                }
                 RelocKind::Abs64 => {
                     let v = s.wrapping_add(a as u64);
                     put(&mut buf, file_off, &v.to_le_bytes());
@@ -523,6 +735,22 @@ pub fn link_executable(
         }
     }
 
+    // 4b. The synthesized `_start`'s TLS set-up: the block and TCB addresses
+    //     and the image to copy.
+    if let Some(f) = start_tls {
+        let text_vaddr = placement[&(0, 0)];
+        let block = placement[&(0, f.bss)];
+        for (at, v) in [
+            (f.block, block),
+            (f.image, tls_vaddr),
+            (f.image_size, tls.filesz),
+            (f.tcb, block + tls.block_size()),
+        ] {
+            let off = file_offset_of(&segments, text_vaddr + at);
+            put(&mut buf, off, &v.to_le_bytes());
+        }
+    }
+
     // 5. Determine the entry point.
     let entry = globals
         .get("_start")
@@ -542,7 +770,14 @@ pub fn link_executable(
     };
 
     // 7. Write the ELF header and program headers into the reserved prefix.
-    write_headers(&mut buf, entry, &segments, sections);
+    let tls_segment = tls.is_present().then_some(Segment {
+        offset: tls_offset,
+        vaddr: tls_vaddr,
+        filesz: tls.filesz,
+        memsz: tls.memsz,
+        flags: PF_R,
+    });
+    write_headers(&mut buf, entry, &segments, tls_segment.map(|s| (s, tls.align)), sections);
 
     Ok(buf)
 }
@@ -728,7 +963,8 @@ fn emit_debug_and_sections(
             SectionKind::Rodata => rodata_shndx,
             SectionKind::Data => data_shndx,
             SectionKind::Bss => bss_shndx,
-            SectionKind::Debug => SHN_UNDEF,
+            // TLS symbols are skipped below (their value is a template offset).
+            SectionKind::Debug | SectionKind::TData | SectionKind::TBss => SHN_UNDEF,
         }
     };
 
@@ -757,7 +993,7 @@ fn emit_debug_and_sections(
         for sym in obj.symbols() {
             let SymbolValue::Defined { section, offset } = sym.value else { continue };
             let kind = obj.sections()[section.index()].kind;
-            if matches!(kind, SectionKind::Debug) {
+            if matches!(kind, SectionKind::Debug) || kind.is_tls() {
                 continue;
             }
             // A global/weak name is emitted once (its winning definition).
@@ -922,7 +1158,13 @@ fn write_shdr_bytes(
 /// Fill `buf`'s reserved prefix with the `Elf64_Ehdr` and the program headers.
 /// When `sections` is `Some`, the header points at the appended section-header
 /// table; otherwise `e_shoff`/`e_shnum`/`e_shstrndx` are zero (no sections).
-fn write_headers(buf: &mut [u8], entry: u64, segments: &[Segment], sections: Option<SectionTable>) {
+fn write_headers(
+    buf: &mut [u8],
+    entry: u64,
+    segments: &[Segment],
+    tls: Option<(Segment, u64)>,
+    sections: Option<SectionTable>,
+) {
     // e_ident.
     put(buf, 0, &ELFMAG);
     buf[4] = ELFCLASS64;
@@ -931,7 +1173,7 @@ fn write_headers(buf: &mut [u8], entry: u64, segments: &[Segment], sections: Opt
     buf[7] = ELFOSABI_SYSV;
     // bytes 8..16 are the padding, already zero.
 
-    let phnum = segments.len() as u16;
+    let phnum = (segments.len() + usize::from(tls.is_some())) as u16;
     put(buf, 16, &ET_EXEC.to_le_bytes()); // e_type
     put(buf, 18, &EM_X86_64.to_le_bytes()); // e_machine
     put(buf, 20, &1u32.to_le_bytes()); // e_version
@@ -962,6 +1204,93 @@ fn write_headers(buf: &mut [u8], entry: u64, segments: &[Segment], sections: Opt
         put(buf, o + 40, &seg.memsz.to_le_bytes()); // p_memsz
         put(buf, o + 48, &PAGE.to_le_bytes()); // p_align
     }
+    // The TLS template (`PT_TLS`), after the loadable segments.
+    if let Some((seg, align)) = tls {
+        let o = (EHDR_SIZE + segments.len() as u64 * PHDR_SIZE) as usize;
+        put(buf, o, &PT_TLS.to_le_bytes());
+        put(buf, o + 4, &seg.flags.to_le_bytes());
+        put(buf, o + 8, &seg.offset.to_le_bytes());
+        put(buf, o + 16, &seg.vaddr.to_le_bytes());
+        put(buf, o + 24, &seg.vaddr.to_le_bytes());
+        put(buf, o + 32, &seg.filesz.to_le_bytes());
+        put(buf, o + 40, &seg.memsz.to_le_bytes());
+        put(buf, o + 48, &align.to_le_bytes());
+    }
+}
+
+/// Whether relocation symbol `sym` of object `obj` resolves to a definition in
+/// a thread-local section.
+fn symbol_is_tls(
+    objects: &[ObjectModule],
+    globals: &DetHashMap<String, GlobalDef>,
+    obj: usize,
+    sym: SymbolId,
+) -> bool {
+    let s = objects[obj].symbol(sym);
+    let (o, section) = match s.value {
+        SymbolValue::Defined { section, .. } if matches!(s.binding, SymbolBinding::Local) => (obj, section),
+        _ => match globals.get(&s.name) {
+            Some(def) => match objects[def.obj].symbol(def.sym).value {
+                SymbolValue::Defined { section, .. } => (def.obj, section),
+                SymbolValue::Undefined => return false,
+            },
+            None => return false,
+        },
+    };
+    objects[o].sections()[section.index()].kind.is_tls()
+}
+
+/// Relax an initial-exec access to local-exec in place (x86-64 psABI / ELF TLS
+/// ABI): the instruction holding the `R_X86_64_GOTTPOFF` field at `field`,
+/// `mov reg, [rip + x@gottpoff]` (`REX.W 8B /r`) or
+/// `add reg, [rip + x@gottpoff]` (`REX.W 03 /r`), becomes
+/// `mov reg, imm32` (`REX.W C7 /0`) or `add reg, imm32` (`REX.W 81 /0`), same
+/// length; the caller writes the offset into the old displacement. `false`
+/// when the bytes are not one of those forms.
+fn relax_ie_to_le(buf: &mut [u8], field: usize) -> bool {
+    if field < 3 {
+        return false;
+    }
+    let (rex, op, m) = (buf[field - 3], buf[field - 2], buf[field - 1]);
+    // REX.W (+R), and a RIP-relative ModRM (mod 00, r/m 101).
+    if rex & 0xFB != 0x48 || m & 0xC7 != 0x05 {
+        return false;
+    }
+    let new_op = match op {
+        0x8B => 0xC7,
+        0x03 => 0x81,
+        _ => return false,
+    };
+    let reg = (m >> 3) & 7;
+    // The register moves from ModRM.reg (REX.R) to ModRM.r/m (REX.B).
+    buf[field - 3] = 0x48 | ((rex >> 2) & 1);
+    buf[field - 2] = new_op;
+    buf[field - 1] = 0xC0 | reg;
+    true
+}
+
+/// Relax a general-dynamic access to local-exec in place (ELF TLS ABI): the
+/// canonical 16-byte sequence around the `R_X86_64_TLSGD` field at `field`,
+///
+/// ```text
+///   66 48 8d 3d <x@tlsgd>      data16 lea rdi, [rip + x@tlsgd]
+///   66 66 48 e8 <__tls_get_addr@plt>
+/// ```
+///
+/// becomes `mov rax, fs:0` (`64 48 8b 04 25 00 00 00 00`) followed by
+/// `lea rax, [rax + x@tpoff]` (`48 8d 80 <imm32>`), whose displacement sits
+/// where the `call`'s was — 8 bytes past the old field, where the caller
+/// writes the offset. `false` when the bytes are not that sequence.
+fn relax_gd_to_le(buf: &mut [u8], field: usize) -> bool {
+    if field < 4 || field + 12 > buf.len() {
+        return false;
+    }
+    if buf[field - 4..field] != [0x66, 0x48, 0x8d, 0x3d] || buf[field + 4..field + 8] != [0x66, 0x66, 0x48, 0xe8] {
+        return false;
+    }
+    let seq = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x8d, 0x80];
+    buf[field - 4..field + 8].copy_from_slice(&seq);
+    true
 }
 
 #[cfg(test)]
