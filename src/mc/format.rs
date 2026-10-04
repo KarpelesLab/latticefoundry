@@ -12,7 +12,7 @@ use crate::mc::object::{ObjectModule, RelocKind};
 use crate::target::{ObjectFormat, TargetArch, Triple};
 
 /// Why an [`ObjectModule`] could not be written in the requested format:
-/// typically a [`RelocKind`](crate::mc::object::RelocKind) the format (or the architecture within it) has
+/// typically a [`RelocKind`] the format (or the architecture within it) has
 /// no relocation for, or an addend that does not fit the in-place field a
 /// REL-style format keeps it in.
 #[derive(Clone, PartialEq, Eq, Debug)]
