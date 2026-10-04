@@ -417,7 +417,7 @@ pub struct AllocOptions {
     ///   middle of a loop leaves its register to others there;
     /// - at an instruction where one vreg dies and another is born, both may
     ///   share a register when the target says the instruction allows it
-    ///   ([`MachineTarget::tied_use`]: a copy, or a two-address operation
+    ///   ([`MachineTarget::tied_uses`]: a copy, or a two-address operation
     ///   whose destination may be its first source);
     /// - a vreg copied into a physical register (an argument register before
     ///   a call or `syscall`) may live in that register, making the copy a
@@ -581,7 +581,7 @@ pub fn allocate_with(mf: &mut MachineFunction, target: &dyn MachineTarget, opts:
 
     // Per point: the (def, use) vreg pair the instruction lets share a
     // register; per vreg: its definition points and its hints.
-    let mut tie: DetHashMap<usize, (VReg, VReg)> = DetHashMap::default();
+    let mut tie: DetHashMap<usize, Vec<(VReg, VReg)>> = DetHashMap::default();
     let mut def_points: Vec<Vec<usize>> = vec![Vec::new(); nv];
     let mut fixed_hint: Vec<Vec<(PReg, u64)>> = vec![Vec::new(); nv];
     let mut partner: Vec<Vec<(VReg, u64)>> = vec![Vec::new(); nv];
@@ -597,14 +597,15 @@ pub fn allocate_with(mf: &mut MachineFunction, target: &dyn MachineTarget, opts:
                         def_points[v.index()].push(p);
                     }
                 }
-                if let Some(k) = target.tied_use(inst)
-                    && let (Some(MachineOperand::Def(Reg::Virtual(d))), Some(MachineOperand::Use(Reg::Virtual(u)))) =
+                for &k in target.tied_uses(inst) {
+                    if let (Some(MachineOperand::Def(Reg::Virtual(d))), Some(MachineOperand::Use(Reg::Virtual(u)))) =
                         (inst.operands.first(), inst.operands.get(k))
-                {
-                    tie.insert(p, (*d, *u));
-                    if d != u {
-                        partner[d.index()].push((*u, weight));
-                        partner[u.index()].push((*d, weight));
+                    {
+                        tie.entry(p).or_default().push((*d, *u));
+                        if d != u {
+                            partner[d.index()].push((*u, weight));
+                            partner[u.index()].push((*d, weight));
+                        }
                     }
                 }
                 if target.is_move(inst.opcode) {
@@ -646,10 +647,12 @@ pub fn allocate_with(mf: &mut MachineFunction, target: &dyn MachineTarget, opts:
                 return true;
             }
             let p = o.start;
-            let Some(&(d, x)) = tie.get(&p) else { return true };
-            let born = segs[d.index()].iter().any(|s| s.start == p);
-            let dies = segs[x.index()].iter().any(|s| s.end == p);
-            !(((d == v && x == u) || (d == u && x == v)) && born && dies)
+            let Some(pairs) = tie.get(&p) else { return true };
+            !pairs.iter().any(|&(d, x)| {
+                let born = segs[d.index()].iter().any(|s| s.start == p);
+                let dies = segs[x.index()].iter().any(|s| s.end == p);
+                ((d == v && x == u) || (d == u && x == v)) && born && dies
+            })
         })
     };
 

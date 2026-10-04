@@ -177,6 +177,9 @@ fn decode_win_prologue(code: &[u8]) -> (Vec<Code>, u32) {
             let n = u64::from(u32::from_le_bytes(c[3..7].try_into().unwrap()));
             let op = if n <= 128 { "ALLOC_SMALL" } else { "ALLOC_LARGE" };
             (7, Some((op, String::new(), n)))
+        } else if c.starts_with(&[0x48, 0x83, 0xEC]) && frame_off.is_none() {
+            // sub rsp, imm8
+            (4, Some(("ALLOC_SMALL", String::new(), u64::from(c[3]))))
         } else if c.starts_with(&[0x48, 0x89, 0xE5]) {
             frame_off = Some(0);
             (3, Some(("SET_FPREG", "RBP".to_owned(), 0)))

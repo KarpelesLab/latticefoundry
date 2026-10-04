@@ -84,15 +84,15 @@ pub trait MachineTarget: std::fmt::Debug {
     /// well-formedness checks and potential future coalescing.
     fn is_move(&self, op: Opcode) -> bool;
 
-    /// The operand index of the use of `inst` that may share a register with
-    /// its first operand, a definition, when the use dies there and the
+    /// The operand indices of the uses of `inst` that may share a register
+    /// with its first operand, a definition, when the use dies there and the
     /// definition is born there: a register copy, or a two-address operation
-    /// whose encoding is correct with the destination equal to that source.
-    /// Only the precise allocation of
+    /// whose encoding is correct with the destination equal to that source
+    /// (either source of a commutative one). Only the precise allocation of
     /// [`allocate_with`](crate::codegen::regalloc::allocate_with) asks; the
     /// default ties nothing.
-    fn tied_use(&self, _inst: &MachineInst) -> Option<usize> {
-        None
+    fn tied_uses(&self, _inst: &MachineInst) -> &'static [usize] {
+        &[]
     }
 
     /// Build a register-to-register move `dst <- src`.

@@ -101,6 +101,10 @@ fn simulate_prologue(code: &[u8]) -> Prologue {
             depth += i64::from(imm32(pc + 3)); // sub rsp, imm32
             subs += 1;
             pc += 7;
+        } else if c.starts_with(&[0x48, 0x83, 0xEC]) {
+            depth += i64::from(c[3] as i8); // sub rsp, imm8
+            subs += 1;
+            pc += 4;
         } else if c.starts_with(&[0x48, 0x83, 0x0C, 0x24, 0x00]) {
             touches.push(depth); // or qword [rsp], 0
             pc += 5;

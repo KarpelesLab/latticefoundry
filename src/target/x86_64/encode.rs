@@ -1738,6 +1738,17 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             cmp_rr_width(e, rnum(&ops[0]), rnum(&ops[1]), iimm(&ops[3]) as u32);
             branch_cc(e, ctx, uimm(&ops[2]) as u8, label_index(&ops[4]), label_index(&ops[5]));
         }
+        X86Op::CmpFlags => match &ops[1] {
+            MachineOperand::Imm(_) => cmp_ri_width(e, rnum(&ops[0]), iimm(&ops[1]), iimm(&ops[3]) as u32),
+            _ => cmp_rr_width(e, rnum(&ops[0]), rnum(&ops[1]), iimm(&ops[3]) as u32),
+        },
+        X86Op::Cmov => {
+            let (d, d2, t) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+            if d != d2 {
+                mov_rr(e, d, d2, true);
+            }
+            cmov_rr(e, uimm(&ops[3]) as u8, d, t, true);
+        }
         X86Op::CmpBrI => {
             cmp_ri_width(e, rnum(&ops[0]), iimm(&ops[1]), iimm(&ops[3]) as u32);
             branch_cc(e, ctx, uimm(&ops[2]) as u8, label_index(&ops[4]), label_index(&ops[5]));
@@ -2214,10 +2225,9 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
     }
 }
 
-/// `sub rsp, imm32`.
+/// `sub rsp, imm8` / `sub rsp, imm32`.
 fn sub_rsp_imm(e: &mut Emitter, n: u32) {
-    e.bytes(&[0x48, 0x81, modrm(3, 5, RSP as u8)]);
-    e.u32(n);
+    alu_ri(e, 5, RSP as u8, n as i32, true);
 }
 
 /// `or qword [rsp], 0` — a stack probe: a read-modify-write of the new top that

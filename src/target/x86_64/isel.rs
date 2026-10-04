@@ -400,6 +400,15 @@ pub enum X86Op {
     /// `[Imm k]` — `add rsp, k`: the epilogue of a frame without a frame
     /// pointer.
     AddRsp = 84,
+
+    // --- fused compare and select ------------------------------------------
+    /// `[Use a, Use b | Imm v, Imm cc, Imm width]` — `cmp a, b` (or against
+    /// the immediate `v`, as [`X86Op::CmpBrI`]), setting the flags for the
+    /// [`X86Op::Cmov`] that follows (`cc` is the condition it will test).
+    CmpFlags = 85,
+    /// `[Def d, Use d, Use t, Imm cc]` — `cmovcc d, t`: a `select` on an
+    /// `icmp` used only there, after `mov d, f` and its [`X86Op::CmpFlags`].
+    Cmov = 86,
 }
 
 impl X86Op {
@@ -456,7 +465,7 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 85] = [
+        const TABLE: [X86Op; 87] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
@@ -465,7 +474,7 @@ impl X86Op {
             Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm, VOp,
             VUnary, VShiftI, VLoad, VStore, LoadVConst, MovGprToX, MovXToGpr, Pinsrw, Pextrw,
             TlsAddr, TlsGd, MulWide, Switch128, InlineAsm, CmpBr, CmpBrI, SetccCmpI, AluRI, ImulRI,
-            Leave, AddRsp,
+            Leave, AddRsp, CmpFlags, Cmov,
         ];
         TABLE[op.0 as usize]
     }
@@ -682,10 +691,11 @@ fn imm(v: u64) -> MachineOperand {
     MachineOperand::Imm(Int::from_u64(v))
 }
 
-/// The `icmp` results of `f` (by value index) used exactly once, by the
-/// `cond_br` ending the block that computes them: the compares
-/// [`X86Op::CmpBr`] fuses into their branch.
-fn fusable_compares(f: &crate::ir::Function) -> DetHashSet<usize> {
+/// The `icmp` results of `f` (by value index) used exactly once, as the
+/// condition of the `cond_br` ending the block that computes them or of a
+/// general-register `select` in it: the compares [`X86Op::CmpBr`] fuses into
+/// its branch and [`X86Op::CmpFlags`] + [`X86Op::Cmov`] into its select.
+fn fusable_compares(module: &Module, f: &crate::ir::Function) -> DetHashSet<usize> {
     let mut uses = vec![0u32; f.value_count()];
     for (_, b) in f.blocks() {
         for &i in b.insts().iter().chain(b.terminator().as_ref()) {
@@ -694,20 +704,33 @@ fn fusable_compares(f: &crate::ir::Function) -> DetHashSet<usize> {
             }
         }
     }
+    let types = module.types();
     let mut out = DetHashSet::default();
     for (_, b) in f.blocks() {
-        let Some(t) = b.terminator() else { continue };
-        let term = f.inst(t);
-        if !matches!(term.kind, InstKind::CondBr { .. }) {
-            continue;
-        }
-        let c = term.operands()[0];
-        if uses[c.index()] == 1
-            && let ValueDef::Inst(id) = f.value(c).def
-            && matches!(f.inst(id).kind, InstKind::ICmp(_))
-            && b.insts().contains(&id)
-        {
-            out.insert(c.index());
+        for &i in b.insts().iter().chain(b.terminator().as_ref()) {
+            let user = f.inst(i);
+            let fusing = match user.kind {
+                InstKind::CondBr { .. } => true,
+                // A select into one general register (not a float, vector or
+                // multi-register integer, which lower otherwise).
+                InstKind::Select => user.result().is_some_and(|r| match types.get(f.value_type(r)) {
+                    Type::Int(bits) => *bits <= 64,
+                    Type::Ptr | Type::PtrIn(_) => true,
+                    _ => false,
+                }),
+                _ => false,
+            };
+            if !fusing {
+                continue;
+            }
+            let c = user.operands()[0];
+            if uses[c.index()] == 1
+                && let ValueDef::Inst(id) = f.value(c).def
+                && matches!(f.inst(id).kind, InstKind::ICmp(_))
+                && b.insts().contains(&id)
+            {
+                out.insert(c.index());
+            }
         }
     }
     out
@@ -804,7 +827,7 @@ impl X86_64Target {
     pub fn select(&self, module: &Module, func: crate::ir::FuncId) -> crate::codegen::mir::MachineFunction {
         self.wide.borrow_mut().clear();
         self.asm_outs.borrow_mut().clear();
-        *self.fused.borrow_mut() = fusable_compares(module.function(func));
+        *self.fused.borrow_mut() = fusable_compares(module, module.function(func));
         crate::codegen::isel::select(self, module, func)
     }
 
@@ -819,7 +842,7 @@ impl X86_64Target {
     ) -> crate::codegen::mir::MachineFunction {
         self.wide.borrow_mut().clear();
         self.asm_outs.borrow_mut().clear();
-        *self.fused.borrow_mut() = fusable_compares(module.function(func));
+        *self.fused.borrow_mut() = fusable_compares(module, module.function(func));
         crate::codegen::isel::select_with_syms(self, module, func, syms)
     }
 
@@ -1974,19 +1997,21 @@ impl MachineTarget for X86_64Target {
     /// The copies and the two-address operations whose encoding is correct
     /// with the destination equal to the first source (`mov d, a` is skipped
     /// then): the integer and SSE ALU operations, shifts, extensions, loads,
-    /// and compares (which read their sources before writing `d`).
-    fn tied_use(&self, inst: &MachineInst) -> Option<usize> {
+    /// and compares (which read their sources before writing `d`); for a
+    /// commutative operation, either source.
+    fn tied_uses(&self, inst: &MachineInst) -> &'static [usize] {
         use X86Op::*;
         match X86Op::decode(inst.opcode) {
             // Copies between vregs (of one class: their registers are equal
             // only then).
             MovRR => {
                 let virt = |o: &MachineOperand| matches!(o.reg(), Some(Reg::Virtual(_)));
-                (virt(&inst.operands[0]) && virt(&inst.operands[1])).then_some(1)
+                if virt(&inst.operands[0]) && virt(&inst.operands[1]) { &[1] } else { &[] }
             }
-            Add | Sub | And | Or | Xor | Imul | ShlI | ShrI | SarI | ShlCl | ShrCl | SarCl | AluRI | ImulRI
-            | Movsx | Movzx | Load | SetccCmp | SetccCmpI | FAdd | FSub | FMul | FDiv => Some(1),
-            _ => None,
+            Add | And | Or | Xor | Imul | FAdd | FMul => &[1, 2],
+            Sub | ShlI | ShrI | SarI | ShlCl | ShrCl | SarCl | AluRI | ImulRI | Movsx | Movzx | Load | SetccCmp
+            | SetccCmpI | FSub | FDiv => &[1],
+            _ => &[],
         }
     }
 
@@ -2217,6 +2242,18 @@ impl TargetIsel for X86_64Target {
             InstKind::Select if lo.mf().vreg_class(lo.result_reg(inst)) == RegClass::Fp => {
                 let ops = inst.operands().to_vec();
                 self.vec_select(lo, inst, &ops);
+            }
+            InstKind::Select if self.fused_compare(lo, inst.operands()[0]).is_some() => {
+                // d = f; cmp a, b; cmovcc d, t: still branchless (§6d).
+                let (pred, x, y) = self.fused_compare(lo, inst.operands()[0]).expect("a fused compare");
+                let d = lo.result_reg(inst);
+                let (cmp, _) = self.compare(lo, pred, x, y);
+                let t = self.oper(lo, inst.operands()[1]);
+                let f = self.oper(lo, inst.operands()[2]);
+                let cc = cmp[2].clone();
+                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_v(f)]));
+                lo.emit(MachineInst::new(X86Op::CmpFlags.opcode(), cmp));
+                lo.emit(MachineInst::new(X86Op::Cmov.opcode(), vec![def_v(d), use_v(d), use_v(t), cc]));
             }
             InstKind::Select => {
                 let d = lo.result_reg(inst);
