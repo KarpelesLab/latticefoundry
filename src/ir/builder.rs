@@ -13,7 +13,7 @@
 //! data layout and lower to `ptr_add` (`docs/ir-design.md` §6).
 
 use crate::ir::inst::{
-    AtomicOrdering, BinOp, CastOp, Flags, FloatPred, InstData, InstId, InstKind, IntPred, ReduceOp,
+    AtomicOrdering, BinOp, CastOp, Flags, FloatPred, InlineAsm, InstData, InstId, InstKind, IntPred, ReduceOp,
     RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
 use crate::ir::types::{Type, TypeContext, TypeId};
@@ -600,6 +600,22 @@ impl<'a> FunctionBuilder<'a> {
         let i64t = self.types.int(64);
         self.emit(InstKind::Syscall, operands, Flags::NONE, Some(i64t))
             .expect("syscall has a result")
+    }
+
+    /// GCC-style inline assembly (`docs/ir-design.md` §6i). `operands` are the
+    /// value operands in [`InlineAsm::operand_slots`] order. Returns the
+    /// instruction's result — the first register output — or `None` when the
+    /// asm has no register output; read the other register outputs with
+    /// [`FunctionBuilder::asm_output`].
+    pub fn inline_asm(&mut self, asm: InlineAsm, operands: &[ValueId]) -> Option<ValueId> {
+        let result_ty = asm.result_output().and_then(|i| asm.outputs[i].ty);
+        self.emit(InstKind::InlineAsm(Box::new(asm)), operands.to_vec(), Flags::NONE, result_ty)
+    }
+
+    /// Register output `n` of the inline asm whose result is `asm` (that
+    /// output's value, of type `ty`).
+    pub fn asm_output(&mut self, asm: ValueId, n: u32, ty: TypeId) -> ValueId {
+        self.emit(InstKind::AsmOutput(n), vec![asm], Flags::NONE, Some(ty)).expect("asm_output has a result")
     }
 
     // --- terminators -------------------------------------------------------

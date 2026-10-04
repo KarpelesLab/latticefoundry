@@ -318,6 +318,8 @@ fn build(args: &[String]) -> Result<(), String> {
         .with_os(triple.os)
         .with_reloc_model(opts.reloc_model())
         .with_unwind_tables(opts.unwind_tables());
+    // Inline asm the target cannot assemble is a clean error, not a panic.
+    target::check_module(triple.arch, &module, &syms).map_err(|e| e.to_string())?;
     if triple.arch == TargetArch::Wasm32 {
         return build_wasm(&opts, &module, &syms, &cg);
     }

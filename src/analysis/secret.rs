@@ -256,7 +256,7 @@ impl SolveHooks<Taint> for Hooks<'_> {
         })
     }
 
-    fn transfer(&self, _inst: InstId, data: &InstData, _operands: &[Taint]) -> Option<Taint> {
+    fn transfer(&self, _inst: InstId, data: &InstData, operands: &[Taint]) -> Option<Taint> {
         let ops = data.operands();
         let root = |i: usize| ops.get(i).and_then(|v| self.roots[v.index()]).unwrap_or(MemRoot::Unknown);
         Some(match &data.kind {
@@ -273,6 +273,13 @@ impl SolveHooks<Taint> for Hooks<'_> {
             }
             InstKind::Syscall | InstKind::Alloca { .. } | InstKind::DynAlloca { .. } => {
                 Taint::Public
+            }
+            // An inline asm's outputs derive from its operands and, when it
+            // may read memory, from whatever (escaped) memory holds; its
+            // pointer operands escape, so that memory is the unknown root.
+            InstKind::InlineAsm(asm) => {
+                let from_ops = operands.iter().any(|t| t.is_secret());
+                Taint::from_secret(from_ops || (asm.may_access_memory() && self.mem.root_secret(MemRoot::Unknown)))
             }
             _ => return None,
         })
@@ -510,6 +517,9 @@ fn summarize_memory(
                     mem.taint(MemRoot::Unknown);
                 }
                 InstKind::Syscall if ops.iter().any(|&a| secret(a)) => mem.taint(MemRoot::Unknown),
+                InstKind::InlineAsm(asm) if asm.may_access_memory() && ops.iter().any(|&a| secret(a)) => {
+                    mem.taint(MemRoot::Unknown);
+                }
                 _ => {}
             }
         }

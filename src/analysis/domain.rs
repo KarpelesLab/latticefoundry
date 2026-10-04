@@ -179,7 +179,9 @@ pub(crate) fn concrete_eval(
         | crate::ir::InstKind::Load { .. }
         | crate::ir::InstKind::Store { .. }
         | crate::ir::InstKind::Call
-        | crate::ir::InstKind::Syscall => None,
+        | crate::ir::InstKind::Syscall
+        | crate::ir::InstKind::InlineAsm(_)
+        | crate::ir::InstKind::AsmOutput(_) => None,
         kind if kind.is_atomic() => None,
         kind => match eval(types, inst.ty, kind, &inst.flags, operands) {
             EvalOutcome::Value(v) => Some(v),

@@ -567,6 +567,17 @@ impl TargetIsel for VirtualTarget {
                 lo.emit(MachineInst::new(VOp::Syscall.opcode(), operands));
             }
             // Float / unmodeled value ops: keep structurally well-formed.
+            // The abstract target has no assembler: an inline asm is an
+            // unsupported operation the interpreter reports when reached.
+            InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => {
+                let d = if inst.result().is_some() {
+                    lo.result_reg(inst)
+                } else {
+                    lo.fresh_vreg(crate::codegen::mir::RegClass::Gpr)
+                };
+                let uses: Vec<VReg> = inst.operands().iter().map(|&o| lo.reg(o)).collect();
+                lo.emit(unsupported(d, &uses));
+            }
             InstKind::Unary(_) | InstKind::FCmp(_) | InstKind::Cast(_) => {
                 let d = lo.result_reg(inst);
                 let uses: Vec<VReg> = inst.operands().iter().map(|&o| lo.reg(o)).collect();

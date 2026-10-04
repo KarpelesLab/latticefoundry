@@ -648,6 +648,155 @@ impl ReduceOp {
     }
 }
 
+/// One output operand of an [`inline_asm`](InstKind::InlineAsm): its GCC-style
+/// constraint (`"=r"`, `"=&a"`, `"+m"`, ...), an optional symbolic name for
+/// `%[name]` references in the template, and — for a **register output** —
+/// the type of the value it produces. An **indirect** (memory) output, whose
+/// constraint allows only memory ([`InlineAsm::is_indirect`]), produces no
+/// value: the asm writes through the pointer operand that stands for it, and
+/// `ty` is `None`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct AsmOutput {
+    /// The constraint string, starting with `=` (write-only) or `+` (read-write).
+    pub constraint: String,
+    /// The `[name]` the template may use for this operand.
+    pub name: Option<String>,
+    /// The produced value's type (register outputs), `None` for an indirect one.
+    pub ty: Option<TypeId>,
+}
+
+/// One input operand of an [`inline_asm`](InstKind::InlineAsm): its constraint
+/// (`"r"`, `"a"`, `"m"`, `"i"`, `"0"`, ...) and optional symbolic name.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct AsmInput {
+    /// The constraint string (no `=`/`+` prefix).
+    pub constraint: String,
+    /// The `[name]` the template may use for this operand.
+    pub name: Option<String>,
+}
+
+/// The payload of an [`inline_asm`](InstKind::InlineAsm) instruction: a GCC
+/// extended-asm statement (`docs/ir-design.md` §6i).
+///
+/// Operands are numbered as in GCC: the outputs `0..outputs.len()`, then the
+/// inputs. The **value operands** of the instruction are, in order: one per
+/// output that needs one (an indirect output's pointer, or a `+` register
+/// output's incoming value), then one per input (an indirect input's pointer,
+/// or the input value). See [`InlineAsm::operand_slots`].
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct InlineAsm {
+    /// The assembler template, with `%0`, `%[name]`, `%k1`, `%=`, `%%` ...
+    /// still unsubstituted (each target's lowering expands them).
+    pub template: String,
+    /// The output operands.
+    pub outputs: Vec<AsmOutput>,
+    /// The input operands.
+    pub inputs: Vec<AsmInput>,
+    /// The clobber list: register names, `"memory"`, `"cc"`.
+    pub clobbers: Vec<String>,
+    /// `volatile` (GCC's `asm volatile`, LLVM's `sideeffect`): the asm has
+    /// effects beyond its outputs and must run exactly where written.
+    pub volatile: bool,
+}
+
+/// Which asm operand one value operand of an
+/// [`inline_asm`](InstKind::InlineAsm) stands for (see
+/// [`InlineAsm::operand_slots`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AsmSlot {
+    /// Output `i`'s value operand: the pointer of an indirect output, or the
+    /// incoming value of a `+` register output.
+    Output(usize),
+    /// Input `i`'s value operand.
+    Input(usize),
+}
+
+impl InlineAsm {
+    /// A constraint with its leading modifiers (`=`, `+`, `&`, `%`) removed.
+    pub fn constraint_body(c: &str) -> &str {
+        c.trim_start_matches(['=', '+', '&', '%'])
+    }
+
+    /// Whether a constraint allows only memory (`m`, `o`, `V`, possibly with
+    /// modifiers and alternatives), so its operand is a pointer to the memory
+    /// rather than a value. A constraint that also allows a register or an
+    /// immediate (`"rm"`, `"g"`) is a value operand.
+    pub fn is_indirect(c: &str) -> bool {
+        let mut body = c.chars().filter(|ch| !matches!(ch, '=' | '+' | '&' | '%' | ',' | '*' | '?' | '!')).peekable();
+        body.peek().is_some() && body.all(|ch| matches!(ch, 'm' | 'o' | 'V'))
+    }
+
+    /// Whether a constraint allows only an immediate (`i`, `n`, or a
+    /// target's immediate-range letter): its operand must be a constant (or,
+    /// for `i`, a symbol address).
+    pub fn is_immediate_only(c: &str) -> bool {
+        let body = Self::constraint_body(c);
+        !body.is_empty()
+            && body.chars().all(|ch| matches!(ch, 'i' | 'n' | 's' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'e' | 'Z'))
+    }
+
+    /// The output an input constraint is tied to (a matching constraint `"0"`,
+    /// `"1"`, ... or `"[name]"`), if it is one.
+    pub fn tied_output(&self, c: &str) -> Option<usize> {
+        let body = Self::constraint_body(c);
+        if !body.is_empty() && body.chars().all(|ch| ch.is_ascii_digit()) {
+            return body.parse().ok();
+        }
+        let name = body.strip_prefix('[')?.strip_suffix(']')?;
+        self.outputs.iter().position(|o| o.name.as_deref() == Some(name))
+    }
+
+    /// Whether output `i` produces a value (a register output).
+    pub fn is_register_output(&self, i: usize) -> bool {
+        self.outputs.get(i).is_some_and(|o| !Self::is_indirect(&o.constraint))
+    }
+
+    /// The register outputs, in order (the instruction's result is the first;
+    /// `asm_output` reads the others).
+    pub fn register_outputs(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.outputs.len()).filter(|&i| self.is_register_output(i))
+    }
+
+    /// The output whose value is the instruction's own result: the first
+    /// register output, if any.
+    pub fn result_output(&self) -> Option<usize> {
+        self.register_outputs().next()
+    }
+
+    /// Which asm operand each of the instruction's value operands stands for,
+    /// in operand order.
+    pub fn operand_slots(&self) -> Vec<AsmSlot> {
+        let mut slots = Vec::new();
+        for (i, o) in self.outputs.iter().enumerate() {
+            if Self::is_indirect(&o.constraint) || o.constraint.starts_with('+') {
+                slots.push(AsmSlot::Output(i));
+            }
+        }
+        slots.extend((0..self.inputs.len()).map(AsmSlot::Input));
+        slots
+    }
+
+    /// Whether the asm clobbers memory (`"memory"` in the clobber list).
+    pub fn clobbers_memory(&self) -> bool {
+        self.clobbers.iter().any(|c| c == "memory")
+    }
+
+    /// Whether the asm may read or write memory: it clobbers memory or has an
+    /// indirect (memory) operand.
+    pub fn may_access_memory(&self) -> bool {
+        self.clobbers_memory()
+            || self.outputs.iter().any(|o| Self::is_indirect(&o.constraint))
+            || self.inputs.iter().any(|i| Self::is_indirect(&i.constraint))
+    }
+
+    /// Whether the asm is an opaque effect (as strong as a call to an unknown
+    /// function) rather than a pure function of its inputs: it is `volatile`,
+    /// or it may access memory.
+    pub fn has_side_effect(&self) -> bool {
+        self.volatile || self.may_access_memory()
+    }
+}
+
 /// An opcode together with its immediate/structural data.
 ///
 /// Value operands live in [`InstData::operands`], *not* here; this carries only
@@ -864,6 +1013,28 @@ pub enum InstKind {
     /// speculated. Its result is unknown to every analysis. A poison operand is
     /// undefined behavior (the kernel would observe an arbitrary register).
     Syscall,
+    /// GCC-style inline assembly (`docs/ir-design.md` §6i); the payload holds
+    /// the template, constraints, clobbers and `volatile` flag, and the value
+    /// operands are laid out per [`InlineAsm::operand_slots`]. The result is
+    /// the first register output (type = that output's type), or none (`void`)
+    /// when there is no register output; the other register outputs are read
+    /// by [`AsmOutput`](InstKind::AsmOutput) projections.
+    ///
+    /// Semantics: the template is opaque. A `volatile` asm, or one that
+    /// clobbers memory or has a memory operand, is an effect exactly as strong
+    /// as a call to an unknown function (a full memory clobber that escapes
+    /// its pointer operands; never removed, duplicated, reordered with other
+    /// memory operations, calls or syscalls, hoisted or speculated). Any other
+    /// asm is a **pure** function of its inputs: it may be removed when no
+    /// output is used, but it is still never hoisted or speculated (its
+    /// template may trap). Every output is unknown to every analysis. A poison
+    /// operand is undefined behavior (the asm would observe an arbitrary
+    /// register).
+    InlineAsm(Box<InlineAsm>),
+    /// Read register output `n` of an `inline_asm`; operand `[asm]` is that
+    /// instruction's result (which names the whole asm). The result type is
+    /// output `n`'s type. Pure: it only projects a value the asm produced.
+    AsmOutput(u32),
 
     // --- SIMD vectors (`docs/ir-design.md` §6e) -----------------------------
     //
@@ -973,7 +1144,8 @@ impl InstKind {
 
     /// Whether this instruction must be kept even when its result is unused,
     /// because it does more than produce a value: every store, call, syscall,
-    /// allocation, atomic operation and fence, and a volatile load. Plain loads
+    /// allocation, atomic operation and fence, a volatile load, and an inline
+    /// asm that is volatile or touches memory. Plain loads
     /// and pure value ops are not included; terminators are kept by their own
     /// rule. Dead-code elimination and constant propagation consult this.
     ///
@@ -987,6 +1159,7 @@ impl InstKind {
             | InstKind::Store { .. }
             | InstKind::Call
             | InstKind::Syscall => true,
+            InstKind::InlineAsm(asm) => asm.has_side_effect(),
             InstKind::Load { volatile, .. } => *volatile,
             k => k.is_atomic(),
         }

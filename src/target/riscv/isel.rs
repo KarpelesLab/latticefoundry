@@ -1638,6 +1638,9 @@ impl TargetIsel for RiscvTarget {
                 lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(s)]));
             }
             InstKind::Call => self.lower_call(lo, inst),
+            InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => {
+                panic!("riscv64 backend: {}", crate::codegen::INLINE_ASM_UNSUPPORTED)
+            }
             InstKind::Syscall => {
                 // Linux RISC-V syscall ABI: number in `a7`, arguments in
                 // `a0..a5`, result in `a0`. Materialize every operand first, then

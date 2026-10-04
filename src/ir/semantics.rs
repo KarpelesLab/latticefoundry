@@ -68,7 +68,8 @@
 //! `CmpXchg` and `Fence` (whose sequential meaning over a memory state is
 //! documented on each opcode in [`crate::ir::inst`] and in `docs/ir-design.md`
 //! §6b), `Call`, `Syscall` (an opaque effect on the outside world, which no pure
-//! evaluator can perform), and the
+//! evaluator can perform), `InlineAsm`/`AsmOutput` (an opaque template, §6i),
+//! and the
 //! terminators `Ret`/`Br`/`CondBr`/`Switch`/`Unreachable` — are about memory
 //! and control-flow *state*, not pure value production. They belong to the
 //! interpreter / verifier layer built in a later phase, and [`eval`] panics if
@@ -367,6 +368,8 @@ pub fn eval(
         | InstKind::Fence(_)
         | InstKind::Call
         | InstKind::Syscall
+        | InstKind::InlineAsm(_)
+        | InstKind::AsmOutput(_)
         | InstKind::Ret
         | InstKind::Br(_)
         | InstKind::CondBr { .. }
@@ -1250,6 +1253,10 @@ pub fn fold(
     flags: &Flags,
     operands: &[Const],
 ) -> Option<FoldResult> {
+    // An inline asm (pure or not) is opaque: its outputs cannot be computed.
+    if matches!(kind, InstKind::InlineAsm(_) | InstKind::AsmOutput(_)) {
+        return None;
+    }
     let mut sem = Vec::with_capacity(operands.len());
     for c in operands {
         sem.push(const_to_sem(types, c)?);

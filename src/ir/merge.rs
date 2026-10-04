@@ -400,7 +400,8 @@ fn copy_body(
 }
 
 /// Copy an instruction, remapping the result type and any [`TypeId`] carried in
-/// its opcode payload (`alloca`, `load`/`store` and the atomics). Value operands
+/// its opcode payload (`alloca`, `load`/`store`, the atomics and an inline asm's
+/// output types). Value operands
 /// are local ids and are preserved as-is.
 fn remap_inst(inst: &InstData, type_map: &[TypeId]) -> InstData {
     let mut new = inst.clone();
@@ -425,6 +426,13 @@ fn remap_inst(inst: &InstData, type_map: &[TypeId]) -> InstData {
         }
         InstKind::CmpXchg { ty, align, success, failure } => {
             InstKind::CmpXchg { ty: m(ty), align: *align, success: *success, failure: *failure }
+        }
+        InstKind::InlineAsm(asm) => {
+            let mut asm = asm.clone();
+            for o in &mut asm.outputs {
+                o.ty = o.ty.as_ref().map(m);
+            }
+            InstKind::InlineAsm(asm)
         }
         other => other.clone(),
     };

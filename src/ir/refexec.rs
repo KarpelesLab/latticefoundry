@@ -236,7 +236,10 @@ impl<'m> Exec<'m> {
                         };
                         self.call(callee, &ops[1..])?
                     }
-                    k if k.has_side_effect() || k.is_atomic() => {
+                    k if k.has_side_effect()
+                        || k.is_atomic()
+                        || matches!(k, InstKind::InlineAsm(_) | InstKind::AsmOutput(_)) =>
+                    {
                         return Err(ExecError::Unsupported(format!("{k:?}")));
                     }
                     k => match eval(module.types(), inst.ty, k, &inst.flags, &ops) {

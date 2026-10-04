@@ -1141,6 +1141,9 @@ impl TargetIsel for AvrTarget {
             }
             InstKind::Call => self.lower_call(lo, i),
             InstKind::Syscall => panic!("avr backend: `syscall` has no meaning on a bare-metal AVR"),
+            InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => {
+                panic!("avr backend: {}", crate::codegen::INLINE_ASM_UNSUPPORTED)
+            }
             InstKind::Unary(_) | InstKind::FCmp(_) => {
                 panic!("avr backend: floating point must be lowered to runtime calls first (see avr::prepare)")
             }

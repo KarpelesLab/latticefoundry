@@ -1862,6 +1862,9 @@ impl TargetIsel for AArch64Target {
                 lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_v(s)]));
             }
             InstKind::Call => self.lower_call(lo, inst),
+            InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => {
+                panic!("aarch64 backend: {}", crate::codegen::INLINE_ASM_UNSUPPORTED)
+            }
             InstKind::Syscall => {
                 // Linux AArch64 syscall ABI: number in `x8`, arguments in
                 // `x0..x5`, result in `x0`. Materialize every operand first, then

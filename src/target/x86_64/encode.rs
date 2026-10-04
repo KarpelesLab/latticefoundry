@@ -929,6 +929,11 @@ struct EncodeCtx<'a> {
     /// Which symbols' addresses must be loaded from the GOT (position-
     /// independent code; see [`crate::codegen::linkage`]).
     got: GotQuery<'a>,
+    /// The function's inline asm statements ([`X86Op::InlineAsm`]).
+    asm: &'a [crate::codegen::mir::MachineAsm],
+    /// The function's own symbol name and IR index (for inline asm).
+    self_name: String,
+    source: u32,
 }
 
 /// Per-function and per-global "address through the GOT?" predicates, by IR
@@ -1177,6 +1182,18 @@ fn encode_rmw_loop(e: &mut Emitter, ops: &[MachineOperand]) {
 fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
     let ops = &inst.operands;
     match X86Op::decode(inst.opcode) {
+        X86Op::InlineAsm => {
+            let id = uimm(&ops[0]) as u32;
+            super::isel::encode_inline_asm(
+                e,
+                inst,
+                &ctx.asm[id as usize],
+                &ctx.self_name,
+                (u64::from(ctx.source) << 16) | u64::from(id),
+                ctx.global_name,
+                ctx.func_name,
+            );
+        }
         X86Op::MovRR => {
             let d = rnum(&ops[0]);
             let s = rnum(&ops[1]);
@@ -1844,7 +1861,16 @@ fn encode_function_inner(
 ) -> Emitted {
     let mut e = Emitter::new();
     let labels: Vec<_> = (0..mf.num_blocks()).map(|_| e.create_label()).collect();
-    let ctx = EncodeCtx { labels: &labels, layout, func_name, global_name, got };
+    let ctx = EncodeCtx {
+        labels: &labels,
+        layout,
+        func_name,
+        global_name,
+        got,
+        asm: mf.inline_asms(),
+        self_name: func_name(mf.info().source),
+        source: mf.info().source,
+    };
 
     // Emit the entry block first (so the function symbol at offset 0 is the
     // entry), then the remaining blocks in arena order.

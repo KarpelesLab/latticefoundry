@@ -105,8 +105,12 @@ use std::cell::RefCell;
 use super::regs::{self, RegFile};
 use crate::target::{CallConvKind, TargetOs, Triple};
 
+mod inline_asm;
 mod wide;
 mod win64;
+
+pub use inline_asm::check_inline_asm;
+pub(crate) use inline_asm::encode_inline_asm;
 
 pub use wide::MUL128_PSEUDO;
 pub(crate) use wide::float_helper;
@@ -356,6 +360,16 @@ pub enum X86Op {
     /// — a multi-way branch on a 128-bit scrutinee: per case, `cmp lo, case_lo;
     /// jne next; cmp hi, case_hi; je case`, then `jmp default`.
     Switch128 = 76,
+
+    // --- inline assembly (see the `inline_asm` submodule) --------------------
+    /// `[Imm id, Imm flags, operands.., Def clobbers..]` — a GCC-style inline
+    /// asm statement: the function's [`crate::codegen::mir::MachineAsm`] `id`
+    /// says which operand holds each asm operand (registers as defs/uses,
+    /// memory operands as a use of their pointer, immediates, symbols); every
+    /// clobbered register is a def. `flags` bit 0: the template is not empty
+    /// (it may branch on its operands). The encoder instantiates the template
+    /// and splices in the bytes rsasm assembles from it.
+    InlineAsm = 77,
 }
 
 impl X86Op {
@@ -383,6 +397,8 @@ impl X86Op {
         };
         match self {
             X86Op::BrCond | X86Op::Switch | X86Op::Switch128 | X86Op::RmwLoop | X86Op::DynAlloca => true,
+            // An opaque template may branch on anything, unless it is empty.
+            X86Op::InlineAsm => flags(1) & 1 != 0,
             X86Op::CvtSi2f => flags(3) & 0b100 != 0,
             X86Op::CvtF2si => flags(3) & 0b10 != 0,
             // The SSE2 vector ops are straight-line data movement and
@@ -404,7 +420,7 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 77] = [
+        const TABLE: [X86Op; 78] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
@@ -412,7 +428,7 @@ impl X86Op {
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
             Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm, VOp,
             VUnary, VShiftI, VLoad, VStore, LoadVConst, MovGprToX, MovXToGpr, Pinsrw, Pextrw,
-            TlsAddr, TlsGd, MulWide, Switch128,
+            TlsAddr, TlsGd, MulWide, Switch128, InlineAsm,
         ];
         TABLE[op.0 as usize]
     }
@@ -639,6 +655,10 @@ pub struct X86_64Target {
     /// The higher 64-bit parts of each integer wider than 64 bits of the
     /// function being lowered, by value index (see the `wide` submodule).
     wide: RefCell<DetHashMap<usize, Vec<VReg>>>,
+    /// The vreg of each register output of an inline asm but its first, by
+    /// (asm result value index, output index), shared by the asm and its
+    /// `asm_output`s (see the `inline_asm` submodule).
+    asm_outs: RefCell<DetHashMap<(usize, usize), VReg>>,
 }
 
 impl Default for X86_64Target {
@@ -650,7 +670,7 @@ impl Default for X86_64Target {
 impl X86_64Target {
     /// Construct the x86-64 target with its fixed register file and SysV ABI.
     pub fn new() -> X86_64Target {
-        X86_64Target { rf: RegFile::new(), win64: false, reloc_model: RelocModel::Static, wide: RefCell::default() }
+        X86_64Target { rf: RegFile::new(), win64: false, reloc_model: RelocModel::Static, wide: RefCell::default(), asm_outs: RefCell::default() }
     }
 
     /// Construct the x86-64 target for the calling convention `cc`:
@@ -658,7 +678,7 @@ impl X86_64Target {
     /// [`isel`](self) module docs); anything else is System V.
     pub fn with_call_conv(cc: CallConvKind) -> X86_64Target {
         if cc == CallConvKind::Win64 {
-            X86_64Target { rf: RegFile::win64(), win64: true, reloc_model: RelocModel::Static, wide: RefCell::default() }
+            X86_64Target { rf: RegFile::win64(), win64: true, reloc_model: RelocModel::Static, wide: RefCell::default(), asm_outs: RefCell::default() }
         } else {
             X86_64Target::new()
         }
@@ -685,6 +705,7 @@ impl X86_64Target {
     /// Lower function `func` of `module` to MIR over this target.
     pub fn select(&self, module: &Module, func: crate::ir::FuncId) -> crate::codegen::mir::MachineFunction {
         self.wide.borrow_mut().clear();
+        self.asm_outs.borrow_mut().clear();
         crate::codegen::isel::select(self, module, func)
     }
 
@@ -698,6 +719,7 @@ impl X86_64Target {
         syms: &StrInterner,
     ) -> crate::codegen::mir::MachineFunction {
         self.wide.borrow_mut().clear();
+        self.asm_outs.borrow_mut().clear();
         crate::codegen::isel::select_with_syms(self, module, func, syms)
     }
 
@@ -1850,6 +1872,12 @@ impl TargetIsel for X86_64Target {
     }
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        // Inline asm places its own operands, whatever their types.
+        match &inst.kind {
+            InstKind::InlineAsm(asm) => return self.lower_inline_asm(lo, inst, asm),
+            InstKind::AsmOutput(n) => return self.lower_asm_output(lo, inst, *n),
+            _ => {}
+        }
         // What the wide-integer legalization left of integers wider than 64
         // bits (see the `wide` submodule).
         if self.lower_wide(lo, inst) {

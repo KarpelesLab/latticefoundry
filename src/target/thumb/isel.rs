@@ -1457,6 +1457,9 @@ impl TargetIsel for ThumbTarget {
                 }
             }
             InstKind::Call => self.lower_call(lo, inst),
+            InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => {
+                panic!("thumb backend: {}", crate::codegen::INLINE_ASM_UNSUPPORTED)
+            }
             InstKind::Syscall => {
                 // The Arm Linux EABI: number in r7, arguments in r0..r5 (the low
                 // word of each 64-bit operand), the result in r0, sign-extended

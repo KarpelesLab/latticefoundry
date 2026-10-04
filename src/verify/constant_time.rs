@@ -99,6 +99,9 @@ pub enum CtRole {
     AllocaSize,
     /// An operand of a `syscall`.
     SyscallOperand,
+    /// An operand of an `inline_asm` with a non-empty template (the template
+    /// is opaque: it may branch on the value or use it as an address).
+    AsmOperand,
     /// The value operand of an atomic store, rmw or cmpxchg.
     AtomicOperand,
     /// An atomic rmw or cmpxchg on memory that may hold a secret.
@@ -132,6 +135,9 @@ impl CtRole {
             CtRole::Multiply => "is a multiply operand (variable time on this target)".into(),
             CtRole::AllocaSize => "is the size of a `dyn_alloca`".into(),
             CtRole::SyscallOperand => "is an operand of a `syscall`".into(),
+            CtRole::AsmOperand => {
+                "is an operand of an `inline_asm` (its template may branch on it or use it as an address)".into()
+            }
             CtRole::AtomicOperand => "is the value operand of an atomic operation".into(),
             CtRole::AtomicOnSecretMemory => {
                 "is memory read by an atomic rmw/cmpxchg (its retry loop compares it)".into()
@@ -279,6 +285,14 @@ pub fn ct_violations_with(
                 InstKind::Syscall => {
                     for &v in ops {
                         flag(v, CtRole::SyscallOperand);
+                    }
+                }
+                // An empty template (`asm("" : "+r"(x))`, the optimization
+                // barrier constant-time code uses) runs no instruction, so its
+                // operands are never branched on; any other template is opaque.
+                InstKind::InlineAsm(asm) if !asm.template.trim().is_empty() => {
+                    for &v in ops {
+                        flag(v, CtRole::AsmOperand);
                     }
                 }
                 InstKind::Call => {
@@ -452,6 +466,8 @@ fn opcode_name(kind: &InstKind) -> &'static str {
         InstKind::Reduce(_) => "reduce",
         InstKind::Call => "call",
         InstKind::Syscall => "syscall",
+        InstKind::InlineAsm(_) => "inline_asm",
+        InstKind::AsmOutput(_) => "asm_output",
         InstKind::Ret => "ret",
         InstKind::Br(_) => "br",
         InstKind::CondBr { .. } => "cond_br",

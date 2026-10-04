@@ -593,6 +593,77 @@ fn write_inst<W: fmt::Write>(
             write!(f, " : ")?;
             write_type(f, module, data.ty)
         }
+        InstKind::InlineAsm(asm) => {
+            // `inline_asm [volatile] "tmpl" [outs(...)] [ins(...)]
+            // [clobbers(...)] : T`; each operand is its constraint, an
+            // optional `[name]`, the type of a register output, and the value
+            // operand standing for it (if any) in parentheses.
+            write!(f, "inline_asm ")?;
+            if asm.volatile {
+                write!(f, "volatile ")?;
+            }
+            write_quoted(f, &asm.template)?;
+            let slots = asm.operand_slots();
+            let operand_of = |slot: crate::ir::inst::AsmSlot| slots.iter().position(|&s| s == slot).map(|i| ops[i]);
+            if !asm.outputs.is_empty() {
+                write!(f, " outs(")?;
+                for (i, o) in asm.outputs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write_quoted(f, &o.constraint)?;
+                    if let Some(n) = &o.name {
+                        write!(f, " [{n}]")?;
+                    }
+                    if let Some(ty) = o.ty {
+                        write!(f, " ")?;
+                        write_type(f, module, ty)?;
+                    }
+                    if let Some(v) = operand_of(crate::ir::inst::AsmSlot::Output(i)) {
+                        write!(f, " (")?;
+                        op(f, v)?;
+                        write!(f, ")")?;
+                    }
+                }
+                write!(f, ")")?;
+            }
+            if !asm.inputs.is_empty() {
+                write!(f, " ins(")?;
+                for (i, a) in asm.inputs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write_quoted(f, &a.constraint)?;
+                    if let Some(n) = &a.name {
+                        write!(f, " [{n}]")?;
+                    }
+                    if let Some(v) = operand_of(crate::ir::inst::AsmSlot::Input(i)) {
+                        write!(f, " (")?;
+                        op(f, v)?;
+                        write!(f, ")")?;
+                    }
+                }
+                write!(f, ")")?;
+            }
+            if !asm.clobbers.is_empty() {
+                write!(f, " clobbers(")?;
+                for (i, c) in asm.clobbers.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write_quoted(f, c)?;
+                }
+                write!(f, ")")?;
+            }
+            write!(f, " : ")?;
+            write_type(f, module, data.ty)
+        }
+        InstKind::AsmOutput(n) => {
+            write!(f, "asm_output ")?;
+            op(f, ops[0])?;
+            write!(f, ", {n} : ")?;
+            write_type(f, module, data.ty)
+        }
         InstKind::Ret => {
             write!(f, "ret")?;
             if let Some(&v) = ops.first() {
@@ -826,6 +897,9 @@ fn write_quoted<W: fmt::Write>(f: &mut W, s: &str) -> fmt::Result {
             '\\' => write!(f, "\\\\")?,
             '\n' => write!(f, "\\n")?,
             '\t' => write!(f, "\\t")?,
+            '\r' => write!(f, "\\r")?,
+            '\0' => write!(f, "\\0")?,
+            c if c.is_ascii_control() => write!(f, "\\x{:02x}", c as u32)?,
             _ => write!(f, "{ch}")?,
         }
     }
@@ -1286,6 +1360,9 @@ enum OpAst {
     Splat(Operand, TypeId),
     Reduce(ReduceOp, Flags, Operand),
     Call(Operand, Vec<Operand>, TypeId),
+    /// The asm and its value operands, in `operand_slots` order.
+    InlineAsm(Box<crate::ir::inst::InlineAsm>, Vec<Operand>),
+    AsmOutput(Operand, u32, TypeId),
     Ret(Option<Operand>),
     Br(u32, Vec<Operand>),
     CondBr(Operand, u32, Vec<Operand>, u32, Vec<Operand>),
@@ -1426,6 +1503,122 @@ impl Parser {
             ))
             .with_span(sp)
         })
+    }
+
+    /// A string literal's text.
+    fn expect_str(&mut self, what: &str) -> PResult<String> {
+        let sp = self.span();
+        if let TokKind::Str(s) = self.peek_kind().clone() {
+            self.bump();
+            Ok(s)
+        } else {
+            self.err(sp, format!("expected {what} (a string literal)"))
+        }
+    }
+
+    /// The body of an `inline_asm` (after the opcode): see `write_inst`.
+    fn parse_inline_asm(&mut self, module: &mut Module) -> PResult<OpAst> {
+        let volatile = self.eat_ident("volatile");
+        let template = self.expect_str("the asm template")?;
+        let mut asm = crate::ir::inst::InlineAsm {
+            template,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            volatile,
+        };
+        // Value operands, tagged by the asm operand they stand for.
+        let mut out_ops: Vec<(usize, Operand)> = Vec::new();
+        let mut in_ops: Vec<(usize, Operand)> = Vec::new();
+        let list = |p: &mut Parser, kw: &str, item: &mut dyn FnMut(&mut Parser, usize) -> PResult<()>| {
+            if !p.eat_ident(kw) {
+                return Ok(());
+            }
+            p.expect(&TokKind::LParen, "`(`")?;
+            let mut i = 0;
+            if !matches!(p.peek_kind(), TokKind::RParen) {
+                loop {
+                    item(p, i)?;
+                    i += 1;
+                    if p.eat(&TokKind::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+            p.expect(&TokKind::RParen, "`)`").map(|_| ())
+        };
+        // `[name]`, then (outputs only) a type, then `(operand)`.
+        fn name(p: &mut Parser) -> PResult<Option<String>> {
+            if p.eat(&TokKind::LBracket) {
+                let (n, _) = p.expect_any_ident()?;
+                p.expect(&TokKind::RBracket, "`]`")?;
+                Ok(Some(n))
+            } else {
+                Ok(None)
+            }
+        }
+        fn operand(p: &mut Parser, module: &mut Module) -> PResult<Option<Operand>> {
+            if p.eat(&TokKind::LParen) {
+                let v = p.parse_operand(module)?;
+                p.expect(&TokKind::RParen, "`)`")?;
+                Ok(Some(v))
+            } else {
+                Ok(None)
+            }
+        }
+        list(self, "outs", &mut |p, i| {
+            let constraint = p.expect_str("an output constraint")?;
+            let name = name(p)?;
+            let ty = if matches!(p.peek_kind(), TokKind::LParen | TokKind::Comma | TokKind::RParen) {
+                None
+            } else {
+                Some(p.parse_type(module)?)
+            };
+            if let Some(v) = operand(p, module)? {
+                out_ops.push((i, v));
+            }
+            asm.outputs.push(crate::ir::inst::AsmOutput { constraint, name, ty });
+            Ok(())
+        })?;
+        list(self, "ins", &mut |p, i| {
+            let constraint = p.expect_str("an input constraint")?;
+            let name = name(p)?;
+            let sp = p.span();
+            match operand(p, module)? {
+                Some(v) => in_ops.push((i, v)),
+                None => return p.err(sp, "an asm input needs an operand `(value)`"),
+            }
+            asm.inputs.push(crate::ir::inst::AsmInput { constraint, name });
+            Ok(())
+        })?;
+        list(self, "clobbers", &mut |p, _| {
+            let c = p.expect_str("a clobber")?;
+            asm.clobbers.push(c);
+            Ok(())
+        })?;
+        self.expect(&TokKind::Colon, "`:`")?;
+        let sp = self.span();
+        let ty = self.parse_type(module)?;
+        // The operands must be exactly the ones the constraints call for.
+        let slots = asm.operand_slots();
+        let given: Vec<crate::ir::inst::AsmSlot> = out_ops
+            .iter()
+            .map(|&(i, _)| crate::ir::inst::AsmSlot::Output(i))
+            .chain(in_ops.iter().map(|&(i, _)| crate::ir::inst::AsmSlot::Input(i)))
+            .collect();
+        if given != slots {
+            return self.err(
+                sp,
+                "inline_asm operands do not match its constraints (an indirect or `+` output, and every input, takes one `(value)`)",
+            );
+        }
+        let want = asm.result_output().and_then(|i| asm.outputs[i].ty).unwrap_or_else(|| module.types_mut().void());
+        if ty != want {
+            return self.err(sp, "an inline_asm's type must be its first register output's type (or `void`)");
+        }
+        let operands = out_ops.into_iter().chain(in_ops).map(|(_, v)| v).collect();
+        Ok(OpAst::InlineAsm(Box::new(asm), operands))
     }
 
     fn expect_any_ident(&mut self) -> PResult<(String, Span)> {
@@ -1979,6 +2172,15 @@ impl Parser {
                     return self.err(span, "a syscall's result type must be `i64`");
                 }
                 Ok(OpAst::Syscall(ops))
+            }
+            "inline_asm" => self.parse_inline_asm(module),
+            "asm_output" => {
+                let v = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let n = self.parse_u32()?;
+                self.expect(&TokKind::Colon, "`:`")?;
+                let ty = self.parse_type(module)?;
+                Ok(OpAst::AsmOutput(v, n, ty))
             }
             "ret" => {
                 if matches!(self.peek_kind(), TokKind::Caret | TokKind::RBrace | TokKind::Eof) {
@@ -2585,6 +2787,17 @@ fn emit_inst(
                 avs.push(resolve_operand(b, a, names, func_names, global_names)?);
             }
             Some(b.syscall(nr, &avs))
+        }
+        OpAst::InlineAsm(asm, ops) => {
+            let mut avs = Vec::with_capacity(ops.len());
+            for a in ops {
+                avs.push(resolve_operand(b, a, names, func_names, global_names)?);
+            }
+            b.inline_asm((**asm).clone(), &avs)
+        }
+        OpAst::AsmOutput(v, n, ty) => {
+            let val = resolve_operand(b, v, names, func_names, global_names)?;
+            Some(b.asm_output(val, *n, *ty))
         }
         OpAst::Ret(v) => {
             let rv = match v {

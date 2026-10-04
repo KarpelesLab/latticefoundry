@@ -1485,6 +1485,7 @@ impl<'a, 'c> FnLower<'a, 'c> {
             InstKind::Freeze | InstKind::Declassify => self.values(ops[0])?,
             InstKind::Call => self.call(i, rty)?,
             InstKind::Syscall => return fail("the syscall op has no WebAssembly lowering (import a host function instead)"),
+            InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => return fail(crate::codegen::INLINE_ASM_UNSUPPORTED),
             other => return fail(format!("unexpected instruction {other:?}")),
         }
         Ok(())

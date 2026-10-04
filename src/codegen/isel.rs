@@ -256,6 +256,12 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
         &self.mf
     }
 
+    /// Record an inline asm statement in the machine function (see
+    /// [`MachineFunction::add_inline_asm`]).
+    pub fn add_inline_asm(&mut self, asm: crate::codegen::mir::MachineAsm) -> u32 {
+        self.mf.add_inline_asm(asm)
+    }
+
     /// The bit width of a value's scalar type; a pointer counts at its address
     /// space's width in the module's data layout (64 under LP64), and anything
     /// else (an aggregate address) at the default space's pointer width.

@@ -78,7 +78,7 @@
 //!   indirect callee must be a pointer into the program address space;
 //! - only a space-0 `ptr` is interchangeable with an aggregate value.
 
-use crate::ir::inst::{AtomicOrdering, BinOp, CastOp, InstData, InstId, InstKind, RmwOp, UnaryOp};
+use crate::ir::inst::{AsmSlot, AtomicOrdering, BinOp, CastOp, InlineAsm, InstData, InstId, InstKind, RmwOp, UnaryOp};
 use crate::ir::types::{FloatKind, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, GlobalId, Module};
@@ -835,6 +835,40 @@ impl<'a> Ctx<'a> {
                     ));
                 }
             }
+            InstKind::InlineAsm(asm) => self.check_inline_asm(inst, asm, ops, ty),
+            InstKind::AsmOutput(n) => {
+                if !self.arity(inst, ops, 1) {
+                    return;
+                }
+                let asm = match func.value(ops[0]).def {
+                    ValueDef::Inst(i) => match &func.inst(i).kind {
+                        InstKind::InlineAsm(asm) => Some(asm),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(asm) = asm else {
+                    self.err(format!(
+                        "instruction #{}: asm_output's operand must be the result of an inline_asm",
+                        inst.index()
+                    ));
+                    return;
+                };
+                let n = *n as usize;
+                if !asm.is_register_output(n) {
+                    self.err(format!(
+                        "instruction #{}: asm_output {n} does not name a register output of its inline_asm",
+                        inst.index()
+                    ));
+                } else if asm.outputs[n].ty != Some(ty) {
+                    self.err(format!(
+                        "instruction #{}: asm_output {n} has type {} but the output is {}",
+                        inst.index(),
+                        render_type(module, ty),
+                        asm.outputs[n].ty.map_or_else(|| "void".to_owned(), |t| render_type(module, t)),
+                    ));
+                }
+            }
             InstKind::Ret => self.check_ret(inst, ops),
             InstKind::Br(_) | InstKind::CondBr { .. } | InstKind::Switch(_) => {
                 self.check_terminator_conds(inst, data);
@@ -1455,6 +1489,127 @@ impl Ctx<'_> {
                 "value {}: address constants are only allowed in global initializers",
                 v.index()
             )),
+        }
+    }
+
+    /// Check an `inline_asm` (`docs/ir-design.md` §6i): the constraint
+    /// prefixes, a type on exactly the register outputs, one value operand
+    /// per [`InlineAsm::operand_slots`] entry (a pointer for an indirect
+    /// operand, the output's type for a `+` register output, a constant or
+    /// symbol for an immediate-only input), matching constraints that name a
+    /// register output, unique operand names, and the result type.
+    fn check_inline_asm(&mut self, inst: InstId, asm: &InlineAsm, ops: &[ValueId], ty: TypeId) {
+        let (func, module) = (self.func, self.module);
+        let i = inst.index();
+        let slots = asm.operand_slots();
+        if ops.len() != slots.len() {
+            self.err(format!(
+                "instruction #{i}: inline_asm takes {} operand(s) for its constraints, found {}",
+                slots.len(),
+                ops.len()
+            ));
+            return;
+        }
+        let first_class = |t: TypeId| {
+            matches!(module.types().get(t), Type::Int(_) | Type::Float(_) | Type::Ptr | Type::PtrIn(_) | Type::Vector(..))
+        };
+        let mut names: Vec<&str> = Vec::new();
+        for (k, o) in asm.outputs.iter().enumerate() {
+            if !(o.constraint.starts_with('=') || o.constraint.starts_with('+')) {
+                self.err(format!("instruction #{i}: asm output {k} constraint `{}` must start with `=` or `+`", o.constraint));
+            }
+            let indirect = InlineAsm::is_indirect(&o.constraint);
+            match (indirect, o.ty) {
+                (true, Some(_)) => self.err(format!("instruction #{i}: asm output {k} is a memory operand and produces no value, but has a type")),
+                (false, None) => self.err(format!("instruction #{i}: asm register output {k} needs a type")),
+                (false, Some(t)) if !first_class(t) => self.err(format!(
+                    "instruction #{i}: asm output {k} must be an integer, float, pointer or vector, found {}",
+                    render_type(module, t)
+                )),
+                _ => {}
+            }
+            names.extend(o.name.as_deref());
+        }
+        for (k, a) in asm.inputs.iter().enumerate() {
+            if a.constraint.starts_with('=') || a.constraint.starts_with('+') {
+                self.err(format!("instruction #{i}: asm input {k} constraint `{}` may not start with `=` or `+`", a.constraint));
+            }
+            if InlineAsm::constraint_body(&a.constraint).is_empty() {
+                self.err(format!("instruction #{i}: asm input {k} has an empty constraint"));
+            }
+            names.extend(a.name.as_deref());
+        }
+        for (k, n) in names.iter().enumerate() {
+            if names[..k].contains(n) {
+                self.err(format!("instruction #{i}: asm operand name `{n}` is used twice"));
+            }
+            if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || n.is_empty() {
+                self.err(format!("instruction #{i}: asm operand name `{n}` is not an identifier"));
+            }
+        }
+        for (slot, &v) in slots.iter().zip(ops) {
+            let vt = func.value_type(v);
+            match *slot {
+                AsmSlot::Output(k) => {
+                    let o = &asm.outputs[k];
+                    if InlineAsm::is_indirect(&o.constraint) {
+                        if !is_ptr(module, vt) {
+                            self.err(format!("instruction #{i}: asm memory output {k} takes a pointer, found {}", render_type(module, vt)));
+                        }
+                    } else if o.ty.is_some_and(|t| t != vt) {
+                        self.err(format!(
+                            "instruction #{i}: asm in-out output {k}'s incoming value is {}, not the output's type",
+                            render_type(module, vt)
+                        ));
+                    }
+                }
+                AsmSlot::Input(k) => {
+                    let a = &asm.inputs[k];
+                    if InlineAsm::is_indirect(&a.constraint) {
+                        if !is_ptr(module, vt) {
+                            self.err(format!("instruction #{i}: asm memory input {k} takes a pointer, found {}", render_type(module, vt)));
+                        }
+                    } else if !first_class(vt) {
+                        self.err(format!(
+                            "instruction #{i}: asm input {k} must be an integer, float, pointer or vector, found {}",
+                            render_type(module, vt)
+                        ));
+                    }
+                    if InlineAsm::is_immediate_only(&a.constraint)
+                        && !matches!(func.value(v).def, ValueDef::Const(_) | ValueDef::Global(_) | ValueDef::Func(_))
+                    {
+                        self.err(format!("instruction #{i}: asm input {k} (`{}`) must be a constant", a.constraint));
+                    }
+                    let body = InlineAsm::constraint_body(&a.constraint);
+                    let matching = body.chars().all(|c| c.is_ascii_digit()) || body.starts_with('[');
+                    if matching {
+                        match asm.tied_output(&a.constraint) {
+                            Some(t) if asm.is_register_output(t) => {}
+                            _ => self.err(format!(
+                                "instruction #{i}: asm input {k} (`{}`) must match a register output",
+                                a.constraint
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+        let want = asm.result_output().and_then(|k| asm.outputs[k].ty);
+        let ok = match want {
+            Some(t) => ty == t,
+            None => matches!(module.types().get(ty), Type::Void),
+        };
+        if !ok {
+            self.err(format!(
+                "instruction #{i}: inline_asm's type must be its first register output's ({}), found {}",
+                want.map_or_else(|| "void".to_owned(), |t| render_type(module, t)),
+                render_type(module, ty)
+            ));
+        }
+        for (k, c) in asm.clobbers.iter().enumerate() {
+            if c.trim().is_empty() {
+                self.err(format!("instruction #{i}: asm clobber {k} is empty"));
+            }
         }
     }
 

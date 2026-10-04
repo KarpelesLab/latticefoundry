@@ -121,6 +121,28 @@ pub fn check_options(arch: TargetArch, opts: &CodegenOptions) -> Result<(), Code
     Ok(())
 }
 
+/// Check that `arch`'s backend can compile what `module` contains, beyond
+/// what [`check_options`] covers: inline asm (`docs/ir-design.md` §6i) is
+/// assembled only by the x86-64 backend, which also checks each statement's
+/// constraints, clobbers and template here so a bad one is a clean error
+/// rather than a backend panic.
+///
+/// # Errors
+///
+/// [`CodegenError::Unsupported`] naming the function and the problem.
+pub fn check_module(arch: TargetArch, module: &Module, syms: &StrInterner) -> Result<(), CodegenError> {
+    if arch == TargetArch::X86_64 {
+        return x86_64::check_inline_asm(module, syms).map_err(|message| CodegenError::Unsupported { arch, message });
+    }
+    match crate::codegen::first_inline_asm(module, syms) {
+        Some(f) => Err(CodegenError::Unsupported {
+            arch,
+            message: format!("function `{f}`: {}", crate::codegen::INLINE_ASM_UNSUPPORTED),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Compile `module` for `arch` under `opts`: the target-generic, fallible entry
 /// point over each backend's `compile_module_with`. For
 /// [`TargetArch::Wasm32`] the object is an envelope around a relocatable wasm
@@ -132,7 +154,8 @@ pub fn check_options(arch: TargetArch, opts: &CodegenOptions) -> Result<(), Code
 /// # Errors
 ///
 /// When `arch`'s backend cannot honor `opts` (see [`check_options`]), or
-/// cannot compile the module ([`CodegenError::Unsupported`], wasm32 only).
+/// cannot compile the module ([`CodegenError::Unsupported`]: see
+/// [`check_module`], and wasm32's own limits).
 pub fn compile_module_for(
     arch: TargetArch,
     module: &Module,
@@ -140,6 +163,7 @@ pub fn compile_module_for(
     opts: &CodegenOptions,
 ) -> Result<CompiledModule, CodegenError> {
     check_options(arch, opts)?;
+    check_module(arch, module, syms)?;
     Ok(match arch {
         TargetArch::X86_64 => x86_64::compile_module_with(module, syms, opts),
         TargetArch::AArch64 => aarch64::compile_module_with(module, syms, opts),

@@ -224,6 +224,8 @@ impl AbstractDomain for Range {
                 | InstKind::Load { .. }
                 | InstKind::Call
                 | InstKind::Syscall
+                | InstKind::InlineAsm(_)
+                | InstKind::AsmOutput(_)
         ) || inst.kind.is_atomic() {
             return Range::Top;
         }

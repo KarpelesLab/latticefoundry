@@ -62,12 +62,14 @@ mod runtime_tests;
 mod win64_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod vector_tests;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod asm_tests;
 
 pub use encode::{
     DebugSource, compile_function, compile_module, compile_module_debug, compile_module_debug_with,
     compile_module_with, compile_to_elf,
 };
-pub use isel::{MUL128_PSEUDO, Sse2Legality, X86Op, X86_64Target};
+pub use isel::{MUL128_PSEUDO, Sse2Legality, X86Op, X86_64Target, check_inline_asm};
 
 use crate::codegen::legalize_int::{LegalizeError, LegalizeOptions, legalize_ints, libgcc_libcall};
 use crate::ir::inst::{BinOp, CastOp, InstKind};

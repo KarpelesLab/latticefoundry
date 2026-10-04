@@ -54,6 +54,21 @@ pub mod target;
 pub mod unwind;
 pub mod vtarget;
 
+/// The diagnostic every backend without an inline-asm lowering gives for an
+/// `inline_asm` (`docs/ir-design.md` §6i): only x86-64 assembles templates.
+pub const INLINE_ASM_UNSUPPORTED: &str = "inline asm is not supported on this target";
+
+/// The first function of `module` that contains an `inline_asm`, with its
+/// name (for "not supported on this target" diagnostics).
+pub fn first_inline_asm(module: &crate::ir::Module, syms: &crate::support::StrInterner) -> Option<String> {
+    module.functions().find_map(|f| {
+        let has = f.blocks().any(|(_, b)| {
+            b.insts().iter().any(|&i| matches!(f.inst(i).kind, crate::ir::InstKind::InlineAsm(_)))
+        });
+        has.then(|| syms.resolve(f.name).to_owned())
+    })
+}
+
 pub use mir::MachineFunction;
 pub use options::{CodegenOptions, CompiledModule, RelocModel};
 pub use unwind::UnwindTables;

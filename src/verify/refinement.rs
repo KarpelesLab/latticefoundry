@@ -456,6 +456,10 @@ impl Enc<'_> {
             // 3. The block's pure instructions (UB guarded by reachability).
             for &inst_id in block.insts() {
                 let inst = func.inst(inst_id);
+                if matches!(inst.kind, InstKind::InlineAsm(_)) {
+                    // Even a pure, output-less asm is opaque: never proved.
+                    return Err(unsupported("inline asm (opaque template)"));
+                }
                 if let Some(res) = inst.result() {
                     let sym = self.encode_inst(func, prefix, inst, res, &mut map, &mut ub, &reach)?;
                     map.insert(res, sym);
@@ -761,6 +765,10 @@ impl Enc<'_> {
             // An opaque effect on the outside world: the checker has no model of
             // the kernel, so a function containing one is skipped, never proved.
             InstKind::Syscall => return Err(unsupported("syscall (opaque external effect)")),
+            // An opaque template: no model, so a function with one is skipped.
+            InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => {
+                return Err(unsupported("inline asm (opaque template)"));
+            }
             // Vector lane moves and reductions: the encoding is scalar bit-vectors
             // only, so a function using them is Unknown, never proved.
             InstKind::ExtractElement { .. }

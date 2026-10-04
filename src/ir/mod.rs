@@ -34,7 +34,8 @@ pub mod types;
 pub mod value;
 
 pub use inst::{
-    AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InstData, InstId, InstKind, IntPred,
+    AsmInput, AsmOutput, AsmSlot, AtomicOrdering, BinOp, CastOp, FastMath, Flags, FloatPred, InlineAsm,
+    InstData, InstId, InstKind, IntPred,
     ReduceOp, RmwOp, SwitchCase, SwitchData, UnaryOp, Use,
 };
 pub use datalayout::{DataLayout, DataLayoutError, Endian, PointerSpec};
@@ -760,5 +761,7 @@ impl Block {
 pub(crate) mod tests;
 #[cfg(test)]
 mod vector_tests;
+#[cfg(test)]
+mod asm_tests;
 #[cfg(test)]
 pub(crate) mod refexec;

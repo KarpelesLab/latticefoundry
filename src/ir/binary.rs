@@ -106,6 +106,11 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 /// opcode tags 40–44 — so no stream without vectors changes and there was no
 /// bump: a reader that predates them rejects such a stream with
 /// [`DecodeError::InvalidTag`] rather than misreading it.
+///
+/// Inline assembly (`docs/ir-design.md` §6i) is the same: `inline_asm` is
+/// opcode tag 45 (the template, a flag byte with bit 0 = `volatile`, then
+/// counted outputs — constraint, optional name, optional type — inputs and
+/// clobbers) and `asm_output` tag 46, with no bump.
 pub const VERSION: u32 = 5;
 
 /// Bit 7 of a (version ≥ 5) global or function attribute byte: an extension
@@ -596,6 +601,7 @@ fn collect_tables(module: &Module) -> Tables {
                 | InstKind::AtomicStore { ty, .. }
                 | InstKind::AtomicRmw { ty, .. }
                 | InstKind::CmpXchg { ty, .. } => tstack.push(*ty),
+                InstKind::InlineAsm(asm) => tstack.extend(asm.outputs.iter().filter_map(|o| o.ty)),
                 _ => {}
             }
         }
@@ -1191,6 +1197,45 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
             w.u8(44);
             w.u8(op.code());
         }
+        // Inline asm uses tags 45/46 (`docs/ir-design.md` §6i); streams
+        // without it keep their bytes, so no version bump was needed.
+        InstKind::InlineAsm(asm) => {
+            w.u8(45);
+            w.str(&asm.template);
+            w.u8(u8::from(asm.volatile));
+            let name = |w: &mut Writer, n: &Option<String>| match n {
+                Some(n) => {
+                    w.u8(1);
+                    w.str(n);
+                }
+                None => w.u8(0),
+            };
+            w.uvarint(asm.outputs.len() as u64);
+            for o in &asm.outputs {
+                w.str(&o.constraint);
+                name(w, &o.name);
+                match o.ty {
+                    Some(ty) => {
+                        w.u8(1);
+                        w.uvarint(t.ty(ty));
+                    }
+                    None => w.u8(0),
+                }
+            }
+            w.uvarint(asm.inputs.len() as u64);
+            for i in &asm.inputs {
+                w.str(&i.constraint);
+                name(w, &i.name);
+            }
+            w.uvarint(asm.clobbers.len() as u64);
+            for c in &asm.clobbers {
+                w.str(c);
+            }
+        }
+        InstKind::AsmOutput(n) => {
+            w.u8(46);
+            w.uvarint(u64::from(*n));
+        }
     }
 }
 
@@ -1660,6 +1705,52 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
                 .ok_or(DecodeError::InvalidTag { what: "reduce op", tag: u32::from(c) })?;
             InstKind::Reduce(op)
         }
+        45 => {
+            let template = r.str()?.to_owned();
+            let volatile = match r.u8()? {
+                0 => false,
+                1 => true,
+                t => return Err(DecodeError::InvalidTag { what: "asm flags", tag: u32::from(t) }),
+            };
+            let name = |r: &mut Reader<'_>| -> Result<Option<String>, DecodeError> {
+                match r.u8()? {
+                    0 => Ok(None),
+                    1 => Ok(Some(r.str()?.to_owned())),
+                    t => Err(DecodeError::InvalidTag { what: "asm operand name", tag: u32::from(t) }),
+                }
+            };
+            // Every entry is at least one byte, so a count beyond the remaining
+            // input is corrupt (and must not drive a huge allocation).
+            let count = |r: &mut Reader<'_>| -> Result<usize, DecodeError> {
+                let n = r.uindex()?;
+                if n > r.remaining() { Err(DecodeError::UnexpectedEof) } else { Ok(n) }
+            };
+            let nout = count(r)?;
+            let mut outputs = Vec::with_capacity(nout);
+            for _ in 0..nout {
+                let constraint = r.str()?.to_owned();
+                let name = name(r)?;
+                let ty = match r.u8()? {
+                    0 => None,
+                    1 => Some(ty(r)?),
+                    t => return Err(DecodeError::InvalidTag { what: "asm output type", tag: u32::from(t) }),
+                };
+                outputs.push(crate::ir::inst::AsmOutput { constraint, name, ty });
+            }
+            let nin = count(r)?;
+            let mut inputs = Vec::with_capacity(nin);
+            for _ in 0..nin {
+                let constraint = r.str()?.to_owned();
+                inputs.push(crate::ir::inst::AsmInput { constraint, name: name(r)? });
+            }
+            let nclob = count(r)?;
+            let mut clobbers = Vec::with_capacity(nclob);
+            for _ in 0..nclob {
+                clobbers.push(r.str()?.to_owned());
+            }
+            InstKind::InlineAsm(Box::new(crate::ir::inst::InlineAsm { template, outputs, inputs, clobbers, volatile }))
+        }
+        46 => InstKind::AsmOutput(r.u32()?),
         t => return Err(DecodeError::InvalidTag { what: "opcode", tag: u32::from(t) }),
     })
 }

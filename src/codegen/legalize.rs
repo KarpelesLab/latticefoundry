@@ -214,6 +214,8 @@ fn always_legal(kind: &InstKind) -> bool {
     matches!(
         kind,
         InstKind::Call
+            | InstKind::InlineAsm(_)
+            | InstKind::AsmOutput(_)
             | InstKind::Freeze
             | InstKind::Ret
             | InstKind::Br(_)

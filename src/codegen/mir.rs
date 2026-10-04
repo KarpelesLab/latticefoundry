@@ -339,6 +339,55 @@ pub struct FrameInfo {
     pub num_params: usize,
 }
 
+/// Where instruction selection placed one operand of an inline asm statement
+/// (see [`MachineAsm`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MachineAsmKind {
+    /// In a register: the instruction operand at `slot` is a `Def` (output)
+    /// or `Use` (input) of it.
+    Reg,
+    /// In memory: the operand at `slot` is a `Use` of the register holding
+    /// its address.
+    Mem,
+    /// An immediate: the operand at `slot` is an `Imm`.
+    Imm,
+    /// A symbol's address: the operand at `slot` is a `Global` or `Func`.
+    Sym,
+}
+
+/// One operand of an inline asm statement, in GCC operand order (outputs,
+/// then inputs).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MachineAsmOperand {
+    /// The `[name]` the template may use for it.
+    pub name: Option<String>,
+    /// How it was placed.
+    pub kind: MachineAsmKind,
+    /// The index of the instruction operand that holds it. A tied input
+    /// shares its output's slot.
+    pub slot: usize,
+    /// The width in bits of its value (which register name `%N` prints).
+    pub bits: u32,
+    /// Whether its constraint pinned the register (rather than the allocator
+    /// choosing it).
+    pub fixed: bool,
+}
+
+/// The target-independent side record of one inline asm instruction: the
+/// template and where each operand lives, which the target's encoder uses to
+/// instantiate the template after register allocation. The instruction
+/// refers to it by index ([`MachineFunction::inline_asm`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MachineAsm {
+    /// The assembler template, unsubstituted.
+    pub template: String,
+    /// The operands, in GCC order.
+    pub operands: Vec<MachineAsmOperand>,
+    /// The index of the first instruction operand that is a clobbered
+    /// register (every operand from there on is a `Def` of one).
+    pub clobbers_from: usize,
+}
+
 /// A function in machine form: an arena of blocks, a virtual-register table, a
 /// stack frame, and its entry block.
 #[derive(Clone, Debug)]
@@ -350,6 +399,7 @@ pub struct MachineFunction {
     frame: Frame,
     entry: Option<MBlockId>,
     info: FrameInfo,
+    asm: Vec<MachineAsm>,
 }
 
 impl MachineFunction {
@@ -362,7 +412,28 @@ impl MachineFunction {
             frame: Frame::default(),
             entry: None,
             info: FrameInfo { source, num_params: 0 },
+            asm: Vec::new(),
         }
+    }
+
+    /// Record an inline asm statement, returning the index its instruction
+    /// refers to it by.
+    pub fn add_inline_asm(&mut self, asm: MachineAsm) -> u32 {
+        self.asm.push(asm);
+        (self.asm.len() - 1) as u32
+    }
+
+    /// The inline asm statement with index `i` (see
+    /// [`MachineFunction::add_inline_asm`]).
+    #[inline]
+    pub fn inline_asm(&self, i: u32) -> &MachineAsm {
+        &self.asm[i as usize]
+    }
+
+    /// Every inline asm statement, by index.
+    #[inline]
+    pub fn inline_asms(&self) -> &[MachineAsm] {
+        &self.asm
     }
 
     /// Allocate a fresh virtual register of the given class.
