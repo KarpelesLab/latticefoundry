@@ -409,7 +409,16 @@ pub fn cfi_x86_64(f: &FunctionFrame) -> Vec<u8> {
     let mut depth: i64 = 8;
     let mut fp: Option<(u8, i64)> = None;
     for step in &f.steps {
-        advance(&mut out, &mut loc, step.end);
+        // Below the frame register an allocation changes no rule, and an xmm
+        // save without one is not described: neither needs a row.
+        let silent = match step.op {
+            FrameOp::Alloc(_) => fp.is_some(),
+            FrameOp::SaveXmm { .. } => fp.is_none(),
+            _ => false,
+        };
+        if !silent {
+            advance(&mut out, &mut loc, step.end);
+        }
         match step.op {
             FrameOp::Push(r) => {
                 depth += 8;
@@ -690,8 +699,8 @@ mod tests {
             0x43, 0x0c, 6, 16,           // mov rbp,rsp: CFA=rbp+16
             0x41, 0x83, 3,               // push rbx: CFA-24
             0x42, 0x8c, 4,               // push r12: CFA-32
-            0x44,                        // sub rsp (CFA on rbp: nothing)
-            0x40 | 27, 0x0a, 0x0c, 7, 8, // pop rbp: remember; CFA=rsp+8
+                                         // sub rsp (CFA on rbp: nothing)
+            0x40 | 31, 0x0a, 0x0c, 7, 8, // pop rbp: remember; CFA=rsp+8
             0x41, 0x0b,                  // ret: restore
         ];
         assert_eq!(cfi, want);

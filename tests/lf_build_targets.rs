@@ -146,8 +146,8 @@ fn firmware_images() {
 #[test]
 fn unsupported_combinations_are_reported() {
     let dir = scratch("errors");
-    let (ok, err) = lf(&dir, &["--target", "x86_64-apple-darwin", "-o", "/dev/null"]);
-    assert!(!ok && err.contains("-c"), "{err}");
+    let (ok, err) = lf(&dir, &["--target", "x86_64-apple-darwin", "--oformat", "binary"]);
+    assert!(!ok && err.contains("macOS"), "{err}");
     let (ok, err) = lf(&dir, &["--target", "x86_64-windows", "--oformat", "ihex"]);
     assert!(!ok && err.contains("oformat"), "{err}");
     let (ok, err) = lf(&dir, &["--target", "sparc-sun-solaris"]);

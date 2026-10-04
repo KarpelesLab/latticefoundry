@@ -12,9 +12,11 @@
 //!
 //! Standard ELF objects, archives and shared libraries are linked by [`gnu`],
 //! a bridge onto our GNU-ld-compatible linker `qld` (which also links PE/COFF
-//! and Mach-O). [`raw`] turns a linked image into a raw binary or Intel HEX
+//! and Mach-O); [`darwin`] links macOS executables and dylibs with qld's ld64
+//! flavor. [`raw`] turns a linked image into a raw binary or Intel HEX
 //! file for firmware.
 
+pub mod darwin;
 pub mod gnu;
 mod image;
 pub mod raw;

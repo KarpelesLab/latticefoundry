@@ -26,6 +26,12 @@
 //! flashable firmware image (vector table, startup code, program, runtime)
 //! and `-c` writes an ELF32 `EM_AVR` object.
 //!
+//! For macOS (`--target x86_64-apple-darwin`, `aarch64-apple-darwin`), the
+//! default output is a Mach-O executable linked by qld's ld64 flavor: `dyld`
+//! loads it, its `LC_MAIN` entry is the entry function (default `main`), and it
+//! links `libSystem` through a generated text stub (see
+//! [`latticefoundry::link::darwin`]); `--shared` builds a `.dylib`.
+//!
 //! For x86-64 Linux, `--shared` builds a **shared library** of position-
 //! independent code (linked by `qld`, optional `-soname`), `--pie` a
 //! position-independent executable against the host C library (its `main` is
@@ -47,7 +53,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use latticefoundry::codegen::{CodegenOptions, RelocModel, StackAssumptions, StackReport};
+use latticefoundry::codegen::{CodegenOptions, RelocModel, StackAssumptions, StackReport, UnwindTables};
 use latticefoundry::ir::{Module, binary, merge_modules, text};
 use latticefoundry::link::raw::{self, RawFormat};
 use latticefoundry::link::{self, ImageOptions};
@@ -89,7 +95,8 @@ fn print_usage() {
     println!(
         "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3] [--entry <name>] [-g] [--lto] [--no-verify]"
     );
-    println!("           [--stack-usage[=all]] [--no-stack-probes] [--target <triple>] [-c [--format <fmt>]]");
+    println!("           [--stack-usage[=all]] [--no-stack-probes] [--[no-]unwind-tables] [--target <triple>]");
+    println!("           [-c [--format <fmt>]]");
     println!("           [--oformat elf|binary|ihex] [--base <addr>]");
     println!("           [--shared [-soname <name>] | --pie | -c [--pic|--pie]] [-L<dir>] [-l<lib>]");
     println!("  lf --version | --help\n");
@@ -101,6 +108,9 @@ fn print_usage() {
     println!("                 indirect call, dyn_alloca, unknown callee) with its call path;");
     println!("                 --stack-usage=all lists the unreachable functions too");
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
+    println!("  --unwind-tables    emit unwind tables: ELF .eh_frame (default with -g, --shared, --pie;");
+    println!("                 Windows .pdata/.xdata and Mach-O compact unwind are always on)");
+    println!("  --no-unwind-tables omit them");
     println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
     println!("                 aarch64-linux, aarch64-windows, aarch64-apple-darwin, riscv64-linux,");
     println!("                 thumbv7m-none-eabi (Cortex-M),");
@@ -113,14 +123,15 @@ fn print_usage() {
     println!("  --base ADDR    image load address (default 0x400000); for binary/ihex, where");
     println!("                 the first byte of code goes; for Cortex-M, the flash origin (default 0)");
     println!("  --shared       build a shared library (position-independent; default lib<input>.so;");
-    println!("                 x86-64, AArch64 or RISC-V Linux)");
-    println!("  -soname <name> set the shared library's DT_SONAME");
+    println!("                 x86-64, AArch64 or RISC-V Linux; lib<input>.dylib on macOS)");
+    println!("  -soname <name> set the shared library's DT_SONAME (macOS: its install name)");
     println!("  --pie          build a position-independent executable against the host C library");
     println!("  --pic          with -c: position-independent code for a shared library");
     println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie, Cortex-M,");
-    println!("                 AArch64 executables)");
+    println!("                 AArch64 and macOS executables)");
     println!("`lf build` compiles one or more IR modules to a static native executable");
-    println!("(for a Windows target, a PE executable whose entry point is `main`).");
+    println!("(for a Windows target, a PE executable whose entry point is `main`; for macOS,");
+    println!("a Mach-O executable started by dyld, linking libSystem, whose LC_MAIN is `main`).");
     println!("With several inputs (or --lto), the modules are IR-linked into one, the");
     println!("-O pipeline runs over the whole program (cross-module inlining), then codegen.");
 }
@@ -154,6 +165,8 @@ struct BuildOptions {
     soname: Option<String>,
     /// `-L<dir>` / `-l<lib>` arguments passed through to the linker.
     link_extra: Vec<String>,
+    /// `--unwind-tables` / `--no-unwind-tables`, if given.
+    unwind: Option<bool>,
 }
 
 /// What `lf build` produces.
@@ -170,8 +183,36 @@ enum OutputKind {
 }
 
 impl BuildOptions {
+    /// The unwind tables for the output's object format: `.pdata`/`.xdata` for
+    /// Windows COFF and compact unwind for Mach-O (both on unless
+    /// `--no-unwind-tables`), DWARF `.eh_frame` for ELF with
+    /// `--unwind-tables`, `-g`, `--shared` or `--pie`.
+    fn unwind_tables(&self) -> UnwindTables {
+        let format = match self.output_kind {
+            OutputKind::Object => self.format.unwrap_or(self.target.object_format()),
+            _ => self.target.object_format(),
+        };
+        let wanted = self.unwind.unwrap_or(match format {
+            ObjectFormat::Coff | ObjectFormat::MachO => true,
+            _ => self.debug || matches!(self.output_kind, OutputKind::Shared | OutputKind::Pie),
+        });
+        match format {
+            _ if !wanted => UnwindTables::None,
+            ObjectFormat::Coff if self.target.os == TargetOs::Windows => UnwindTables::Win64,
+            ObjectFormat::MachO => UnwindTables::CompactUnwind,
+            ObjectFormat::Elf => UnwindTables::EhFrame,
+            _ => UnwindTables::None,
+        }
+    }
+
     /// The relocation model the requested output needs.
     fn reloc_model(&self) -> RelocModel {
+        // Mach-O code is position-independent as compiled (PC-relative data,
+        // calls bound through stubs) and a two-level namespace never
+        // preempts a library's own symbols: no GOT model for a dylib.
+        if self.target.os == TargetOs::Darwin && self.output_kind == OutputKind::Shared {
+            return RelocModel::Static;
+        }
         match self.output_kind {
             OutputKind::Shared => RelocModel::Pic,
             OutputKind::Pie => RelocModel::Pie,
@@ -241,7 +282,8 @@ fn build(args: &[String]) -> Result<(), String> {
     let cg = CodegenOptions::default()
         .with_stack_probes(opts.stack_probes)
         .with_os(triple.os)
-        .with_reloc_model(opts.reloc_model());
+        .with_reloc_model(opts.reloc_model())
+        .with_unwind_tables(opts.unwind_tables());
     if triple.arch == TargetArch::Wasm32 {
         return build_wasm(&opts, &module, &syms, &cg);
     }
@@ -294,6 +336,21 @@ fn build(args: &[String]) -> Result<(), String> {
         opts.output.clone().unwrap_or_else(|| if ext.is_empty() { stem.clone() } else { format!("{stem}.{ext}") })
     };
 
+    if triple.os == TargetOs::Darwin && matches!(opts.output_kind, OutputKind::Executable | OutputKind::Shared) {
+        use latticefoundry::link::darwin::{MachOutput, link_macho};
+        let (kind, output) = if opts.output_kind == OutputKind::Shared {
+            let output = opts.output.clone().unwrap_or_else(|| format!("lib{stem}.dylib"));
+            let name = opts.soname.clone().unwrap_or_else(|| {
+                let file = Path::new(&output).file_name().and_then(|f| f.to_str()).unwrap_or("a.dylib");
+                format!("@rpath/{file}")
+            });
+            (MachOutput::Dylib { install_name: name }, output)
+        } else {
+            (MachOutput::Executable { entry: entry.clone() }, output_or(""))
+        };
+        return link_macho(&obj, triple.arch, &kind, &opts.link_extra, Path::new(&output))
+            .map_err(|e| format!("link error: {e}"));
+    }
     if matches!(opts.output_kind, OutputKind::Shared | OutputKind::Pie) {
         return link_with_qld(&opts, &obj);
     }
@@ -556,6 +613,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut pie = false;
     let mut soname: Option<String> = None;
     let mut link_extra: Vec<String> = Vec::new();
+    let mut unwind = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -568,6 +626,8 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "--stack-usage" => stack_usage = true,
             "--stack-usage=all" => (stack_usage, stack_usage_all) = (true, true),
             "--no-stack-probes" => stack_probes = false,
+            "--unwind-tables" => unwind = Some(true),
+            "--no-unwind-tables" => unwind = Some(false),
             "--target" => {
                 let t = it.next().ok_or("--target requires a triple")?;
                 target = Triple::parse(t).ok_or_else(|| format!("unknown target '{t}'"))?;
@@ -627,22 +687,28 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         return Err("-soname only applies to --shared".to_owned());
     }
     let cortex_m = target.arch == TargetArch::Thumb && output_kind == OutputKind::Executable;
+    let darwin_linked =
+        target.os == TargetOs::Darwin && matches!(output_kind, OutputKind::Executable | OutputKind::Shared);
     let aarch64_elf = target.arch == TargetArch::AArch64 && target.object_format() == ObjectFormat::Elf;
     let aarch64_exe = aarch64_elf && output_kind == OutputKind::Executable;
     if !link_extra.is_empty()
         && !cortex_m
         && !aarch64_exe
+        && !darwin_linked
         && !matches!(output_kind, OutputKind::Shared | OutputKind::Pie)
     {
-        return Err("-L/-l only apply to --shared, --pie, Cortex-M and AArch64 executables".to_owned());
+        return Err("-L/-l only apply to --shared, --pie, Cortex-M, AArch64 and macOS executables".to_owned());
     }
+    let darwin = target.os == TargetOs::Darwin && matches!(target.arch, TargetArch::X86_64 | TargetArch::AArch64);
     if entry.is_some() && matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
         return Err("--entry only applies to executables linked by lf (not --shared or --pie)".to_owned());
     }
     let x86_64_elf = target.arch == TargetArch::X86_64 && target.object_format() == ObjectFormat::Elf;
     let riscv64_elf = target.arch == TargetArch::Riscv64 && target.object_format() == ObjectFormat::Elf;
-    if output_kind == OutputKind::Shared && !x86_64_elf && !aarch64_elf && !riscv64_elf {
-        return Err(format!("--shared needs an x86-64 ELF, AArch64 ELF or RISC-V ELF target, not {target}"));
+    if output_kind == OutputKind::Shared && !x86_64_elf && !aarch64_elf && !riscv64_elf && !darwin {
+        return Err(format!(
+            "--shared needs an x86-64 ELF, AArch64 ELF, RISC-V ELF or macOS target, not {target}"
+        ));
     }
     if output_kind == OutputKind::Pie && !x86_64_elf {
         return Err(format!("--pie needs an x86-64 ELF target, not {target}"));
@@ -663,8 +729,8 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     if target.arch == TargetArch::Avr && base.is_some() {
         return Err("--base does not apply to AVR firmware (flash starts at 0)".to_owned());
     }
-    if target.os == TargetOs::Darwin && output_kind == OutputKind::Executable {
-        return Err(format!("cannot link a {target} executable yet: use -c"));
+    if darwin_linked && (oformat.is_some() || base.is_some()) {
+        return Err("--oformat/--base do not apply to macOS executables".to_owned());
     }
 
     Ok(BuildOptions {
@@ -689,6 +755,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         pie,
         soname,
         link_extra,
+        unwind,
     })
 }
 
