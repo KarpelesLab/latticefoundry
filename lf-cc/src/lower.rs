@@ -71,6 +71,7 @@ impl Tys {
             CType::Array(..) | CType::Record(_) => self.ptr,
             CType::Func(_) => self.ptr,
             CType::Qual(inner, _) => self.of(inner),
+            CType::Vector(..) => unreachable!("vector types are interned through FnLower::ir_of"),
         }
     }
 }
@@ -186,9 +187,11 @@ pub fn lower_with(
         let params: Vec<TypeId> = sig
             .params
             .iter()
-            .map(|p| if p.is_record() { layout::ir_type(cx, &program.records, p) } else { tys.of(p) })
+            .map(|p| {
+                if p.is_record() || p.is_vector() { layout::ir_type(cx, &program.records, p) } else { tys.of(p) }
+            })
             .collect();
-        let ret = if sig.ret.is_record() {
+        let ret = if sig.ret.is_record() || sig.ret.is_vector() {
             layout::ir_type(cx, &program.records, &sig.ret)
         } else {
             tys.of(&sig.ret)
@@ -521,8 +524,9 @@ impl FnLower<'_> {
                         fp += sse;
                     }
                 }
-            } else if pty.is_float() {
-                let ty = self.tys.of(&pty);
+            } else if pty.is_float() || pty.is_vector() {
+                // A vector argument travels in an SSE register, like a float.
+                let ty = self.ir_of(&pty);
                 let align = align_of(&pty);
                 self.b.store(ty, self.slots[obj], incoming, align);
                 if fp < 8 {
@@ -549,8 +553,14 @@ impl FnLower<'_> {
                 r if r.is_record() => {
                     // No value was returned (using it is undefined): hand back
                     // fresh storage of the right type.
-                    let slot = self.b.alloca(self.ir_of(r));
+                    let rty = self.ir_of(r);
+                    let slot = self.b.alloca(rty);
                     self.b.ret(Some(slot));
+                }
+                v if v.is_vector() => {
+                    let ty = v.clone();
+                    let zero = self.vector_splat_const(&ty, 0);
+                    self.b.ret(Some(zero));
                 }
                 other => {
                     let ty = self.tys.of(other);
@@ -573,9 +583,29 @@ impl FnLower<'_> {
         self.terminated = false;
     }
 
-    /// The IR type of a C type (aggregates via the precomputed map).
-    fn ir_of(&self, ty: &CType) -> TypeId {
-        if ty.is_aggregate() { self.agg_types[ty] } else { self.tys.of(ty) }
+    /// The IR type of a C type (aggregates via the precomputed map, vectors
+    /// interned on demand).
+    fn ir_of(&mut self, ty: &CType) -> TypeId {
+        if ty.is_aggregate() {
+            self.agg_types[ty]
+        } else if ty.is_vector() {
+            let records = self.records;
+            layout::ir_type(self.b.types_mut(), records, ty)
+        } else {
+            self.tys.of(ty)
+        }
+    }
+
+    /// The vector of C type `vty` with every lane the integer constant `k`.
+    fn vector_splat_const(&mut self, vty: &CType, k: i64) -> ValueId {
+        let (elem, n) = vty.vector_parts().expect("a vector type");
+        let ety = self.tys.of(elem);
+        let lane = if elem.is_float() {
+            self.b.const_float(ety, float_bits(elem, k as f64))
+        } else {
+            self.b.const_i64(ety, k)
+        };
+        self.b.splat(lane, n)
     }
 
     /// The size in bytes of a pointer's pointee (`1` if not a pointer).
@@ -687,7 +717,8 @@ impl FnLower<'_> {
                         // `return;` in a struct function (using the value is
                         // undefined): hand back fresh storage of the right type.
                         let ty = self.ret_ty.clone();
-                        let slot = self.b.alloca(self.ir_of(&ty));
+                        let rty = self.ir_of(&ty);
+                        let slot = self.b.alloca(rty);
                         self.b.ret(Some(slot));
                     }
                     None => self.b.ret(None),
@@ -1129,22 +1160,22 @@ impl FnLower<'_> {
             TExprKind::Arith(op, l, r) => {
                 let lv = self.lower_rvalue(l);
                 let rv = self.lower_rvalue(r);
-                let binop = if e.ty.is_float() {
-                    float_binop(*op)
-                } else {
-                    arith_binop(*op, e.ty.is_signed())
-                };
-                let res = self.b.bin(binop, lv, rv, Flags::NONE);
+                let res = self.b.bin(lane_binop(*op, &e.ty), lv, rv, Flags::NONE);
                 self.normalize_bitint(res, &e.ty)
             }
             TExprKind::Shift(op, l, r) => {
                 let lv = self.lower_rvalue(l);
                 let rv0 = self.lower_rvalue(r);
-                // The IR requires the shift amount to share the value type.
-                let rv = self.int_resize(rv0, width_of(&r.ty), r.ty.is_signed(), width_of(&l.ty));
+                // The IR requires the shift amount to share the value type (a
+                // vector's amounts already do).
+                let rv = if l.ty.is_vector() {
+                    rv0
+                } else {
+                    self.int_resize(rv0, width_of(&r.ty), r.ty.is_signed(), width_of(&l.ty))
+                };
                 let binop = match op {
                     BinaryOp::Shl => BinOp::Shl,
-                    _ if l.ty.is_signed() => BinOp::AShr,
+                    _ if lane_of(&l.ty).is_signed() => BinOp::AShr,
                     _ => BinOp::LShr,
                 };
                 let res = self.b.bin(binop, lv, rv, Flags::NONE);
@@ -1153,13 +1184,48 @@ impl FnLower<'_> {
             TExprKind::Cmp(op, l, r) => {
                 let lv = self.lower_rvalue(l);
                 let rv = self.lower_rvalue(r);
-                let bit = if l.ty.is_float() {
+                let lane = lane_of(&l.ty);
+                let bit = if lane.is_float() {
                     self.b.fcmp(fcmp_pred(*op), lv, rv, Flags::NONE)
                 } else {
-                    let pred = cmp_pred(*op, l.ty.is_signed());
+                    let pred = cmp_pred(*op, lane.is_signed());
                     self.b.icmp(pred, lv, rv)
                 };
-                self.b.cast(CastOp::ZExt, bit, self.tys.i32)
+                if e.ty.is_vector() {
+                    // A vector comparison: each lane all-ones (-1) or zero.
+                    let ty = self.ir_of(&e.ty);
+                    self.b.cast(CastOp::SExt, bit, ty)
+                } else {
+                    self.b.cast(CastOp::ZExt, bit, self.tys.i32)
+                }
+            }
+            TExprKind::Neg(inner) if e.ty.is_vector() => {
+                let v = self.lower_rvalue(inner);
+                if lane_of(&e.ty).is_float() {
+                    self.b.fneg(v, Flags::NONE)
+                } else {
+                    let zero = self.vector_splat_const(&e.ty, 0);
+                    self.b.sub(zero, v, Flags::NONE)
+                }
+            }
+            TExprKind::BitNot(inner) if e.ty.is_vector() => {
+                let v = self.lower_rvalue(inner);
+                let ones = self.vector_splat_const(&e.ty, -1);
+                self.b.bin(BinOp::Xor, v, ones, Flags::NONE)
+            }
+            TExprKind::VecSplat(inner) => {
+                let v = self.lower_rvalue(inner);
+                let n = e.ty.vector_parts().map_or(1, |(_, n)| n);
+                self.b.splat(v, n)
+            }
+            TExprKind::VecShuffle(a, b, mask) => {
+                let av = self.lower_rvalue(a);
+                let bv = self.lower_rvalue(b);
+                self.b.shuffle_vector(av, bv, mask)
+            }
+            TExprKind::VecConvert(inner) => {
+                let v = self.lower_rvalue(inner);
+                self.convert_lanes(v, &inner.ty, &e.ty)
             }
             TExprKind::Neg(inner) => {
                 let v = self.lower_rvalue(inner);
@@ -1478,7 +1544,7 @@ impl FnLower<'_> {
 
     fn lower_ternary(&mut self, c: &TExpr, t: &TExpr, f: &TExpr, ty: &CType) -> ValueId {
         let cond = self.truth_of(c);
-        let result_ty = self.tys.of(ty);
+        let result_ty = self.ir_of(ty);
         let then_bb = self.b.create_block(&[]);
         let else_bb = self.b.create_block(&[]);
         let join_bb = self.b.create_block(&[result_ty]);
@@ -1576,21 +1642,20 @@ impl FnLower<'_> {
         } else {
             let oldc = self.convert(old, lty, compute_ty);
             let res = if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
-                let amt = self.int_resize(rv0, width_of(rty), rty.is_signed(), width_of(compute_ty));
+                let amt = if compute_ty.is_vector() {
+                    rv0
+                } else {
+                    self.int_resize(rv0, width_of(rty), rty.is_signed(), width_of(compute_ty))
+                };
                 let binop = match op {
                     BinaryOp::Shl => BinOp::Shl,
-                    _ if compute_ty.is_signed() => BinOp::AShr,
+                    _ if lane_of(compute_ty).is_signed() => BinOp::AShr,
                     _ => BinOp::LShr,
                 };
                 self.b.bin(binop, oldc, amt, Flags::NONE)
             } else {
                 let rc = self.convert(rv0, rty, compute_ty);
-                let binop = if compute_ty.is_float() {
-                    float_binop(op)
-                } else {
-                    arith_binop(op, compute_ty.is_signed())
-                };
-                self.b.bin(binop, oldc, rc, Flags::NONE)
+                self.b.bin(lane_binop(op, compute_ty), oldc, rc, Flags::NONE)
             };
             self.convert(res, compute_ty, lty)
         };
@@ -1720,9 +1785,15 @@ impl FnLower<'_> {
         if quals.atomic {
             return self.atomic_load_c(ty, addr, AtomicOrdering::SeqCst);
         }
-        let ity = self.tys.of(ty);
+        let ity = self.ir_of(ty);
         let align = align_of(ty);
-        if quals.volatile { self.b.load_volatile(ity, addr, align) } else { self.b.load(ity, addr, align) }
+        // The IR has no volatile vector access (it could be split into lanes):
+        // a vector is accessed as a whole, which a volatile one is anyway.
+        if quals.volatile && !ty.is_vector() {
+            self.b.load_volatile(ity, addr, align)
+        } else {
+            self.b.load(ity, addr, align)
+        }
     }
 
     /// Store the C `ty` value `v` to `addr` through an lvalue qualified by
@@ -1731,9 +1802,9 @@ impl FnLower<'_> {
         if quals.atomic {
             return self.atomic_store_c(ty, addr, v, AtomicOrdering::SeqCst);
         }
-        let ity = self.tys.of(ty);
+        let ity = self.ir_of(ty);
         let align = align_of(ty);
-        if quals.volatile {
+        if quals.volatile && !ty.is_vector() {
             self.b.store_volatile(ity, addr, v, align);
         } else {
             self.b.store(ity, addr, v, align);
@@ -2037,6 +2108,11 @@ impl FnLower<'_> {
         }
         match (from, to) {
             (_, CType::Void) => v,
+            // Between same-size vectors and integers: the bits reinterpreted.
+            (CType::Vector(..), _) | (_, CType::Vector(..)) => {
+                let ty = self.ir_of(to);
+                if self.b.value_type(v) == ty { v } else { self.b.cast(CastOp::Bitcast, v, ty) }
+            }
             (_, CType::Bool) => {
                 // `x != 0` in the source type; floats use an ordered `!=` (`une`).
                 let bit = if from.is_float() {
@@ -2084,6 +2160,46 @@ impl FnLower<'_> {
                 self.int_resize(v, width_of(from), from.is_signed(), width_of(to))
             }
         }
+    }
+
+    /// Convert the vector `v` of C type `from` lane by lane to the vector type
+    /// `to` (same lane count), each lane as a C cast of its element would.
+    fn convert_lanes(&mut self, v: ValueId, from: &CType, to: &CType) -> ValueId {
+        let (fe, _) = from.vector_parts().expect("a vector type");
+        let (te, _) = to.vector_parts().expect("a vector type");
+        let ty = self.ir_of(to);
+        let op = match (fe.is_float(), te.is_float()) {
+            (true, true) => {
+                let (fb, tb) = (fe.float_ty().map_or(0, FloatTy::bits), te.float_ty().map_or(0, FloatTy::bits));
+                match fb.cmp(&tb) {
+                    std::cmp::Ordering::Less => CastOp::FpExt,
+                    std::cmp::Ordering::Greater => CastOp::FpTrunc,
+                    std::cmp::Ordering::Equal => return v,
+                }
+            }
+            (true, false) => {
+                if te.is_signed() {
+                    CastOp::FpToSi
+                } else {
+                    CastOp::FpToUi
+                }
+            }
+            (false, true) => {
+                if fe.is_signed() {
+                    CastOp::SiToFp
+                } else {
+                    CastOp::UiToFp
+                }
+            }
+            (false, false) => match width_of(fe).cmp(&width_of(te)) {
+                std::cmp::Ordering::Less if fe.is_signed() => CastOp::SExt,
+                std::cmp::Ordering::Less => CastOp::ZExt,
+                std::cmp::Ordering::Greater => CastOp::Trunc,
+                // Elements differing only in signedness: the same IR type.
+                std::cmp::Ordering::Equal => return v,
+            },
+        };
+        self.b.cast(op, v, ty)
     }
 
     /// Resize an integer value from `from_w` bits (with the given signedness) to
@@ -2310,6 +2426,18 @@ fn sysv_eightbytes(types: &TypeContext, ty: TypeId) -> Option<Vec<bool>> {
     Some(ebs.into_iter().map(|c| c.unwrap_or(true)).collect())
 }
 
+/// The lane type of a vector type, or the type itself.
+fn lane_of(ty: &CType) -> &CType {
+    ty.vector_parts().map_or(ty, |(elem, _)| elem)
+}
+
+/// The IR binary opcode for C arithmetic operator `op` on values of C type
+/// `ty` (a scalar, or a vector computed lane-wise).
+fn lane_binop(op: BinaryOp, ty: &CType) -> BinOp {
+    let lane = lane_of(ty);
+    if lane.is_float() { float_binop(op) } else { arith_binop(op, lane.is_signed()) }
+}
+
 /// Whether arithmetic on the C type `ty` wraps exactly at its storage width,
 /// so a wrapping IR add/sub/and/or/xor at that width computes it: a plain
 /// integer, or a `_BitInt` whose value bits fill its storage (not `_Bool`).
@@ -2331,6 +2459,9 @@ fn width_of(ty: &CType) -> u16 {
 fn align_of(ty: &CType) -> u32 {
     match ty {
         CType::Qual(inner, _) => align_of(inner),
+        // A vector access assumes only its elements' alignment (an unaligned
+        // vector move), so a vector reached through any pointer is safe.
+        CType::Vector(elem, _) => align_of(elem),
         CType::Void | CType::Bool => 1,
         CType::Int(i) => (i.width / 8) as u32,
         CType::Float(f) => u32::from(f.bits() / 8),

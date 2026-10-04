@@ -322,7 +322,7 @@ fn compile_program(
     } else {
         x86_64::compile_module_with(&module, &syms, &cg).object
     };
-    emit_globals(&mut obj, &program.globals, cfg);
+    emit_globals(&mut obj, &program.globals, &program.records, cfg);
     apply_weak_references(&mut obj, &program.sigs, &program.globals);
     Ok(obj)
 }
@@ -367,7 +367,7 @@ fn verify_or(module: &Module, stage: &str) -> Result<(), BuildError> {
 /// contributed here). Writable globals go in `.data`; read-only objects (string
 /// literals) in `.rodata`. Each global's fully-materialized initializer image is
 /// copied verbatim.
-fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal], cfg: &CodegenConfig) {
+fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal], records: &ast::Records, cfg: &CodegenConfig) {
     if globals.is_empty() {
         return;
     }
@@ -388,14 +388,17 @@ fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal], cfg: &CodegenConfig
             continue;
         }
         let size = g.bytes.len().max(1);
-        let align = size.next_power_of_two().clamp(1, 8);
+        // A type wanting more than 8 (a 16-byte vector, an over-aligned
+        // record) gets it, up to the sections' 16.
+        let natural = (layout::align_of(records, &g.ty) as usize).min(16);
+        let align = size.next_power_of_two().clamp(1, 8).max(natural);
         let (sec, bytes) = if g.readonly {
             let sec = *rodata
-                .get_or_insert_with(|| obj.add_section(Section::new(".rodata", SectionKind::Rodata, 8)));
+                .get_or_insert_with(|| obj.add_section(Section::new(".rodata", SectionKind::Rodata, 16)));
             (sec, &mut rodata_bytes)
         } else {
             let sec = *data
-                .get_or_insert_with(|| obj.add_section(Section::new(".data", SectionKind::Data, 8)));
+                .get_or_insert_with(|| obj.add_section(Section::new(".data", SectionKind::Data, 16)));
             (sec, &mut data_bytes)
         };
         while !bytes.len().is_multiple_of(align) {

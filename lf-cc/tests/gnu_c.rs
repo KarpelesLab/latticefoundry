@@ -425,7 +425,6 @@ fn unsupported_constructs_are_rejected_clearly() {
         ("__int128 g; int main(void) { return 0; }", "__int128"),
         ("_Float128 f(_Float128); int main(void) { f(1.0); return 0; }", "_Float128"),
         ("_Float128 q(void); int main(void) { return (int)q(); }", "_Float128"),
-        ("typedef float v4 __attribute__((vector_size(16))); int main(void){return 0;}", "vector"),
         ("__thread int t; int main(void) { return 0; }", "thread-local"),
         ("int main(void) { static _Thread_local int t; return t; }", "thread-local"),
         ("_Complex double z; int main(void) { return 0; }", "_Complex"),

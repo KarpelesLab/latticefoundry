@@ -45,6 +45,7 @@ pub fn size_of(recs: &Records, ty: &CType) -> u64 {
         // `sizeof` a function designator is 1 (a GCC extension); function
         // pointers are `Pointer` and take the pointer size above.
         CType::Func(_) => 1,
+        CType::Vector(elem, n) => size_of(recs, elem) * u64::from(*n),
     }
 }
 
@@ -59,6 +60,8 @@ pub fn align_of(recs: &Records, ty: &CType) -> u64 {
         CType::Array(elem, _) => align_of(recs, elem),
         CType::Record(id) => record_align(recs, *id),
         CType::Func(_) => 1,
+        // A vector is aligned to its size, as gcc aligns it.
+        CType::Vector(..) => size_of(recs, ty).next_power_of_two(),
     }
 }
 
@@ -295,6 +298,21 @@ pub fn ir_type(cx: &mut TypeContext, recs: &Records, ty: &CType) -> TypeId {
         CType::Record(id) => ir_record(cx, recs, *id),
         // A function type only ever appears behind a pointer in lowered code.
         CType::Func(_) => cx.ptr(),
+        CType::Vector(elem, n) => {
+            let e = ir_type(cx, recs, elem);
+            cx.vector(e, *n)
+        }
+    }
+}
+
+/// Whether `ty` is a vector or an array of them: over-aligned, but laid out by
+/// the IR exactly as C lays it out (a vector aligns to its size), and its IR
+/// type is what classifies it as SSE data for the calling convention.
+fn holds_vectors(ty: &CType) -> bool {
+    match ty.unqual() {
+        CType::Vector(..) => true,
+        CType::Array(elem, _) => holds_vectors(elem),
+        _ => false,
     }
 }
 
@@ -312,7 +330,9 @@ fn ir_record(cx: &mut TypeContext, recs: &Records, id: RecordId) -> TypeId {
             if def.packed
                 || def.align.is_some()
                 || def.fields.iter().any(|f| {
-                    f.align.is_some() || f.bit_width.is_some() || align_of(recs, &f.ty) > 8
+                    f.align.is_some()
+                        || f.bit_width.is_some()
+                        || (align_of(recs, &f.ty) > 8 && !holds_vectors(&f.ty))
                 })
             {
                 let size = record_size(recs, id);

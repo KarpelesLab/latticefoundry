@@ -3356,6 +3356,9 @@ fn has_builtin(name: &str) -> bool {
             | "__builtin_inff"
             | "__builtin_nan"
             | "__builtin_nanf"
+            | "__builtin_shufflevector"
+            | "__builtin_shuffle"
+            | "__builtin_convertvector"
     ) || (BUILTIN_VA_LIST_TYPE && name == "__builtin_va_list")
 }
 
@@ -3411,9 +3414,9 @@ const STATEMENT_EXPRESSIONS: bool = true;
 /// decorated): true only for attributes whose meaning lf-cc provides — the
 /// pure diagnostics or optimization hints (ignoring them is a correct
 /// implementation), and the ones the parser implements (`aligned`, `packed`,
-/// `mode`, `gnu_inline`, `transparent_union`). Other attributes that change
-/// layout, linkage, or code (`section`, `alias`, `weak`, `cleanup`,
-/// `constructor`, `vector_size`, …) answer 0.
+/// `mode`, `gnu_inline`, `transparent_union`, `vector_size`, `visibility`,
+/// `weak`). Other attributes that change layout, linkage, or code (`section`,
+/// `alias`, `cleanup`, `constructor`, …) answer 0.
 fn has_gnu_attribute(name: &str) -> bool {
     let name = name.strip_prefix("gnu::").unwrap_or(name);
     matches!(
@@ -3423,6 +3426,9 @@ fn has_gnu_attribute(name: &str) -> bool {
             | "mode"
             | "gnu_inline"
             | "transparent_union"
+            | "vector_size"
+            | "visibility"
+            | "weak"
             | "noreturn"
             | "unused"
             | "used"

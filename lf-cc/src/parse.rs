@@ -153,8 +153,8 @@ struct Attrs {
     gnu_inline: bool,
     /// `transparent_union` on a union type.
     transparent_union: bool,
-    /// `vector_size(N)`: GCC vector types are not supported.
-    vector_size: bool,
+    /// `vector_size(N)`: the type is a GCC vector of `N` bytes.
+    vector_size: Option<u64>,
     /// `visibility("default"|"hidden"|"protected"|"internal")`.
     visibility: Option<Visibility>,
     /// `weak`.
@@ -203,7 +203,9 @@ impl Attrs {
         self.packed |= other.packed;
         self.gnu_inline |= other.gnu_inline;
         self.transparent_union |= other.transparent_union;
-        self.vector_size |= other.vector_size;
+        if other.vector_size.is_some() {
+            self.vector_size = other.vector_size;
+        }
         if other.visibility.is_some() {
             self.visibility = other.visibility;
         }
@@ -1041,7 +1043,10 @@ impl Parser {
                     let n = n as u64;
                     attrs.aligned = Some(attrs.aligned.map_or(n, |a| a.max(n)));
                 } else {
-                    attrs.vector_size = true;
+                    if n <= 0 {
+                        return Err(Diagnostic::error("the vector size must be positive").with_span(sp));
+                    }
+                    attrs.vector_size = Some(n as u64);
                 }
                 self.expect_punct(Punct::RParen, "')' after the attribute argument")?;
             }
@@ -1068,21 +1073,43 @@ impl Parser {
     }
 
     /// Apply the type-changing attributes of `attrs` to a declared type:
-    /// `mode(...)` resizes an integer type (keeping its signedness), and a GCC
-    /// vector type is rejected.
+    /// `mode(...)` resizes an integer type (keeping its signedness), and
+    /// `vector_size(N)` makes it a GCC vector of `N` bytes.
     fn apply_type_attrs(&self, ty: CType, attrs: &Attrs, span: Span) -> PResult<CType> {
-        if attrs.vector_size {
-            return Err(Diagnostic::error("GCC vector types (vector_size) are not supported")
-                .with_span(span));
-        }
         if let CType::Qual(inner, q) = ty {
             return Ok(self.apply_type_attrs(*inner, attrs, span)?.qualified(q));
         }
-        match (attrs.mode, ty) {
-            (Some(w), CType::Int(i)) => Ok(CType::Int(IntTy::new(w, i.signed))),
-            (Some(w), CType::Bool) => Ok(CType::Int(IntTy::new(w, false))),
-            (_, ty) => Ok(ty),
+        let ty = match (attrs.mode, ty) {
+            (Some(w), CType::Int(i)) => CType::Int(IntTy::new(w, i.signed)),
+            (Some(w), CType::Bool) => CType::Int(IntTy::new(w, false)),
+            (_, ty) => ty,
+        };
+        match attrs.vector_size {
+            Some(bytes) => self.vector_type(ty, bytes, span),
+            None => Ok(ty),
         }
+    }
+
+    /// The GCC vector type of `bytes` bytes of `elem` elements: the element
+    /// must be an integer (not `_Bool` or a `_BitInt`) or `float`/`double`,
+    /// and the size a power-of-two multiple of the element size.
+    fn vector_type(&self, elem: CType, bytes: u64, span: Span) -> PResult<CType> {
+        let valid_elem = matches!(&elem, CType::Int(i) if i.bitint.is_none() && i.width <= 64)
+            || matches!(elem, CType::Float(FloatTy::F32 | FloatTy::F64));
+        if !valid_elem {
+            return Err(Diagnostic::error(format!(
+                "invalid vector element type '{elem}' (an integer or floating type is required)"
+            ))
+            .with_span(span));
+        }
+        let esize = layout::size_of(&self.records, &elem);
+        if !bytes.is_multiple_of(esize) || !(bytes / esize).is_power_of_two() {
+            return Err(Diagnostic::error(format!(
+                "the vector size {bytes} is not a power-of-two multiple of the element size {esize}"
+            ))
+            .with_span(span));
+        }
+        Ok(CType::Vector(Box::new(elem), (bytes / esize) as u32))
     }
 
     /// Finish a declarator: parse its trailing GNU extensions (attributes and an
@@ -1095,9 +1122,12 @@ impl Parser {
         sattrs: &Attrs,
     ) -> PResult<(Option<String>, CType, Attrs)> {
         let label = self.parse_declarator_extensions()?;
+        let dattrs = std::mem::take(&mut self.decl_attrs);
+        // The declaration specifiers' attributes already shaped the base type;
+        // the declarator's own apply to the declared type.
+        let ty = self.apply_type_attrs(ty, &dattrs, span)?;
         let mut attrs = sattrs.clone();
-        attrs.merge(std::mem::take(&mut self.decl_attrs));
-        let ty = self.apply_type_attrs(ty, &attrs, span)?;
+        attrs.merge(dattrs);
         Ok((label, ty, attrs))
     }
 
@@ -2101,7 +2131,7 @@ impl Parser {
             }
             ExprKind::Generic(..) => None,
             // `va_arg` yields its type operand; the others are `void`.
-            ExprKind::VaArg(_, ty) => Some(ty.clone()),
+            ExprKind::VaArg(_, ty) | ExprKind::ConvertVector(_, ty) => Some(ty.clone()),
             ExprKind::VaStart(..) | ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => Some(CType::Void),
             ExprKind::LabelAddr(_) => Some(CType::ptr_to(CType::Void)),
             ExprKind::StmtExpr(stmts) => match stmts.last() {
@@ -3303,6 +3333,18 @@ impl Parser {
         Ok(if c != 0 { a } else { b })
     }
 
+    /// `__builtin_convertvector ( expr , type-name )`: the vector `expr`
+    /// converted element-wise to the vector type `type-name`.
+    fn parse_builtin_convertvector(&mut self) -> PResult<Expr> {
+        let start = self.bump().span;
+        self.expect_punct(Punct::LParen, "'(' after __builtin_convertvector")?;
+        let e = self.parse_assign()?;
+        self.expect_punct(Punct::Comma, "',' in __builtin_convertvector")?;
+        let ty = self.parse_type_name()?;
+        let end = self.expect_punct(Punct::RParen, "')' to close __builtin_convertvector")?;
+        Ok(Expr { kind: ExprKind::ConvertVector(Box::new(e), ty), span: start.merge(end) })
+    }
+
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let expr = self.parse_primary()?;
         self.parse_postfix_tail(expr)
@@ -3381,6 +3423,7 @@ impl Parser {
                             return self.parse_builtin_types_compatible();
                         }
                         "__builtin_choose_expr" => return self.parse_builtin_choose_expr(),
+                        "__builtin_convertvector" => return self.parse_builtin_convertvector(),
                         _ => {}
                     }
                 }

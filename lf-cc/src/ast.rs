@@ -38,6 +38,10 @@ pub enum CType {
     /// *designator* has this type; used as a value it decays to `Pointer(Func)`
     /// (a function pointer), which is the only form that reaches storage.
     Func(Box<FuncType>),
+    /// A GCC vector type (`T __attribute__((vector_size(N)))`): `lanes` elements
+    /// of the integer or floating element type, a value operated on
+    /// element-wise (an IR `<lanes x T>` vector, `docs/ir-design.md` §6e).
+    Vector(Box<CType>, u32),
     /// A `volatile`- and/or `_Atomic`-qualified type (`const` and `restrict`
     /// change no generated code and are not modelled). Only the qualifiers
     /// that change how an object is accessed are tracked, and only where they
@@ -412,6 +416,19 @@ impl CType {
         matches!(self, CType::Func(_))
     }
 
+    /// Whether this is a GCC vector type.
+    pub fn is_vector(&self) -> bool {
+        matches!(self, CType::Vector(..))
+    }
+
+    /// The element type and lane count of a vector type.
+    pub fn vector_parts(&self) -> Option<(&CType, u32)> {
+        match self {
+            CType::Vector(elem, n) => Some((elem, *n)),
+            _ => None,
+        }
+    }
+
     /// Whether this is an aggregate (array or record) type.
     pub fn is_aggregate(&self) -> bool {
         self.is_array() || self.is_record()
@@ -527,6 +544,7 @@ impl fmt::Display for CType {
             CType::Pointer(inner) => write!(f, "{inner} *"),
             CType::Array(elem, n) => write!(f, "{elem}[{n}]"),
             CType::Record(_) => write!(f, "struct/union"),
+            CType::Vector(elem, n) => write!(f, "__vector({n}) {elem}"),
             CType::Qual(inner, q) => {
                 if q.atomic {
                     write!(f, "_Atomic ")?;
@@ -693,6 +711,9 @@ pub enum ExprKind {
     /// GNU `&&label`: the "address" of a label in the enclosing function (a
     /// `void *` usable only as the operand of `goto *`).
     LabelAddr(String),
+    /// `__builtin_convertvector(v, T)`: the vector `v` converted element-wise
+    /// to the vector type `T` (of the same length).
+    ConvertVector(Box<Expr>, CType),
 }
 
 /// One association of a `_Generic` selection: a type (`None` for `default`) and

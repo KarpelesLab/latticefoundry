@@ -21,6 +21,8 @@ use crate::layout;
 
 #[path = "sema_atomic.rs"]
 mod atomic;
+#[path = "sema_vector.rs"]
+mod vector;
 
 /// A function-local object with storage (a parameter or a local variable),
 /// addressed by an [`ObjId`] within its function.
@@ -396,6 +398,15 @@ pub enum TExprKind {
     },
     /// `__atomic_thread_fence(order)`; `void`.
     AtomicFence(MemOrder),
+    /// A scalar (already of the element type) broadcast to every lane of this
+    /// node's vector type.
+    VecSplat(Box<TExpr>),
+    /// `__builtin_shufflevector`/`__builtin_shuffle`: lane `k` of the result
+    /// is lane `mask[k]` of the concatenation of the two (same-typed) vectors.
+    VecShuffle(Box<TExpr>, Box<TExpr>, Vec<u32>),
+    /// `__builtin_convertvector`: the vector converted lane by lane to this
+    /// node's vector type (same lane count).
+    VecConvert(Box<TExpr>),
 }
 
 /// A C11 memory order (`memory_order_*` / `__ATOMIC_*`).
@@ -968,6 +979,21 @@ impl Checker {
     ) {
         let ty = ty.unqual();
         match ty {
+            CType::Vector(elem, n) => {
+                let Init::List(items) = init else {
+                    self.error(span, "a vector global's initializer must be a brace-enclosed list");
+                    return;
+                };
+                let stride = self.size_of(elem);
+                let mut idx = 0u64;
+                for item in items {
+                    idx = apply_index_designators(&item.designators, idx);
+                    if idx < u64::from(*n) {
+                        self.build_global_bytes(elem, &item.init, off + idx * stride, bytes, relocs, span);
+                    }
+                    idx += 1;
+                }
+            }
             CType::Array(elem, n) => {
                 // `char[] = "..."` (or a wide array from `L"…"`/`u"…"`/`U"…"`)
                 // writes the literal element bytes directly, when the array's
@@ -1656,7 +1682,12 @@ impl Checker {
             if ctx.scopes.last().unwrap().contains_key(&d.name) {
                 self.error(d.span, format!("redeclaration of '{}'", d.name));
             }
-            let id = ctx.add_object_aligned(&d.name, ty.clone().qualified(quals), d.align);
+            // An object whose type wants more than the stack's natural 8-byte
+            // alignment (a 16-byte vector, an over-aligned record) is
+            // over-aligned explicitly, so gcc-compiled code may rely on it.
+            let natural = layout::align_of(&self.records, &ty);
+            let align = d.align.or((natural > 8).then_some(natural));
+            let id = ctx.add_object_aligned(&d.name, ty.clone().qualified(quals), align);
             ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Local(id));
             let init_built = match &d.init {
                 Some(init) => self.build_init(ctx, &ty, init, d.span),
@@ -1742,7 +1773,7 @@ impl Checker {
             self.error(span, "invalid initializer for a struct/union object");
             return None;
         }
-        if ty.is_aggregate() {
+        if braced_aggregate(ty, init) {
             let mut stores = Vec::new();
             self.build_agg_stores(ctx, ty, init, 0, &mut stores, span)?;
             Some(InitBuilt::Aggregate(stores))
@@ -1841,6 +1872,27 @@ impl Checker {
                 }
                 Some(())
             }
+            // A vector initialized lane by lane, like an array.
+            CType::Vector(elem, n) => {
+                let Init::List(items) = init else {
+                    self.error(span, "a vector initializer must be a brace-enclosed list");
+                    return None;
+                };
+                let elem = (**elem).clone();
+                let stride = self.size_of(&elem);
+                let mut idx = 0u64;
+                for item in items {
+                    idx = apply_index_designators(&item.designators, idx);
+                    if idx < u64::from(*n) {
+                        self.build_member_init(ctx, &elem, &item.init, base + idx * stride, out, span)?;
+                    } else {
+                        self.error(span, "excess elements in a vector initializer");
+                        return None;
+                    }
+                    idx += 1;
+                }
+                Some(())
+            }
             CType::Record(id) => {
                 let id = *id;
                 let items = match init {
@@ -1897,7 +1949,7 @@ impl Checker {
         span: Span,
     ) -> Option<()> {
         let ty = ty.unqual();
-        if ty.is_aggregate() {
+        if braced_aggregate(ty, init) {
             self.build_agg_stores(ctx, ty, init, base, out, span)
         } else {
             let v = self.build_scalar_init(ctx, ty, init, span)?;
@@ -1999,6 +2051,7 @@ impl Checker {
             ExprKind::VaEnd(ap) => self.check_va_end(ctx, ap, span),
             ExprKind::VaCopy(dst, src) => self.check_va_copy(ctx, dst, src, span),
             ExprKind::StmtExpr(stmts) => self.check_stmt_expr(ctx, stmts, span),
+            ExprKind::ConvertVector(v, ty) => self.check_convertvector(ctx, v, ty, span),
             ExprKind::LabelAddr(name) => {
                 let Some(&id) = ctx.labels.get(name) else {
                     self.error(span, format!("use of undeclared label '{name}'"));
@@ -2176,7 +2229,7 @@ impl Checker {
             return None;
         }
         let obj = ctx.add_object("", cty.clone().qualified(quals));
-        let (zero_size, stores) = if cty.is_aggregate() {
+        let (zero_size, stores) = if braced_aggregate(&cty, init) {
             let mut stores = Vec::new();
             self.build_agg_stores(ctx, &cty, init, 0, &mut stores, span)?;
             (self.size_of(&cty), stores)
@@ -2232,6 +2285,9 @@ impl Checker {
         // `a[i]` is `*(a + i)`, where either operand may be the pointer.
         let a = self.check_rvalue(ctx, base)?;
         let b = self.check_rvalue(ctx, index)?;
+        if a.ty.is_vector() {
+            return self.check_vector_index(ctx, a, b, span);
+        }
         let (ptr, idx) = if a.ty.is_pointer() { (a, b) } else { (b, a) };
         if !ptr.ty.is_pointer() || !idx.ty.is_integer() {
             self.error(span, "invalid subscript: need a pointer/array and an integer");
@@ -2367,6 +2423,9 @@ impl Checker {
         match op {
             UnaryOp::Plus => {
                 let te = self.check_rvalue(ctx, inner)?;
+                if te.ty.is_vector() {
+                    return Some(te);
+                }
                 if !te.ty.is_arithmetic() {
                     self.error(span, "unary '+' requires an arithmetic operand");
                     return None;
@@ -2376,6 +2435,10 @@ impl Checker {
             }
             UnaryOp::Neg => {
                 let te = self.check_rvalue(ctx, inner)?;
+                if te.ty.is_vector() {
+                    let ty = te.ty.clone();
+                    return Some(TExpr::new(TExprKind::Neg(Box::new(te)), ty, span));
+                }
                 if !te.ty.is_arithmetic() {
                     self.error(span, "unary '-' requires an arithmetic operand");
                     return None;
@@ -2386,6 +2449,10 @@ impl Checker {
             }
             UnaryOp::BitNot => {
                 let te = self.check_rvalue(ctx, inner)?;
+                if te.ty.vector_parts().is_some_and(|(e, _)| e.is_integer()) {
+                    let ty = te.ty.clone();
+                    return Some(TExpr::new(TExprKind::BitNot(Box::new(te)), ty, span));
+                }
                 if !te.ty.is_integer() {
                     self.error(span, "unary '~' requires an integer operand");
                     return None;
@@ -2473,6 +2540,11 @@ impl Checker {
 
         let lt = self.check_rvalue(ctx, l)?;
         let rt = self.check_rvalue(ctx, r)?;
+
+        // GCC vector operations (element-wise).
+        if lt.ty.is_vector() || rt.ty.is_vector() {
+            return self.check_vector_binary(op, lt, rt, span);
+        }
 
         // Pointer arithmetic and comparisons.
         if lt.ty.is_pointer() || rt.ty.is_pointer() {
@@ -2647,6 +2719,9 @@ impl Checker {
             ));
         }
         let rt = self.check_rvalue(ctx, r)?;
+        if target_ty.is_vector() || rt.ty.is_vector() {
+            return self.check_vector_assign(compound, lt, rt, span);
+        }
         match compound {
             None => {
                 let rc = self.convert(rt, &target_ty);
@@ -2798,6 +2873,40 @@ impl Checker {
     /// `static` object, a `constexpr`, an enumerator, a file-scope object, or a
     /// declared function). Used by `check_call` to detect a call to an
     /// as-yet-undeclared function.
+    /// `v = x` / `v op= x` where the target or the value is a vector: both
+    /// must be vectors of one size (a scalar right operand of a compound
+    /// assignment is broadcast, as in a binary operation).
+    fn check_vector_assign(&mut self, compound: Option<BinaryOp>, lt: TExpr, rt: TExpr, span: Span) -> Option<TExpr> {
+        let target_ty = lt.ty.clone();
+        if !target_ty.is_vector() {
+            self.error(span, format!("cannot assign a '{}' to a '{target_ty}'", rt.ty));
+            return None;
+        }
+        match compound {
+            None => {
+                if !rt.ty.is_vector() {
+                    self.error(span, format!("cannot assign a '{}' to a '{target_ty}'", rt.ty));
+                    return None;
+                }
+                let rc = self.vector_operand(rt, &target_ty, span)?;
+                Some(TExpr::new(TExprKind::Assign(Box::new(lt), Box::new(rc)), target_ty, span))
+            }
+            Some(op) => {
+                // Type the operation as the binary operator would.
+                let probe = self.check_vector_binary(op, lt.clone(), rt, span)?;
+                let (TExprKind::Arith(_, _, r) | TExprKind::Shift(_, _, r)) = probe.kind else {
+                    self.error(span, "invalid compound assignment on a vector");
+                    return None;
+                };
+                Some(TExpr::new(
+                    TExprKind::Compound { lvalue: Box::new(lt), rhs: r, op, compute_ty: target_ty.clone() },
+                    target_ty,
+                    span,
+                ))
+            }
+        }
+    }
+
     fn ident_in_scope(&self, ctx: &FnCtx, name: &str) -> bool {
         ctx.lookup(name).is_some()
             || self.constexprs.contains_key(name)
@@ -2868,6 +2977,8 @@ impl Checker {
             | "ctzll" | "ffs" | "ffsl" | "ffsll" | "parity" | "parityl" | "parityll" => {
                 return self.builtin_bit_count(ctx, base, args, span);
             }
+            "shufflevector" => return self.builtin_shufflevector(ctx, args, span),
+            "shuffle" => return self.builtin_shuffle(ctx, args, span),
             "bswap16" => return self.builtin_bswap(ctx, args, 16, span),
             "bswap32" => return self.builtin_bswap(ctx, args, 32, span),
             "bswap64" => return self.builtin_bswap(ctx, args, 64, span),
@@ -3268,6 +3379,18 @@ impl Checker {
             // Cast to void: evaluate for effect; result is void.
             return Some(TExpr::new(TExprKind::Convert(Box::new(te)), CType::Void, span));
         }
+        // A vector casts to/from a vector or an integer of the same size,
+        // reinterpreting the bits.
+        if ty.is_vector() || te.ty.is_vector() {
+            let ok = (ty.is_vector() || ty.is_integer())
+                && (te.ty.is_vector() || te.ty.is_integer())
+                && self.size_of(ty) == self.size_of(&te.ty);
+            if !ok {
+                self.error(span, format!("cannot cast '{}' to '{ty}' (a vector cast needs equal sizes)", te.ty));
+                return None;
+            }
+            return Some(self.convert(te, ty));
+        }
         if !te.ty.is_scalar() {
             self.error(span, "cannot cast a non-scalar value");
             return None;
@@ -3295,6 +3418,10 @@ impl Checker {
         let cond = self.check_cond(ctx, c)?;
         let tt = self.check_rvalue(ctx, t)?;
         let ft = self.check_rvalue(ctx, f)?;
+        if (tt.ty.is_vector() || ft.ty.is_vector()) && tt.ty != ft.ty {
+            self.error(span, format!("conditional arms of types '{}' and '{}' do not match", tt.ty, ft.ty));
+            return None;
+        }
         let result_ty = if tt.ty.is_arithmetic() && ft.ty.is_arithmetic() {
             usual_arith(&tt.ty, &ft.ty)
         } else if tt.ty.is_pointer() {
@@ -3350,6 +3477,17 @@ impl Checker {
             return e;
         }
         let span = e.span;
+        // Only a same-size vector or integer converts to/from a vector (a bit
+        // reinterpretation); anything else is a type error, not a conversion.
+        if (e.ty.is_vector() || to.is_vector())
+            && !matches!(to, CType::Void)
+            && !((e.ty.is_vector() || e.ty.is_integer())
+                && (to.is_vector() || to.is_integer())
+                && self.size_of(&e.ty) == self.size_of(to))
+        {
+            self.error(span, format!("cannot convert '{}' to '{to}'", e.ty));
+            return e;
+        }
         TExpr::new(TExprKind::Convert(Box::new(e)), to.clone(), span)
     }
 }
@@ -3365,6 +3503,12 @@ fn size_t() -> CType {
 /// `int a[10];`).
 fn ty_is_more_complete(new_ty: &CType, old_ty: &CType) -> bool {
     matches!((old_ty, new_ty), (CType::Array(_, 0), CType::Array(_, n)) if *n != 0)
+}
+
+/// Whether an object of type `ty` is initialized element by element from
+/// `init`: an array or record, or a vector given a brace-enclosed list.
+fn braced_aggregate(ty: &CType, init: &Init) -> bool {
+    ty.is_aggregate() || (ty.is_vector() && matches!(init, Init::List(_)))
 }
 
 /// Whether field `idx` of record `id` is an unnamed bit-field (padding or a
@@ -3950,6 +4094,7 @@ fn idents_in_expr(e: &Expr, out: &mut HashSet<String>) {
         | ExprKind::SizeofExpr(a)
         | ExprKind::Member(a, _, _)
         | ExprKind::VaArg(a, _)
+        | ExprKind::ConvertVector(a, _)
         | ExprKind::VaEnd(a) => idents_in_expr(a, out),
         ExprKind::Binary(_, a, b)
         | ExprKind::Assign(_, a, b)
