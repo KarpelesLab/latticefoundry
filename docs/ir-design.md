@@ -326,9 +326,10 @@ constraining of them (hidden > protected > default), as the gABI specifies for
 the static linker. Attributes live in `Function::attrs` (`FuncAttrs`) and in
 `GlobalAttrs::visibility`; the `.lfb` format carries them from version 3.
 
-**Position-independent code** (`CodegenOptions::reloc_model`, x86-64): a
-symbol is *locally bound* when it is `internal`, `hidden`, or — for PIE — any
-definition in the module. Direct calls always use `R_X86_64_PLT32` (the linker
+**Position-independent code** (`CodegenOptions::reloc_model`, x86-64 and
+AArch64): a symbol is *locally bound* when it is `internal`, `hidden`, or —
+for PIE — any definition in the module. On x86-64, direct calls always use
+`R_X86_64_PLT32` (the linker
 resolves a locally bound one directly). Taking the address of a locally bound
 global or function is a RIP-relative `lea` (`R_X86_64_PC32`); any other address
 (default or protected visibility, external declarations) is loaded from the
@@ -337,6 +338,13 @@ their canonical address may be the executable's. Address constants in data stay
 `R_X86_64_64` for the linker to turn into dynamic relocations, and `constant`
 globals holding an address move from `.rodata` to `.data.rel.ro` (made read-only
 after relocation), so a shared object never needs text relocations.
+
+AArch64 follows the same binding rules with its own sequences: a locally bound
+address is `adrp`+`add` (`R_AARCH64_ADR_PREL_PG_HI21` +
+`R_AARCH64_ADD_ABS_LO12_NC`), any other is loaded from the GOT with
+`adrp`+`ldr` (`R_AARCH64_ADR_GOT_PAGE` + `R_AARCH64_LD64_GOT_LO12_NC`), and
+calls stay `bl` (`R_AARCH64_CALL26`, which the linker routes through a PLT
+entry for a preemptible callee).
 
 ## 4c. Thread-local storage  *(decided)*
 
@@ -706,8 +714,10 @@ the same whichever OS it runs on. The choice is made once per compilation by a
 
 - **Calling convention** (`Triple::call_conv`): x86-64 uses the Microsoft x64
   convention on Windows and System V elsewhere; AArch64 uses AAPCS64 (the Apple
-  and Microsoft variants differ only in variadic calls, which the AArch64
-  backend does not lower, and in reserving `x18`, which it never allocates);
+  and Microsoft variants differ in variadic calls and in reserving `x18`,
+  which the backend never allocates; it implements the base standard's
+  variadic calls, with the `va_list` register save area, and Darwin's, where
+  anonymous arguments go on the stack; Windows on Arm's are not lowered);
   Cortex-M Thumb (`thumbv7m`) uses the 32-bit AAPCS base standard, so a
   floating-point value travels in core registers like the integer of its width
   (the soft-float lowering makes it one before isel).
@@ -902,7 +912,9 @@ that may take a conditional branch depending on a register value:
 
 - x86-64: the terminators, the `u64`↔float fix-ups, the `lock cmpxchg` loop,
   and `dyn_alloca`'s probe loop;
-- AArch64 and RISC-V: the terminators and the atomic retry loops;
+- AArch64: the terminators, the atomic retry loops and `dyn_alloca`'s probe
+  loop;
+- RISC-V: the terminators and the atomic retry loops;
 - Thumb: the terminators only. Its compare-and-set and `select` are `IT`
   blocks (`cmp`/`tst`, `ite`, two `mov`s), which issue every instruction
   whatever the condition, so they are not branches.
@@ -928,9 +940,9 @@ lowering (the float conversions, atomics, `dyn_alloca`, division) has its
 secret operands rejected by the verifier.
 
 The same holds under position-independent code, where globals are reached
-through the GOT, and under the Win64 convention, where stack-passed
-arguments and `xmm` saves are added. The tests disassemble the whole
-`.text` of those builds.
+through the GOT (on x86-64 and AArch64), and under the Win64 convention,
+where stack-passed arguments and `xmm` saves are added. The tests
+disassemble (or, on AArch64, decode) the whole `.text` of those builds.
 
 ### Code generation passes
 

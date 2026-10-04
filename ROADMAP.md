@@ -27,10 +27,12 @@ the exit criteria are what "done" means for each phase.
 > - **DWARF** (`lf build -g`)
 > - the **`-O0..-O3`** pipeline
 > - **LTO**
-> - a native **dynamic stack allocation** op (`DynAlloca`)
-> - **shared-library output** on x86-64: position-independent code
->   (`CodegenOptions::reloc_model`, GOT/PLT), symbol visibility
->   (`hidden`/`protected`), `lf build --shared`/`--pie` linked by qld
+> - a native **dynamic stack allocation** op (`DynAlloca`, x86-64 and
+>   AArch64, with stack probes)
+> - **shared-library output** on x86-64 and AArch64: position-independent
+>   code (`CodegenOptions::reloc_model`, GOT/PLT), symbol visibility
+>   (`hidden`/`protected`), `lf build --shared` (and `--pie` on x86-64)
+>   linked by qld
 > - **PE/COFF and Mach-O** object writers (x86-64, AArch64), the **Microsoft
 >   x64 calling convention** for Windows targets, target triples
 >   (`lf build --target`, `-c`), PE executables via qld, and **raw binary /
@@ -52,8 +54,11 @@ the exit criteria are what "done" means for each phase.
 > - three targets:
 >   - **x86-64** executes, with the full System V ABI including
 >     struct-by-value and variadics.
->   - **AArch64** covers integer, FP and the AAPCS64 aggregate ABI, validated
->     with `llvm-mc` and an interpreter.
+>   - **AArch64** covers integer, FP, the AAPCS64 aggregate ABI, variadic
+>     functions (Linux and Darwin), `DynAlloca`, PIC and DWARF; it writes
+>     ELF objects and links Linux executables and shared libraries with qld.
+>     It is validated with `llvm-mc`, an IR interpreter, and an A64 emulator
+>     that runs the linked programs, including against clang-compiled C.
 >   - **RISC-V RV64IM** covers integer, validated the same way.
 >
 > About 460 framework tests pass, and every commit is green: build, test and
@@ -67,11 +72,11 @@ the exit criteria are what "done" means for each phase.
 >
 > Still open in Phase 10:
 >
-> - position-independent code on AArch64 and RISC-V (shared-library output
->   is x86-64 only)
+> - position-independent code on RISC-V (shared-library output is x86-64
+>   and AArch64 only)
 > - sanitizers
 > - RISC-V FP, C extension and relocations
-> - `DynAlloca` on AArch64 and RISC-V
+> - `DynAlloca` on RISC-V
 > - the deferred bets: B6 (region form), B7 (full content-addressing), B10
 >   (provenance types; only the constant-time step is done) and B11 (verified
 >   lowering)
@@ -382,8 +387,12 @@ for the target's ABI; encodings match the architecture manual.
 
 *Progress:* x86-64 ✅ (integer, SSE, full System V ABI incl. struct-by-value
 and variadics; executes natively). AArch64 ✅ integer + scalar FP + AAPCS64
-aggregates (validated vs `llvm-mc` + an A64-MIR interpreter; no native
-execution on the x86-64 host). RISC-V 🔶 RV64IM integer, plus the A
+aggregates + variadics (the `va_list` register save area; Darwin's
+stack-passed anonymous arguments) + `DynAlloca` + PIC, ELF objects linked by
+qld into Linux executables and shared libraries (validated vs `llvm-mc`, an
+A64-MIR interpreter, and an A64 emulator running the qld-linked programs,
+cross-checked against clang-compiled C; no native execution on the x86-64
+host). RISC-V 🔶 RV64IM integer, plus the A
 extension for atomics (validated vs `llvm-mc` + interpreter); F/D, C and
 relocations remain. Volatile accesses, atomics (`atomic_load`/`atomic_store`/
 `atomic_rmw`/`cmpxchg`) and fences lower on all three targets from each ISA's
@@ -403,10 +412,13 @@ the GOT (`mov reg, [rip + sym@GOTPCREL]`), locally bound ones (`internal`,
 `R_X86_64_PLT32`, and pointer-holding constants move to `.data.rel.ro`; no
 absolute 32-bit relocation is emitted. Symbol **visibility** (`hidden`/
 `protected`, [ir-design §4b](docs/ir-design.md)) reaches ELF `st_other`, and
-functions take `internal`/`weak` linkage. AArch64 and RISC-V reject the PIC
-models with a clear error (`target::compile_module_for`); they need GOT
-sequences (`adrp`+`ldr` `R_AARCH64_ADR_GOT_PAGE`/`LD64_GOT_LO12_NC`, `auipc`+`ld`
-`R_RISCV_GOT_HI20`).
+functions take `internal`/`weak` linkage. AArch64 generates the same models
+with `adrp`+`ldr` GOT loads (`R_AARCH64_ADR_GOT_PAGE`/`LD64_GOT_LO12_NC`) and
+`adrp`+`add` for locally bound symbols; its shared libraries (qld) carry no
+text relocation, and a test loads one into the emulator, applies its dynamic
+relocations and interposes a symbol. RISC-V rejects the PIC models with a
+clear error (`target::compile_module_for`); it needs `auipc`+`ld`
+`R_RISCV_GOT_HI20`.
 **Thread-local storage** on x86-64 ([ir-design §4c](docs/ir-design.md)):
 `global thread_local @x` lives in `.tdata`/`.tbss` (`STT_TLS`) and is reached
 through `%fs` with the model the relocation model and locality pick —
@@ -561,16 +573,17 @@ programs.
 
 *Progress:* JIT ✅, DWARF line tables (`lf build -g`, gdb-loadable) ✅,
 `-O0..-O3` + LTO ✅, z3rs superoptimizer ✅, native dynamic stack allocation
-(`DynAlloca`, x86-64) ✅, native `syscall` op (Linux ABI on all three targets;
+(`DynAlloca`, x86-64 and AArch64) ✅, native `syscall` op (Linux ABI on all three targets;
 x86-64 execution-tested, freestanding) ✅, per-function stack usage
 (`codegen::stack`: exact static frame sizes read off each target's frame
 layout, callees / indirect calls / syscalls / `dyn_alloca`, and
 `StackReport::worst_case_depth` over the call graph with caller-supplied bounds;
 `compile_module_with` on all three targets, `lf build --stack-usage`) ✅, stack
-probes (`CodegenOptions::stack_probes`, default on: frames and x86-64
-`dyn_alloca` move `sp` one 4 KiB page at a time and touch each step, so an
-overflow faults on the guard; x86-64 execution-tested, AArch64/RISC-V
-emulated; AArch64 frames beyond 4 KiB now encode correctly) ✅, green-thread
+probes (`CodegenOptions::stack_probes`, default on: frames and the x86-64
+and AArch64 `dyn_alloca` move `sp` one 4 KiB page at a time and touch each
+step, so an overflow faults on the guard; x86-64 execution-tested,
+AArch64/RISC-V emulated; AArch64 frames beyond 4 KiB now encode correctly)
+✅, green-thread
 runtime support ([docs/runtime-support.md](docs/runtime-support.md)):
 LF-emitted context save/restore/switch routines with a versioned context
 layout on all three targets, x86-64 signal preemption through the `ucontext`
