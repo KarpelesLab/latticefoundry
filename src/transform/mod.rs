@@ -27,6 +27,7 @@ pub mod inline;
 pub mod licm;
 pub mod mem2reg;
 pub mod pipeline;
+pub mod sanitize;
 pub mod sccp;
 pub mod simplify_cfg;
 pub mod superopt;

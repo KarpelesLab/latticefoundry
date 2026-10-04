@@ -49,6 +49,11 @@
 //! data included; undefined functions imported from `"env"`), and with `-c` a
 //! relocatable wasm object for `wasm-ld`. A module that declares no data
 //! layout gets the wasm32 one (ILP32).
+//!
+//! `--sanitize=<checks>` inserts run-time checks for undefined behavior
+//! (`transform::sanitize`) into the verified module before the `-O` pipeline;
+//! failures are reported on stderr by a freestanding runtime linked into the
+//! program, or trap with `--sanitize-trap`.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -62,6 +67,7 @@ use latticefoundry::target::{ObjectFormat, TargetArch, TargetOs, Triple};
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::{Diagnostic, FileId, Severity};
 use latticefoundry::transform::pipeline::{self, OptLevel};
+use latticefoundry::transform::sanitize::{self, SanitizeKinds, SanitizeOptions};
 use latticefoundry::{target, verify};
 
 fn main() -> ExitCode {
@@ -99,6 +105,7 @@ fn print_usage() {
     println!("           [-c [--format <fmt>]]");
     println!("           [--oformat elf|binary|ihex] [--base <addr>]");
     println!("           [--shared [-soname <name>] | --pie | -c [--pic|--pie]] [-L<dir>] [-l<lib>]");
+    println!("           [--sanitize=<checks>] [--sanitize-trap[=<checks>]] [--sanitize-halt]");
     println!("  lf --version | --help\n");
     println!("  -O0..-O3       optimization level (default: -O0)");
     println!("  -g / --debug   emit DWARF debug info (source lines, symbols)");
@@ -129,6 +136,13 @@ fn print_usage() {
     println!("  --pic          with -c: position-independent code for a shared library");
     println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie, Cortex-M,");
     println!("                 AArch64 and macOS executables)");
+    println!("  --sanitize=K,… insert run-time checks for undefined behavior: undefined (all),");
+    println!("                 signed-integer-overflow, unsigned-integer-overflow, shift,");
+    println!("                 integer-divide-by-zero, float-cast-overflow, bounds, object-size,");
+    println!("                 null, alignment, unreachable, exact (reports go to stderr on Linux;");
+    println!("                 elsewhere the program supplies __lf_ub_report)");
+    println!("  --sanitize-trap[=K,…]  trap (ud2 / the target's trap) instead of reporting");
+    println!("  --sanitize-halt        exit with status 1 after the first report");
     println!("`lf build` compiles one or more IR modules to a static native executable");
     println!("(for a Windows target, a PE executable whose entry point is `main`; for macOS,");
     println!("a Mach-O executable started by dyld, linking libSystem, whose LC_MAIN is `main`).");
@@ -167,6 +181,13 @@ struct BuildOptions {
     link_extra: Vec<String>,
     /// `--unwind-tables` / `--no-unwind-tables`, if given.
     unwind: Option<bool>,
+    /// `--sanitize=`: the undefined-behavior checks to insert.
+    sanitize: SanitizeKinds,
+    /// `--sanitize-trap[=]`: the checks that trap instead of reporting.
+    sanitize_trap: SanitizeKinds,
+    /// Whether a sanitized program continues after a report
+    /// (`--sanitize-halt` turns it off).
+    sanitize_recover: bool,
 }
 
 /// What `lf build` produces.
@@ -267,6 +288,19 @@ fn build(args: &[String]) -> Result<(), String> {
     // Verify (Structural tier) unless suppressed.
     if opts.verify {
         verify_or_err(&module, "input")?;
+    }
+
+    // Instrument for undefined behavior before optimizing, so the flags the
+    // checks cover are checked before the optimizer exploits them.
+    if !opts.sanitize.is_empty() {
+        let mut sopts = SanitizeOptions::new(opts.sanitize, opts.target.arch, opts.target.os);
+        sopts.trap = opts.sanitize_trap.intersect(opts.sanitize);
+        sopts.recover = opts.sanitize_recover;
+        let file = opts.inputs.first().cloned().unwrap_or_default();
+        sanitize::sanitize_module(&mut module, &mut syms, &file, &sopts)?;
+        if opts.verify {
+            verify_or_err(&module, "sanitized")?;
+        }
     }
 
     // Run the optimization pipeline, then re-verify (a pass must preserve validity).
@@ -614,6 +648,9 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut soname: Option<String> = None;
     let mut link_extra: Vec<String> = Vec::new();
     let mut unwind = None;
+    let mut sanitize = SanitizeKinds::NONE;
+    let mut sanitize_trap = SanitizeKinds::NONE;
+    let mut sanitize_recover = true;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -645,6 +682,16 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             flag if (flag.starts_with("-L") || flag.starts_with("-l")) && flag.len() > 2 => {
                 link_extra.push(flag.to_owned());
             }
+            flag if flag.starts_with("--sanitize=") || flag.starts_with("-fsanitize=") => {
+                let list = flag.split_once('=').map_or("", |(_, v)| v);
+                sanitize = sanitize.union(SanitizeKinds::parse(list)?);
+            }
+            "--sanitize-trap" | "-fsanitize-trap" => sanitize_trap = SanitizeKinds::ALL,
+            flag if flag.starts_with("--sanitize-trap=") || flag.starts_with("-fsanitize-trap=") => {
+                let list = flag.split_once('=').map_or("", |(_, v)| v);
+                sanitize_trap = sanitize_trap.union(SanitizeKinds::parse(list)?);
+            }
+            "--sanitize-halt" | "--no-sanitize-recover" | "-fno-sanitize-recover" => sanitize_recover = false,
             "--format" => {
                 let f = it.next().ok_or("--format requires elf, coff or macho")?;
                 format = Some(ObjectFormat::parse(f).ok_or_else(|| format!("unknown object format '{f}'"))?);
@@ -756,6 +803,9 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         soname,
         link_extra,
         unwind,
+        sanitize,
+        sanitize_trap,
+        sanitize_recover,
     })
 }
 
