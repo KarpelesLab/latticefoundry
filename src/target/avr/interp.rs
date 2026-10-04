@@ -9,10 +9,15 @@
 //! low byte first), and every `SREG` flag the executed instructions define.
 //! An instruction it does not know, an access outside memory, a `break`, or
 //! running out of steps is an error.
+//!
+//! Instructions are decoded by the disassembler's AVR decoder
+//! ([`crate::mc::disasm::avr::decode_inst`]), so execution and `lf-dis`
+//! read machine code the same way.
 
 use std::fmt;
 
 use super::Device;
+use crate::mc::disasm::avr::{AvrInst, Op, Ptr, decode_inst};
 
 /// Why execution stopped abnormally.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,313 +223,174 @@ impl Avr {
         res
     }
 
+    /// The instruction at word address `w`, decoded by the disassembler's
+    /// decoder ([`decode_inst`]) — the one AVR decoder.
+    fn fetch(&self, w: u32) -> Option<AvrInst> {
+        let [a, b] = self.word(w).to_le_bytes();
+        let [c, d] = self.word(w + 1).to_le_bytes();
+        decode_inst(&[a, b, c, d])
+    }
+
     /// Execute one instruction.
     pub(crate) fn step(&mut self) -> Result<(), Fault> {
         self.steps += 1;
         let pc = self.pc;
         let op = self.word(pc);
-        let d5 = usize::from((op >> 4) & 0x1f);
-        let r5 = usize::from(((op >> 5) & 0x10) | (op & 0xf));
-        let d4 = 16 + usize::from((op >> 4) & 0xf);
-        let k8 = (((op >> 4) & 0xf0) | (op & 0xf)) as u8;
-        let mut next = pc + 1;
         let bad = || Fault(format!("unknown instruction {op:#06x} at {:#x}", pc * 2));
-        match op >> 12 {
-            0x0..=0x2 => {
-                let (d, r) = (self.data[d5], self.data[r5]);
-                match op >> 10 {
-                    0b000000 => {
-                        if op == 0 {
-                        } else if op & 0xff00 == 0x0100 {
-                            let (dd, rr) = (usize::from((op >> 4) & 0xf) * 2, usize::from(op & 0xf) * 2);
-                            let v = self.pair(rr);
-                            self.set_pair(dd, v);
-                        } else {
-                            return Err(bad());
-                        }
-                    }
-                    0b000001 => {
-                        self.sub8(d, r, self.flag(C), true);
-                    }
-                    0b000010 => self.data[d5] = self.sub8(d, r, self.flag(C), true),
-                    0b000011 => self.data[d5] = self.add8(d, r, false),
-                    0b000100 => {
-                        // cpse
-                        if d == r {
-                            next += self.len(next);
-                        }
-                    }
-                    0b000101 => {
-                        self.sub8(d, r, false, false);
-                    }
-                    0b000110 => self.data[d5] = self.sub8(d, r, false, false),
-                    0b000111 => self.data[d5] = self.add8(d, r, self.flag(C)),
-                    0b001000 => self.data[d5] = self.logic(d & r),
-                    0b001001 => self.data[d5] = self.logic(d ^ r),
-                    0b001010 => self.data[d5] = self.logic(d | r),
-                    0b001011 => self.data[d5] = r,
-                    _ => return Err(bad()),
+        let i = self.fetch(pc).ok_or_else(bad)?;
+        let mut next = pc + u32::from(i.len) / 2;
+        let (d, r) = (usize::from(i.d), usize::from(i.r));
+        let (dv, rv) = (self.data[d], self.data[r]);
+        let k8 = i.k as u8;
+        match i.op {
+            Op::Nop => {}
+            Op::Movw => {
+                let v = self.pair(r);
+                self.set_pair(d, v);
+            }
+            Op::Cpc => {
+                self.sub8(dv, rv, self.flag(C), true);
+            }
+            Op::Sbc => self.data[d] = self.sub8(dv, rv, self.flag(C), true),
+            Op::Add => self.data[d] = self.add8(dv, rv, false),
+            Op::Cpse => {
+                if dv == rv {
+                    next += self.len(next);
                 }
             }
-            0x3 => {
-                let d = self.data[d4];
-                self.sub8(d, k8, false, false);
+            Op::Cp => {
+                self.sub8(dv, rv, false, false);
             }
-            0x4 => {
-                let d = self.data[d4];
-                self.data[d4] = self.sub8(d, k8, self.flag(C), true);
+            Op::Sub => self.data[d] = self.sub8(dv, rv, false, false),
+            Op::Adc => self.data[d] = self.add8(dv, rv, self.flag(C)),
+            Op::And => self.data[d] = self.logic(dv & rv),
+            Op::Eor => self.data[d] = self.logic(dv ^ rv),
+            Op::Or => self.data[d] = self.logic(dv | rv),
+            Op::Mov => self.data[d] = rv,
+            Op::Cpi => {
+                self.sub8(dv, k8, false, false);
             }
-            0x5 => {
-                let d = self.data[d4];
-                self.data[d4] = self.sub8(d, k8, false, false);
-            }
-            0x6 => {
-                let v = self.data[d4] | k8;
-                self.data[d4] = self.logic(v);
-            }
-            0x7 => {
-                let v = self.data[d4] & k8;
-                self.data[d4] = self.logic(v);
-            }
-            0x8 | 0xa => {
-                // ldd/std Y+q, Z+q
-                let q = u32::from(((op >> 8) & 0x20) | ((op >> 7) & 0x18) | (op & 7));
-                let base = if op & 8 != 0 { self.pair(28) } else { self.pair(30) };
-                let a = u32::from(base) + q;
-                if op & 0x0200 != 0 {
-                    let v = self.data[d5];
-                    self.wr(a, v)?;
+            Op::Sbci => self.data[d] = self.sub8(dv, k8, self.flag(C), true),
+            Op::Subi => self.data[d] = self.sub8(dv, k8, false, false),
+            Op::Ori => self.data[d] = self.logic(dv | k8),
+            Op::Andi => self.data[d] = self.logic(dv & k8),
+            Op::Ldi => self.data[d] = k8,
+            Op::Ldd | Op::Std => {
+                let a = u32::from(self.pair(i.ptr.base())) + i.k as u32;
+                if i.op == Op::Std {
+                    self.wr(a, rv)?;
                 } else {
-                    self.data[d5] = self.rd(a)?;
+                    self.data[d] = self.rd(a)?;
                 }
             }
-            0x9 => self.exec9(op, d5, r5, &mut next)?,
-            0xb => {
-                let a = usize::from(((op >> 5) & 0x30) | (op & 0xf)) + 0x20;
-                if op & 0x0800 != 0 {
-                    self.data[a] = self.data[d5];
+            Op::Lds => self.data[d] = self.rd(i.k as u32)?,
+            Op::Sts => self.wr(i.k as u32, rv)?,
+            Op::Ld | Op::St => {
+                let p = i.ptr.base();
+                let mut a = self.pair(p);
+                if i.ptr.pre_dec() {
+                    a = a.wrapping_sub(1);
+                    self.set_pair(p, a);
+                }
+                if i.op == Op::St {
+                    self.wr(u32::from(a), rv)?;
                 } else {
-                    self.data[d5] = self.data[a];
+                    self.data[d] = self.rd(u32::from(a))?;
                 }
-            }
-            0xc | 0xd => {
-                let k = ((op & 0xfff) as i16) << 4 >> 4;
-                if op >> 12 == 0xd {
-                    self.push_ret(pc + 1)?;
-                }
-                if k == -1 {
-                    return Err(Fault(format!("halted in a self-loop at {:#x}", pc * 2)));
-                }
-                next = (pc as i32 + 1 + i32::from(k)) as u32 & 0x7fff;
-            }
-            0xe => self.data[d4] = k8,
-            0xf => {
-                if op & 0x0800 == 0 {
-                    let s = op & 7;
-                    let k = (((op >> 3) & 0x7f) as i8) << 1 >> 1;
-                    let set = self.sreg() & (1 << s) != 0;
-                    let want = op & 0x0400 == 0;
-                    if set == want {
-                        next = (pc as i32 + 1 + i32::from(k)) as u32;
-                    }
-                } else if op & 0x0c08 == 0x0800 {
-                    // bld / bst (the T flag)
-                    let b = 1u8 << (op & 7);
-                    if op & 0x0200 != 0 {
-                        let t = self.data[d5] & b != 0;
-                        self.set_flags(1 << 6, if t { 1 << 6 } else { 0 });
-                    } else if self.flag(1 << 6) {
-                        self.data[d5] |= b;
-                    } else {
-                        self.data[d5] &= !b;
-                    }
-                } else if op & 0x0c08 == 0x0c00 {
-                    // sbrc / sbrs
-                    let bit = self.data[d5] & (1 << (op & 7)) != 0;
-                    let skip_if_set = op & 0x0200 != 0;
-                    if bit == skip_if_set {
-                        next += self.len(next);
-                    }
-                } else {
-                    return Err(bad());
-                }
-            }
-            _ => return Err(bad()),
-        }
-        self.pc = next;
-        Ok(())
-    }
-
-    /// The length in words of the instruction at `w`.
-    fn len(&self, w: u32) -> u32 {
-        let op = self.word(w);
-        if op & 0xfe0c == 0x940c || op & 0xfe0f == 0x9000 || op & 0xfe0f == 0x9200 { 2 } else { 1 }
-    }
-
-    fn exec9(&mut self, op: u16, d5: usize, r5: usize, next: &mut u32) -> Result<(), Fault> {
-        let pc = self.pc;
-        let bad = || Fault(format!("unknown instruction {op:#06x} at {:#x}", pc * 2));
-        match (op >> 9) & 7 {
-            0 => {
-                // loads: ld/lpm/pop
-                match op & 0xf {
-                    0x4 | 0x5 => {
-                        let z = self.pair(30);
-                        self.data[d5] = self.flash[usize::from(z)];
-                        if op & 1 != 0 {
-                            self.set_pair(30, z.wrapping_add(1));
-                        }
-                    }
-                    0x9 | 0x1 | 0xd => {
-                        let p = match op & 0xf {
-                            0x9 => 28,
-                            0x1 => 30,
-                            _ => 26,
-                        };
-                        let a = self.pair(p);
-                        self.data[d5] = self.rd(u32::from(a))?;
-                        self.set_pair(p, a.wrapping_add(1));
-                    }
-                    0xc => {
-                        let a = self.pair(26);
-                        self.data[d5] = self.rd(u32::from(a))?;
-                    }
-                    0xf => self.data[d5] = self.pop()?,
-                    _ => return Err(bad()),
-                }
-            }
-            1 => match op & 0xf {
-                0x9 | 0x1 | 0xd => {
-                    let p = match op & 0xf {
-                        0x9 => 28,
-                        0x1 => 30,
-                        _ => 26,
-                    };
-                    let a = self.pair(p);
-                    let v = self.data[d5];
-                    self.wr(u32::from(a), v)?;
+                if i.ptr.post_inc() {
                     self.set_pair(p, a.wrapping_add(1));
                 }
-                0xc => {
-                    let a = self.pair(26);
-                    let v = self.data[d5];
-                    self.wr(u32::from(a), v)?;
-                }
-                0xf => {
-                    let v = self.data[d5];
-                    self.push(v)?;
-                }
-                _ => return Err(bad()),
-            },
-            2 => {
-                // one-operand ops, jmp/call, misc
-                if op & 0xfe0c == 0x940c {
-                    let k = (u32::from((op >> 4) & 0x1f) << 17) | (u32::from(op & 1) << 16) | u32::from(self.word(pc + 1));
-                    if op & 2 != 0 {
-                        self.push_ret(pc + 2)?;
-                    }
-                    *next = k;
-                    return Ok(());
-                }
-                let d = self.data[d5];
-                match op {
-                    0x9508 => {
-                        let hi = self.pop()?;
-                        let lo = self.pop()?;
-                        *next = u32::from(lo) | (u32::from(hi) << 8);
-                        return Ok(());
-                    }
-                    0x9509 => {
-                        self.push_ret(pc + 1)?;
-                        *next = u32::from(self.pair(30));
-                        return Ok(());
-                    }
-                    0x9409 => {
-                        *next = u32::from(self.pair(30));
-                        return Ok(());
-                    }
-                    0x94f8 => {
-                        self.set_flags(I, 0);
-                        return Ok(());
-                    }
-                    0x9478 => {
-                        self.set_flags(I, I);
-                        return Ok(());
-                    }
-                    0x9598 => return Err(Fault(format!("break at {:#x}", pc * 2))),
-                    _ => {}
-                }
-                match op & 0xfe0f {
-                    0x9400 => {
-                        let r = !d;
-                        self.nzs(r, V | C, C);
-                        self.data[d5] = r;
-                    }
-                    0x9401 => {
-                        let r = self.sub8(0, d, false, false);
-                        self.data[d5] = r;
-                    }
-                    0x9402 => self.data[d5] = d.rotate_left(4),
-                    0x9403 => {
-                        let r = d.wrapping_add(1);
-                        self.nzs(r, V, if d == 0x7f { V } else { 0 });
-                        self.data[d5] = r;
-                    }
-                    0x9405..=0x9407 => {
-                        let c = d & 1;
-                        let r = match op & 0xf {
-                            5 => (d >> 1) | (d & 0x80),
-                            6 => d >> 1,
-                            _ => (d >> 1) | (u8::from(self.flag(C)) << 7),
-                        };
-                        let n = r & 0x80 != 0;
-                        let v = n ^ (c != 0);
-                        self.nzs(r, V | C, if v { V } else { 0 } | c);
-                        self.data[d5] = r;
-                    }
-                    0x940a => {
-                        let r = d.wrapping_sub(1);
-                        self.nzs(r, V, if d == 0x80 { V } else { 0 });
-                        self.data[d5] = r;
-                    }
-                    _ => return Err(bad()),
+            }
+            Op::Lpm if i.ptr != Ptr::None => {
+                let z = self.pair(30);
+                self.data[d] = self.flash[usize::from(z)];
+                if i.ptr.post_inc() {
+                    self.set_pair(30, z.wrapping_add(1));
                 }
             }
-            3 => {
-                // adiw / sbiw
-                let p = 24 + 2 * usize::from((op >> 4) & 3);
-                let k = ((op >> 2) & 0x30) | (op & 0xf);
-                let a = self.pair(p);
-                let (r, c, v) = if op & 0x0100 == 0 {
-                    let r = a.wrapping_add(k);
-                    (r, u32::from(a) + u32::from(k) > 0xffff, (!a & r) & 0x8000 != 0)
-                } else {
-                    let r = a.wrapping_sub(k);
-                    (r, k > a, (a & !r) & 0x8000 != 0)
+            Op::Pop => self.data[d] = self.pop()?,
+            Op::Push => self.push(rv)?,
+            Op::Jmp | Op::Call => {
+                if i.op == Op::Call {
+                    self.push_ret(pc + 2)?;
+                }
+                next = i.k as u32;
+            }
+            Op::Ret => {
+                let hi = self.pop()?;
+                let lo = self.pop()?;
+                next = u32::from(lo) | (u32::from(hi) << 8);
+            }
+            Op::Icall => {
+                self.push_ret(pc + 1)?;
+                next = u32::from(self.pair(30));
+            }
+            Op::Ijmp => next = u32::from(self.pair(30)),
+            // `cli` / `sei`: the interrupt flag.
+            Op::Bclr if i.b == 7 => self.set_flags(I, 0),
+            Op::Bset if i.b == 7 => self.set_flags(I, I),
+            Op::Break => return Err(Fault(format!("break at {:#x}", pc * 2))),
+            Op::Com => {
+                let v = !dv;
+                self.nzs(v, V | C, C);
+                self.data[d] = v;
+            }
+            Op::Neg => self.data[d] = self.sub8(0, dv, false, false),
+            Op::Swap => self.data[d] = dv.rotate_left(4),
+            Op::Inc => {
+                let v = dv.wrapping_add(1);
+                self.nzs(v, V, if dv == 0x7f { V } else { 0 });
+                self.data[d] = v;
+            }
+            Op::Asr | Op::Lsr | Op::Ror => {
+                let c = dv & 1;
+                let v = match i.op {
+                    Op::Asr => (dv >> 1) | (dv & 0x80),
+                    Op::Lsr => dv >> 1,
+                    _ => (dv >> 1) | (u8::from(self.flag(C)) << 7),
                 };
-                self.set_pair(p, r);
-                let n = r & 0x8000 != 0;
+                let n = v & 0x80 != 0;
+                let ov = n ^ (c != 0);
+                self.nzs(v, V | C, if ov { V } else { 0 } | c);
+                self.data[d] = v;
+            }
+            Op::Dec => {
+                let v = dv.wrapping_sub(1);
+                self.nzs(v, V, if dv == 0x80 { V } else { 0 });
+                self.data[d] = v;
+            }
+            Op::Adiw | Op::Sbiw => {
+                let k = i.k as u16;
+                let a = self.pair(d);
+                let (v, c, ov) = if i.op == Op::Adiw {
+                    let v = a.wrapping_add(k);
+                    (v, u32::from(a) + u32::from(k) > 0xffff, (!a & v) & 0x8000 != 0)
+                } else {
+                    let v = a.wrapping_sub(k);
+                    (v, k > a, (a & !v) & 0x8000 != 0)
+                };
+                self.set_pair(d, v);
+                let n = v & 0x8000 != 0;
                 let mut f = 0;
                 if c {
                     f |= C;
                 }
-                if v {
+                if ov {
                     f |= V;
                 }
                 if n {
                     f |= N;
                 }
-                if n ^ v {
+                if n ^ ov {
                     f |= S;
                 }
-                if r == 0 {
+                if v == 0 {
                     f |= Z;
                 }
                 self.set_flags(C | V | N | S | Z, f);
             }
-            6 | 7 => {
-                // mul
-                let p = u16::from(self.data[d5]) * u16::from(self.data[r5]);
+            Op::Mul => {
+                let p = u16::from(dv) * u16::from(rv);
                 self.set_pair(0, p);
                 let mut f = 0;
                 if p & 0x8000 != 0 {
@@ -535,9 +401,52 @@ impl Avr {
                 }
                 self.set_flags(C | Z, f);
             }
+            Op::In => self.data[d] = self.data[usize::from(i.a) + 0x20],
+            Op::Out => self.data[usize::from(i.a) + 0x20] = rv,
+            Op::Rjmp | Op::Rcall => {
+                if i.op == Op::Rcall {
+                    self.push_ret(pc + 1)?;
+                }
+                if i.k == -1 {
+                    return Err(Fault(format!("halted in a self-loop at {:#x}", pc * 2)));
+                }
+                next = (pc as i32 + 1 + i.k) as u32 & 0x7fff;
+            }
+            Op::Brbs | Op::Brbc => {
+                let set = self.sreg() & (1 << i.b) != 0;
+                if set == (i.op == Op::Brbs) {
+                    next = (pc as i32 + 1 + i.k) as u32;
+                }
+            }
+            Op::Bld | Op::Bst => {
+                // The T flag.
+                let b = 1u8 << i.b;
+                if i.op == Op::Bst {
+                    let t = dv & b != 0;
+                    self.set_flags(1 << 6, if t { 1 << 6 } else { 0 });
+                } else if self.flag(1 << 6) {
+                    self.data[d] |= b;
+                } else {
+                    self.data[d] &= !b;
+                }
+            }
+            Op::Sbrc | Op::Sbrs => {
+                let bit = rv & (1 << i.b) != 0;
+                if bit == (i.op == Op::Sbrs) {
+                    next += self.len(next);
+                }
+            }
+            // Defined by the manual, but nothing the generated code uses.
             _ => return Err(bad()),
         }
+        self.pc = next;
         Ok(())
+    }
+
+    /// The length in words of the instruction at `w` (an unknown word counts
+    /// as one).
+    fn len(&self, w: u32) -> u32 {
+        self.fetch(w).map_or(1, |i| u32::from(i.len) / 2)
     }
 
     /// Run until the PC reaches the word address `stop`, for at most `budget`
