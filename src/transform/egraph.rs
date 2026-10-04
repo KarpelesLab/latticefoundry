@@ -764,6 +764,13 @@ impl<'a> EGraph<'a> {
         // a tainted one. Both components only decrease, so the fixpoint still
         // terminates; without secrets every node is untainted and this is the
         // plain cost fixpoint.
+        //
+        // `u64::MAX` marks a class with no extraction yet. The cost of a tree
+        // over a DAG with much sharing grows exponentially with its depth (a
+        // hash's rounds reuse every intermediate twice), so a real cost
+        // saturates at `COST_CAP` instead: still finite, just no longer
+        // ordered against other saturated costs.
+        const COST_CAP: u64 = u64::MAX - 1;
         let leaf_secret = |op: &NodeOp| match (op, secret) {
             (NodeOp::Leaf(v), Some(s)) => s.get(v.index()).copied().unwrap_or(false),
             _ => false,
@@ -787,10 +794,10 @@ impl<'a> EGraph<'a> {
                             finite = false;
                             break;
                         }
-                        cost = cost.saturating_add(cc);
+                        cost = cost.saturating_add(cc).min(COST_CAP);
                         tainted |= best_taint[root[ch]];
                     }
-                    if finite && cost < u64::MAX && (tainted, cost) < (best_taint[ci], best_cost[ci]) {
+                    if finite && (tainted, cost) < (best_taint[ci], best_cost[ci]) {
                         best_cost[ci] = cost;
                         best_taint[ci] = tainted;
                         best_node[ci] = Some(node.clone());
@@ -1454,6 +1461,31 @@ mod tests {
         if let Err(diags) = verify_module(&m) {
             panic!("output must verify: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
         }
+    }
+
+    /// A deep chain of shared subterms (`x_{n+1} = x_n * x_n + x_n`) has a
+    /// tree cost far beyond `u64`; extraction must saturate the cost, not
+    /// leave the classes unextractable (found compiling gnulib's `sm3.c` at
+    /// -O2, whose 64 rounds reuse each intermediate).
+    #[test]
+    fn exponential_tree_cost_still_extracts() {
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("eqsat-deep");
+        let i32t = m.types_mut().int(32);
+        let f = build_fn(&mut m, &mut syms, "f", &[i32t], i32t, |b, p| {
+            let mut x = p[0];
+            for _ in 0..80 {
+                let sq = b.mul(x, x, Flags::NONE);
+                x = b.add(sq, x, Flags::NONE);
+            }
+            let zero = b.const_i64(i32t, 0);
+            b.add(x, zero, Flags::NONE)
+        });
+        assert!(verify_module(&m).is_ok());
+        assert_eq!(run_eqsat(&mut m, f), Changed::Yes, "the `+ 0` folds away");
+        let func = m.function(f);
+        assert_eq!(count_kind(func, |k| matches!(k, InstKind::Bin(BinOp::Mul))), 80, "every round kept once");
+        assert!(verify_module(&m).is_ok(), "output must verify");
     }
 
     #[test]
