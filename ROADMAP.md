@@ -642,6 +642,17 @@ gap to a genuine bootstrap compiler is **the headers**.
 libc (or statically with `-nostdlib`), so gzip builds with **no gcc or system
 `ld` at any step**.
 
+It also uses the framework features built since: `-shared` (with
+`-Wl,-soname,`) links shared objects that gcc-built programs `dlopen`, and
+`-pie` links position-independent executables. `-fPIC`/`-fPIE` select the
+relocation model. `static` gives IR internal linkage, and
+`visibility(...)`/`-fvisibility=` and `weak` map onto the IR symbol attributes.
+`volatile` lowers to volatile loads and stores. `_Atomic`, the builtin
+`<stdatomic.h>`, and the `__atomic_*`/`__sync_*` builtins lower to the IR
+atomics (a two-thread program loses no update). GCC vector types lower to IR
+`<N x T>` vectors and cross calls in XMM registers like gcc's. C99 plain
+`inline` definitions no longer emit an external symbol.
+
 Each package exposed a handful of real gaps: K&R functions, implicit int,
 GNU keyword aliases, wide literals and `alloca`, plus a few miscompiles. All of
 them were fixed at the source, and every fix also counts toward M9.
@@ -656,17 +667,25 @@ correct; the gap is only in mixing `lf-cc` objects with gcc-compiled ones.
 *Status (2026-09-29):* **reached.** `/usr/include` is searched by default, and
 the ~120 glibc headers tested (the 28 core ones plus ~95 more) all compile.
 gzip, bzip2, Lua and SQLite build against them with output byte-identical
-to gcc's. Remaining, each with a clear error today:
-- GCC vector types, `_Atomic`, `__thread`/TLS (the root backend has x86-64
-  thread-locals, ir-design §4c; lf-cc does not emit them yet);
+to gcc's. Remaining, each with a clear error today unless noted:
+- `__thread`/TLS (the root backend has x86-64 thread-locals, ir-design §4c;
+  lf-cc does not emit them yet);
 - `__int128`/`_Float128`/`_Complex` *values* (declarations work; the root
   x86-64 backend now compiles `i128` with gcc's `__int128` ABI, ir-design
   §3b, so `__int128` needs only the lf-cc hookup);
 - a true 80-bit `long double`;
-- `__label__`, `__auto_type` and range designators;
-- `tgmath.h` and `stdatomic.h`;
-- C99 plain-`inline` external-definition semantics;
-- SSE classification for float-only unions and packed structs.
+- `__label__`, `__auto_type` and range designators (so gcc's own
+  `<stdatomic.h>`, which uses `__auto_type`, compiles only through lf-cc's
+  builtin one);
+- `tgmath.h`;
+- `_Atomic` structs and unions, and 16-byte atomics;
+- `__builtin_shuffle` with a non-constant mask;
+- SSE classification for float-only unions and packed structs, and for a
+  struct wrapping a 16-byte vector. The backend splits such a struct into two
+  SSE eightbytes where gcc passes it whole in one XMM register (SSEUP), so it
+  silently disagrees with gcc objects. Vectors passed directly are correct.
+- `#pragma GCC visibility push/pop` is silently ignored. The attribute and
+  `-fvisibility=` work.
 
 The original plan follows.
 
