@@ -117,8 +117,13 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
 - `lf build --target <triple>` picks the OS as well as the architecture:
   `-c` writes a relocatable **ELF, PE/COFF or Mach-O** object (x86-64 and
   AArch64 for COFF/Mach-O), Windows targets use the **Microsoft x64 calling
-  convention** and link a PE executable through qld, and `--oformat
-  binary|ihex` writes a **raw binary or Intel HEX** firmware image.
+  convention** and link a PE executable through qld, macOS targets link a
+  **Mach-O executable** (or `--shared` dylib) through qld's ld64 flavor, and
+  `--oformat binary|ihex` writes a **raw binary or Intel HEX** firmware image.
+- **Unwind tables** come from the same frame layout as the prologue: Windows
+  x64 `.pdata`/`.xdata`, Mach-O compact unwind, and DWARF `.eh_frame` for
+  x86-64 ELF (`--unwind-tables`, default with `-g`, `--shared`, `--pie`), so
+  debuggers, profilers and the Windows exception dispatcher walk LF frames.
 - An in-process JIT runs the same code without writing an executable.
 - `lf-as` assembles GNU-syntax assembly for x86-64, AArch64 and RISC-V using
   rsasm.
@@ -145,8 +150,8 @@ Roadmap phases 0–9 are complete, and most of Phase 10 is too. See
 | AArch64 | Integer, scalar FP, AAPCS64 struct-by-value | Encodings checked against `llvm-mc`; A64-MIR interpreter |
 | RISC-V  | RV64IM integer | Encodings checked against `llvm-mc`; interpreter |
 
-Not done yet: position-independent code on AArch64/RISC-V, Windows unwind
-tables (`.pdata`/`.xdata`), Mach-O executables, sanitizers, RISC-V FP and
+Not done yet: position-independent code on AArch64/RISC-V, AArch64 unwind
+tables beyond Mach-O compact unwind, sanitizers, RISC-V FP and
 relocations, dynamic `alloca` on AArch64/RISC-V, and the deferred bets (B6
 region form, B7 full content-addressing, B10 provenance types, B11 verified
 lowering).

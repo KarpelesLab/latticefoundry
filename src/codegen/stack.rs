@@ -60,7 +60,10 @@
 //! and the remainder is small enough that the gap stays within one interval);
 //! an adjustment of at least the interval moves the stack pointer one interval
 //! at a time and writes to the new top after each step (unrolled for a few
-//! pages, a counted loop beyond), then applies the sub-interval remainder. On
+//! pages, a counted loop beyond), then applies the sub-interval remainder. (The
+//! Windows x64 frame allocates a small fixed part before setting `rbp` and the
+//! rest after, see `x86_64::encode::FrameLayout::prologue_plan`; when the
+//! whole is probed, the rest first touches the new top.) On
 //! x86-64 and AArch64 a `dyn_alloca` does the same at run time (touching the
 //! current top first, then every interval of the requested size). An interval of 4096 bytes
 //! is at most the guard size on every Linux configuration (4 KiB pages or

@@ -738,6 +738,49 @@ the same whichever OS it runs on. The choice is made once per compilation by a
   cannot express with an error, never silently.
 - **Symbol names** stay the IR names everywhere; the Mach-O writer adds the
   platform's leading underscore itself.
+- **Unwind tables** (`codegen::unwind`, chosen by `CodegenOptions::unwind`,
+  defaulting to the OS's own): each backend describes a function's prologue
+  as frame steps (push, set the frame register, allocate, save an `xmm`) taken
+  from the same plan its prologue instructions are spliced from, at the
+  offsets those instructions encode to, so a table cannot drift from the code.
+  One description feeds three writers:
+  - **Windows x64** `.xdata` `UNWIND_INFO` + `.pdata` `RUNTIME_FUNCTION`s
+    (image-relative `RelocKind::ImageRel32`, COFF `ADDR32NB`). The Windows
+    x86-64 frame is ordered for its codes: `push rbp`, the callee-saved
+    pushes, a small fixed allocation (the `xmm6..15` save area plus a pad),
+    `lea rbp, [rsp + n]` (`UWOP_SET_FPREG`, `n` ≤ 240) so `rbp` lands on the
+    saved-`rbp` slot exactly as under System V, the `xmm` saves
+    (`UWOP_SAVE_XMM128`, offsets from the frame base), and only then the rest
+    of the frame. The unwinder recomputes `rsp` from `rbp` once it is set, so
+    that rest — probed page by page when large — and every `dyn_alloca` need
+    no code, and the table is exact at every instruction, including inside a
+    probe loop where a stack overflow faults.
+  - **DWARF `.eh_frame`** for ELF (x86-64; opt-in, and on for `-g`,
+    `--shared`, `--pie`): the CFA on `rsp` until `rbp` is set, on `rbp` after,
+    and back on `rsp + 8` between each epilogue's `pop rbp` and its `ret`.
+  - **Mach-O compact unwind** (`__LD,__compact_unwind`, folded by the linker
+    into `__unwind_info`): `UNWIND_X86_64_MODE_RBP_FRAME` (the System V frame:
+    `rbx`, `r12`–`r15` saved right below `rbp`) and, on arm64,
+    `UNWIND_ARM64_MODE_FRAME` for frames without callee-saved registers.
+  - **Not yet:** AArch64's callee-saved registers sit at the bottom of the
+    frame (`sp`-relative, possibly beyond `save_reg`'s 504-byte reach) and its
+    probe loop sits inside the prologue, while Windows ARM64 unwind codes
+    restore `sp`-relative saves before `set_fp` and map codes one-to-one onto
+    prologue instructions; Apple's arm64 frame mode wants the saves in pairs
+    right below `x29`. Both need an AArch64 prologue reordered like the
+    Windows x64 one, so AArch64 Windows objects carry no `.pdata`, arm64
+    Mach-O frames with callee-saved registers no compact record, and AArch64
+    ELF no `.eh_frame` yet.
+- **Executables** (`lf build`): static ELF on Linux (our own linker, or qld),
+  PE through qld's MinGW driver (entry `main`, no imports), and Mach-O through
+  qld's ld64 driver. A macOS process always links `libSystem` — `dyld`
+  initializes it and passes `main`'s return value to its `exit` — and the
+  system-call interface is private, so there is no static Mach-O: the image is
+  a PIE `MH_EXECUTE` with `LC_LOAD_DYLINKER` and `LC_MAIN`, linked against a
+  generated `libSystem.B.dylib` text stub (`.tbd`) that exports the object's
+  undefined symbols (or a real SDK's with `-L... -lSystem`); `--shared` gives
+  an `MH_DYLIB`. Mach-O code needs no GOT model for a dylib: it is
+  PC-relative as compiled and a two-level namespace does not preempt.
 - **Rejected: a convention per call site.** It would let two ABIs meet inside
   one module, which no front end needs today and every backend would have to
   support; a module-wide choice keeps the lowering one well-tested path per

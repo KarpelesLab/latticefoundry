@@ -35,8 +35,14 @@ the exit criteria are what "done" means for each phase.
 >   linked by qld
 > - **PE/COFF and Mach-O** object writers (x86-64, AArch64), the **Microsoft
 >   x64 calling convention** for Windows targets, target triples
->   (`lf build --target`, `-c`), PE executables via qld, and **raw binary /
+>   (`lf build --target`, `-c`), PE executables via qld, **Mach-O
+>   executables and dylibs** via qld's ld64 flavor (`dyld` + `LC_MAIN`,
+>   linking `libSystem` through a generated `.tbd` stub), and **raw binary /
 >   Intel HEX** firmware output
+> - **unwind tables** derived from the frame layouts: Windows x64
+>   `.pdata`/`.xdata` (every frame shape, including probed frames and
+>   `dyn_alloca`, through an `rbp` frame register), Mach-O compact unwind,
+>   and opt-in DWARF `.eh_frame` for x86-64 ELF
 > - **stack usage reports** (per-function frame sizes from the frame layout,
 >   worst-case depth over the call graph, `lf build --stack-usage`) and
 >   **stack probes** (on by default) on all three targets
@@ -638,9 +644,19 @@ layout on all three targets, x86-64 signal preemption through the `ucontext`
 yield-point pass whose loop selection uses a first B9 cost lattice ✅, other output
 formats (PE/COFF and Mach-O objects, the Microsoft x64 convention on x86-64
 Windows — execution-tested on Linux against gcc's `ms_abi` and a
-callee-saved-register harness —, `target::Triple`, raw binary / Intel HEX) ✅.
-Open: dynamic linking, PGO hooks, sanitizers, richer alias analysis, Windows
-unwind tables (`.pdata`/`.xdata`), Mach-O executables.
+callee-saved-register harness —, `target::Triple`, raw binary / Intel HEX) ✅,
+Mach-O executables and dylibs (`link::darwin`: qld's ld64 flavor, `LC_MAIN`
+started by `dyld`, `libSystem` from a generated text stub; structural checks
+with `llvm-objdump --macho`, since they cannot run here) ✅, unwind tables
+from the frame layout (`codegen::unwind`; [ir-design §6c](docs/ir-design.md)):
+Windows x64 `.pdata`/`.xdata` whose codes `llvm-readobj --unwind` decodes to
+exactly the prologue, Mach-O compact unwind (`RBP_FRAME` on x86-64, `FRAME`
+on arm64 for frames without callee-saved registers), and DWARF `.eh_frame`
+for x86-64 ELF (`--unwind-tables`, default with `-g`/`--shared`/`--pie`;
+`llvm-dwarfdump` and a `gdb` backtrace) ✅.
+Open: dynamic linking, PGO hooks, sanitizers, richer alias analysis, unwind
+tables for AArch64 beyond Mach-O compact unwind (Windows ARM64 `.xdata` and
+ELF `.eh_frame`; see ir-design §6c).
 
 ## 5. Testing strategy
 
