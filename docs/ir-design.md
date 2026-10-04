@@ -346,6 +346,14 @@ address is `adrp`+`add` (`R_AARCH64_ADR_PREL_PG_HI21` +
 calls stay `bl` (`R_AARCH64_CALL26`, which the linker routes through a PLT
 entry for a preemptible callee).
 
+RISC-V likewise: a locally bound address is `auipc`+`addi`
+(`R_RISCV_PCREL_HI20` against the symbol, then `R_RISCV_PCREL_LO12_I`
+against a local label on the `auipc`, since the low part is the low bits of
+*that instruction's* displacement), any other is loaded from the GOT with
+`auipc`+`ld` (`R_RISCV_GOT_HI20`, then the same label-relative
+`R_RISCV_PCREL_LO12_I`), and calls stay `auipc`+`jalr` under one
+`R_RISCV_CALL_PLT`.
+
 ## 4c. Thread-local storage  *(decided)*
 
 A global marked `thread_local` has **one instance per thread**:
@@ -718,7 +726,8 @@ the same whichever OS it runs on. The choice is made once per compilation by a
   which the backend never allocates; it implements the base standard's
   variadic calls, with the `va_list` register save area, and Darwin's, where
   anonymous arguments go on the stack; Windows on Arm's are not lowered);
-  Cortex-M Thumb (`thumbv7m`) uses the 32-bit AAPCS base standard, so a
+  RISC-V uses LP64D (§6h); Cortex-M Thumb (`thumbv7m`) uses the 32-bit
+  AAPCS base standard, so a
   floating-point value travels in core registers like the integer of its width
   (the soft-float lowering makes it one before isel).
   Every function in a module follows the same convention; there is no
@@ -914,7 +923,10 @@ that may take a conditional branch depending on a register value:
   and `dyn_alloca`'s probe loop;
 - AArch64: the terminators, the atomic retry loops and `dyn_alloca`'s probe
   loop;
-- RISC-V: the terminators and the atomic retry loops;
+- RISC-V: the terminators, the atomic retry loops and `dyn_alloca`'s probe
+  loop (its float compares are `feq`/`flt`/`fle` with `xori`/`and`/`or`, and
+  its float-to-integer conversions single saturating instructions, so
+  floating point adds no branch);
 - Thumb: the terminators only. Its compare-and-set and `select` are `IT`
   blocks (`cmp`/`tst`, `ite`, two `mov`s), which issue every instruction
   whatever the condition, so they are not branches.
@@ -1272,6 +1284,67 @@ published avr-gcc ABI and the ELF/AVR relocation list:
 - **Rejected: word-addressed data in program memory.** `lpm` reads bytes, so
   flash data pointers are byte addresses; only functions use word addresses,
   matching avr-gcc's function pointers.
+
+## 6h. RISC-V: RV64GC and the LP64D convention  *(decided)*
+
+`target::riscv` targets RV64GC (the I base with the M, A, F, D and C
+extensions) under the LP64D psABI, through the ordinary MIR/regalloc
+pipeline, clean-room from the RISC-V ISA manual and the RISC-V ELF psABI:
+
+- **Floating point.** `f32`/`f64` live in `f0`–`f31` (a single NaN-boxed).
+  The IR fixes the value of every float result but not the payload of a NaN,
+  and RISC-V arithmetic returns the canonical NaN, so no fix-up is needed;
+  `fneg` is a sign injection (`fsgnjn`), exact for NaNs as the IR requires.
+  A multiply feeding an add or subtract becomes one fused instruction only
+  when **both** carry `contract` (the IR's only license to skip a rounding),
+  and only when the multiply has no other use. `fptosi`/`fptoui` are the
+  saturating `fcvt` with `rtz` (out of range is poison, so saturation refines
+  it); `frem` is a call to C's `fmod`/`fmodf`, declared by the backend when a
+  module needs it. `f16` would need Zfh and is rejected.
+- **LP64D.** An argument is placed part by part: a scalar in the next `a`
+  register, a named float in the next `fa` register and then like an integer
+  of its size (integer register, then an 8-byte stack slot), a variadic float
+  like an integer. A struct (flattened through nested structs and arrays)
+  whose fields are one float, two floats, or a float and an integer of at
+  most 8 bytes goes in one `fa`/`a` register per field when enough remain;
+  otherwise up to 16 bytes travel as one or two 8-byte integer chunks (split
+  between `a7` and the stack if need be) and anything larger by reference.
+  A result is placed as a first argument would be with only `a0`/`a1` and
+  `fa0`/`fa1`; one that does not fit comes back through memory whose address
+  is a hidden `a0` argument. A struct value is, in the backend, a pointer to
+  its storage; the call site classifies by the callee's parameter types, so a
+  plain pointer may be passed where a struct is expected.
+- **Addressing.** Everything is PC-relative (the `medany` code model): a call
+  is `auipc ra`+`jalr` under `R_RISCV_CALL_PLT`, an address `auipc`+`addi`
+  with `R_RISCV_PCREL_HI20`/`R_RISCV_PCREL_LO12_I` — the low part's symbol is
+  a local label on the `auipc`, not the target — or a GOT load under PIC
+  (§4b). No `R_RISCV_RELAX` is emitted, so linking never depends on the
+  global pointer.
+- **Frames.** From `sp` up: the outgoing stack arguments, `ra` and the
+  callee-saved `s`/`fs` registers, the slots. A function using `dyn_alloca`
+  reserves `s0` as a frame pointer (slots and incoming arguments are
+  addressed from it) and keeps the outgoing area at the bottom of the moving
+  `sp`; with probes, it touches the current top with a load (`0(sp)` may hold
+  a saved register) and then every new page.
+- **The C extension** is a final encoding choice: with it on, every
+  instruction that has a 16-bit form takes it, except those a relocation
+  patches, branches and jumps (their displacements are fixed up after
+  layout), and the word-counted loops of the probe, `dyn_alloca` and LR/SC
+  expansions. The object then carries `EF_RISCV_RVC`.
+- **Validation.** The host cannot run RISC-V code, so an instruction-set
+  simulator with its own decoder (and its own compressed-instruction
+  expander) runs the linked machine code — linked by a test linker, or by qld
+  and loaded from the file with its dynamic relocations applied —
+  differentially against the reference evaluator and a MIR interpreter, and
+  runs clang-compiled `rv64gc` C calling the backend's functions and back.
+
+- **Rejected: relaxation.** `R_RISCV_RELAX` lets the linker shorten
+  `auipc` pairs into `jal` or `gp`-relative forms; it is an optimization whose
+  `gp` form needs startup code to set `gp`, and unrelaxed code is correct
+  everywhere.
+- **Rejected: compressed branches.** `c.j`/`c.beqz` would need a relaxation
+  loop over block layout (their ranges are short); branches are a small part
+  of the code.
 
 ## 7. Instruction flags: one unified model  *(decided)*
 

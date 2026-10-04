@@ -107,7 +107,8 @@ pub enum CallConvKind {
     Win64,
     /// The Arm AAPCS64 (AArch64 on every OS).
     Aapcs64,
-    /// The RISC-V LP64 integer calling convention.
+    /// The RISC-V LP64D calling convention (the LP64 integer convention plus
+    /// the hardware floating-point one: floats in `fa0`–`fa7`).
     RiscvLp64,
     /// The 32-bit Arm AAPCS, base standard (soft-float: floating-point values
     /// in core registers), as Cortex-M code uses it.

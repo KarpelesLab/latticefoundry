@@ -210,6 +210,38 @@ fn float_lowering_is_branch_free() {
     assert!(bad.is_empty(), "conditional branches {bad:08x?}");
 }
 
+/// Floats live across a call sit in the callee-saved `fs` registers, which
+/// the prologue saves (`fsd`) and the epilogue restores, and which the stack
+/// report counts; the simulator's harness checks every `fs` register comes
+/// back intact.
+#[test]
+fn float_callee_saved_registers_are_saved_and_reported() {
+    let mut src = String::from(
+        "module \"keep\"\nfunc @leaf(f64) -> f64 {\nentry ^0(%x: f64):\n  %r = fmul %x, %x : f64\n  ret %r\n}\n\
+         func @keep(f64) -> f64 {\nentry ^0(%x: f64):\n",
+    );
+    for k in 0..12 {
+        src += &format!("  %v{k} = fadd %x, f64 {:#018x} : f64\n", (k as f64 + 1.5).to_bits());
+    }
+    src += "  %c = call @leaf(%x) : f64\n  %s0 = fadd %c, %v0 : f64\n";
+    for k in 1..12 {
+        src += &format!("  %s{k} = fadd %s{}, %v{k} : f64\n", k - 1);
+    }
+    src += "  ret %s11\n}\n";
+    let (m, syms) = parse(&src);
+    let out = super::compile_module_with(&m, &syms, &crate::codegen::CodegenOptions::default());
+    let keep = out.stack.get("keep").unwrap();
+    assert_eq!(keep.saved_registers, 8 * 13, "ra and fs0-fs11");
+    assert_eq!(out.stack.get("leaf").unwrap().saved_registers, 0);
+    if let Some(dis) = objdump(&out.object.sections()[0].bytes, false) {
+        for r in ["fs0", "fs11"] {
+            assert!(dis.contains(&format!("fsd\t{r}")) && dis.contains(&format!("fld\t{r}")), "{r}:\n{dis}");
+        }
+    }
+    let h = super::diff_tests::Harness::new(&src);
+    assert_eq!(h.check("keep", &[vec![2.0f64.to_bits()], vec![(-0.5f64).to_bits()]]), 2);
+}
+
 // ===========================================================================
 // LP64D argument placement, on the selected MIR
 // ===========================================================================
