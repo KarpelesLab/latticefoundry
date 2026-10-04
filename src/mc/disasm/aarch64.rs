@@ -1,0 +1,9 @@
+//! The AArch64 decoder (not yet implemented: every encoding decodes as data).
+
+use super::Inst;
+
+/// Decode one AArch64 instruction from the start of `bytes` (non-empty),
+/// located at address `addr`.
+pub fn decode(bytes: &[u8], _addr: u64) -> Inst {
+    Inst::data(bytes, 4, true)
+}

@@ -28,12 +28,15 @@
 //! - [`format`](mod@format) — [`write_object`], which picks the writer a
 //!   [`Triple`](crate::target::Triple) calls for.
 //! - [`asm`] — textual assembly → ELF objects, via our own `rsasm` assembler.
+//! - [`disasm`] — the disassemblers (x86-64, AArch64, RISC-V, Thumb-2, AVR,
+//!   wasm32) and the object readers and listings behind `lf-dis`.
 //!
 //! Everything here is deterministic (tenet T5): the same inputs always produce
 //! byte-identical output.
 
 pub mod asm;
 pub mod coff;
+pub mod disasm;
 pub mod dwarf;
 pub mod elf;
 pub mod emit;
