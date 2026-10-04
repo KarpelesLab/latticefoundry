@@ -610,7 +610,7 @@ impl Pp {
     /// 1/2/4/8-byte accesses) and `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}`,
     /// matching the `__atomic_*`/`__sync_*` builtins sema implements.
     ///
-    /// Deliberately *not* predefined: `__SIZEOF_INT128__` (no `__int128`),
+    /// Deliberately *not* predefined:
     /// `__SSE__`/`__SSE2__`/`__MMX__` (no intrinsics; the headers keyed on them
     /// include `<*intrin.h>`), `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16` (no
     /// 16-byte atomics), `__STDC_UTF_16__` (`u""` literals are not UTF-16-encoded
@@ -649,6 +649,7 @@ impl Pp {
             ("__SIZEOF_INT__", "4"),
             ("__SIZEOF_LONG__", "8"),
             ("__SIZEOF_LONG_LONG__", "8"),
+            ("__SIZEOF_INT128__", "16"),
             ("__SIZEOF_POINTER__", "8"),
             ("__SIZEOF_SIZE_T__", "8"),
             ("__SIZEOF_PTRDIFF_T__", "8"),

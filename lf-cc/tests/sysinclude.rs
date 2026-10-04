@@ -352,7 +352,7 @@ int main(void) { return 0; }
     assert_eq!(probe(&gnu, "__STRICT_ANSI__"), vec![0]);
     assert_eq!(probe(&gnu, "__OPTIMIZE__"), vec![0]);
     assert_eq!(probe(&gnu, "__NO_INLINE__"), vec![1]);
-    assert_eq!(probe(&gnu, "__SIZEOF_INT128__"), vec![0], "no __int128");
+    assert_eq!(values("__SIZEOF_INT128__", &gnu), vec![16], "__int128");
     assert_eq!(probe(&gnu, "__SSE2__"), vec![0], "no vector intrinsics");
     let iso = PpOptions { std: CStd::C17, ..opts() };
     assert_eq!(probe(&iso, "__STRICT_ANSI__"), vec![1]);

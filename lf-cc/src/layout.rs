@@ -316,6 +316,44 @@ fn holds_vectors(ty: &CType) -> bool {
     }
 }
 
+/// Whether `ty` is an `__int128` or an array of them: 16-aligned, which the
+/// module data layout (`i128:128`, see `lower::data_layout`) gives the IR type
+/// too, so the IR lays it out exactly as C does.
+fn holds_int128(ty: &CType) -> bool {
+    match ty.unqual() {
+        CType::Int(i) => i.width == 128,
+        CType::Array(elem, _) => holds_int128(elem),
+        _ => false,
+    }
+}
+
+/// Whether a record (at any depth) has an `__int128` member, which makes the
+/// IR blob modelling it 16-aligned like the C record.
+fn record_holds_int128(recs: &Records, id: RecordId) -> bool {
+    recs.get(id).fields.iter().any(|f| {
+        let mut ty = f.ty.unqual();
+        while let CType::Array(elem, _) = ty {
+            ty = elem.unqual();
+        }
+        match ty {
+            CType::Record(inner) => record_holds_int128(recs, *inner),
+            other => holds_int128(other),
+        }
+    })
+}
+
+/// The leading member of the byte blob modelling a record of `align` bytes
+/// the IR cannot express field by field: an integer of its alignment, capped
+/// at 8 bytes — or an `i128`, 16-aligned, when the record holds one.
+fn blob_head(cx: &mut TypeContext, recs: &Records, id: RecordId, align: u64) -> (TypeId, u64) {
+    if align >= 16 && record_holds_int128(recs, id) {
+        (cx.int(128), 16)
+    } else {
+        let a = align.min(8);
+        (cx.int((a * 8) as u32), a)
+    }
+}
+
 fn ir_record(cx: &mut TypeContext, recs: &Records, id: RecordId) -> TypeId {
     let def = recs.get(id);
     match def.kind {
@@ -332,12 +370,11 @@ fn ir_record(cx: &mut TypeContext, recs: &Records, id: RecordId) -> TypeId {
                 || def.fields.iter().any(|f| {
                     f.align.is_some()
                         || f.bit_width.is_some()
-                        || (align_of(recs, &f.ty) > 8 && !holds_vectors(&f.ty))
+                        || (align_of(recs, &f.ty) > 8 && !holds_vectors(&f.ty) && !holds_int128(&f.ty))
                 })
             {
                 let size = record_size(recs, id);
-                let align = record_align(recs, id).min(8);
-                let head = cx.int((align * 8) as u32);
+                let (head, align) = blob_head(cx, recs, id, record_align(recs, id));
                 return if size > align {
                     let i8t = cx.int(8);
                     let pad = cx.array(i8t, size - align);
@@ -352,8 +389,7 @@ fn ir_record(cx: &mut TypeContext, recs: &Records, id: RecordId) -> TypeId {
         }
         RecordKind::Union => {
             let size = record_size(recs, id);
-            let align = record_align(recs, id).min(8);
-            let head = cx.int((align * 8) as u32);
+            let (head, align) = blob_head(cx, recs, id, record_align(recs, id));
             if size > align {
                 let i8t = cx.int(8);
                 let pad = cx.array(i8t, size - align);

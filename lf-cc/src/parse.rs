@@ -2435,6 +2435,10 @@ impl Parser {
         if !ty.is_integer() {
             return Err(Diagnostic::error("bit-field has a non-integer type").with_span(colon));
         }
+        if ty.int_width().is_some_and(|w| w > 64) {
+            return Err(Diagnostic::error(format!("bit-fields of type '{ty}' are not supported"))
+                .with_span(colon));
+        }
         let width_span = self.peek_span();
         let value = self.parse_const_expr()?;
         if value < 0 {

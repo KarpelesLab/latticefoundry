@@ -16,7 +16,7 @@ use latticefoundry::ir::types::{Type, TypeContext, TypeId};
 use latticefoundry::ir::value::{FloatBits, ValueId};
 use latticefoundry::codegen::RelocModel;
 use latticefoundry::ir::{
-    BlockId, Const, FuncAttrs, FuncId, GlobalAttrs, GlobalId, Global, Linkage, Module, Visibility,
+    BlockId, Const, DataLayout, FuncAttrs, FuncId, GlobalAttrs, GlobalId, Global, Linkage, Module, Visibility,
 };
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::puremp;
@@ -42,6 +42,7 @@ struct Tys {
     i16: TypeId,
     i32: TypeId,
     i64: TypeId,
+    i128: TypeId,
     f32: TypeId,
     f64: TypeId,
 }
@@ -53,6 +54,7 @@ impl Tys {
             16 => self.i16,
             32 => self.i32,
             64 => self.i64,
+            128 => self.i128,
             _ => self.i32,
         }
     }
@@ -156,6 +158,7 @@ pub fn lower_with(
     cfg: &CodegenConfig,
 ) -> (Module, StrInterner) {
     let mut module = Module::new(module_name.to_owned());
+    module.set_data_layout(data_layout());
     let mut syms = StrInterner::new();
     let linemap = LineMap::new(source);
 
@@ -169,6 +172,7 @@ pub fn lower_with(
             i16: cx.int(16),
             i32: cx.int(32),
             i64: cx.int(64),
+            i128: cx.int(128),
             f32: cx.float(latticefoundry::ir::types::FloatKind::F32),
             f64: cx.float(latticefoundry::ir::types::FloatKind::F64),
         }
@@ -227,7 +231,7 @@ pub fn lower_with(
         let init = if g.ty.is_pointer() {
             module.intern_const(Const::Null(ty))
         } else if g.ty.unsupported_value().is_some() {
-            // A declaration-only `_Float128`/complex/`__int128` object (sema
+            // A declaration-only `_Float128`/complex object (sema
             // allows only `extern` ones): no IR constant models it.
             module.intern_const(Const::Poison(ty))
         } else if let Some(fty) = g.ty.float_ty() {
@@ -237,7 +241,7 @@ pub fn lower_with(
             module.intern_const(Const::Float { ty, bits })
         } else if g.ty.is_scalar() {
             let value = decode_le(&g.bytes);
-            module.intern_const(Const::Int { ty, value: puremp::Int::from_i64(value) })
+            module.intern_const(Const::Int { ty, value: puremp::Int::from_i128(value) })
         } else {
             module.intern_const(Const::Poison(ty))
         };
@@ -364,13 +368,21 @@ pub fn lower_with(
     (module, syms)
 }
 
-/// Decode up to 8 little-endian bytes into an `i64` (for scalar global inits).
-fn decode_le(bytes: &[u8]) -> i64 {
-    let mut buf = [0u8; 8];
-    for (i, b) in bytes.iter().take(8).enumerate() {
+/// The module data layout: LP64 with gcc's 16-byte alignment for `__int128`
+/// (`i128:128`), so IR struct layouts and stack slots match C's.
+pub fn data_layout() -> DataLayout {
+    DataLayout::parse("i128:128").expect("a valid data layout")
+}
+
+/// Decode up to 16 little-endian bytes, sign-extended, into an `i128` (for
+/// scalar global inits).
+fn decode_le(bytes: &[u8]) -> i128 {
+    let mut buf = [0u8; 16];
+    for (i, b) in bytes.iter().take(16).enumerate() {
         buf[i] = *b;
     }
-    i64::from_le_bytes(buf)
+    let n = bytes.len().clamp(1, 16) as u32 * 8;
+    (i128::from_le_bytes(buf) << (128 - n)) >> (128 - n)
 }
 
 /// Decode a float global's little-endian IEEE image into [`FloatBits`].
@@ -536,8 +548,10 @@ impl FnLower<'_> {
                 let ty = self.tys.of(&pty);
                 let align = align_of(&pty);
                 self.b.store(ty, self.slots[obj], incoming, align);
-                if gp < 6 {
-                    gp += 1;
+                // An `__int128` takes two registers, or none (the stack).
+                let regs = if width_of(&pty) == 128 { 2 } else { 1 };
+                if gp + regs <= 6 {
+                    gp += regs;
                 }
             }
         }
@@ -827,9 +841,11 @@ impl FnLower<'_> {
         // type) so it matches on the full register the backend's switch lowering
         // compares against — the case immediates are compared at 64-bit width, so
         // e.g. a signed `int` value of `-1` must sit as `0xFFFF_FFFF_FFFF_FFFF`,
-        // not `0x0000_0000_FFFF_FFFF`, to hit `case -1:`.
+        // not `0x0000_0000_FFFF_FFFF`, to hit `case -1:`. An `__int128` value
+        // is switched on at its own width.
         let raw = self.lower_rvalue(value);
-        let vv = self.int_resize(raw, width_of(&value.ty), value.ty.is_signed(), 64);
+        let width = width_of(&value.ty).max(64);
+        let vv = self.int_resize(raw, width_of(&value.ty), value.ty.is_signed(), width);
         let blocks: Vec<BlockId> = (0..nmarks).map(|_| self.b.create_block(&[])).collect();
         let exit = self.b.create_block(&[]);
         let default_bb = match default {
@@ -838,7 +854,10 @@ impl FnLower<'_> {
         };
         let case_list: Vec<(puremp::Int, BlockId, Vec<ValueId>)> = cases
             .iter()
-            .map(|(v, id)| (puremp::Int::from_i64(*v as i64), blocks[*id as usize], Vec::new()))
+            .map(|(v, id)| {
+                let v = if width == 128 { puremp::Int::from_i128(*v) } else { puremp::Int::from_i64(*v as i64) };
+                (v, blocks[*id as usize], Vec::new())
+            })
             .collect();
         self.b.switch(vv, default_bb, &[], case_list);
         // The body is entered only through case/default marks (jump targets), not
@@ -1121,6 +1140,8 @@ impl FnLower<'_> {
                     // function (see sema); materialize a float zero of that type.
                     let ty = self.tys.of(&e.ty);
                     self.b.const_float(ty, float_bits(&e.ty, *v as f64))
+                } else if width_of(&e.ty) == 128 {
+                    self.b.const_int(self.tys.i128, puremp::Int::from_i128(*v))
                 } else {
                     let ty = self.tys.of(&e.ty);
                     self.b.const_i64(ty, *v as i64)
@@ -1479,12 +1500,19 @@ impl FnLower<'_> {
     /// `gp_offset < 48` (stride 8), else from `overflow_arg_area` (stride 8); an
     /// SSE-class `T` (float/double) reads from `reg_save_area + fp_offset` while
     /// `fp_offset < 176` (stride 16), else the overflow area. The scalar value is
-    /// then loaded from the chosen address.
+    /// then loaded from the chosen address. An `__int128` takes two registers
+    /// (both must be left: `gp_offset <= 32`) or a 16-aligned overflow slot.
     fn lower_va_arg(&mut self, ap: &TExpr, ty: &CType) -> ValueId {
         let p = self.lower_rvalue(ap);
         let is_sse = ty.is_float();
-        let (off_field, max, stride) =
-            if is_sse { (4u64, 176i64, 16i64) } else { (0u64, 48i64, 8i64) };
+        let wide = width_of(ty) == 128;
+        let (off_field, max, stride) = if is_sse {
+            (4u64, 176i64, 16i64)
+        } else if wide {
+            (0u64, 40i64, 16i64)
+        } else {
+            (0u64, 48i64, 8i64)
+        };
         let off_ptr = self.offset_ptr(p, off_field);
         let cur = self.b.load(self.tys.i32, off_ptr, 4);
         let maxc = self.b.const_i64(self.tys.i32, max);
@@ -1505,11 +1533,15 @@ impl FnLower<'_> {
         self.b.store(self.tys.i32, off_ptr, new_off, 4);
         self.b.br(join, &[addr_r]);
 
-        // Overflow area: addr = overflow_arg_area; overflow_arg_area += 8.
+        // Overflow area: addr = overflow_arg_area; overflow_arg_area += 8 (an
+        // `__int128` first rounds the area up to 16 and takes 16).
         self.switch(ov_bb);
         let ov_slot = self.offset_ptr(p, 8);
-        let ov = self.b.load(self.tys.ptr, ov_slot, 8);
-        let eight = self.b.const_i64(self.tys.i64, 8);
+        let mut ov = self.b.load(self.tys.ptr, ov_slot, 8);
+        if wide {
+            ov = self.align_ptr(ov, 16);
+        }
+        let eight = self.b.const_i64(self.tys.i64, if wide { 16 } else { 8 });
         let new_ov = self.b.ptr_add(ov, eight, true);
         self.b.store(self.tys.ptr, ov_slot, new_ov, 8);
         self.b.br(join, &[ov]);

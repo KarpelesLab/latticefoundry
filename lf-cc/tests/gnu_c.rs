@@ -421,12 +421,8 @@ fn check_errors(src: &str) -> String {
 #[test]
 fn unsupported_constructs_are_rejected_clearly() {
     let cases: &[(&str, &str)] = &[
-        ("int main(void) { __int128 x = 1; return (int)x; }", "__int128"),
-        ("__int128 g; int main(void) { return 0; }", "__int128"),
         ("_Float128 f(_Float128); int main(void) { f(1.0); return 0; }", "_Float128"),
         ("_Float128 q(void); int main(void) { return (int)q(); }", "_Float128"),
-        ("__thread int t; int main(void) { return 0; }", "thread-local"),
-        ("int main(void) { static _Thread_local int t; return t; }", "thread-local"),
         ("_Complex double z; int main(void) { return 0; }", "_Complex"),
         ("double _Complex csqrt(double _Complex); int main(void) { csqrt(1.0); return 0; }", "_Complex"),
         ("int main(void) { _Complex int ci; return 0; }", "complex integer"),

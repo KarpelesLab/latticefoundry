@@ -483,13 +483,12 @@ impl CType {
     }
 
     /// If values of this type cannot be computed with (only declared), the name
-    /// of the unsupported type: `__int128` (a 128-bit integer) or `_Float128`.
+    /// of the unsupported type: `_Float128` or a `_Complex` type.
     /// Prototypes, typedefs, pointers and `extern` declarations may still name
     /// these types; sema rejects any expression that would produce such a value.
     pub fn unsupported_value(&self) -> Option<&'static str> {
         match self {
             CType::Qual(inner, _) => inner.unsupported_value(),
-            CType::Int(i) if i.width > 64 => Some("__int128"),
             CType::Float(FloatTy::F128) => Some("_Float128"),
             CType::Float(f) if f.is_complex() => Some("_Complex"),
             _ => None,

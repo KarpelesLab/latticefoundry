@@ -269,6 +269,16 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut extra: Vec<String> = opts.lib_dirs.iter().map(|d| format!("-L{d}")).collect();
     let soname = if opts.shared { take_soname(&mut link_items) } else { None };
     extra.extend(link_items);
+    // A shared library takes the compiler runtime too, as gcc links it: the
+    // 128-bit division and float-conversion helpers (`__divti3`,
+    // `__floattidf`, ...) come from the static libgcc. (An executable's hosted
+    // link adds `-lgcc` itself.)
+    if opts.shared
+        && let Some(gcc) = crt.as_ref().and_then(|c| c.gcc_libdir.as_ref())
+    {
+        extra.push(format!("-L{}", gcc.display()));
+        extra.push("-lgcc".to_owned());
+    }
     let argv: Vec<OsString> = match &crt {
         _ if opts.shared => {
             shared_library_args(crt.as_ref(), &[], soname.as_deref(), &extra, Path::new(&output))

@@ -615,7 +615,7 @@ struct Checker {
     /// The active language dialect (gates implicit function declarations, etc.).
     std: CStd,
     /// Nonzero while checking an unevaluated operand (`sizeof`), where naming a
-    /// value of an unsupported type (`__int128`, `_Float128`) is harmless.
+    /// value of an unsupported type (`_Float128`, `_Complex`) is harmless.
     unevaluated: u32,
     /// The labels (name → id) of the function being checked, so `&&label` can
     /// also appear in the constant initializer of a `static` local (a dispatch
@@ -1983,8 +1983,8 @@ impl Checker {
     // --- expressions -------------------------------------------------------
 
     /// Type-check an expression. Every subexpression passes through here, so it
-    /// is also where a value of a type lf-cc cannot compute with (`__int128`,
-    /// `_Float128`) is rejected: such types may be *named* by declarations (the
+    /// is also where a value of a type lf-cc cannot compute with (`_Float128`,
+    /// `_Complex`) is rejected: such types may be *named* by declarations (the
     /// glibc headers declare many `_Float128` functions) but not evaluated.
     fn check_expr(&mut self, ctx: &mut FnCtx, e: &Expr) -> Option<TExpr> {
         let te = self.check_expr_kind(ctx, e)?;
@@ -1995,6 +1995,12 @@ impl Checker {
                 e.span,
                 format!("values of type '{name}' are not supported (it may only be declared)"),
             );
+            return None;
+        }
+        // An access to an `_Atomic` object is a real atomic operation, and
+        // x86-64 has none wider than 8 bytes without `cmpxchg16b`.
+        if self.unevaluated == 0 && te.quals.atomic && self.size_of(&te.ty) > 8 {
+            self.error(e.span, format!("_Atomic objects of type '{}' (wider than 8 bytes) are not supported", te.ty));
             return None;
         }
         Some(te)
