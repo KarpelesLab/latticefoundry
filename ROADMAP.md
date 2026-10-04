@@ -721,6 +721,7 @@ gap to a genuine bootstrap compiler is **the headers**.
 | bash 3.2    | ✅ all 130 core files; feature battery identical to system bash |
 | Lua 5.4.6   | ✅ **real glibc headers**; byte-identical to gcc at -O0/-O2 (M9) |
 | SQLite 3.45 | ✅ **real glibc headers**, amalgamation + shell; byte-identical to gcc (M9) |
+| coreutils 9.5 | ✅ `./configure CC=lf-cc && make`, every program; `make check` 974/1147 pass vs gcc 993, all 11 failures from the 80-bit `long double` gap ([lf-cc/docs/coreutils.md](lf-cc/docs/coreutils.md)) |
 
 `lf-cc` is now its own driver. It links through our `qld` against the host
 libc (or statically with `-nostdlib`), so gzip builds with **no gcc or system
@@ -757,7 +758,7 @@ them were fixed at the source, and every fix also counts toward M9.
 
 Remaining C niche items: `_BitInt` wider than 64 bits (and `__int128`
 bit-fields), a true 80-bit
-`long double`, `_Complex`, VLAs, flexible array members, and gcc object-ABI
+`long double`, `_Complex`, variably modified types beyond a block-scope VLA's outer bound, flexible array members, and gcc object-ABI
 compatibility for struct-by-value. Whole-program struct-by-value is already
 correct; the gap is only in mixing `lf-cc` objects with gcc-compiled ones.
 
