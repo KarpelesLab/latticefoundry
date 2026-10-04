@@ -324,6 +324,224 @@ pub(crate) fn fstore(size: u64, rs2: u32, rs1: u32, imm: i32) -> u32 {
     s_type(imm, rs2, rs1, if size == 4 { 2 } else { 3 }, 0x27)
 }
 
+// --- the C extension (RV64C) -----------------------------------------------
+
+/// Whether `r` is one of the eight registers a 3-bit compressed register
+/// field names (`x8`–`x15` / `f8`–`f15`).
+#[inline]
+fn creg(r: u32) -> bool {
+    (8..=15).contains(&r)
+}
+
+/// Whether `v` fits a 6-bit signed immediate.
+#[inline]
+fn fits6(v: i32) -> bool {
+    (-32..=31).contains(&v)
+}
+
+/// A CI-format halfword: `funct3 | imm[5] | rd | imm[4:0] | op`.
+fn c_ci(f3: u32, imm: i32, rd: u32, op: u32) -> u16 {
+    let u = imm as u32;
+    ((f3 << 13) | (((u >> 5) & 1) << 12) | (rd << 7) | ((u & 31) << 2) | op) as u16
+}
+
+/// A CR-format halfword: `funct4 | rd/rs1 | rs2 | 10`.
+fn c_cr(f4: u32, rd: u32, rs2: u32) -> u16 {
+    ((f4 << 12) | (rd << 7) | (rs2 << 2) | 0b10) as u16
+}
+
+/// A CA-format halfword: `funct6 | rd'/rs1' | funct2 | rs2' | 01`.
+fn c_ca(f6: u32, rd: u32, f2: u32, rs2: u32) -> u16 {
+    ((f6 << 10) | ((rd - 8) << 7) | (f2 << 5) | ((rs2 - 8) << 2) | 0b01) as u16
+}
+
+/// The 16-bit RV64C form of the 32-bit instruction `w`, if it has one
+/// (RISC-V ISA manual, "C" Standard Extension; when several apply, the
+/// choice `llvm-mc` makes). Branches and jumps are not compressed (their
+/// displacements are fixed up in 32-bit fields), nor is any form the
+/// extension reserves or uses for hints (`c.li x0`, `c.slli` by 0, ...).
+pub(crate) fn compress(w: u32) -> Option<u16> {
+    let op = w & 0x7F;
+    let rd = (w >> 7) & 31;
+    let f3 = (w >> 12) & 7;
+    let rs1 = (w >> 15) & 31;
+    let rs2 = (w >> 20) & 31;
+    let f7 = w >> 25;
+    let imm_i = (w as i32) >> 20;
+    let imm_s = ((w as i32) >> 25 << 5) | ((w >> 7) & 31) as i32;
+    match (op, f3) {
+        // addi: c.addi, c.addi16sp, c.addi4spn, c.li, c.mv.
+        (0x13, 0) => {
+            let imm = imm_i;
+            if rd == rs1 && rd != 0 && imm != 0 && fits6(imm) {
+                return Some(c_ci(0b000, imm, rd, 0b01));
+            }
+            if rd == 2 && rs1 == 2 && imm != 0 && imm % 16 == 0 && (-512..=496).contains(&imm) {
+                let u = imm as u32;
+                let bits = (((u >> 9) & 1) << 12)
+                    | (((u >> 4) & 1) << 6)
+                    | (((u >> 6) & 1) << 5)
+                    | (((u >> 7) & 3) << 3)
+                    | (((u >> 5) & 1) << 2);
+                return Some(((0b011 << 13) | bits | (2 << 7) | 0b01) as u16);
+            }
+            if rs1 == 2 && creg(rd) && imm > 0 && imm % 4 == 0 && imm <= 1020 {
+                let u = imm as u32;
+                let bits = (((u >> 4) & 3) << 11) | (((u >> 6) & 15) << 7) | (((u >> 2) & 1) << 6) | (((u >> 3) & 1) << 5);
+                return Some((bits | ((rd - 8) << 2)) as u16);
+            }
+            if rs1 == 0 && rd != 0 && fits6(imm) {
+                return Some(c_ci(0b010, imm, rd, 0b01));
+            }
+            if rd == 0 && rs1 == 0 && imm == 0 {
+                return Some(0x0001); // c.nop
+            }
+            if imm == 0 && rd != 0 && rs1 != 0 {
+                return Some(c_cr(0b1000, rd, rs1));
+            }
+            None
+        }
+        // slli: c.slli.
+        (0x13, 1) => {
+            let sh = (w >> 20) & 63;
+            (rd == rs1 && rd != 0 && sh != 0 && w >> 26 == 0).then(|| c_ci(0b000, sh as i32, rd, 0b10))
+        }
+        // srli / srai: c.srli / c.srai.
+        (0x13, 5) => {
+            let sh = (w >> 20) & 63;
+            let f2 = match w >> 26 {
+                0 => 0,
+                0x10 => 1,
+                _ => return None,
+            };
+            (rd == rs1 && creg(rd) && sh != 0).then(|| {
+                ((0b100 << 13) | (((sh >> 5) & 1) << 12) | (f2 << 10) | ((rd - 8) << 7) | ((sh & 31) << 2) | 0b01) as u16
+            })
+        }
+        // andi: c.andi.
+        (0x13, 7) => (rd == rs1 && creg(rd) && fits6(imm_i)).then(|| {
+            let u = imm_i as u32;
+            ((0b100 << 13) | (((u >> 5) & 1) << 12) | (0b10 << 10) | ((rd - 8) << 7) | ((u & 31) << 2) | 0b01) as u16
+        }),
+        // addiw: c.addiw (`sext.w` included).
+        (0x1B, 0) => (rd == rs1 && rd != 0 && fits6(imm_i)).then(|| c_ci(0b001, imm_i, rd, 0b01)),
+        // lui: c.lui (not into x0 or sp, nonzero 6-bit signed).
+        (0x37, _) => {
+            let imm = (w as i32) >> 12;
+            (rd != 0 && rd != 2 && imm != 0 && fits6(imm)).then(|| c_ci(0b011, imm, rd, 0b01))
+        }
+        // add: c.add (either operand order), c.mv.
+        (0x33, 0) if f7 == 0 => {
+            if rd != 0 && rs1 == 0 && rs2 != 0 {
+                return Some(c_cr(0b1000, rd, rs2));
+            }
+            if rd != 0 && rs2 == 0 && rs1 != 0 {
+                return Some(c_cr(0b1000, rd, rs1));
+            }
+            if rd != 0 && rd == rs1 && rs2 != 0 {
+                return Some(c_cr(0b1001, rd, rs2));
+            }
+            if rd != 0 && rd == rs2 && rs1 != 0 {
+                return Some(c_cr(0b1001, rd, rs1));
+            }
+            None
+        }
+        // sub, xor, or, and: c.sub (not commutative), c.xor/c.or/c.and (either
+        // operand order).
+        (0x33, _) => {
+            let f2 = match (f7, f3) {
+                (0x20, 0) => 0,
+                (0, 4) => 1,
+                (0, 6) => 2,
+                (0, 7) => 3,
+                _ => return None,
+            };
+            if creg(rd) && rd == rs1 && creg(rs2) {
+                return Some(c_ca(0b100011, rd, f2, rs2));
+            }
+            (f2 != 0 && creg(rd) && rd == rs2 && creg(rs1)).then(|| c_ca(0b100011, rd, f2, rs1))
+        }
+        // subw, addw: c.subw, c.addw (either operand order).
+        (0x3B, 0) => {
+            let f2 = match f7 {
+                0x20 => 0,
+                0 => 1,
+                _ => return None,
+            };
+            if creg(rd) && rd == rs1 && creg(rs2) {
+                return Some(c_ca(0b100111, rd, f2, rs2));
+            }
+            (f2 == 1 && creg(rd) && rd == rs2 && creg(rs1)).then(|| c_ca(0b100111, rd, f2, rs1))
+        }
+        // ld / lw / fld (and the stores below): the sp-relative forms, then
+        // the compressed-register forms.
+        (0x03, 3) | (0x07, 3) => {
+            let fp = op == 0x07;
+            let imm = imm_i;
+            if rs1 == 2 && (fp || rd != 0) && imm % 8 == 0 && (0..=504).contains(&imm) {
+                let u = imm as u32;
+                let bits = (((u >> 5) & 1) << 12) | (((u >> 3) & 3) << 5) | (((u >> 6) & 7) << 2);
+                return Some((((if fp { 0b001 } else { 0b011 }) << 13) | bits | (rd << 7) | 0b10) as u16);
+            }
+            (creg(rd) && creg(rs1) && imm % 8 == 0 && (0..=248).contains(&imm)).then(|| {
+                let u = imm as u32;
+                ((((if fp { 0b001 } else { 0b011 }) << 13) | (((u >> 3) & 7) << 10) | (((u >> 6) & 3) << 5))
+                    | ((rs1 - 8) << 7)
+                    | ((rd - 8) << 2)) as u16
+            })
+        }
+        (0x03, 2) => {
+            let imm = imm_i;
+            if rs1 == 2 && rd != 0 && imm % 4 == 0 && (0..=252).contains(&imm) {
+                let u = imm as u32;
+                let bits = (((u >> 5) & 1) << 12) | (((u >> 2) & 7) << 4) | (((u >> 6) & 3) << 2);
+                return Some(((0b010 << 13) | bits | (rd << 7) | 0b10) as u16);
+            }
+            (creg(rd) && creg(rs1) && imm % 4 == 0 && (0..=124).contains(&imm)).then(|| {
+                let u = imm as u32;
+                ((0b010 << 13) | (((u >> 3) & 7) << 10) | (((u >> 2) & 1) << 6) | (((u >> 6) & 1) << 5) | ((rs1 - 8) << 7) | ((rd - 8) << 2))
+                    as u16
+            })
+        }
+        (0x23, 3) | (0x27, 3) => {
+            let fp = op == 0x27;
+            let imm = imm_s;
+            if rs1 == 2 && imm % 8 == 0 && (0..=504).contains(&imm) {
+                let u = imm as u32;
+                let bits = (((u >> 3) & 7) << 10) | (((u >> 6) & 7) << 7);
+                return Some((((if fp { 0b101 } else { 0b111 }) << 13) | bits | (rs2 << 2) | 0b10) as u16);
+            }
+            (creg(rs2) && creg(rs1) && imm % 8 == 0 && (0..=248).contains(&imm)).then(|| {
+                let u = imm as u32;
+                ((((if fp { 0b101 } else { 0b111 }) << 13) | (((u >> 3) & 7) << 10) | (((u >> 6) & 3) << 5))
+                    | ((rs1 - 8) << 7)
+                    | ((rs2 - 8) << 2)) as u16
+            })
+        }
+        (0x23, 2) => {
+            let imm = imm_s;
+            if rs1 == 2 && imm % 4 == 0 && (0..=252).contains(&imm) {
+                let u = imm as u32;
+                let bits = (((u >> 2) & 15) << 9) | (((u >> 6) & 3) << 7);
+                return Some(((0b110 << 13) | bits | (rs2 << 2) | 0b10) as u16);
+            }
+            (creg(rs2) && creg(rs1) && imm % 4 == 0 && (0..=124).contains(&imm)).then(|| {
+                let u = imm as u32;
+                ((0b110 << 13) | (((u >> 3) & 7) << 10) | (((u >> 2) & 1) << 6) | (((u >> 6) & 1) << 5) | ((rs1 - 8) << 7) | ((rs2 - 8) << 2))
+                    as u16
+            })
+        }
+        // jalr x0/ra, 0(rs1): c.jr / c.jalr (`ret` is c.jr ra).
+        (0x67, 0) if imm_i == 0 && rs1 != 0 => match rd {
+            0 => Some(c_cr(0b1000, rs1, 0)),
+            1 => Some(c_cr(0b1001, rs1, 0)),
+            _ => None,
+        },
+        (0x73, 0) if w == 0x0010_0073 => Some(0x9002), // c.ebreak
+        _ => None,
+    }
+}
+
 /// A load `l{b,h,w,d}{,u} rd, imm(rs1)` for a byte `size` (unsigned for sub-word,
 /// matching the interpreter's zero-extending load model). `funct3`: `ld`=011,
 /// `lwu`=110, `lhu`=101, `lbu`=100.
@@ -738,22 +956,42 @@ pub(crate) struct RvReloc {
     pub(crate) kind: RelocKind,
 }
 
-/// The little-endian 32-bit-word buffer with a branch-fixup table and the
-/// relocations of its external references.
+/// The little-endian instruction buffer with a branch-fixup table and the
+/// relocations of its external references. With `compress` (the C
+/// extension), every instruction that has a 16-bit form is emitted in it —
+/// except the words a relocation patches, branches (their displacements are
+/// fixed up later, in 32-bit fields), and the expansions whose internal
+/// branch displacements are counted in words, which turn compression off
+/// while they emit.
 struct RvBuf {
     bytes: Vec<u8>,
     fixups: Vec<Fixup>,
     relocs: Vec<RvReloc>,
+    /// Emit compressed instructions where they exist.
+    compress: bool,
+    /// How many upcoming words must stay 32-bit (a relocation patches them).
+    pinned: u32,
 }
 
 impl RvBuf {
     fn new() -> RvBuf {
-        RvBuf { bytes: Vec::new(), fixups: Vec::new(), relocs: Vec::new() }
+        RvBuf { bytes: Vec::new(), fixups: Vec::new(), relocs: Vec::new(), compress: false, pinned: 0 }
     }
 
-    /// Record a relocation of `kind` on the next instruction word.
+    /// Record a relocation of `kind` on the next instruction word (both words
+    /// of an `auipc`+`jalr` call), which stays uncompressed.
     fn reloc(&mut self, kind: RelocKind, target: RelocTarget) {
         self.relocs.push(RvReloc { offset: self.offset(), target, kind });
+        self.pinned = if kind == RelocKind::RiscvCallPlt { 2 } else { 1 };
+    }
+
+    /// Run `f` with compression off (an expansion with word-counted internal
+    /// branches).
+    fn uncompressed(&mut self, f: impl FnOnce(&mut RvBuf)) {
+        let saved = self.compress;
+        self.compress = false;
+        f(self);
+        self.compress = saved;
     }
 
     /// Emit `auipc d, 0` + a low-part instruction forming the address of
@@ -773,16 +1011,25 @@ impl RvBuf {
         self.bytes.len() as u64
     }
 
-    /// Append one 32-bit instruction word.
+    /// Append one instruction: its 16-bit form when compressing and one
+    /// exists, else the 32-bit word.
     #[inline]
     fn word(&mut self, w: u32) {
+        if self.pinned > 0 {
+            self.pinned -= 1;
+        } else if self.compress
+            && let Some(h) = compress(w)
+        {
+            self.bytes.extend_from_slice(&h.to_le_bytes());
+            return;
+        }
         self.bytes.extend_from_slice(&w.to_le_bytes());
     }
 
-    /// Append a branch word and record a fixup to `block`.
+    /// Append a branch word (always 32-bit) and record a fixup to `block`.
     fn branch(&mut self, w: u32, block: usize, kind: FixupKind) {
         self.fixups.push(Fixup { at: self.offset(), block, kind });
-        self.word(w);
+        self.bytes.extend_from_slice(&w.to_le_bytes());
     }
 
     /// Resolve every branch fixup against the final block offsets.
@@ -971,7 +1218,7 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         RvOp::FpSetup => b.word(mv(FP.into(), SP.into())),
         RvOp::FpRestore => b.word(mv(SP.into(), FP.into())),
         RvOp::TouchSp => b.word(store(8, ZERO.into(), SP.into(), 0)),
-        RvOp::DynAlloca => encode_dyn_alloca(b, ops, ctx.layout),
+        RvOp::DynAlloca => b.uncompressed(|b| encode_dyn_alloca(b, ops, ctx.layout)),
         RvOp::FAdd | RvOp::FSub | RvOp::FMul | RvOp::FDiv => {
             let f5 = match RvOp::decode(inst.opcode) {
                 RvOp::FAdd => 0b00000,
@@ -1021,7 +1268,7 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let delta = simm(&ops[0]);
             let probe = ops.get(1).is_some_and(|o| simm(o) != 0);
             if probe && delta <= -(STACK_PROBE_INTERVAL as i64) {
-                probed_sp_sub(b, delta.unsigned_abs());
+                b.uncompressed(|b| probed_sp_sub(b, delta.unsigned_abs()));
             } else if fits12(delta) {
                 b.word(addi(SP.into(), SP.into(), delta as i32));
             } else {
@@ -1081,8 +1328,8 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         RvOp::Fence => {
             b.word(fence(simm(&ops[0]) as u32, simm(&ops[1]) as u32, simm(&ops[2]) as u32));
         }
-        RvOp::AtomicRmw => encode_atomic_rmw(b, ops),
-        RvOp::CmpXchg => encode_cmpxchg(b, ops),
+        RvOp::AtomicRmw => b.uncompressed(|b| encode_atomic_rmw(b, ops)),
+        RvOp::CmpXchg => b.uncompressed(|b| encode_cmpxchg(b, ops)),
     }
 }
 
@@ -1479,7 +1726,7 @@ pub fn encode_function(
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
 ) -> Emitted {
-    let (bytes, relocs) = encode_function_rv(mf, layout, func_name, global_name);
+    let (bytes, relocs) = encode_function_rv(mf, layout, func_name, global_name, false);
     let relocations = relocs
         .into_iter()
         .map(|r| EmittedReloc {
@@ -1495,14 +1742,17 @@ pub fn encode_function(
     Emitted { bytes, relocations }
 }
 
-/// [`encode_function`] with the relocations in their structured form.
+/// [`encode_function`] with the relocations in their structured form, and
+/// the C extension's compressed instructions with `compressed`.
 fn encode_function_rv(
     mf: &MachineFunction,
     layout: &FrameLayout,
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
+    compressed: bool,
 ) -> (Vec<u8>, Vec<RvReloc>) {
     let mut b = RvBuf::new();
+    b.compress = compressed;
     let ctx = EncodeCtx { layout, func_name, global_name };
 
     // Emit the entry block first (so the function symbol at offset 0 is the
@@ -1536,6 +1786,7 @@ fn compile_function_full(
     opts: &CodegenOptions,
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
+    ropts: &RiscvOptions,
 ) -> (Vec<u8>, Vec<RvReloc>, StackUsage) {
     let target = target_for(module, func, Some(syms), opts);
     let mut mf = target.select(module, func);
@@ -1543,7 +1794,7 @@ fn compile_function_full(
     let layout = layout_frame_with(&mf, &target, opts);
     insert_prologue_epilogue(&mut mf, &layout);
     let stack = layout.stack_usage(&mf, func_name);
-    let (bytes, relocs) = encode_function_rv(&mf, &layout, func_name, global_name);
+    let (bytes, relocs) = encode_function_rv(&mf, &layout, func_name, global_name, ropts.compressed);
     (bytes, relocs, stack)
 }
 
@@ -1632,6 +1883,32 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
     compile_module_with(module, syms, &CodegenOptions::default()).object
 }
 
+/// The RISC-V-specific code-generation options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RiscvOptions {
+    /// Use the C extension: emit the 16-bit form of every instruction that
+    /// has one (RV64GC). Off by default (RV64G code).
+    pub compressed: bool,
+}
+
+impl RiscvOptions {
+    /// These options with the C extension on or off.
+    pub fn with_compressed(mut self, on: bool) -> RiscvOptions {
+        self.compressed = on;
+        self
+    }
+
+    /// The options a target-triple spelling asks for: the C extension when
+    /// its architecture names it (`riscv64gc`, `riscv64imac`, ...), not for
+    /// a bare `riscv64`.
+    pub fn for_triple(triple: &str) -> RiscvOptions {
+        let arch = triple.split('-').next().unwrap_or("").to_ascii_lowercase();
+        let ext = arch.strip_prefix("riscv64").unwrap_or("");
+        RiscvOptions { compressed: ext.contains('c') }
+    }
+}
+
 /// Like [`compile_module`], under `opts`, and also returning every defined
 /// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
 ///
@@ -1646,6 +1923,16 @@ pub fn compile_module_with(
     module: &Module,
     syms: &StrInterner,
     opts: &CodegenOptions,
+) -> CompiledModule {
+    compile_module_riscv(module, syms, opts, &RiscvOptions::default())
+}
+
+/// [`compile_module_with`] under RISC-V-specific options (the C extension).
+pub fn compile_module_riscv(
+    module: &Module,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+    ropts: &RiscvOptions,
 ) -> CompiledModule {
     if let Err(e) = crate::target::check_options(crate::target::TargetArch::Riscv64, opts) {
         panic!("{e}");
@@ -1675,13 +1962,15 @@ pub fn compile_module_with(
             continue;
         }
         let fid = crate::ir::FuncId::from_index(i);
-        let (bytes, relocs, usage) = compile_function_full(module, syms, fid, opts, &func_name, &global_name);
+        let (bytes, relocs, usage) =
+            compile_function_full(module, syms, fid, opts, &func_name, &global_name, ropts);
         stack.push(usage);
-        // 4-align this function's start within .text (RV instructions are words).
+        // 4-align this function's start within .text (after compressed code,
+        // with a `c.nop`).
         {
             let sec = obj.section_mut(text);
             while !sec.bytes.len().is_multiple_of(4) {
-                sec.bytes.push(0);
+                sec.bytes.extend_from_slice(&0x0001u16.to_le_bytes());
             }
         }
         let off = obj.section(text).bytes.len() as u64;

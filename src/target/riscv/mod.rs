@@ -58,6 +58,8 @@ mod dyn_tests;
 #[cfg(test)]
 mod pic_tests;
 #[cfg(test)]
+mod rvc_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod stack_tests;
@@ -66,7 +68,7 @@ mod runtime_tests;
 #[cfg(test)]
 mod vector_tests;
 
-pub use encode::{compile_function, compile_module, compile_module_with};
+pub use encode::{RiscvOptions, compile_function, compile_module, compile_module_riscv, compile_module_with};
 pub use isel::{RiscvTarget, RvOp};
 
 // ===========================================================================
@@ -113,8 +115,7 @@ fn elf_reloc_type(kind: RelocKind) -> Option<u32> {
 }
 
 /// ELF64, little-endian, `EM_RISCV`, `RELA`, `e_flags` = the LP64D
-/// double-float ABI (the code is RV64GC-compatible and uses no compressed
-/// instructions).
+/// double-float ABI ([`write_elf`] adds `EF_RISCV_RVC` for compressed code).
 pub const ELF: ElfTarget = ElfTarget {
     class: ElfClass::Elf64,
     endian: crate::ir::Endian::Little,
@@ -189,12 +190,30 @@ pub fn link_shared(
     result
 }
 
+/// Whether any code section of `obj` holds a compressed (16-bit)
+/// instruction: walking it instruction by instruction, a halfword whose low
+/// two bits are not `11` starts one.
+pub fn uses_compressed(obj: &crate::mc::object::ObjectModule) -> bool {
+    obj.sections().iter().filter(|s| s.kind == crate::mc::object::SectionKind::Text).any(|s| {
+        let mut at = 0;
+        while at + 2 <= s.bytes.len() {
+            if s.bytes[at] & 3 != 3 {
+                return true;
+            }
+            at += 4;
+        }
+        false
+    })
+}
+
 /// Serialize a RISC-V object (from [`compile_module`]) as an ELF64
-/// relocatable file for the LP64D ABI.
+/// relocatable file for the LP64D ABI, with `EF_RISCV_RVC` when its code
+/// uses compressed instructions.
 ///
 /// # Errors
 ///
 /// A relocation kind RISC-V has no number for.
 pub fn write_elf(obj: &crate::mc::object::ObjectModule) -> Result<Vec<u8>, crate::mc::elf::ElfError> {
-    crate::mc::elf::write_with(obj, &ELF)
+    let rvc = if uses_compressed(obj) { EF_RISCV_RVC } else { 0 };
+    crate::mc::elf::write_with(obj, &ElfTarget { flags: ELF.flags | rvc, ..ELF })
 }

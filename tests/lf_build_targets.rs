@@ -83,6 +83,11 @@ fn riscv64_executables_link_through_qld() {
     assert_ne!(u64::from_le_bytes(exe[24..32].try_into().unwrap()), 0, "an entry point");
     let pic = build_ok(&dir, &["--target", "riscv64-linux", "-c", "--pic"], "p.o");
     assert_eq!(u16::from_le_bytes([pic[18], pic[19]]), 243);
+    // `riscv64gc` adds the C extension: compressed code, EF_RISCV_RVC.
+    let rvc = build_ok(&dir, &["--target", "riscv64gc-linux", "-c"], "c.o");
+    assert_eq!(u32::from_le_bytes(rvc[48..52].try_into().unwrap()), 0x5, "RVC | FLOAT_ABI_DOUBLE");
+    let gc = build_ok(&dir, &["--target", "riscv64gc-linux"], "tgc");
+    assert_eq!(u16::from_le_bytes([gc[18], gc[19]]), 243);
     let so = build_ok(&dir, &["--target", "riscv64-linux", "--shared", "-soname", "libtg.so.1"], "libtg.so");
     assert_eq!(u16::from_le_bytes([so[16], so[17]]), 3, "ET_DYN");
     assert_eq!(u16::from_le_bytes([so[18], so[19]]), 243, "EM_RISCV");

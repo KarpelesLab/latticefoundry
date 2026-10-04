@@ -16,7 +16,8 @@
 //! the result into a flashable image (`-L`/`-l` add the runtime library, e.g.
 //! `-lgcc`, for the soft-float and 64-bit division helpers).
 //!
-//! For RISC-V (`--target riscv64-linux`), the LP64D code links through qld
+//! For RISC-V (`--target riscv64-linux`; `riscv64gc-linux` adds the C
+//! extension's compressed instructions), the LP64D code links through qld
 //! into a static Linux executable whose `_start` calls the entry function and
 //! exits with its result; `-c` writes an ELF64 `EM_RISCV` object (`-c --pic`
 //! a position-independent one), and `--shared` a shared library.
@@ -134,6 +135,9 @@ struct BuildOptions {
     target: Triple,
     /// The AVR device named by `--target` (for an AVR target).
     device: Option<target::avr::Device>,
+    /// The RISC-V options the `--target` spelling asks for (`riscv64gc`: the
+    /// C extension).
+    riscv: target::riscv::RiscvOptions,
     format: Option<ObjectFormat>,
     oformat: Option<RawFormat>,
     base: Option<u64>,
@@ -260,6 +264,10 @@ fn build(args: &[String]) -> Result<(), String> {
             target::check_options(TargetArch::Avr, &cg).map_err(|e| e.to_string())?;
             let device = opts.device.unwrap_or(target::avr::Device::ATMEGA328P);
             target::avr::compile_module_for_device(&module, &syms, &cg, &device)
+        }
+        TargetArch::Riscv64 => {
+            target::check_options(TargetArch::Riscv64, &cg).map_err(|e| e.to_string())?;
+            target::riscv::compile_module_riscv(&module, &syms, &cg, &opts.riscv)
         }
         arch => target::compile_module_for(arch, &module, &syms, &cg).map_err(|e| e.to_string())?,
     };
@@ -527,6 +535,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut stack_probes = true;
     let mut target = Triple::default_target();
     let mut device = None;
+    let mut riscv = target::riscv::RiscvOptions::default();
     let mut format = None;
     let mut oformat = None;
     let mut base = None;
@@ -550,6 +559,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
                 let t = it.next().ok_or("--target requires a triple")?;
                 target = Triple::parse(t).ok_or_else(|| format!("unknown target '{t}'"))?;
                 device = target::avr::Device::from_triple(t);
+                riscv = target::riscv::RiscvOptions::for_triple(t);
             }
             "-c" => output_kind = OutputKind::Object,
             "--shared" | "-shared" => output_kind = OutputKind::Shared,
@@ -656,6 +666,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         stack_probes,
         target,
         device,
+        riscv,
         format,
         oformat,
         base,

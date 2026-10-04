@@ -174,6 +174,26 @@ impl Ref<'_> {
                         None
                     }
                     InstKind::Fence(_) => None,
+                    // One thread: the atomics' sequential meaning.
+                    InstKind::AtomicRmw { op, ty, .. } => {
+                        let at = Self::addr(&ops[0])?;
+                        let old = self.load(*ty, at);
+                        let w = self.m.types().bit_width(*ty).unwrap_or(64);
+                        let (o, v) = (value_bits(&old).ok_or("rmw on poison")?, value_bits(&ops[1]).ok_or("rmw of poison")?);
+                        let new = SemValue::int(w, Int::from_u64(op.apply(o, masked(v, w), w)));
+                        self.store(*ty, at, &new)?;
+                        Some(old)
+                    }
+                    InstKind::CmpXchg { ty, .. } => {
+                        let at = Self::addr(&ops[0])?;
+                        let old = self.load(*ty, at);
+                        let w = self.m.types().bit_width(*ty).unwrap_or(64);
+                        let o = value_bits(&old).ok_or("cmpxchg on poison")?;
+                        if o == masked(value_bits(&ops[1]).ok_or("cmpxchg of poison")?, w) {
+                            self.store(*ty, at, &ops[2])?;
+                        }
+                        Some(old)
+                    }
                     InstKind::Call => {
                         let callee = inst.operands()[0];
                         let target = match f.value(callee).def {
@@ -329,8 +349,14 @@ impl Harness {
     }
 
     pub(super) fn with_options(src: &str, opts: &CodegenOptions) -> Harness {
+        Harness::with_riscv(src, opts, &super::RiscvOptions::default())
+    }
+
+    /// A harness whose machine code is compiled under `ropts` (e.g. with the
+    /// C extension).
+    pub(super) fn with_riscv(src: &str, opts: &CodegenOptions, ropts: &super::RiscvOptions) -> Harness {
         let (m, syms) = parse(src);
-        let compiled = super::compile_module_with(&m, &syms, opts);
+        let compiled = super::compile_module_riscv(&m, &syms, opts, ropts);
         let image = super::sim::link(&[&compiled.object]).unwrap_or_else(|e| panic!("link: {e}"));
         // The module the backend selects from (vectors scalarized, `fmod`
         // declared), lowered for the MIR interpreter.
