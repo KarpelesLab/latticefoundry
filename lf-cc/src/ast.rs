@@ -38,6 +38,39 @@ pub enum CType {
     /// *designator* has this type; used as a value it decays to `Pointer(Func)`
     /// (a function pointer), which is the only form that reaches storage.
     Func(Box<FuncType>),
+    /// A `volatile`- and/or `_Atomic`-qualified type (`const` and `restrict`
+    /// change no generated code and are not modelled). Only the qualifiers
+    /// that change how an object is accessed are tracked, and only where they
+    /// can matter: in a declared type, a pointee, an array element or a member.
+    /// Sema strips them when it forms an lvalue, recording them on the lvalue
+    /// expression instead (see [`CType::unqual`] / [`CType::quals`]); a
+    /// qualified type never reaches arithmetic or conversions.
+    Qual(Box<CType>, Quals),
+}
+
+/// The access-relevant type qualifiers: `volatile` (every access is performed
+/// exactly as written) and `_Atomic` (every access is an atomic operation).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Quals {
+    /// `volatile`.
+    pub volatile: bool,
+    /// `_Atomic`.
+    pub atomic: bool,
+}
+
+impl Quals {
+    /// No qualifier.
+    pub const NONE: Quals = Quals { volatile: false, atomic: false };
+
+    /// Whether no qualifier is present.
+    pub fn is_empty(self) -> bool {
+        !self.volatile && !self.atomic
+    }
+
+    /// The union of two qualifier sets.
+    pub fn union(self, other: Quals) -> Quals {
+        Quals { volatile: self.volatile || other.volatile, atomic: self.atomic || other.atomic }
+    }
 }
 
 /// The type of a function: its return type, parameter types, and whether it is
@@ -279,6 +312,33 @@ impl Records {
 }
 
 impl CType {
+    /// The type without its top-level qualifiers.
+    pub fn unqual(&self) -> &CType {
+        match self {
+            CType::Qual(inner, _) => inner.unqual(),
+            other => other,
+        }
+    }
+
+    /// The top-level qualifiers of the type.
+    pub fn quals(&self) -> Quals {
+        match self {
+            CType::Qual(inner, q) => q.union(inner.quals()),
+            _ => Quals::NONE,
+        }
+    }
+
+    /// This type with the qualifiers `q` added at the top level.
+    pub fn qualified(self, q: Quals) -> CType {
+        if q.is_empty() {
+            return self;
+        }
+        match self {
+            CType::Qual(inner, old) => CType::Qual(inner, old.union(q)),
+            other => CType::Qual(Box::new(other), q),
+        }
+    }
+
     /// The signed `int` type (`i32`).
     pub fn int() -> CType {
         CType::Int(IntTy::new(32, true))
@@ -411,6 +471,7 @@ impl CType {
     /// these types; sema rejects any expression that would produce such a value.
     pub fn unsupported_value(&self) -> Option<&'static str> {
         match self {
+            CType::Qual(inner, _) => inner.unsupported_value(),
             CType::Int(i) if i.width > 64 => Some("__int128"),
             CType::Float(FloatTy::F128) => Some("_Float128"),
             CType::Float(f) if f.is_complex() => Some("_Complex"),
@@ -466,6 +527,15 @@ impl fmt::Display for CType {
             CType::Pointer(inner) => write!(f, "{inner} *"),
             CType::Array(elem, n) => write!(f, "{elem}[{n}]"),
             CType::Record(_) => write!(f, "struct/union"),
+            CType::Qual(inner, q) => {
+                if q.atomic {
+                    write!(f, "_Atomic ")?;
+                }
+                if q.volatile {
+                    write!(f, "volatile ")?;
+                }
+                write!(f, "{inner}")
+            }
             CType::Func(ft) => {
                 write!(f, "{} (", ft.ret)?;
                 for (i, p) in ft.params.iter().enumerate() {

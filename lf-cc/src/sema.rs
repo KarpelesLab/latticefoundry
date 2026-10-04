@@ -12,12 +12,15 @@ use std::collections::{HashMap, HashSet};
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records,
-    Stmt, StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, Quals, RecordId,
+    Records, Stmt, StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use latticefoundry::ir::Visibility;
 use crate::cstd::CStd;
 use crate::layout;
+
+#[path = "sema_atomic.rs"]
+mod atomic;
 
 /// A function-local object with storage (a parameter or a local variable),
 /// addressed by an [`ObjId`] within its function.
@@ -39,6 +42,9 @@ pub struct Program {
     /// and linked alongside the translation unit's object.
     pub toplevel_asm: Vec<String>,
 }
+
+/// The diagnostic for an `_Atomic` aggregate object.
+const ATOMIC_SCALARS_ONLY: &str = "_Atomic is only supported on scalar (integer, floating or pointer) types";
 
 /// The diagnostic for a thread-local object: the backends have no TLS
 /// relocations or thread-pointer addressing yet.
@@ -110,8 +116,10 @@ pub struct FuncSig {
 pub struct TGlobal {
     /// The global's symbol name (its C name, or its GNU asm label).
     pub name: String,
-    /// The global's type.
+    /// The global's type (unqualified).
     pub ty: CType,
+    /// The object's `volatile`/`_Atomic` qualifiers.
+    pub quals: Quals,
     /// The initializer image (already the full size of the object).
     pub bytes: Vec<u8>,
     /// Whether the object belongs in read-only data (string literals).
@@ -175,8 +183,10 @@ pub struct TFunc {
 pub struct LocalInfo {
     /// The object's source name.
     pub name: String,
-    /// The object's type.
+    /// The object's type (unqualified).
     pub ty: CType,
+    /// The object's `volatile`/`_Atomic` qualifiers.
+    pub quals: Quals,
     /// An explicit `_Alignas`/`alignas` alignment override (over-aligning the
     /// object's stack storage), if any.
     pub align: Option<u64>,
@@ -260,8 +270,12 @@ pub enum TStmt {
 pub struct TExpr {
     /// The expression variant.
     pub kind: TExprKind,
-    /// The expression's C type.
+    /// The expression's C type (never qualified).
     pub ty: CType,
+    /// For an lvalue, the qualifiers of the object it designates: accesses
+    /// through a `volatile` lvalue are volatile, through an `_Atomic` one
+    /// atomic (`seq_cst`). Empty for every rvalue.
+    pub quals: Quals,
     /// The source span.
     pub span: Span,
 }
@@ -357,11 +371,78 @@ pub enum TExprKind {
     /// A GNU statement expression `({ ... })`: run the statements, then yield
     /// the value of the final expression statement (absent for a `void` one).
     StmtExpr(Vec<TStmt>, Option<Box<TExpr>>),
+    /// An atomic load of `*ptr` (`__atomic_load_n`); the node's type is the
+    /// object's.
+    AtomicLoad { ptr: Box<TExpr>, order: MemOrder },
+    /// An atomic store of `value` (already of the object's type) to `*ptr`;
+    /// `void`.
+    AtomicStore { ptr: Box<TExpr>, value: Box<TExpr>, order: MemOrder },
+    /// An atomic read-modify-write `*ptr = *ptr op value`, yielding the old
+    /// value (`fetch_old`) or the new one, typed like the object. On a pointer
+    /// object `value` is a `long` byte offset (GCC does not scale it).
+    AtomicRmw { op: AtomicOp, ptr: Box<TExpr>, value: Box<TExpr>, order: MemOrder, fetch_old: bool },
+    /// A strong compare-exchange of `*ptr`: if it holds the expected value,
+    /// store `desired`. With `by_ref`, `expected` points to the expected value
+    /// and receives the value found on failure; otherwise it is the expected
+    /// value. Yields the `_Bool` success flag, or the value found (`want_old`).
+    AtomicCas {
+        ptr: Box<TExpr>,
+        expected: Box<TExpr>,
+        desired: Box<TExpr>,
+        by_ref: bool,
+        success: MemOrder,
+        failure: MemOrder,
+        want_old: bool,
+    },
+    /// `__atomic_thread_fence(order)`; `void`.
+    AtomicFence(MemOrder),
+}
+
+/// A C11 memory order (`memory_order_*` / `__ATOMIC_*`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemOrder {
+    /// `relaxed`.
+    Relaxed,
+    /// `consume` (implemented as `acquire`).
+    Consume,
+    /// `acquire`.
+    Acquire,
+    /// `release`.
+    Release,
+    /// `acq_rel`.
+    AcqRel,
+    /// `seq_cst`.
+    SeqCst,
+}
+
+/// The operation of an atomic read-modify-write builtin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AtomicOp {
+    /// Exchange: the new value is the operand.
+    Xchg,
+    /// `old + v` (wrapping).
+    Add,
+    /// `old - v` (wrapping).
+    Sub,
+    /// `old & v`.
+    And,
+    /// `old | v`.
+    Or,
+    /// `old ^ v`.
+    Xor,
+    /// `~(old & v)`.
+    Nand,
 }
 
 impl TExpr {
     fn new(kind: TExprKind, ty: CType, span: Span) -> TExpr {
-        TExpr { kind, ty, span }
+        TExpr { kind, ty, quals: Quals::NONE, span }
+    }
+
+    /// This (lvalue) expression with the qualifiers `q` added.
+    fn with_quals(mut self, q: Quals) -> TExpr {
+        self.quals = self.quals.union(q);
+        self
     }
 
     /// Whether this typed expression designates an lvalue (has storage).
@@ -566,6 +647,7 @@ impl Checker {
         self.globals.push(TGlobal {
             name,
             ty,
+            quals: Quals::NONE,
             bytes,
             readonly: true,
             defined: true,
@@ -752,7 +834,12 @@ impl Checker {
         let is_decl_only = g.storage == Storage::Extern && !has_init;
         let is_static = g.storage == Storage::Static;
 
-        let mut ty = g.ty.clone();
+        let quals = g.ty.quals();
+        let mut ty = g.ty.unqual().clone();
+        if quals.atomic && !ty.is_scalar() {
+            self.error(g.span, ATOMIC_SCALARS_ONLY);
+            return;
+        }
         if let Some(init) = &g.init {
             ty = self.deduce_array_len(&ty, init);
         }
@@ -789,6 +876,7 @@ impl Checker {
             if is_static {
                 self.globals[idx].is_static = true;
             }
+            self.globals[idx].quals = self.globals[idx].quals.union(quals);
             if g.attrs.visibility.is_some() {
                 self.globals[idx].visibility = g.attrs.visibility;
             }
@@ -808,6 +896,7 @@ impl Checker {
         self.globals.push(TGlobal {
             name: symbol.to_owned(),
             ty,
+            quals,
             bytes,
             readonly: false,
             defined: !is_decl_only,
@@ -877,6 +966,7 @@ impl Checker {
         relocs: &mut Vec<GlobalReloc>,
         span: Span,
     ) {
+        let ty = ty.unqual();
         match ty {
             CType::Array(elem, n) => {
                 // `char[] = "..."` (or a wide array from `L"…"`/`u"…"`/`U"…"`)
@@ -884,7 +974,7 @@ impl Checker {
                 // element type matches the literal's element width.
                 if let Init::Expr(e) = init
                     && let ExprKind::StrLit(s, kind) = &e.kind
-                    && matches!(**elem, CType::Int(IntTy { bitint: None, .. }))
+                    && matches!(elem.unqual(), CType::Int(IntTy { bitint: None, .. }))
                     && layout::size_of(&self.records, elem) == kind.elem_width()
                 {
                     let limit = (*n).saturating_mul(kind.elem_width());
@@ -1122,7 +1212,7 @@ impl Checker {
             }
         }
         let sig_index = self.sig_index[&f.name];
-        let ret = f.ret.clone();
+        let ret = f.ret.unqual().clone();
         // Collect every label in the function up front so `goto` may reference a
         // label that appears later (forward references); labels have function
         // scope, not block scope. Duplicate labels are diagnosed here.
@@ -1466,8 +1556,14 @@ impl Checker {
                 self.error(d.span, format!("objects of type '{name}' are not supported"));
                 continue;
             }
-            // Deduce an incomplete array length from its initializer.
-            let mut ty = d.ty.clone();
+            // Deduce an incomplete array length from its initializer. The
+            // object's qualifiers are kept apart from its type.
+            let quals = d.ty.quals();
+            let mut ty = d.ty.unqual().clone();
+            if quals.atomic && !ty.is_scalar() {
+                self.error(d.span, ATOMIC_SCALARS_ONLY);
+                continue;
+            }
             if let Some(init) = &d.init {
                 ty = self.deduce_array_len(&ty, init);
             }
@@ -1511,6 +1607,7 @@ impl Checker {
                         self.globals[i].visibility = d.attrs.visibility;
                     }
                     self.globals[i].weak |= d.attrs.weak;
+                    self.globals[i].quals = self.globals[i].quals.union(quals);
                     i
                 } else {
                     let i = self.globals.len();
@@ -1519,6 +1616,7 @@ impl Checker {
                     self.globals.push(TGlobal {
                         name: symbol.to_owned(),
                         ty: ty.clone(),
+                        quals,
                         bytes: Vec::new(),
                         readonly: false,
                         defined: false,
@@ -1548,7 +1646,7 @@ impl Checker {
                 if ctx.scopes.last().unwrap().contains_key(&d.name) {
                     self.error(d.span, format!("redeclaration of '{}'", d.name));
                 }
-                let idx = self.make_static_local(&d.name, &ty, d);
+                let idx = self.make_static_local(&d.name, &ty, quals, d);
                 ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Static(idx));
                 continue;
             }
@@ -1558,7 +1656,7 @@ impl Checker {
             if ctx.scopes.last().unwrap().contains_key(&d.name) {
                 self.error(d.span, format!("redeclaration of '{}'", d.name));
             }
-            let id = ctx.add_object_aligned(&d.name, ty.clone(), d.align);
+            let id = ctx.add_object_aligned(&d.name, ty.clone().qualified(quals), d.align);
             ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Local(id));
             let init_built = match &d.init {
                 Some(init) => self.build_init(ctx, &ty, init, d.span),
@@ -1590,7 +1688,7 @@ impl Checker {
     /// constant expression (like a file-scope object); it is materialized to the
     /// object's storage image once. The symbol is given a unique name and
     /// internal linkage (it is not visible outside the function).
-    fn make_static_local(&mut self, name: &str, ty: &CType, d: &VarDecl) -> usize {
+    fn make_static_local(&mut self, name: &str, ty: &CType, quals: Quals, d: &VarDecl) -> usize {
         // Materialize the constant initializer first (it may intern string
         // literals, which append globals), then take the next global index.
         let size = self.size_of(ty) as usize;
@@ -1610,6 +1708,7 @@ impl Checker {
         self.globals.push(TGlobal {
             name: sym,
             ty: ty.clone(),
+            quals,
             bytes,
             readonly: false,
             defined: true,
@@ -1691,14 +1790,15 @@ impl Checker {
         out: &mut Vec<AggStore>,
         span: Span,
     ) -> Option<()> {
-        match ty {
+        match ty.unqual() {
             CType::Array(elem, n) => {
                 // `char[]` (or a wide `wchar_t[]`/`char16_t[]`/`char32_t[]`)
                 // initialized from a matching string literal: one store per
                 // element, decoded from the literal's little-endian element bytes.
+                let elem = elem.unqual();
                 if let Init::Expr(e) = init
                     && let ExprKind::StrLit(s, kind) = &e.kind
-                    && matches!(**elem, CType::Int(IntTy { bitint: None, .. }))
+                    && matches!(elem, CType::Int(IntTy { bitint: None, .. }))
                     && layout::size_of(&self.records, elem) == kind.elem_width()
                 {
                     let w = kind.elem_width() as usize;
@@ -1796,6 +1896,7 @@ impl Checker {
         out: &mut Vec<AggStore>,
         span: Span,
     ) -> Option<()> {
+        let ty = ty.unqual();
         if ty.is_aggregate() {
             self.build_agg_stores(ctx, ty, init, base, out, span)
         } else {
@@ -1958,6 +2059,7 @@ impl Checker {
 
     /// Type-check `__builtin_va_arg(ap, T)`: the result is a value of type `T`.
     fn check_va_arg(&mut self, ctx: &mut FnCtx, ap: &Expr, ty: &CType, span: Span) -> Option<TExpr> {
+        let ty = ty.unqual();
         let ap_ptr = self.check_va_list_ptr(ctx, ap, span)?;
         if !(ty.is_integer() || ty.is_pointer() || ty.is_float()) {
             self.error(span, "va_arg supports only integer, pointer, and floating types");
@@ -2060,6 +2162,8 @@ impl Checker {
         init: &Init,
         span: Span,
     ) -> Option<TExpr> {
+        let quals = ty.quals();
+        let ty = ty.unqual();
         if matches!(ty, CType::Void) {
             self.error(span, "compound literal cannot have type 'void'");
             return None;
@@ -2071,7 +2175,7 @@ impl Checker {
             self.error(span, "compound literal has incomplete struct/union type");
             return None;
         }
-        let obj = ctx.add_object("", cty.clone());
+        let obj = ctx.add_object("", cty.clone().qualified(quals));
         let (zero_size, stores) = if cty.is_aggregate() {
             let mut stores = Vec::new();
             self.build_agg_stores(ctx, &cty, init, 0, &mut stores, span)?;
@@ -2080,7 +2184,7 @@ impl Checker {
             let v = self.build_scalar_init(ctx, &cty, init, span)?;
             (0u64, vec![AggStore { offset: 0, value: v, bits: None }])
         };
-        Some(TExpr::new(TExprKind::CompoundLiteral { obj, zero_size, stores }, cty, span))
+        Some(TExpr::new(TExprKind::CompoundLiteral { obj, zero_size, stores }, cty, span).with_quals(quals))
     }
 
     /// Check an expression and apply array-to-pointer decay (the "value of" an
@@ -2094,16 +2198,22 @@ impl Checker {
     /// function designator to a function pointer.
     fn decay(&mut self, te: TExpr) -> TExpr {
         if matches!(te.ty, CType::Func(_)) {
-            let TExpr { kind, ty, span } = te;
+            let TExpr { kind, ty, quals, span } = te;
             return match kind {
                 // `f` → &f (a function pointer).
                 TExprKind::FuncRef(idx) => TExpr::new(TExprKind::FuncPtr(idx), CType::ptr_to(ty), span),
                 // `*fp` (a dereferenced function pointer) → the pointer itself.
                 TExprKind::Deref(inner) => *inner,
-                other => TExpr { kind: other, ty, span },
+                other => TExpr { kind: other, ty, quals, span },
             };
         }
-        match te.ty.decayed() {
+        // An array object's qualifiers belong to its elements: a `volatile`
+        // array decays to a pointer to `volatile` elements.
+        let decayed = match &te.ty {
+            CType::Array(elem, _) => Some(CType::ptr_to((**elem).clone().qualified(te.quals))),
+            other => other.decayed(),
+        };
+        match decayed {
             Some(ptr_ty) => {
                 let span = te.span;
                 TExpr::new(TExprKind::Decay(Box::new(te)), ptr_ty, span)
@@ -2127,7 +2237,8 @@ impl Checker {
             self.error(span, "invalid subscript: need a pointer/array and an integer");
             return None;
         }
-        let elem = ptr.ty.pointee().cloned().unwrap();
+        let qelem = ptr.ty.pointee().cloned().unwrap();
+        let (elem, elem_quals) = (qelem.unqual().clone(), qelem.quals());
         if matches!(elem, CType::Void) {
             self.error(span, "cannot subscript a pointer to 'void'");
             return None;
@@ -2145,7 +2256,7 @@ impl Checker {
             ptr_ty,
             span,
         );
-        Some(TExpr::new(TExprKind::Deref(Box::new(addr)), elem, span))
+        Some(TExpr::new(TExprKind::Deref(Box::new(addr)), elem, span).with_quals(elem_quals))
     }
 
     fn check_member(
@@ -2167,11 +2278,12 @@ impl Checker {
                     return None;
                 }
             };
+            let (inner, inner_quals) = (inner.unqual().clone(), inner.quals());
             if !inner.is_record() {
                 self.error(span, "'->' requires a pointer to a struct/union");
                 return None;
             }
-            TExpr::new(TExprKind::Deref(Box::new(bt)), inner, span)
+            TExpr::new(TExprKind::Deref(Box::new(bt)), inner, span).with_quals(inner_quals)
         } else {
             let bt = self.check_expr(ctx, base)?;
             if !bt.ty.is_record() {
@@ -2191,23 +2303,29 @@ impl Checker {
             self.error(span, format!("no member named '{name}' in the struct/union"));
             return None;
         };
+        // A member of a qualified struct is qualified like it (and by its own
+        // declared qualifiers).
+        let quals = record_lvalue.quals.union(fty.quals());
+        let fty = fty.unqual().clone();
         let kind = match bits {
             Some(bits) => TExprKind::BitField { base: Box::new(record_lvalue), offset, bits },
             None => TExprKind::Field { base: Box::new(record_lvalue), offset },
         };
-        Some(TExpr::new(kind, fty, span))
+        Some(TExpr::new(kind, fty, span).with_quals(quals))
     }
 
     fn check_ident(&mut self, ctx: &mut FnCtx, name: &str, span: Span) -> Option<TExpr> {
         match ctx.lookup(name) {
             Some(Binding::Local(id)) => {
                 let ty = ctx.locals[id].ty.clone();
-                return Some(TExpr::new(TExprKind::Obj(id), ty, span));
+                let quals = ctx.locals[id].quals;
+                return Some(TExpr::new(TExprKind::Obj(id), ty, span).with_quals(quals));
             }
             // A `static` block-scope object resolves to its backing global.
             Some(Binding::Static(idx)) => {
                 let ty = self.globals[idx].ty.clone();
-                return Some(TExpr::new(TExprKind::Global(idx), ty, span));
+                let quals = self.globals[idx].quals;
+                return Some(TExpr::new(TExprKind::Global(idx), ty, span).with_quals(quals));
             }
             None => {}
         }
@@ -2221,7 +2339,8 @@ impl Checker {
         }
         if let Some(&idx) = self.global_index.get(name) {
             let ty = self.globals[idx].ty.clone();
-            return Some(TExpr::new(TExprKind::Global(idx), ty, span));
+            let quals = self.globals[idx].quals;
+            return Some(TExpr::new(TExprKind::Global(idx), ty, span).with_quals(quals));
         }
         if let Some(&idx) = self.sig_index.get(name) {
             // A function designator: its type is the function type. Used as a
@@ -2286,12 +2405,13 @@ impl Checker {
             UnaryOp::Deref => {
                 let te = self.check_rvalue(ctx, inner)?;
                 match te.ty.pointee().cloned() {
-                    Some(CType::Void) => {
+                    Some(p) if matches!(p.unqual(), CType::Void) => {
                         self.error(span, "cannot dereference a 'void *'");
                         None
                     }
                     Some(pointee) => {
-                        Some(TExpr::new(TExprKind::Deref(Box::new(te)), pointee, span))
+                        let (ty, quals) = (pointee.unqual().clone(), pointee.quals());
+                        Some(TExpr::new(TExprKind::Deref(Box::new(te)), ty, span).with_quals(quals))
                     }
                     None => {
                         self.error(span, format!("cannot dereference non-pointer '{}'", te.ty));
@@ -2304,13 +2424,13 @@ impl Checker {
                 // `&function` yields a function pointer (same value the designator
                 // decays to); `&(*fp)` folds back to the pointer `fp`.
                 if matches!(te.ty, CType::Func(_)) {
-                    let TExpr { kind, ty, span: sp } = te;
+                    let TExpr { kind, ty, quals, span: sp } = te;
                     return match kind {
                         TExprKind::FuncRef(idx) => {
                             Some(TExpr::new(TExprKind::FuncPtr(idx), CType::ptr_to(ty), sp))
                         }
                         TExprKind::Deref(inner) => Some(*inner),
-                        other => Some(TExpr { kind: other, ty, span: sp }),
+                        other => Some(TExpr { kind: other, ty, quals, span: sp }),
                     };
                 }
                 if te.is_bitfield() {
@@ -2321,7 +2441,8 @@ impl Checker {
                     self.error(span, "cannot take the address of a non-lvalue");
                     return None;
                 }
-                let ty = CType::ptr_to(te.ty.clone());
+                // `&x` of a `volatile`/`_Atomic` object points to a qualified type.
+                let ty = CType::ptr_to(te.ty.clone().qualified(te.quals));
                 Some(TExpr::new(TExprKind::AddrOf(Box::new(te)), ty, span))
             }
         }
@@ -2595,6 +2716,14 @@ impl Checker {
                 CType::ptr_to(CType::Void),
                 span,
             ));
+        }
+        // The GNU atomic builtins (`__atomic_*`, `__sync_*`), unless the program
+        // declares a function of that name itself.
+        if let ExprKind::Ident(name) = &callee.kind
+            && (name.starts_with("__atomic_") || name.starts_with("__sync_"))
+            && !self.ident_in_scope(ctx, name)
+        {
+            return self.check_atomic_builtin(ctx, name, callee.span, args, span);
         }
         // GNU `__builtin_<name>` calls that are not one of the specially-parsed
         // forms (the `va_*` family become dedicated AST nodes in the parser) and
@@ -3132,6 +3261,8 @@ impl Checker {
         inner: &Expr,
         span: Span,
     ) -> Option<TExpr> {
+        // A cast yields an rvalue: qualifiers on its type are meaningless.
+        let ty = ty.unqual();
         let te = self.check_rvalue(ctx, inner)?;
         if matches!(ty, CType::Void) {
             // Cast to void: evaluate for effect; result is void.
@@ -3214,6 +3345,7 @@ impl Checker {
     /// Insert an explicit conversion of `e` to `to`, or return `e` unchanged if
     /// its type already matches.
     fn convert(&mut self, e: TExpr, to: &CType) -> TExpr {
+        let to = to.unqual();
         if &e.ty == to {
             return e;
         }
@@ -3333,9 +3465,13 @@ impl FnCtx {
         self.add_object_aligned(name, ty, None)
     }
 
+    /// Add an object of (possibly qualified) type `ty`; its qualifiers are
+    /// recorded apart from its (unqualified) type.
     fn add_object_aligned(&mut self, name: &str, ty: CType, align: Option<u64>) -> ObjId {
         let id = self.locals.len();
-        self.locals.push(LocalInfo { name: name.to_owned(), ty, align });
+        let quals = ty.quals();
+        let ty = ty.unqual().clone();
+        self.locals.push(LocalInfo { name: name.to_owned(), ty, quals, align });
         id
     }
 

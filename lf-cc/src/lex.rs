@@ -131,6 +131,9 @@ pub enum Keyword {
     /// `__asm__` / `__asm` (always) and `asm` (GNU dialects): an asm label on a
     /// declarator, an asm statement, or a file-scope asm declaration.
     Asm,
+    /// `_Atomic` (C11): the atomic type qualifier, or the `_Atomic ( type-name )`
+    /// type specifier.
+    Atomic,
 }
 
 /// The punctuators and operators recognized by the subset.
@@ -199,6 +202,7 @@ fn keyword_from(word: &str) -> Option<Keyword> {
         "unsigned" => Keyword::Unsigned,
         "const" => Keyword::Const,
         "volatile" => Keyword::Volatile,
+        "_Atomic" => Keyword::Atomic,
         "extern" => Keyword::Extern,
         "static" => Keyword::Static,
         "register" => Keyword::Register,

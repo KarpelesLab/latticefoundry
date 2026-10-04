@@ -34,6 +34,7 @@ fn field_align(recs: &Records, f: &Field, packed: bool) -> u64 {
 /// The size in bytes of a C type under the natural-alignment layout.
 pub fn size_of(recs: &Records, ty: &CType) -> u64 {
     match ty {
+        CType::Qual(inner, _) => size_of(recs, inner),
         CType::Void => 1,
         CType::Bool => 1,
         CType::Int(i) => u64::from(i.width) / 8,
@@ -50,6 +51,7 @@ pub fn size_of(recs: &Records, ty: &CType) -> u64 {
 /// The alignment in bytes of a C type.
 pub fn align_of(recs: &Records, ty: &CType) -> u64 {
     match ty {
+        CType::Qual(inner, _) => align_of(recs, inner),
         CType::Void | CType::Bool => 1,
         CType::Int(i) => (u64::from(i.width) / 8).clamp(1, 16),
         CType::Float(f) => f.align(),
@@ -89,7 +91,7 @@ pub struct BitPlacement {
 /// type `ty`. The storage unit is the natural size of the declared type in bits
 /// (`_Bool` occupies an 8-bit unit but permits only a single value bit).
 fn bitfield_unit_bits(ty: &CType) -> u16 {
-    match ty {
+    match ty.unqual() {
         CType::Bool => 8,
         CType::Int(i) => i.width,
         _ => 32,
@@ -147,7 +149,7 @@ fn record_layout(recs: &Records, id: RecordId) -> RecordLayout {
                             unit_bits: bitfield_unit_bits(&f.ty),
                             bit_offset: (offset_bits - unit_start) as u32,
                             width: w as u32,
-                            signed: f.ty.is_signed(),
+                            signed: f.ty.unqual().is_signed(),
                         });
                         if !def.packed {
                             align = align.max(align_of(recs, &f.ty));
@@ -179,7 +181,7 @@ fn record_layout(recs: &Records, id: RecordId) -> RecordLayout {
                             unit_bits: bitfield_unit_bits(&f.ty),
                             bit_offset: 0,
                             width: w,
-                            signed: f.ty.is_signed(),
+                            signed: f.ty.unqual().is_signed(),
                         });
                         if !def.packed {
                             align = align.max(align_of(recs, &f.ty));
@@ -247,7 +249,7 @@ pub fn resolve_member_bits(
     }
     for (i, f) in def.fields.iter().enumerate() {
         if f.anonymous
-            && let CType::Record(sub) = &f.ty
+            && let CType::Record(sub) = f.ty.unqual()
             && let Some((off, ty, bp)) = resolve_member_bits(recs, *sub, name)
         {
             return Some((layout.offsets[i] + off, ty, bp));
@@ -265,6 +267,7 @@ pub fn resolve_member_bits(
 /// storage `alloca` reserves.
 pub fn ir_type(cx: &mut TypeContext, recs: &Records, ty: &CType) -> TypeId {
     match ty {
+        CType::Qual(inner, _) => ir_type(cx, recs, inner),
         CType::Void => cx.void(),
         CType::Bool => cx.int(8),
         CType::Int(i) => cx.int(u32::from(i.width)),

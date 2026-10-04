@@ -605,11 +605,15 @@ impl Pp {
     /// cannot compile. Individual newer capabilities are advertised instead
     /// through `__has_builtin`/`__has_attribute`/`__has_feature`.
     ///
+    /// The atomics model: the `__ATOMIC_*` memory orders, every
+    /// `__GCC_ATOMIC_*_LOCK_FREE` at 2 (always lock-free: x86-64 has atomic
+    /// 1/2/4/8-byte accesses) and `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{1,2,4,8}`,
+    /// matching the `__atomic_*`/`__sync_*` builtins sema implements.
+    ///
     /// Deliberately *not* predefined: `__SIZEOF_INT128__` (no `__int128`),
-    /// `__SSE__`/`__SSE2__`/`__MMX__` (no vector types or intrinsics; the
-    /// headers keyed on them include `<*intrin.h>`), `__GCC_ATOMIC_*` and
-    /// `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_*` (no `__atomic_*`/`__sync_*`
-    /// builtins), `__STDC_UTF_16__` (`u""` literals are not UTF-16-encoded
+    /// `__SSE__`/`__SSE2__`/`__MMX__` (no intrinsics; the headers keyed on them
+    /// include `<*intrin.h>`), `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16` (no
+    /// 16-byte atomics), `__STDC_UTF_16__` (`u""` literals are not UTF-16-encoded
     /// beyond the BMP), and `__STDC_EMBED_*__` (no `__has_embed`).
     /// `__PIC__`/`__PIE__` follow [`PpOptions::pic`]/[`PpOptions::pie`].
     fn define_predefined(&mut self, opts: &PpOptions) {
@@ -771,6 +775,26 @@ impl Pp {
                 };
                 self.define_object(&format!("__{p}_{field}__"), &v);
             }
+        }
+
+        // The C11 memory orders, as the `__atomic_*` builtins number them, and
+        // the lock-freedom of every atomic type.
+        for (name, val) in [
+            ("__ATOMIC_RELAXED", "0"),
+            ("__ATOMIC_CONSUME", "1"),
+            ("__ATOMIC_ACQUIRE", "2"),
+            ("__ATOMIC_RELEASE", "3"),
+            ("__ATOMIC_ACQ_REL", "4"),
+            ("__ATOMIC_SEQ_CST", "5"),
+            ("__GCC_ATOMIC_TEST_AND_SET_TRUEVAL", "1"),
+        ] {
+            self.define_object(name, val);
+        }
+        for ty in ["BOOL", "CHAR", "CHAR8_T", "CHAR16_T", "CHAR32_T", "WCHAR_T", "SHORT", "INT", "LONG", "LLONG", "POINTER"] {
+            self.define_object(&format!("__GCC_ATOMIC_{ty}_LOCK_FREE"), "2");
+        }
+        for n in [1, 2, 4, 8] {
+            self.define_object(&format!("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_{n}"), "1");
         }
 
         // The prefix the ABI prepends to C names at the symbol level: none on
@@ -2303,6 +2327,9 @@ impl Pp {
             "__const__" | "__const" => Some(TokenKind::Keyword(Keyword::Const)),
             "__volatile__" | "__volatile" => Some(TokenKind::Keyword(Keyword::Volatile)),
             "__signed__" | "__signed" => Some(TokenKind::Keyword(Keyword::Signed)),
+            // `_Atomic` lives in the reserved namespace; gcc accepts it under
+            // every standard (as an extension before C11).
+            "_Atomic" => Some(TokenKind::Keyword(Keyword::Atomic)),
             // GNU `asm`: the reserved spellings everywhere, the plain keyword only
             // under the GNU dialects (in ISO modes `asm` is an ordinary identifier).
             "__asm__" | "__asm" => Some(TokenKind::Keyword(Keyword::Asm)),
@@ -3258,7 +3285,7 @@ fn undecorate(name: &str) -> &str {
 /// comparisons). Anything else — in particular builtins `sema` would silently
 /// alias to an implicitly-declared `int` function — answers 0.
 fn has_builtin(name: &str) -> bool {
-    matches!(
+    is_atomic_builtin(name) || matches!(
         name,
         "__builtin_va_start"
             | "__builtin_va_arg"
@@ -3330,6 +3357,44 @@ fn has_builtin(name: &str) -> bool {
             | "__builtin_nan"
             | "__builtin_nanf"
     ) || (BUILTIN_VA_LIST_TYPE && name == "__builtin_va_list")
+}
+
+/// Whether `name` is one of the GNU atomic builtins sema implements (the
+/// `__atomic_*` family and the legacy `__sync_*` one).
+fn is_atomic_builtin(name: &str) -> bool {
+    const OPS: [&str; 6] = ["add", "sub", "and", "or", "xor", "nand"];
+    if let Some(rest) = name.strip_prefix("__atomic_") {
+        return matches!(
+            rest,
+            "load_n"
+                | "store_n"
+                | "exchange_n"
+                | "compare_exchange_n"
+                | "load"
+                | "store"
+                | "exchange"
+                | "compare_exchange"
+                | "test_and_set"
+                | "clear"
+                | "thread_fence"
+                | "signal_fence"
+                | "always_lock_free"
+                | "is_lock_free"
+        ) || rest.strip_suffix("_fetch").is_some_and(|op| OPS.contains(&op))
+            || rest.strip_prefix("fetch_").is_some_and(|op| OPS.contains(&op));
+    }
+    if let Some(rest) = name.strip_prefix("__sync_") {
+        return matches!(
+            rest,
+            "synchronize"
+                | "bool_compare_and_swap"
+                | "val_compare_and_swap"
+                | "lock_test_and_set"
+                | "lock_release"
+        ) || rest.strip_suffix("_and_fetch").is_some_and(|op| OPS.contains(&op))
+            || rest.strip_prefix("fetch_and_").is_some_and(|op| OPS.contains(&op));
+    }
+    false
 }
 
 /// Whether the parser implements the `__builtin_va_list` type keyword. The
@@ -3416,7 +3481,9 @@ fn has_c_attribute(name: &str) -> i128 {
 /// modules, …) answers 0.
 fn has_feature(name: &str, std: CStd) -> bool {
     match name {
-        "c_alignas" | "c_alignof" | "c_static_assert" | "c_generic_selections" => std.is_c11(),
+        "c_alignas" | "c_alignof" | "c_static_assert" | "c_generic_selections" | "c_atomic" => {
+            std.is_c11()
+        }
         _ => false,
     }
 }

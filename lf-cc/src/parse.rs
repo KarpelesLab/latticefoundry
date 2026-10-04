@@ -13,7 +13,7 @@ use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
     AsmOperand, AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, Field, FloatTy, FuncDef, FuncProto, FuncType,
-    GenericAssoc, Init, InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt,
+    GenericAssoc, Init, InitItem, IntTy, Param, Quals, RecordDef, RecordId, RecordKind, Records, Stmt,
     StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
@@ -44,6 +44,7 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         pending_attrs: Attrs::default(),
         spec_inline: false,
         spec_thread: false,
+        spec_quals: Quals::NONE,
         va_list_record: None,
         cur_func: None,
         in_params: 0,
@@ -115,6 +116,9 @@ struct Parser {
     /// Whether the current declaration's specifiers included `_Thread_local` /
     /// `__thread`. Reset like `spec_inline`.
     spec_thread: bool,
+    /// The `volatile`/`_Atomic` qualifiers among the declaration specifiers
+    /// being parsed (saved and restored around nested specifier sequences).
+    spec_quals: Quals,
     /// The record modelling the System V `__va_list_tag` behind the builtin
     /// `__builtin_va_list` type, created on first use.
     va_list_record: Option<RecordId>,
@@ -634,6 +638,8 @@ impl Parser {
     ) -> PResult<FnDecl> {
         let is_static = decl.storage == Storage::Static;
         let is_inline = self.spec_inline;
+        // Qualifiers on a return type are meaningless (the value is an rvalue).
+        let ret = ret.unqual().clone();
         self.cur_func = Some(name.clone());
         self.push_scope();
         // An old-style (K&R) function definition opens with an *identifier
@@ -1069,6 +1075,9 @@ impl Parser {
             return Err(Diagnostic::error("GCC vector types (vector_size) are not supported")
                 .with_span(span));
         }
+        if let CType::Qual(inner, q) = ty {
+            return Ok(self.apply_type_attrs(*inner, attrs, span)?.qualified(q));
+        }
         match (attrs.mode, ty) {
             (Some(w), CType::Int(i)) => Ok(CType::Int(IntTy::new(w, i.signed))),
             (Some(w), CType::Bool) => Ok(CType::Int(IntTy::new(w, false))),
@@ -1305,7 +1314,9 @@ impl Parser {
             // A trailing attribute on the parameter declarator, e.g.
             // `int desc __attribute__((unused))` (GNU) or `int x [[maybe_unused]]`.
             let (_label, ty, _attrs) = self.finish_declarator(ty, span, &sattrs)?;
-            // A parameter of array or function type decays to a pointer.
+            // A parameter of array or function type decays to a pointer; its
+            // top-level qualifiers are not part of the function's type.
+            let ty = ty.unqual().clone();
             let ty = ty.decayed().unwrap_or(ty);
             // A parameter of transparent-union type (GNU) is passed exactly like
             // the union's first member, and accepts an argument of any member
@@ -1422,6 +1433,7 @@ impl Parser {
             loop {
                 let (pname, pty, psp) = self.parse_named_declarator(base.clone())?;
                 let (_label, pty, _attrs) = self.finish_declarator(pty, psp, &sattrs)?;
+                let pty = pty.unqual().clone();
                 let pty = pty.decayed().unwrap_or(pty);
                 if !names.iter().any(|(n, _)| *n == pname) {
                     return Err(Diagnostic::error(format!(
@@ -1484,6 +1496,7 @@ impl Parser {
                 | Keyword::Unsigned
                 | Keyword::Const
                 | Keyword::Volatile
+                | Keyword::Atomic
                 | Keyword::Restrict
                 | Keyword::Inline
                 | Keyword::Noreturn
@@ -1518,10 +1531,12 @@ impl Parser {
     fn parse_decl_specs_impl(&mut self, allow_implicit_int: bool) -> PResult<CType> {
         let start = self.peek_span();
         let mut attrs = std::mem::take(&mut self.pending_attrs);
-        let ty = self.parse_decl_specs_body(allow_implicit_int, &mut attrs)?;
-        let ty = self.apply_type_attrs(ty, &attrs, start)?;
+        let outer_quals = std::mem::replace(&mut self.spec_quals, Quals::NONE);
+        let ty = self.parse_decl_specs_body(allow_implicit_int, &mut attrs);
+        let quals = std::mem::replace(&mut self.spec_quals, outer_quals);
+        let ty = self.apply_type_attrs(ty?, &attrs, start)?;
         self.spec_attrs = attrs;
-        Ok(ty)
+        Ok(ty.qualified(quals))
     }
 
     fn parse_decl_specs_body(
@@ -1721,9 +1736,30 @@ impl Parser {
                 _ => {}
             }
             match self.peek() {
-                TokenKind::Keyword(
-                    Keyword::Const | Keyword::Volatile | Keyword::Restrict | Keyword::Noreturn,
-                ) => {
+                TokenKind::Keyword(Keyword::Const | Keyword::Restrict | Keyword::Noreturn) => {
+                    self.bump();
+                }
+                TokenKind::Keyword(Keyword::Volatile) => {
+                    self.spec_quals.volatile = true;
+                    self.bump();
+                }
+                // `_Atomic ( type-name )`: the atomic version of a type (a type
+                // specifier); a bare `_Atomic` is the qualifier.
+                TokenKind::Keyword(Keyword::Atomic)
+                    if matches!(self.peek_at(1), TokenKind::Punct(Punct::LParen)) =>
+                {
+                    if explicit.is_some() || numeric_seen {
+                        return self.err("`_Atomic(type-name)` cannot combine with another type specifier");
+                    }
+                    self.bump();
+                    self.bump(); // (
+                    let inner = self.parse_type_name()?;
+                    self.expect_punct(Punct::RParen, "')' after the _Atomic type name")?;
+                    explicit = Some(inner.qualified(Quals { volatile: false, atomic: true }));
+                    saw_any = true;
+                }
+                TokenKind::Keyword(Keyword::Atomic) => {
+                    self.spec_quals.atomic = true;
                     self.bump();
                 }
                 TokenKind::Keyword(Keyword::Inline) => {
@@ -1909,21 +1945,24 @@ impl Parser {
     fn parse_pointers(&mut self, mut base: CType) -> PResult<CType> {
         self.skip_attributes()?;
         while self.eat_punct(Punct::Star) {
-            // Skip pointer qualifiers and attributes (`char *__restrict p`,
-            // `void * __attribute__((aligned(8))) p`).
+            // Pointer qualifiers and attributes (`char *__restrict p`, `int
+            // *volatile p`, `void * __attribute__((aligned(8))) p`); `volatile`
+            // and `_Atomic` qualify the pointer object itself.
+            let mut quals = Quals::NONE;
             loop {
-                if self.is_kw(Keyword::Const)
-                    || self.is_kw(Keyword::Volatile)
-                    || self.is_kw(Keyword::Restrict)
-                {
+                if self.is_kw(Keyword::Const) || self.is_kw(Keyword::Restrict) {
                     self.bump();
+                } else if self.eat_kw(Keyword::Volatile) {
+                    quals.volatile = true;
+                } else if self.eat_kw(Keyword::Atomic) {
+                    quals.atomic = true;
                 } else if self.at_attribute() {
                     self.skip_attributes()?;
                 } else {
                     break;
                 }
             }
-            base = CType::ptr_to(base);
+            base = CType::ptr_to(base).qualified(quals);
         }
         Ok(base)
     }
@@ -2043,7 +2082,7 @@ impl Parser {
             ExprKind::Member(base, name, arrow) => {
                 let bt = self.expr_type(base)?;
                 let rec = if *arrow { bt.pointee().cloned()? } else { bt };
-                if let CType::Record(id) = rec {
+                if let CType::Record(id) = *rec.unqual() {
                     layout::resolve_member(&self.records, id, name).map(|(_, ty)| ty)
                 } else {
                     None
@@ -2127,7 +2166,7 @@ impl Parser {
                 let (params, variadic) = self.parse_param_list()?;
                 let param_tys = params.iter().map(|p| p.ty.clone()).collect();
                 self.named_fn_params = Some(params);
-                CType::Func(Box::new(FuncType { ret: base, params: param_tys, variadic }))
+                CType::Func(Box::new(FuncType { ret: base.unqual().clone(), params: param_tys, variadic }))
             } else {
                 self.declarator_suffixes(base)?
             };
@@ -2147,7 +2186,8 @@ impl Parser {
         if self.is_punct(Punct::LParen) {
             let (params, variadic) = self.parse_param_list()?;
             let param_tys: Vec<CType> = params.into_iter().map(|p| p.ty).collect();
-            return Ok(CType::Func(Box::new(FuncType { ret: base, params: param_tys, variadic })));
+            let ret = base.unqual().clone();
+            return Ok(CType::Func(Box::new(FuncType { ret, params: param_tys, variadic })));
         }
         self.parse_array_suffix(base)
     }
@@ -2324,6 +2364,7 @@ impl Parser {
     /// that the width is in `0..=bits(ty)` (where `_Bool` counts as one bit).
     fn parse_bitfield_width(&mut self, ty: &CType) -> PResult<u32> {
         let colon = self.expect_punct(Punct::Colon, "':' in bit-field")?;
+        let ty = ty.unqual();
         if !ty.is_integer() {
             return Err(Diagnostic::error("bit-field has a non-integer type").with_span(colon));
         }
@@ -2542,7 +2583,7 @@ impl Parser {
                 } else {
                     (self.const_lvalue_addr(base)?, self.expr_type(base)?)
                 };
-                let CType::Record(id) = rec else { return None };
+                let CType::Record(id) = *rec.unqual() else { return None };
                 let (off, _) = layout::resolve_member(&self.records, id, name)?;
                 Some(addr + i128::from(off))
             }
@@ -3024,6 +3065,7 @@ impl Parser {
                 | Keyword::Unsigned
                 | Keyword::Const
                 | Keyword::Volatile
+                | Keyword::Atomic
                 | Keyword::Restrict
                 | Keyword::Typeof
                 | Keyword::TypeofUnqual
@@ -3202,7 +3244,7 @@ impl Parser {
         let mut member = Some(self.expect_ident()?);
         loop {
             if let Some((name, sp)) = member.take() {
-                let CType::Record(id) = ty else {
+                let CType::Record(id) = *ty.unqual() else {
                     return Err(Diagnostic::error("__builtin_offsetof of a member of a non-record type")
                         .with_span(sp));
                 };
@@ -3218,7 +3260,7 @@ impl Parser {
                 let sp = self.bump().span;
                 let idx = self.parse_const_expr()?;
                 self.expect_punct(Punct::RBracket, "']' in __builtin_offsetof")?;
-                let CType::Array(elem, _) = ty else {
+                let CType::Array(elem, _) = ty.unqual().clone() else {
                     return Err(Diagnostic::error("subscript of a non-array in __builtin_offsetof")
                         .with_span(sp));
                 };
@@ -3242,7 +3284,9 @@ impl Parser {
         self.expect_punct(Punct::Comma, "',' in __builtin_types_compatible_p")?;
         let b = self.parse_type_name()?;
         let end = self.expect_punct(Punct::RParen, "')' to close __builtin_types_compatible_p")?;
-        Ok(Expr { kind: ExprKind::IntLit(i128::from(a == b), CType::int()), span: start.merge(end) })
+        // Top-level qualifiers do not affect compatibility (gcc ignores them).
+        let same = a.unqual() == b.unqual();
+        Ok(Expr { kind: ExprKind::IntLit(i128::from(same), CType::int()), span: start.merge(end) })
     }
 
     /// `__builtin_choose_expr ( const-expr , e1 , e2 )`: selects `e1` when the

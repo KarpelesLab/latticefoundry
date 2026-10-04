@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use latticefoundry::ir::builder::FunctionBuilder;
-use latticefoundry::ir::inst::{BinOp, CastOp, Flags, FloatPred, IntPred};
+use latticefoundry::ir::inst::{AtomicOrdering, BinOp, CastOp, Flags, FloatPred, IntPred, RmwOp};
 use latticefoundry::ir::types::{Type, TypeContext, TypeId};
 use latticefoundry::ir::value::{FloatBits, ValueId};
 use latticefoundry::codegen::RelocModel;
@@ -21,10 +21,12 @@ use latticefoundry::ir::{
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::puremp;
 
-use crate::ast::{BinaryOp, CType, FloatTy, Records};
+use crate::ast::{BinaryOp, CType, FloatTy, Quals, Records};
 use crate::layout;
 use crate::layout::BitPlacement;
-use crate::sema::{AggStore, FuncSig, LocalInfo, Program, TExpr, TExprKind, TFunc, TGlobal, TStmt};
+use crate::sema::{
+    AggStore, AtomicOp, FuncSig, LocalInfo, MemOrder, Program, TExpr, TExprKind, TFunc, TGlobal, TStmt,
+};
 use crate::CodegenConfig;
 
 /// The size in bytes of a System V `__va_list_tag` (`va_copy` copies this many).
@@ -68,6 +70,7 @@ impl Tys {
             CType::Pointer(_) => self.ptr,
             CType::Array(..) | CType::Record(_) => self.ptr,
             CType::Func(_) => self.ptr,
+            CType::Qual(inner, _) => self.of(inner),
         }
     }
 }
@@ -628,10 +631,11 @@ impl FnLower<'_> {
             TStmt::InitLocal(id, v) => {
                 self.set_line(v.span);
                 let val = self.lower_rvalue(v);
-                let ty = self.tys.of(&self.locals[*id].ty);
-                let align = align_of(&self.locals[*id].ty);
+                let ty = self.locals[*id].ty.clone();
                 let slot = self.slots[*id];
-                self.b.store(ty, slot, val, align);
+                // Initialization is not an atomic access, but it is a volatile one.
+                let quals = Quals { atomic: false, ..self.locals[*id].quals };
+                self.store_access(&ty, slot, val, quals);
             }
             TStmt::CopyInit { obj, src, size } => {
                 self.set_line(src.span);
@@ -648,7 +652,7 @@ impl FnLower<'_> {
                     let addr = self.offset_ptr(base, st.offset);
                     match &st.bits {
                         Some(bp) => {
-                            self.bitfield_write_at(addr, bp, val);
+                            self.bitfield_write_at(addr, bp, val, false);
                         }
                         None => {
                             let ty = self.tys.of(&st.value.ty);
@@ -1005,7 +1009,7 @@ impl FnLower<'_> {
             let addr = self.offset_ptr(base, st.offset);
             match &st.bits {
                 Some(bp) => {
-                    self.bitfield_write_at(addr, bp, val);
+                    self.bitfield_write_at(addr, bp, val, false);
                 }
                 None => {
                     let ty = self.tys.of(&st.value.ty);
@@ -1102,13 +1106,11 @@ impl FnLower<'_> {
             | TExprKind::Field { .. }
             | TExprKind::CompoundLiteral { .. } => {
                 let addr = self.lower_lvalue(e);
-                let ty = self.tys.of(&e.ty);
-                let align = align_of(&e.ty);
-                self.b.load(ty, addr, align)
+                self.load_access(&e.ty, addr, e.quals)
             }
             TExprKind::BitField { base, offset, bits } => {
                 let addr = self.bitfield_unit_addr(base, *offset);
-                self.bitfield_read_at(addr, bits)
+                self.bitfield_read_at(addr, bits, e.quals.volatile)
             }
             TExprKind::Decay(inner) => self.lower_lvalue(inner),
             TExprKind::CopyAssign { dst, src, size } => {
@@ -1195,13 +1197,11 @@ impl FnLower<'_> {
                 if let TExprKind::BitField { base, offset, bits } = &lval.kind {
                     let addr = self.bitfield_unit_addr(base, *offset);
                     let v = self.lower_rvalue(rval);
-                    self.bitfield_write_at(addr, bits, v)
+                    self.bitfield_write_at(addr, bits, v, lval.quals.volatile)
                 } else {
                     let addr = self.lower_lvalue(lval);
                     let v = self.lower_rvalue(rval);
-                    let ty = self.tys.of(&lval.ty);
-                    let align = align_of(&lval.ty);
-                    self.b.store(ty, addr, v, align);
+                    self.store_access(&lval.ty, addr, v, lval.quals);
                     v
                 }
             }
@@ -1265,6 +1265,112 @@ impl FnLower<'_> {
                     None => self.void_value(),
                 }
             }
+            TExprKind::AtomicLoad { ptr, order } => {
+                let p = self.lower_rvalue(ptr);
+                self.atomic_load_c(&e.ty, p, load_order(*order))
+            }
+            TExprKind::AtomicStore { ptr, value, order } => {
+                let p = self.lower_rvalue(ptr);
+                let v = self.lower_rvalue(value);
+                self.atomic_store_c(&value.ty, p, v, store_order(*order));
+                self.void_value()
+            }
+            TExprKind::AtomicRmw { op, ptr, value, order, fetch_old } => {
+                self.lower_atomic_rmw(&e.ty, *op, ptr, value, *order, *fetch_old)
+            }
+            TExprKind::AtomicCas { ptr, expected, desired, by_ref, success, failure, want_old } => {
+                let p = self.lower_rvalue(ptr);
+                let ty = desired.ty.clone();
+                let acc = self.atomic_access_ty(&ty);
+                let (exp_bits, exp_ptr) = if *by_ref {
+                    let ep = self.lower_rvalue(expected);
+                    let ev = self.b.load(acc, ep, align_of(&ty));
+                    (ev, Some(ep))
+                } else {
+                    let ev = self.lower_rvalue(expected);
+                    (self.atomic_bits(&ty, ev, true), None)
+                };
+                let d = self.lower_rvalue(desired);
+                let des_bits = self.atomic_bits(&ty, d, true);
+                let old = self.b.cmpxchg(p, exp_bits, des_bits, rmw_order(*success), failure_order(*failure));
+                if *want_old {
+                    return self.atomic_bits(&ty, old, false);
+                }
+                let ok = self.b.cmpxchg_success(old, exp_bits);
+                if let Some(ep) = exp_ptr {
+                    // On failure the value found is written back to `*expected`.
+                    let fail = self.b.create_block(&[]);
+                    let join = self.b.create_block(&[]);
+                    self.b.cond_br(ok, join, &[], fail, &[]);
+                    self.switch(fail);
+                    self.b.store(acc, ep, old, align_of(&ty));
+                    self.b.br(join, &[]);
+                    self.switch(join);
+                }
+                self.b.cast(CastOp::ZExt, ok, self.tys.i8)
+            }
+            TExprKind::AtomicFence(order) => {
+                if let Some(o) = fence_order(*order) {
+                    self.b.fence(o);
+                }
+                self.void_value()
+            }
+        }
+    }
+
+    /// An atomic read-modify-write builtin on the C `ty` object at `*ptr`:
+    /// performed at the object's integer access type (a pointer's bits as
+    /// `i64`, a float's as its same-width integer), yielding the old or the
+    /// new value.
+    fn lower_atomic_rmw(
+        &mut self,
+        ty: &CType,
+        op: AtomicOp,
+        ptr: &TExpr,
+        value: &TExpr,
+        order: MemOrder,
+        fetch_old: bool,
+    ) -> ValueId {
+        let p = self.lower_rvalue(ptr);
+        let v = self.lower_rvalue(value);
+        let v_acc = if value.ty.is_pointer() {
+            self.b.cast(CastOp::PtrToInt, v, self.tys.i64)
+        } else {
+            self.atomic_bits(ty, v, true)
+        };
+        let rop = match op {
+            AtomicOp::Xchg => RmwOp::Xchg,
+            AtomicOp::Add => RmwOp::Add,
+            AtomicOp::Sub => RmwOp::Sub,
+            AtomicOp::And => RmwOp::And,
+            AtomicOp::Or => RmwOp::Or,
+            AtomicOp::Xor => RmwOp::Xor,
+            AtomicOp::Nand => RmwOp::Nand,
+        };
+        let old = self.b.atomic_rmw(rop, p, v_acc, rmw_order(order));
+        let res = if fetch_old {
+            old
+        } else {
+            match op {
+                AtomicOp::Xchg => v_acc,
+                AtomicOp::Add => self.b.add(old, v_acc, Flags::NONE),
+                AtomicOp::Sub => self.b.sub(old, v_acc, Flags::NONE),
+                AtomicOp::And => self.b.bin(BinOp::And, old, v_acc, Flags::NONE),
+                AtomicOp::Or => self.b.bin(BinOp::Or, old, v_acc, Flags::NONE),
+                AtomicOp::Xor => self.b.bin(BinOp::Xor, old, v_acc, Flags::NONE),
+                AtomicOp::Nand => {
+                    let both = self.b.bin(BinOp::And, old, v_acc, Flags::NONE);
+                    let ty = self.b.value_type(both);
+                    let ones = self.b.const_i64(ty, -1);
+                    self.b.bin(BinOp::Xor, both, ones, Flags::NONE)
+                }
+            }
+        };
+        if ty.is_pointer() {
+            let res_ty = self.b.value_type(res);
+            if res_ty == self.tys.ptr { res } else { self.b.cast(CastOp::IntToPtr, res, self.tys.ptr) }
+        } else {
+            self.atomic_bits(ty, res, false)
         }
     }
 
@@ -1401,8 +1507,9 @@ impl FnLower<'_> {
         // A bit-field compound assignment reads through its storage unit, computes
         // in `compute_ty`, and writes back with a masked read-modify-write.
         if let TExprKind::BitField { base, offset, bits } = &lvalue.kind {
+            let volatile = lvalue.quals.volatile;
             let unit_addr = self.bitfield_unit_addr(base, *offset);
-            let old = self.bitfield_read_at(unit_addr, bits);
+            let old = self.bitfield_read_at(unit_addr, bits, volatile);
             let oldc = self.convert(old, &lvalue.ty, compute_ty);
             let rv0 = self.lower_rvalue(rhs);
             let res = if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
@@ -1425,20 +1532,40 @@ impl FnLower<'_> {
             };
             let newv = self.convert(res, compute_ty, &lvalue.ty);
             let _ = result_ty;
-            return self.bitfield_write_at(unit_addr, bits, newv);
+            return self.bitfield_write_at(unit_addr, bits, newv, volatile);
         }
 
         let addr = self.lower_lvalue(lvalue);
-        let lty = self.tys.of(&lvalue.ty);
-        let align = align_of(&lvalue.ty);
-        let old = self.b.load(lty, addr, align);
+        if lvalue.quals.atomic {
+            return self.lower_atomic_compound(&lvalue.ty, addr, rhs, op, compute_ty);
+        }
+        let old = self.load_access(&lvalue.ty, addr, lvalue.quals);
+        let rv0 = self.lower_rvalue(rhs);
+        let new = self.compound_value(old, rv0, &lvalue.ty, &rhs.ty, op, compute_ty);
+        self.store_access(&lvalue.ty, addr, new, lvalue.quals);
+        // The value of a compound assignment is the new value in the lvalue type.
+        let _ = result_ty;
+        new
+    }
 
-        let new = if lvalue.ty.is_pointer() {
+    /// The new value of `lvalue op= rhs` given the lvalue's `old` value (of C
+    /// type `lty`) and the already-evaluated right operand `rv0` (of `rty`):
+    /// pointer `+=`/`-=` scale by the pointee size; otherwise the operation runs
+    /// in `compute_ty` and converts back to `lty` (wrapping a `_BitInt`).
+    fn compound_value(
+        &mut self,
+        old: ValueId,
+        rv0: ValueId,
+        lty: &CType,
+        rty: &CType,
+        op: BinaryOp,
+        compute_ty: &CType,
+    ) -> ValueId {
+        let new = if lty.is_pointer() {
             // Pointer compound: scale the index by the pointee size.
-            let idx0 = self.lower_rvalue(rhs);
-            let idx = self.convert(idx0, &rhs.ty, &CType::long());
+            let idx = self.convert(rv0, rty, &CType::long());
             let elem = self.tys.i64;
-            let psize = self.pointee_size(&lvalue.ty);
+            let psize = self.pointee_size(lty);
             let scale = self.b.const_i64(elem, psize as i64);
             let mut off = self.b.mul(idx, scale, Flags::NONE);
             if op == BinaryOp::Sub {
@@ -1447,15 +1574,9 @@ impl FnLower<'_> {
             }
             self.b.ptr_add(old, off, true)
         } else {
-            let oldc = self.convert(old, &lvalue.ty, compute_ty);
-            let rv0 = self.lower_rvalue(rhs);
+            let oldc = self.convert(old, lty, compute_ty);
             let res = if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
-                let amt = self.int_resize(
-                    rv0,
-                    width_of(&rhs.ty),
-                    rhs.ty.is_signed(),
-                    width_of(compute_ty),
-                );
+                let amt = self.int_resize(rv0, width_of(rty), rty.is_signed(), width_of(compute_ty));
                 let binop = match op {
                     BinaryOp::Shl => BinOp::Shl,
                     _ if compute_ty.is_signed() => BinOp::AShr,
@@ -1463,7 +1584,7 @@ impl FnLower<'_> {
                 };
                 self.b.bin(binop, oldc, amt, Flags::NONE)
             } else {
-                let rc = self.convert(rv0, &rhs.ty, compute_ty);
+                let rc = self.convert(rv0, rty, compute_ty);
                 let binop = if compute_ty.is_float() {
                     float_binop(op)
                 } else {
@@ -1471,22 +1592,161 @@ impl FnLower<'_> {
                 };
                 self.b.bin(binop, oldc, rc, Flags::NONE)
             };
-            self.convert(res, compute_ty, &lvalue.ty)
+            self.convert(res, compute_ty, lty)
         };
         // A `_BitInt` lvalue wraps to its N-bit range before the write-back.
-        let new = self.normalize_bitint(new, &lvalue.ty);
-        self.b.store(lty, addr, new, align);
-        // The value of a compound assignment is the new value in the lvalue type.
-        let _ = result_ty;
+        self.normalize_bitint(new, lty)
+    }
+
+    /// `lvalue op= rhs` on an `_Atomic` lvalue of C type `lty` at `addr`: one
+    /// `seq_cst` read-modify-write. Integer `+ - & | ^` (and pointer `+= -=`)
+    /// map onto `atomic_rmw`, since their result modulo the lvalue's width only
+    /// depends on the operands modulo it; every other operation (and a float,
+    /// `_Bool` or padded `_BitInt` lvalue) runs a compare-exchange loop. The
+    /// result is the new value.
+    fn lower_atomic_compound(
+        &mut self,
+        lty: &CType,
+        addr: ValueId,
+        rhs: &TExpr,
+        op: BinaryOp,
+        compute_ty: &CType,
+    ) -> ValueId {
+        let rv0 = self.lower_rvalue(rhs);
+        if lty.is_pointer() {
+            let idx = self.convert(rv0, &rhs.ty, &CType::long());
+            let psize = self.pointee_size(lty);
+            let scale = self.b.const_i64(self.tys.i64, psize as i64);
+            let mut off = self.b.mul(idx, scale, Flags::NONE);
+            if op == BinaryOp::Sub {
+                let zero = self.b.const_i64(self.tys.i64, 0);
+                off = self.b.sub(zero, off, Flags::NONE);
+            }
+            let old = self.b.atomic_rmw(RmwOp::Add, addr, off, AtomicOrdering::SeqCst);
+            let new = self.b.add(old, off, Flags::NONE);
+            return self.b.cast(CastOp::IntToPtr, new, self.tys.ptr);
+        }
+        let rmw = match op {
+            BinaryOp::Add => Some(RmwOp::Add),
+            BinaryOp::Sub => Some(RmwOp::Sub),
+            BinaryOp::BitAnd => Some(RmwOp::And),
+            BinaryOp::BitOr => Some(RmwOp::Or),
+            BinaryOp::BitXor => Some(RmwOp::Xor),
+            _ => None,
+        };
+        if let Some(rmw) = rmw
+            && wraps_at_width(lty)
+            && compute_ty.is_integer()
+        {
+            let v = self.convert(rv0, &rhs.ty, lty);
+            let old = self.b.atomic_rmw(rmw, addr, v, AtomicOrdering::SeqCst);
+            return self.b.bin(arith_binop(op, lty.is_signed()), old, v, Flags::NONE);
+        }
+        let rty = rhs.ty.clone();
+        let (_, new) = self.atomic_update(lty, addr, &mut |this, old| {
+            this.compound_value(old, rv0, lty, &rty, op, compute_ty)
+        });
         new
+    }
+
+    /// The type an atomic access of C type `ty` is performed at: its own IR
+    /// type for an integer or pointer, the same-width integer for a float
+    /// (whose bits are moved unchanged).
+    fn atomic_access_ty(&self, ty: &CType) -> TypeId {
+        match ty {
+            CType::Float(FloatTy::F32) => self.tys.i32,
+            CType::Float(_) => self.tys.i64,
+            other => self.tys.of(other),
+        }
+    }
+
+    /// Reinterpret a value between C type `ty` and its atomic access type.
+    fn atomic_bits(&mut self, ty: &CType, v: ValueId, to_access: bool) -> ValueId {
+        if !ty.is_float() {
+            return v;
+        }
+        let to = if to_access { self.atomic_access_ty(ty) } else { self.tys.of(ty) };
+        self.b.cast(CastOp::Bitcast, v, to)
+    }
+
+    /// An atomic load of a C `ty` value from `addr`.
+    fn atomic_load_c(&mut self, ty: &CType, addr: ValueId, ord: AtomicOrdering) -> ValueId {
+        let acc = self.atomic_access_ty(ty);
+        let v = self.b.atomic_load(acc, addr, ord);
+        self.atomic_bits(ty, v, false)
+    }
+
+    /// An atomic store of the C `ty` value `v` to `addr`.
+    fn atomic_store_c(&mut self, ty: &CType, addr: ValueId, v: ValueId, ord: AtomicOrdering) {
+        let acc = self.atomic_access_ty(ty);
+        let v = self.atomic_bits(ty, v, true);
+        self.b.atomic_store(acc, addr, v, ord);
+    }
+
+    /// Atomically replace the C `ty` value at `addr` with `f(old)` by a
+    /// `seq_cst` compare-exchange loop; returns `(old, new)`. `f` emits
+    /// straight-line code only.
+    fn atomic_update(
+        &mut self,
+        ty: &CType,
+        addr: ValueId,
+        f: &mut dyn FnMut(&mut Self, ValueId) -> ValueId,
+    ) -> (ValueId, ValueId) {
+        let acc = self.atomic_access_ty(ty);
+        let first = self.b.atomic_load(acc, addr, AtomicOrdering::SeqCst);
+        let lp = self.b.create_block(&[acc]);
+        let done = self.b.create_block(&[acc, acc]);
+        self.b.br(lp, &[first]);
+        self.switch(lp);
+        let old_bits = self.b.param(lp, 0);
+        let old = self.atomic_bits(ty, old_bits, false);
+        let new = f(self, old);
+        let new_bits = self.atomic_bits(ty, new, true);
+        let seen = self.b.cmpxchg(addr, old_bits, new_bits, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst);
+        let ok = self.b.cmpxchg_success(seen, old_bits);
+        self.b.cond_br(ok, done, &[old_bits, new_bits], lp, &[seen]);
+        self.switch(done);
+        let old_bits = self.b.param(done, 0);
+        let new_bits = self.b.param(done, 1);
+        let old = self.atomic_bits(ty, old_bits, false);
+        let new = self.atomic_bits(ty, new_bits, false);
+        (old, new)
+    }
+
+    /// Load a C `ty` value from `addr` through an lvalue qualified by `quals`:
+    /// a `seq_cst` atomic load for `_Atomic`, a volatile load for `volatile`,
+    /// else a plain load.
+    fn load_access(&mut self, ty: &CType, addr: ValueId, quals: Quals) -> ValueId {
+        if quals.atomic {
+            return self.atomic_load_c(ty, addr, AtomicOrdering::SeqCst);
+        }
+        let ity = self.tys.of(ty);
+        let align = align_of(ty);
+        if quals.volatile { self.b.load_volatile(ity, addr, align) } else { self.b.load(ity, addr, align) }
+    }
+
+    /// Store the C `ty` value `v` to `addr` through an lvalue qualified by
+    /// `quals` (see [`Self::load_access`]).
+    fn store_access(&mut self, ty: &CType, addr: ValueId, v: ValueId, quals: Quals) {
+        if quals.atomic {
+            return self.atomic_store_c(ty, addr, v, AtomicOrdering::SeqCst);
+        }
+        let ity = self.tys.of(ty);
+        let align = align_of(ty);
+        if quals.volatile {
+            self.b.store_volatile(ity, addr, v, align);
+        } else {
+            self.b.store(ity, addr, v, align);
+        }
     }
 
     fn lower_incdec(&mut self, target: &TExpr, inc: bool, post: bool, scale: u64) -> ValueId {
         // A bit-field `++`/`--` reads its (extended) value, adjusts by one, and
         // writes back through a masked read-modify-write.
         if let TExprKind::BitField { base, offset, bits } = &target.kind {
+            let volatile = target.quals.volatile;
             let unit_addr = self.bitfield_unit_addr(base, *offset);
-            let old = self.bitfield_read_at(unit_addr, bits);
+            let old = self.bitfield_read_at(unit_addr, bits, volatile);
             let ty = self.tys.of(&target.ty);
             let one = self.b.const_i64(ty, 1);
             let new = if inc {
@@ -1494,31 +1754,79 @@ impl FnLower<'_> {
             } else {
                 self.b.sub(old, one, Flags::NONE)
             };
-            let stored = self.bitfield_write_at(unit_addr, bits, new);
+            let stored = self.bitfield_write_at(unit_addr, bits, new, volatile);
             return if post { old } else { stored };
         }
         let addr = self.lower_lvalue(target);
-        let ty = self.tys.of(&target.ty);
-        let align = align_of(&target.ty);
-        let old = self.b.load(ty, addr, align);
-        let new = if target.ty.is_pointer() {
+        if target.quals.atomic {
+            return self.lower_atomic_incdec(&target.ty, addr, inc, post, scale);
+        }
+        let old = self.load_access(&target.ty, addr, target.quals);
+        let new = self.step_value(old, &target.ty, inc, scale);
+        self.store_access(&target.ty, addr, new, target.quals);
+        if post { old } else { new }
+    }
+
+    /// `old ± 1` for `++`/`--` on a C `ty` value (a pointer steps by `scale`
+    /// bytes; a `_BitInt` wraps to its range).
+    fn step_value(&mut self, old: ValueId, ty: &CType, inc: bool, scale: u64) -> ValueId {
+        let ity = self.tys.of(ty);
+        if ty.is_pointer() {
             let delta = if inc { scale as i64 } else { -(scale as i64) };
             let off = self.b.const_i64(self.tys.i64, delta);
             self.b.ptr_add(old, off, true)
-        } else if target.ty.is_float() {
-            let one = self.b.const_float(ty, float_bits(&target.ty, 1.0));
+        } else if ty.is_float() {
+            let one = self.b.const_float(ity, float_bits(ty, 1.0));
             let op = if inc { BinOp::FAdd } else { BinOp::FSub };
             self.b.bin(op, old, one, Flags::NONE)
         } else {
-            let one = self.b.const_i64(ty, 1);
+            let one = self.b.const_i64(ity, 1);
             let stepped = if inc {
                 self.b.add(old, one, Flags::NONE)
             } else {
                 self.b.sub(old, one, Flags::NONE)
             };
-            self.normalize_bitint(stepped, &target.ty)
-        };
-        self.b.store(ty, addr, new, align);
+            self.normalize_bitint(stepped, ty)
+        }
+    }
+
+    /// `++`/`--` on an `_Atomic` lvalue: an `atomic_rmw` add/sub for an
+    /// integer or pointer that wraps at its width, else a compare-exchange
+    /// loop.
+    fn lower_atomic_incdec(&mut self, ty: &CType, addr: ValueId, inc: bool, post: bool, scale: u64) -> ValueId {
+        if ty.is_pointer() {
+            let delta = if inc { scale as i64 } else { -(scale as i64) };
+            let d = self.b.const_i64(self.tys.i64, delta);
+            let old_i = self.b.atomic_rmw(RmwOp::Add, addr, d, AtomicOrdering::SeqCst);
+            let new_i = self.b.add(old_i, d, Flags::NONE);
+            let v = if post { old_i } else { new_i };
+            return self.b.cast(CastOp::IntToPtr, v, self.tys.ptr);
+        }
+        if wraps_at_width(ty) {
+            let ity = self.tys.of(ty);
+            let one = self.b.const_i64(ity, 1);
+            let op = if inc { RmwOp::Add } else { RmwOp::Sub };
+            let old = self.b.atomic_rmw(op, addr, one, AtomicOrdering::SeqCst);
+            if post {
+                return old;
+            }
+            return if inc { self.b.add(old, one, Flags::NONE) } else { self.b.sub(old, one, Flags::NONE) };
+        }
+        let (old, new) = self.atomic_update(ty, addr, &mut |this, old| {
+            if matches!(ty, CType::Bool) {
+                // `b++` / `b--` on a `_Bool`: `(b ± 1) != 0`.
+                let i32t = this.tys.i32;
+                let wide = this.b.cast(CastOp::ZExt, old, i32t);
+                let one = this.b.const_i64(i32t, 1);
+                let stepped =
+                    if inc { this.b.add(wide, one, Flags::NONE) } else { this.b.sub(wide, one, Flags::NONE) };
+                let zero = this.b.const_i64(i32t, 0);
+                let nz = this.b.icmp(IntPred::Ne, stepped, zero);
+                this.b.cast(CastOp::ZExt, nz, this.tys.i8)
+            } else {
+                this.step_value(old, ty, inc, scale)
+            }
+        });
         if post { old } else { new }
     }
 
@@ -1536,11 +1844,15 @@ impl FnLower<'_> {
     /// The mask/shift arithmetic is performed in a work width of at least 32 bits
     /// (the IR backend does not reliably truncate sub-word shift results), then
     /// truncated back to the declared-type width.
-    fn bitfield_read_at(&mut self, addr: ValueId, bp: &BitPlacement) -> ValueId {
+    fn bitfield_read_at(&mut self, addr: ValueId, bp: &BitPlacement, volatile: bool) -> ValueId {
         let unit_bits = bp.unit_bits;
         let unit_ty = self.tys.for_int(unit_bits);
         let align = u32::from(unit_bits / 8).max(1);
-        let raw = self.b.load(unit_ty, addr, align);
+        let raw = if volatile {
+            self.b.load_volatile(unit_ty, addr, align)
+        } else {
+            self.b.load(unit_ty, addr, align)
+        };
         let w = work_bits(unit_bits);
         // Zero-extend the loaded unit into the work width; the bits above the field
         // are shifted out during extraction, so their value is irrelevant.
@@ -1566,14 +1878,18 @@ impl FnLower<'_> {
     ///
     /// As in [`Self::bitfield_read_at`], the bit manipulation is done in a work
     /// width of at least 32 bits and truncated to the unit width for the store.
-    fn bitfield_write_at(&mut self, addr: ValueId, bp: &BitPlacement, value: ValueId) -> ValueId {
+    fn bitfield_write_at(&mut self, addr: ValueId, bp: &BitPlacement, value: ValueId, volatile: bool) -> ValueId {
         let unit_bits = bp.unit_bits;
         let unit_ty = self.tys.for_int(unit_bits);
         let align = u32::from(unit_bits / 8).max(1);
         let w = work_bits(unit_bits);
         let work_ty = self.tys.for_int(w);
 
-        let old = self.b.load(unit_ty, addr, align);
+        let old = if volatile {
+            self.b.load_volatile(unit_ty, addr, align)
+        } else {
+            self.b.load(unit_ty, addr, align)
+        };
         let old_w = self.int_resize(old, unit_bits, false, w);
         let value_w = self.int_resize(value, unit_bits, false, w);
 
@@ -1587,7 +1903,11 @@ impl FnLower<'_> {
         let vsh = self.b.bin(BinOp::Shl, vmask, off, Flags::NONE);
         let newv_w = self.b.bin(BinOp::Or, cleared, vsh, Flags::NONE);
         let newv = self.int_resize(newv_w, w, false, unit_bits);
-        self.b.store(unit_ty, addr, newv, align);
+        if volatile {
+            self.b.store_volatile(unit_ty, addr, newv, align);
+        } else {
+            self.b.store(unit_ty, addr, newv, align);
+        }
 
         // The value of the assignment is the field read back: sign/zero-extend the
         // masked low bits to the declared-type width.
@@ -1816,6 +2136,57 @@ impl FnLower<'_> {
     }
 }
 
+/// The IR ordering of an atomic load with C order `o`: a releasing order is
+/// not meaningful for a load, so it is strengthened to `seq_cst` (as gcc does
+/// for an invalid memory model).
+fn load_order(o: MemOrder) -> AtomicOrdering {
+    match o {
+        MemOrder::Relaxed => AtomicOrdering::Relaxed,
+        MemOrder::Consume | MemOrder::Acquire => AtomicOrdering::Acquire,
+        _ => AtomicOrdering::SeqCst,
+    }
+}
+
+/// The IR ordering of an atomic store with C order `o` (an acquiring order is
+/// strengthened to `seq_cst`).
+fn store_order(o: MemOrder) -> AtomicOrdering {
+    match o {
+        MemOrder::Relaxed => AtomicOrdering::Relaxed,
+        MemOrder::Release => AtomicOrdering::Release,
+        _ => AtomicOrdering::SeqCst,
+    }
+}
+
+/// The IR ordering of a read-modify-write (or a compare-exchange's success)
+/// with C order `o`; `consume` is implemented as `acquire`.
+fn rmw_order(o: MemOrder) -> AtomicOrdering {
+    match o {
+        MemOrder::Relaxed => AtomicOrdering::Relaxed,
+        MemOrder::Consume | MemOrder::Acquire => AtomicOrdering::Acquire,
+        MemOrder::Release => AtomicOrdering::Release,
+        MemOrder::AcqRel => AtomicOrdering::AcqRel,
+        MemOrder::SeqCst => AtomicOrdering::SeqCst,
+    }
+}
+
+/// The IR ordering of a compare-exchange's failure (a load): its releasing
+/// part is dropped (C11 7.17.7.4).
+fn failure_order(o: MemOrder) -> AtomicOrdering {
+    match o {
+        MemOrder::Relaxed | MemOrder::Release => AtomicOrdering::Relaxed,
+        MemOrder::Consume | MemOrder::Acquire | MemOrder::AcqRel => AtomicOrdering::Acquire,
+        MemOrder::SeqCst => AtomicOrdering::SeqCst,
+    }
+}
+
+/// The IR fence for C order `o`; a `relaxed` fence orders nothing.
+fn fence_order(o: MemOrder) -> Option<AtomicOrdering> {
+    match o {
+        MemOrder::Relaxed => None,
+        _ => Some(rmw_order(o)),
+    }
+}
+
 fn arith_binop(op: BinaryOp, signed: bool) -> BinOp {
     match op {
         BinaryOp::Add => BinOp::Add,
@@ -1939,6 +2310,13 @@ fn sysv_eightbytes(types: &TypeContext, ty: TypeId) -> Option<Vec<bool>> {
     Some(ebs.into_iter().map(|c| c.unwrap_or(true)).collect())
 }
 
+/// Whether arithmetic on the C type `ty` wraps exactly at its storage width,
+/// so a wrapping IR add/sub/and/or/xor at that width computes it: a plain
+/// integer, or a `_BitInt` whose value bits fill its storage (not `_Bool`).
+fn wraps_at_width(ty: &CType) -> bool {
+    matches!(ty, CType::Int(i) if i.bitint.is_none_or(|n| n == i.width))
+}
+
 /// The width in bits of an integer/`_Bool` C type (`_Bool` = 8), else 0.
 fn width_of(ty: &CType) -> u16 {
     match ty {
@@ -1952,6 +2330,7 @@ fn width_of(ty: &CType) -> u16 {
 /// types reach `load`/`store`; aggregates are copied byte-wise.
 fn align_of(ty: &CType) -> u32 {
     match ty {
+        CType::Qual(inner, _) => align_of(inner),
         CType::Void | CType::Bool => 1,
         CType::Int(i) => (i.width / 8) as u32,
         CType::Float(f) => u32::from(f.bits() / 8),
