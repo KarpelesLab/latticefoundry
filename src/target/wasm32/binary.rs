@@ -806,7 +806,7 @@ fn binding_flags(linkage: Linkage, visibility: Visibility) -> u32 {
 /// Test support: decoding function bodies back into instructions.
 #[cfg(test)]
 pub(crate) mod decode {
-    use super::{WasmObject, leb};
+    use super::WasmObject;
 
     impl WasmObject {
         /// The expression of the function called `name`, its holes filled with
@@ -827,73 +827,20 @@ pub(crate) mod decode {
     }
 
     /// The opcodes of an expression, in order: one byte, or `0xFC00 | sub` /
-    /// `0xFE00 | sub` for the prefixed forms. Immediates are skipped per the
-    /// Core Specification's instruction encodings (the subset this backend
-    /// emits).
+    /// `0xFE00 | sub` for the prefixed forms, decoded by the shared
+    /// disassembler ([`crate::mc::disasm::wasm::decode_inst`]).
     ///
     /// # Panics
     ///
-    /// On an opcode outside that subset, or truncated input.
+    /// On an encoding the decoder does not know, or truncated input.
     pub(crate) fn opcodes(expr: &[u8]) -> Vec<u32> {
         let mut at = 0;
         let mut out = Vec::new();
-        let u = |at: &mut usize| leb::read_u64(expr, at).expect("an immediate");
         while at < expr.len() {
-            let op = expr[at];
-            at += 1;
-            let code = match op {
-                0x02..=0x04 => {
-                    at += 1; // the block type
-                    u32::from(op)
-                }
-                0x0c | 0x0d | 0x10 | 0x20..=0x24 => {
-                    u(&mut at);
-                    u32::from(op)
-                }
-                0x0e => {
-                    let n = u(&mut at);
-                    for _ in 0..=n {
-                        u(&mut at);
-                    }
-                    0x0e
-                }
-                0x11 => {
-                    u(&mut at);
-                    at += 1; // table 0
-                    0x11
-                }
-                0x28..=0x3e => {
-                    u(&mut at);
-                    u(&mut at);
-                    u32::from(op)
-                }
-                0x41 | 0x42 => {
-                    leb::read_i64(expr, &mut at).expect("a constant");
-                    u32::from(op)
-                }
-                0x43 => {
-                    at += 4;
-                    0x43
-                }
-                0x44 => {
-                    at += 8;
-                    0x44
-                }
-                0xfc => 0xfc00 | u(&mut at) as u32,
-                0xfe => {
-                    let sub = u(&mut at) as u32;
-                    if sub == 0x03 {
-                        at += 1;
-                    } else {
-                        u(&mut at);
-                        u(&mut at);
-                    }
-                    0xfe00 | sub
-                }
-                0x00 | 0x01 | 0x05 | 0x0b | 0x0f | 0x1a | 0x1b | 0x45..=0xc4 => u32::from(op),
-                other => panic!("opcode {other:#x} is not one this backend emits"),
-            };
-            out.push(code);
+            let (inst, len) = crate::mc::disasm::wasm::decode_inst(&expr[at..])
+                .unwrap_or_else(|| panic!("undecodable instruction at {at}: {:02x?}", &expr[at..]));
+            out.push(inst.code());
+            at += len;
         }
         out
     }
