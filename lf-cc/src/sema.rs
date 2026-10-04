@@ -16,6 +16,7 @@ use crate::ast::{
     Records, Stmt, StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use latticefoundry::ir::Visibility;
+use crate::consteval::{self, CInt, ConstEnv};
 use crate::cstd::CStd;
 use crate::layout;
 
@@ -479,7 +480,7 @@ impl TExpr {
 /// The integer promotion: `_Bool`/`char`/`short` become `int`; other types are
 /// unchanged. A `_BitInt(N)` is *not* an integer-promotion candidate (C23): it
 /// keeps its own type even when narrower than `int`.
-fn promote(ty: &CType) -> CType {
+pub(crate) fn promote(ty: &CType) -> CType {
     match ty {
         CType::Bool => CType::int(),
         CType::Int(i) if i.bitint.is_none() && i.width < 32 => CType::int(),
@@ -519,7 +520,7 @@ fn to_unsigned(ty: &CType) -> CType {
 /// their common type. Floating types rank above every integer type: if either
 /// operand is `double` the result is `double`; else if either is `float` the
 /// result is `float`; otherwise the integer promotions and integer UAC apply.
-fn usual_arith(a: &CType, b: &CType) -> CType {
+pub(crate) fn usual_arith(a: &CType, b: &CType) -> CType {
     if a.is_float() || b.is_float() {
         let has_double =
             a.float_ty() == Some(crate::ast::FloatTy::F64) || b.float_ty() == Some(crate::ast::FloatTy::F64);
@@ -961,7 +962,14 @@ impl Checker {
         // may have changed).
         let gtypes: HashMap<&str, &CType> =
             self.global_index.iter().map(|(n, &i)| (n.as_str(), &self.globals[i].ty)).collect();
-        const_eval_with(e, &self.enum_consts, &self.records, &gtypes, &self.cur_labels)
+        let env = SemaConsts {
+            enums: &self.enum_consts,
+            constexprs: &self.constexprs,
+            recs: &self.records,
+            gtypes,
+            labels: &self.cur_labels,
+        };
+        consteval::eval(e, &env).map(|c| c.value)
     }
 
     /// Materialize an initializer to little-endian bytes at `off` within `bytes`
@@ -3637,70 +3645,49 @@ impl FnCtx {
     }
 }
 
-/// A constant evaluator over the untyped AST for global initializers, resolving
-/// enumerator constants and `sizeof`.
-fn const_eval_with(
-    e: &Expr,
-    enums: &HashMap<String, i128>,
-    recs: &Records,
-    gtypes: &HashMap<&str, &CType>,
-    labels: &HashMap<String, u32>,
-) -> Option<i128> {
-    let rec = |x: &Expr| const_eval_with(x, enums, recs, gtypes, labels);
-    match &e.kind {
-        ExprKind::IntLit(v, _) => Some(*v),
-        // `&&label` (GNU labels as values) is the label's dispatch number.
-        ExprKind::LabelAddr(name) => labels.get(name).map(|&id| label_value(id)),
-        ExprKind::Ident(name) => enums.get(name).copied(),
-        ExprKind::Unary(op, inner) => {
-            let v = rec(inner)?;
-            match op {
-                UnaryOp::Neg => Some(-v),
-                UnaryOp::Plus => Some(v),
-                UnaryOp::BitNot => Some(!v),
-                UnaryOp::LNot => Some(i128::from(v == 0)),
-                _ => None,
+/// Sema's view of an integer constant expression: enumerators and `constexpr`
+/// objects, `sizeof` a file-scope object or an expression whose type the AST
+/// fixes on its own, and `&&label`.
+struct SemaConsts<'a> {
+    enums: &'a HashMap<String, i128>,
+    constexprs: &'a HashMap<String, (i128, CType)>,
+    recs: &'a Records,
+    gtypes: HashMap<&'a str, &'a CType>,
+    labels: &'a HashMap<String, u32>,
+}
+
+impl ConstEnv for SemaConsts<'_> {
+    fn ident(&self, name: &str) -> Option<CInt> {
+        if let Some((v, ty)) = self.constexprs.get(name) {
+            return Some(CInt::new(*v, ty));
+        }
+        self.enums.get(name).map(|&v| CInt::natural(v))
+    }
+
+    fn size_of_type(&self, ty: &CType) -> u64 {
+        layout::size_of(self.recs, ty)
+    }
+
+    fn align_of_type(&self, ty: &CType) -> u64 {
+        layout::align_of(self.recs, ty)
+    }
+
+    /// `sizeof expr` is a constant expression: its operand is unevaluated and
+    /// only its static type is measured. In a global initializer the operand
+    /// is one whose type the AST fixes on its own (a string literal, a cast, a
+    /// nested `sizeof`, …) — see `ast_static_type`.
+    fn size_of_expr(&self, e: &Expr) -> Option<u64> {
+        ast_static_type(e, &self.gtypes).map(|ty| layout::size_of(self.recs, &ty))
+    }
+
+    fn other(&self, e: &Expr) -> Option<CInt> {
+        match &e.kind {
+            // `&&label` (GNU labels as values) is the label's dispatch number.
+            ExprKind::LabelAddr(name) => {
+                self.labels.get(name).map(|&id| CInt::new(label_value(id), &CType::long()))
             }
+            _ => None,
         }
-        ExprKind::Binary(op, l, r) => {
-            let a = rec(l)?;
-            let b = rec(r)?;
-            match op {
-                BinaryOp::Add => Some(a + b),
-                BinaryOp::Sub => Some(a - b),
-                BinaryOp::Mul => Some(a * b),
-                BinaryOp::Div if b != 0 => Some(a / b),
-                BinaryOp::Rem if b != 0 => Some(a % b),
-                BinaryOp::BitAnd => Some(a & b),
-                BinaryOp::BitOr => Some(a | b),
-                BinaryOp::BitXor => Some(a ^ b),
-                BinaryOp::Shl => Some(a << b),
-                BinaryOp::Shr => Some(a >> b),
-                BinaryOp::Eq => Some(i128::from(a == b)),
-                BinaryOp::Ne => Some(i128::from(a != b)),
-                BinaryOp::Lt => Some(i128::from(a < b)),
-                BinaryOp::Le => Some(i128::from(a <= b)),
-                BinaryOp::Gt => Some(i128::from(a > b)),
-                BinaryOp::Ge => Some(i128::from(a >= b)),
-                BinaryOp::LAnd => Some(i128::from(a != 0 && b != 0)),
-                BinaryOp::LOr => Some(i128::from(a != 0 || b != 0)),
-                _ => None,
-            }
-        }
-        ExprKind::Cond(c, t, f) => {
-            if rec(c)? != 0 { rec(t) } else { rec(f) }
-        }
-        ExprKind::Cast(_, inner) => rec(inner),
-        ExprKind::SizeofType(ty) => Some(layout::size_of(recs, ty) as i128),
-        // `sizeof expr` is a constant expression: its operand is unevaluated and
-        // only its static type is measured. In a global initializer the operand
-        // is one whose type the AST fixes on its own (a string literal, a cast, a
-        // nested `sizeof`, …) — see `ast_static_type`.
-        ExprKind::SizeofExpr(inner) => {
-            ast_static_type(inner, gtypes).map(|ty| layout::size_of(recs, &ty) as i128)
-        }
-        ExprKind::AlignofType(ty) => Some(layout::align_of(recs, ty) as i128),
-        _ => None,
     }
 }
 

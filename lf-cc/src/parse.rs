@@ -16,6 +16,7 @@ use crate::ast::{
     GenericAssoc, Init, InitItem, IntTy, Param, Quals, RecordDef, RecordId, RecordKind, Records, Stmt,
     StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
+use crate::consteval::{self, CInt, ConstEnv, reduce_const_to_type};
 use crate::cstd::CStd;
 use crate::layout;
 use crate::lex::{Keyword, Punct, Token, TokenKind};
@@ -215,6 +216,42 @@ impl Attrs {
     /// The symbol attributes (visibility, weak) among these attributes.
     fn sym(&self) -> SymAttrs {
         SymAttrs { visibility: self.visibility, weak: self.weak, gnu_inline: self.gnu_inline }
+    }
+}
+
+/// The parser's integer constant expressions: enumerators and `constexpr`
+/// objects by name, `sizeof` from the parser's symbol table, and the classic
+/// `offsetof` address arithmetic.
+impl ConstEnv for Parser {
+    fn ident(&self, name: &str) -> Option<CInt> {
+        let v = *self.enum_map.get(name)?;
+        Some(match self.constexprs.iter().rev().find(|(n, ..)| n == name) {
+            Some((_, _, ty)) => CInt::new(v, ty),
+            None => CInt::natural(v),
+        })
+    }
+
+    fn size_of_type(&self, ty: &CType) -> u64 {
+        layout::size_of(&self.records, ty)
+    }
+
+    fn align_of_type(&self, ty: &CType) -> u64 {
+        layout::align_of(&self.records, ty)
+    }
+
+    fn size_of_expr(&self, e: &Expr) -> Option<u64> {
+        Some(layout::size_of(&self.records, &self.expr_type(e)?))
+    }
+
+    fn other(&self, e: &Expr) -> Option<CInt> {
+        match &e.kind {
+            // The classic `offsetof`: `(size_t) &((T *) 0)->m` — the address
+            // of a member reached from a constant pointer is a constant.
+            ExprKind::Unary(UnaryOp::AddrOf, inner) => {
+                Some(CInt::new(self.const_lvalue_addr(inner)?, &CType::Int(IntTy::new(64, false))))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2562,45 +2599,10 @@ impl Parser {
     }
 
     /// Fold a parsed expression to a constant integer, or `None` if it is not a
-    /// constant expression the parser can evaluate.
+    /// constant expression the parser can evaluate. The folding is typed (see
+    /// [`consteval`]); the result is the value normalized to its type.
     fn eval_const_expr(&self, e: &Expr) -> Option<i128> {
-        match &e.kind {
-            ExprKind::IntLit(v, _) => Some(*v),
-            ExprKind::Ident(name) => self.enum_map.get(name).copied(),
-            // The classic `offsetof`: `(size_t) &((T *) 0)->m` — the address of
-            // a member reached from a constant pointer is a constant.
-            ExprKind::Unary(UnaryOp::AddrOf, inner) => self.const_lvalue_addr(inner),
-            ExprKind::Unary(op, inner) => {
-                let v = self.eval_const_expr(inner)?;
-                match op {
-                    UnaryOp::Neg => Some(-v),
-                    UnaryOp::Plus => Some(v),
-                    UnaryOp::BitNot => Some(!v),
-                    UnaryOp::LNot => Some(i128::from(v == 0)),
-                    _ => None,
-                }
-            }
-            ExprKind::Binary(op, l, r) => {
-                let a = self.eval_const_expr(l)?;
-                let b = self.eval_const_expr(r)?;
-                eval_binop(*op, a, b)
-            }
-            ExprKind::Cond(c, t, f) => {
-                let cv = self.eval_const_expr(c)?;
-                if cv != 0 { self.eval_const_expr(t) } else { self.eval_const_expr(f) }
-            }
-            ExprKind::Cast(_, inner) => self.eval_const_expr(inner),
-            ExprKind::SizeofType(ty) => Some(layout::size_of(&self.records, ty) as i128),
-            // `sizeof expr` is a constant: the operand is not evaluated, only its
-            // static type measured (e.g. `sizeof arr / sizeof arr[0]`,
-            // `sizeof member.field`, `sizeof "literal"`).
-            ExprKind::SizeofExpr(inner) => {
-                let ty = self.expr_type(inner)?;
-                Some(layout::size_of(&self.records, &ty) as i128)
-            }
-            ExprKind::AlignofType(ty) => Some(layout::align_of(&self.records, ty) as i128),
-            _ => None,
-        }
+        consteval::eval(e, self).map(|c| c.value)
     }
 
     /// The constant address of an lvalue reached from a constant pointer through
@@ -3551,28 +3553,6 @@ fn size_t_ty() -> CType {
     CType::Int(IntTy::new(64, false))
 }
 
-/// Reduce an integer constant `v` to the representable value of integer type
-/// `ty`: mask to the type's value-bit count (`N` for a `_BitInt(N)`), then
-/// sign-extend for a signed type. `_Bool` normalizes to 0/1. Non-integer types
-/// are returned unchanged.
-fn reduce_const_to_type(v: i128, ty: &CType) -> i128 {
-    let (bits, signed) = match ty {
-        CType::Bool => return i128::from(v != 0),
-        CType::Int(i) => (u32::from(i.value_bits()), i.signed),
-        _ => return v,
-    };
-    if bits == 0 || bits >= 128 {
-        return v;
-    }
-    let mask = (1i128 << bits) - 1;
-    let m = v & mask;
-    if signed && (m & (1i128 << (bits - 1))) != 0 {
-        m - (1i128 << bits)
-    } else {
-        m
-    }
-}
-
 /// The integer promotion of a type (for `typeof` typing): `_Bool`/`char`/`short`
 /// become `int`; other types (including `_BitInt`, which is not promoted) are
 /// unchanged.
@@ -3685,30 +3665,4 @@ fn is_va_builtin(name: &str) -> bool {
         name,
         "__builtin_va_start" | "__builtin_va_arg" | "__builtin_va_end" | "__builtin_va_copy"
     )
-}
-
-/// Fold a binary operator over two constant integers (constant-expression
-/// evaluation for array sizes, enum values, and designators).
-fn eval_binop(op: BinaryOp, a: i128, b: i128) -> Option<i128> {
-    Some(match op {
-        BinaryOp::Add => a + b,
-        BinaryOp::Sub => a - b,
-        BinaryOp::Mul => a * b,
-        BinaryOp::Div if b != 0 => a / b,
-        BinaryOp::Rem if b != 0 => a % b,
-        BinaryOp::BitAnd => a & b,
-        BinaryOp::BitOr => a | b,
-        BinaryOp::BitXor => a ^ b,
-        BinaryOp::Shl => a << b,
-        BinaryOp::Shr => a >> b,
-        BinaryOp::Eq => i128::from(a == b),
-        BinaryOp::Ne => i128::from(a != b),
-        BinaryOp::Lt => i128::from(a < b),
-        BinaryOp::Le => i128::from(a <= b),
-        BinaryOp::Gt => i128::from(a > b),
-        BinaryOp::Ge => i128::from(a >= b),
-        BinaryOp::LAnd => i128::from(a != 0 && b != 0),
-        BinaryOp::LOr => i128::from(a != 0 || b != 0),
-        _ => return None,
-    })
 }

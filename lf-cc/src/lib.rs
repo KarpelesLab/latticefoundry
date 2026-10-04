@@ -11,6 +11,7 @@
 //! tree, and a [`lower`]ing pass to the IR builder. No `unsafe` is used.
 
 pub mod ast;
+pub mod consteval;
 pub mod cstd;
 pub mod headers;
 pub mod layout;
