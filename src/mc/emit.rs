@@ -17,6 +17,17 @@
 //!   [`Relocation`](crate::mc::object::Relocation)) in the
 //!   [`Emitted`] result.
 //!
+//! A third kind of reference is the **relaxable branch** ([`Emitter::branch`]):
+//! a PC-relative jump to a label with a short (`rel8`) and a long (`rel32`)
+//! encoding. Every such branch starts short; [`finish`](Emitter::finish) lays
+//! the buffer out, grows each branch whose target is out of the short form's
+//! reach, and repeats until nothing changes (sizes only grow, so this
+//! terminates). The bytes between branches are moved, never re-encoded, so
+//! every other label, fixup and offset is remapped to where it ends up; a
+//! caller that needs final offsets of its own binds labels and reads them back
+//! with [`Emitter::finish_with_labels`]. Code that computes a PC-relative
+//! displacement by hand must not span a relaxable branch.
+//!
 //! The emitter is entirely target-independent and deterministic: relocations
 //! come out in emission order and the same sequence of calls always yields the
 //! same bytes.
@@ -107,12 +118,35 @@ struct Fixup {
     addend: i64,
 }
 
+/// One relaxable branch: its long form sits in the buffer at `at` until
+/// [`Emitter::finish`] decides which form it takes.
+#[derive(Clone, Debug)]
+struct Relax {
+    at: u64,
+    short: Vec<u8>,
+    long: Vec<u8>,
+    label: Label,
+}
+
+impl Relax {
+    /// The length of the long form (opcode + `rel32`).
+    fn long_len(&self) -> u64 {
+        self.long.len() as u64 + 4
+    }
+
+    /// The length of the short form (opcode + `rel8`).
+    fn short_len(&self) -> u64 {
+        self.short.len() as u64 + 1
+    }
+}
+
 /// A growable little-endian byte buffer with a label + fixup resolver.
 #[derive(Clone, Debug, Default)]
 pub struct Emitter {
     buf: Vec<u8>,
     labels: Vec<Option<u64>>,
     fixups: Vec<Fixup>,
+    relaxes: Vec<Relax>,
 }
 
 impl Emitter {
@@ -255,13 +289,35 @@ impl Emitter {
         self.reference(RelocKind::Plt32, target, addend);
     }
 
+    /// Emit a relaxable PC-relative branch to `label`: the opcode bytes
+    /// `short` followed by a `rel8` displacement when the target is within
+    /// reach, else `long` followed by a `rel32` (both measured from the end
+    /// of the instruction). The form is chosen by [`Emitter::finish`]; until
+    /// then the long form occupies the buffer.
+    pub fn branch(&mut self, short: &[u8], long: &[u8], label: Label) {
+        let at = self.offset();
+        self.bytes(long);
+        self.zeros(4);
+        self.relaxes.push(Relax { at, short: short.to_vec(), long: long.to_vec(), label });
+    }
+
     /// Resolve every fixup and return the finished bytes plus the relocations
     /// that unresolved external references produced.
     ///
-    /// Internal [`Label`] references are patched in place; each external symbol
-    /// reference becomes an [`EmittedReloc`]. Fails if a referenced label was
-    /// never bound, or if a resolved value does not fit its field.
-    pub fn finish(mut self) -> Result<Emitted, EmitError> {
+    /// Relaxable branches are sized and encoded first (see the
+    /// [module docs](self)). Internal [`Label`] references are patched in
+    /// place; each external symbol reference becomes an [`EmittedReloc`].
+    /// Fails if a referenced label was never bound, or if a resolved value
+    /// does not fit its field.
+    pub fn finish(self) -> Result<Emitted, EmitError> {
+        self.finish_with_labels().map(|(out, _)| out)
+    }
+
+    /// Like [`Emitter::finish`], but also returns every label's final offset
+    /// (by [`Label::index`]; `None` for one never bound), after relaxation
+    /// moved the code.
+    pub fn finish_with_labels(mut self) -> Result<(Emitted, Vec<Option<u64>>), EmitError> {
+        self.relax()?;
         let mut relocations = Vec::new();
         for fx in &self.fixups {
             match &fx.target {
@@ -297,7 +353,80 @@ impl Emitter {
                 }
             }
         }
-        Ok(Emitted { bytes: self.buf, relocations })
+        Ok((Emitted { bytes: self.buf, relocations }, self.labels))
+    }
+
+    /// Size the relaxable branches, rebuild the buffer with each in its
+    /// chosen form, and move every label and fixup to its new offset.
+    fn relax(&mut self) -> Result<(), EmitError> {
+        if self.relaxes.is_empty() {
+            return Ok(());
+        }
+        let n = self.relaxes.len();
+        let mut long = vec![false; n];
+        // `shrink[i]`: the bytes saved by the branches before branch `i`.
+        let mut shrink = vec![0u64; n + 1];
+        let saved_before = |shrink: &[u64], relaxes: &[Relax], p: u64| -> u64 {
+            // Branches entirely before `p` (`at < p`); a label at a branch's
+            // own start stays in front of it.
+            let k = relaxes.partition_point(|r| r.at < p);
+            shrink[k]
+        };
+        loop {
+            for i in 0..n {
+                let r = &self.relaxes[i];
+                let saving = if long[i] { 0 } else { r.long_len() - r.short_len() };
+                shrink[i + 1] = shrink[i] + saving;
+            }
+            let mut changed = false;
+            for i in 0..n {
+                if long[i] {
+                    continue;
+                }
+                let r = &self.relaxes[i];
+                let target = self.labels[r.label.index()].ok_or(EmitError::UndefinedLabel(r.label))?;
+                let target = target - saved_before(&shrink, &self.relaxes, target);
+                let end = r.at - shrink[i] + r.short_len();
+                let disp = target as i64 - end as i64;
+                if i8::try_from(disp).is_err() {
+                    long[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Rebuild the buffer: the bytes between branches move down, each
+        // branch takes its chosen form.
+        let mut out = Vec::with_capacity(self.buf.len());
+        let mut from = 0usize;
+        for (i, r) in self.relaxes.iter().enumerate() {
+            out.extend_from_slice(&self.buf[from..r.at as usize]);
+            from = (r.at + r.long_len()) as usize;
+            let target = self.labels[r.label.index()].ok_or(EmitError::UndefinedLabel(r.label))?;
+            let target = (target - saved_before(&shrink, &self.relaxes, target)) as i64;
+            if long[i] {
+                out.extend_from_slice(&r.long);
+                let disp = target - (out.len() as i64 + 4);
+                let disp = i32::try_from(disp).map_err(|_| EmitError::FieldOverflow { offset: out.len() as u64, value: disp })?;
+                out.extend_from_slice(&disp.to_le_bytes());
+            } else {
+                out.extend_from_slice(&r.short);
+                let disp = target - (out.len() as i64 + 1);
+                out.push(disp as i8 as u8);
+            }
+        }
+        out.extend_from_slice(&self.buf[from..]);
+        for l in self.labels.iter_mut().flatten() {
+            *l -= saved_before(&shrink, &self.relaxes, *l);
+        }
+        for fx in &mut self.fixups {
+            fx.at -= saved_before(&shrink, &self.relaxes, fx.at);
+        }
+        self.buf = out;
+        self.relaxes.clear();
+        Ok(())
     }
 }
 
@@ -448,5 +577,97 @@ mod tests {
             e.finish().unwrap()
         };
         assert_eq!(build(), build());
+    }
+
+    /// `jmp` to a label `gap` bytes of filler past the branch (forward) and
+    /// the bytes produced.
+    fn forward_jmp(gap: usize) -> Vec<u8> {
+        let mut e = Emitter::new();
+        let l = e.create_label();
+        e.branch(&[0xeb], &[0xe9], l);
+        e.zeros(gap);
+        e.bind_label(l);
+        e.u8(0xc3);
+        e.finish().unwrap().bytes
+    }
+
+    #[test]
+    fn relaxable_branch_takes_the_short_form_up_to_the_rel8_boundary() {
+        // +127 is the farthest a rel8 reaches.
+        let b = forward_jmp(127);
+        assert_eq!(&b[..2], &[0xeb, 127]);
+        assert_eq!(b.len(), 2 + 127 + 1);
+        // One byte more needs the rel32 form.
+        let b = forward_jmp(128);
+        assert_eq!(&b[..5], &[0xe9, 128, 0, 0, 0]);
+        assert_eq!(b.len(), 5 + 128 + 1);
+    }
+
+    #[test]
+    fn backward_relaxable_branch_boundary() {
+        // A backward branch reaches -128 from its end: the label 126 bytes
+        // before a 2-byte branch.
+        for (gap, short) in [(126usize, true), (127, false)] {
+            let mut e = Emitter::new();
+            let l = e.create_label();
+            e.bind_label(l);
+            e.zeros(gap);
+            e.branch(&[0x75], &[0x0f, 0x85], l);
+            let b = e.finish().unwrap().bytes;
+            if short {
+                assert_eq!(&b[gap..], &[0x75, 0x80]);
+            } else {
+                let disp = -(gap as i32) - 6;
+                let mut want = vec![0x0f, 0x85];
+                want.extend_from_slice(&disp.to_le_bytes());
+                assert_eq!(&b[gap..], &want[..]);
+            }
+        }
+    }
+
+    #[test]
+    fn relaxation_moves_labels_fixups_and_cascades() {
+        // Two forward branches over each other: the outer one's target is in
+        // reach only if the inner one is short. With 124 bytes between, both
+        // fit; a pcrel32 fixup and a label after them move down too.
+        let mut e = Emitter::new();
+        let outer = e.create_label();
+        let inner = e.create_label();
+        let after = e.create_label();
+        e.branch(&[0xeb], &[0xe9], outer);
+        e.branch(&[0x74], &[0x0f, 0x84], inner);
+        e.zeros(122);
+        e.bind_label(inner);
+        e.bind_label(outer);
+        e.u8(0xe8);
+        e.pcrel32(Ref::Label(after), 0);
+        e.bind_label(after);
+        let (out, labels) = e.finish_with_labels().unwrap();
+        assert_eq!(&out.bytes[..4], &[0xeb, 124, 0x74, 122]);
+        assert_eq!(labels[after.index()], Some(4 + 122 + 5));
+        assert_eq!(&out.bytes[127..131], &[0, 0, 0, 0], "call to the next instruction");
+        // With a longer body the inner branch grows, which pushes the outer
+        // one out of reach as well.
+        let mut e = Emitter::new();
+        let outer = e.create_label();
+        let inner = e.create_label();
+        e.branch(&[0xeb], &[0xe9], outer);
+        e.zeros(124);
+        e.branch(&[0x74], &[0x0f, 0x84], inner);
+        e.zeros(128);
+        e.bind_label(inner);
+        e.bind_label(outer);
+        let b = e.finish().unwrap().bytes;
+        assert_eq!(b[0], 0xe9);
+        assert_eq!(&b[5 + 124..5 + 124 + 2], &[0x0f, 0x84]);
+        assert_eq!(b.len(), 5 + 124 + 6 + 128);
+    }
+
+    #[test]
+    fn unbound_relaxable_target_is_an_error() {
+        let mut e = Emitter::new();
+        let l = e.create_label();
+        e.branch(&[0xeb], &[0xe9], l);
+        assert_eq!(e.finish(), Err(EmitError::UndefinedLabel(l)));
     }
 }
