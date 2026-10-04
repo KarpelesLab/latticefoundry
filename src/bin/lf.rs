@@ -16,6 +16,11 @@
 //! the result into a flashable image (`-L`/`-l` add the runtime library, e.g.
 //! `-lgcc`, for the soft-float and 64-bit division helpers).
 //!
+//! For RISC-V (`--target riscv64-linux`), the LP64D code links through qld
+//! into a static Linux executable whose `_start` calls the entry function and
+//! exits with its result; `-c` writes an ELF64 `EM_RISCV` object (`-c --pic`
+//! a position-independent one).
+//!
 //! For AVR (`--target avr-atmega328p`), `--oformat ihex|binary` links a
 //! flashable firmware image (vector table, startup code, program, runtime)
 //! and `-c` writes an ELF32 `EM_AVR` object.
@@ -93,7 +98,8 @@ fn print_usage() {
     println!("  --stack-usage  print each function's stack frame and the worst-case depth");
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
     println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
-    println!("                 aarch64-linux, aarch64-windows, aarch64-apple-darwin, thumbv7m-none-eabi (Cortex-M),");
+    println!("                 aarch64-linux, aarch64-windows, aarch64-apple-darwin, riscv64-linux,");
+    println!("                 thumbv7m-none-eabi (Cortex-M),");
     println!("                 ... (ABI + object format), wasm32 (a WebAssembly module;");
     println!("                 with -c, a wasm-ld object), avr-atmega328p (AVR firmware:");
     println!("                 --oformat ihex|binary, or -c for an ELF object)");
@@ -321,6 +327,7 @@ fn build(args: &[String]) -> Result<(), String> {
             target::aarch64::link::link_executable(vec![obj], &entry, &opts.link_extra, Path::new(&output_or("")))
                 .map_err(|e| format!("link error: {e}"))
         }
+        (TargetArch::Riscv64, ObjectFormat::Elf, None) => target::riscv::link_static_executable(&obj, &entry, &output_or("")),
         (TargetArch::X86_64 | TargetArch::AArch64, ObjectFormat::Coff, None) => {
             let entry = opts.entry.as_deref().unwrap_or("main");
             link_pe(&obj, triple, entry, &output_or("exe"), opts.base)

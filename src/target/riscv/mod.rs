@@ -124,6 +124,46 @@ pub const ELF: ElfTarget = ElfTarget {
     reloc_type: elf_reloc_type,
 };
 
+/// The startup object of a static Linux executable: `_start` calls `entry`
+/// (a `() -> i64` function) and exits with its result (`exit_group`, Linux
+/// RISC-V syscall 94). The kernel hands `_start` an aligned `sp`; the code
+/// uses no global pointer (`gp`), since nothing is relaxed against it.
+pub fn startup_object(entry: &str) -> crate::mc::object::ObjectModule {
+    let src = format!(
+        "module \"rv-start\"\nfunc @\"{entry}\"() -> i64\nfunc @_start() -> void {{\nentry ^0:\n  \
+         %r = call @\"{entry}\"() : i64\n  %x = syscall i64 94, %r : i64\n  unreachable\n}}\n"
+    );
+    let mut syms = crate::support::StrInterner::new();
+    let m = crate::ir::text::parse_module(&src, crate::support::diagnostics::FileId::new(0), &mut syms)
+        .expect("the startup module parses");
+    compile_module(&m, &syms)
+}
+
+/// Link `obj` (and the [`startup_object`] calling `entry`) into a static
+/// RISC-V Linux executable at `output`, with qld (`-m elf64lriscv -static`).
+/// The objects travel through temporary files next to `output`.
+///
+/// # Errors
+///
+/// When an object cannot be written or the link fails.
+pub fn link_static_executable(
+    obj: &crate::mc::object::ObjectModule,
+    entry: &str,
+    output: &str,
+) -> Result<(), String> {
+    let start = startup_object(entry);
+    let (tmp, tmp_start) = (format!("{output}.lf-tmp.o"), format!("{output}.lf-start.o"));
+    for (path, o) in [(&tmp, obj), (&tmp_start, &start)] {
+        let bytes = write_elf(o).map_err(|e| format!("cannot write a RISC-V ELF object: {e}"))?;
+        std::fs::write(path, bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
+    }
+    let args = ["-m", "elf64lriscv", "-static", "-e", "_start", "-o", output, &tmp_start, &tmp];
+    let result = crate::link::gnu::link_gnu("lf", &args).map_err(|e| format!("link error: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp_start);
+    result
+}
+
 /// Serialize a RISC-V object (from [`compile_module`]) as an ELF64
 /// relocatable file for the LP64D ABI.
 ///

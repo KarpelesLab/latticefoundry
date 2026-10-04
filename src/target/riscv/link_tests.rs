@@ -174,6 +174,29 @@ fn qld_links_an_executable_that_runs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `link_static_executable` (what `lf build --target riscv64-linux` does):
+/// `_start` calls the entry and exits with its result through `ecall`.
+#[test]
+fn static_executables_start_and_exit() {
+    let dir = scratch("start");
+    let src = PROGRAM.replace("func @entry(i64) -> i64 {\nentry ^0(%x: i64):", "func @main() -> i64 {\nentry ^0:\n  %x = add i64 0, i64 10 : i64");
+    let (m, syms) = parse(&src);
+    let exe = dir.join("main");
+    super::link_static_executable(&super::compile_module(&m, &syms), "main", exe.to_str().unwrap()).unwrap();
+    let image = load_elf(&std::fs::read(&exe).unwrap()).unwrap();
+    let mut cpu = Cpu::new(&image);
+    let exited = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = exited.clone();
+    cpu.syscall = Some(Box::new(move |nr, args| {
+        seen.set(Some((nr, args[0])));
+        Err("exited".into())
+    }));
+    let r = cpu.call(image.symbols["_start"], &[], &[], STACK_TOP - 4096);
+    assert_eq!(r, Err(super::sim::Fault::Other("exited".into())));
+    assert_eq!(exited.get(), Some((94, 31)), "exit_group(main())");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ===========================================================================
 // Interoperation with C compiled by clang
 // ===========================================================================

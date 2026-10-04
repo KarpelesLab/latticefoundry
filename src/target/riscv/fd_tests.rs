@@ -166,6 +166,50 @@ fn compiled_float_code_decodes_with_llvm_objdump() {
     }
 }
 
+/// The constant-time audit with floating point included (`docs/ir-design.md`
+/// §6d): no float op the isel selects may branch on data, and a
+/// straight-line function using every one of them (compares, conversions in
+/// both directions and both signednesses, a float `select`, fused
+/// multiply-adds) compiles to machine code without a single conditional
+/// branch. (A secret float is rejected by the verifier anyway; this keeps the
+/// lowering itself branch-free.)
+#[test]
+fn float_lowering_is_branch_free() {
+    use RvOp::*;
+    for op in [FAdd, FSub, FMul, FDiv, FMadd, FSgnj, FCmp, FLi, FCvtFF, FCvtFI, FCvtIF, FMvXF, FMvFX, Select, SetCmp] {
+        assert!(!op.may_branch_on_data(&[]), "{op:?}");
+    }
+    let mut src = String::from(
+        "module \"ct\"\nfunc @f(f64, f32, i64, i32) -> f64 {\nentry ^0(%a: f64, %b: f32, %n: i64, %m: i32):\n",
+    );
+    src += "  %e = fpext %b : f64\n  %s = fadd %a, %e : f64\n  %t = fsub %s, %a : f64\n  %u = fmul contract %t, %e : f64\n";
+    src += "  %v = fadd contract %u, %a : f64\n  %w = fdiv %v, %e : f64\n  %x = fneg %w : f64\n";
+    let mut acc = String::from("%x");
+    for (k, pred) in ["oeq", "one", "ord", "uno", "ueq", "ult", "oge", "ugt"].iter().enumerate() {
+        src += &format!("  %c{k} = fcmp {pred} %x, %a : i1\n  %s{k} = select %c{k}, %a, {acc} : f64\n");
+        acc = format!("%s{k}");
+    }
+    src += &format!("  %i = fptosi {acc} : i64\n  %j = fptoui %b : i32\n  %k = sitofp %n : f64\n  %l = uitofp %m : f32\n");
+    src += "  %lt = fptrunc %k : f32\n  %l2 = fadd %l, %lt : f32\n  %ld = fpext %l2 : f64\n  %fi = sitofp %i : f64\n";
+    src += "  %fj = uitofp %j : f64\n  %r1 = fadd %ld, %fi : f64\n  %r2 = fadd %r1, %fj : f64\n  ret %r2\n}\n";
+    let (m, _) = parse(&src);
+    let f = FuncId::from_index(0);
+    let mf = super::RiscvTarget::new().select(&m, f);
+    let branches = mf
+        .block_ids()
+        .flat_map(|b| mf.block(b).insts.iter())
+        .filter(|i| RvOp::decode(i.opcode).may_branch_on_data(&i.operands))
+        .count();
+    assert_eq!(branches, 0);
+    let code = super::compile_function(&m, f).bytes;
+    let bad: Vec<u32> = code
+        .chunks(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .filter(|w| w & 0x7F == 0x63)
+        .collect();
+    assert!(bad.is_empty(), "conditional branches {bad:08x?}");
+}
+
 // ===========================================================================
 // LP64D argument placement, on the selected MIR
 // ===========================================================================

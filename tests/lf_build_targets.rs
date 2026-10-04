@@ -74,6 +74,19 @@ fn objects_in_each_format() {
 }
 
 #[test]
+fn riscv64_executables_link_through_qld() {
+    let dir = scratch("riscv64");
+    let exe = build_ok(&dir, &["--target", "riscv64-linux"], "t");
+    assert_eq!(&exe[..4], b"\x7fELF");
+    assert_eq!(u16::from_le_bytes([exe[16], exe[17]]), 2, "ET_EXEC");
+    assert_eq!(u16::from_le_bytes([exe[18], exe[19]]), 243, "EM_RISCV");
+    assert_ne!(u64::from_le_bytes(exe[24..32].try_into().unwrap()), 0, "an entry point");
+    let pic = build_ok(&dir, &["--target", "riscv64-linux", "-c", "--pic"], "p.o");
+    assert_eq!(u16::from_le_bytes([pic[18], pic[19]]), 243);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn windows_executables_link_through_qld() {
     let dir = scratch("pe");
     for (triple, machine) in [("x86_64-windows", 0x8664u16), ("aarch64-windows", 0xaa64)] {
