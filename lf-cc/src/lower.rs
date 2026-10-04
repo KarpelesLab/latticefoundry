@@ -719,6 +719,10 @@ impl FnLower<'_> {
             TStmt::Expr(Some(e)) => {
                 self.lower_effect(e);
             }
+            TStmt::Asm(a) => {
+                self.set_line(a.span);
+                self.lower_asm(a);
+            }
             TStmt::Block(stmts) => self.lower_block(stmts),
             TStmt::InitLocal(id, v) => {
                 self.set_line(v.span);
@@ -1073,6 +1077,93 @@ impl FnLower<'_> {
     }
 
     /// Lower an expression to a pointer to its storage (it must be an lvalue).
+    /// Lower a GNU `asm` statement to an `inline_asm` (`docs/ir-design.md`
+    /// §6i): each output's address is taken before the asm (a `+` output's
+    /// value read there too) and the result stored back after it; a memory
+    /// operand passes its object's address (a memory input that is not an
+    /// lvalue goes through a temporary).
+    fn lower_asm(&mut self, a: &crate::sema::TAsm) {
+        use latticefoundry::ir::{AsmInput, AsmOutput, InlineAsm};
+        let mut outputs = Vec::with_capacity(a.outputs.len());
+        let mut out_ops = Vec::new();
+        // (output index, the lvalue, its address unless a bit-field)
+        let mut writes: Vec<(usize, &TExpr, Option<ValueId>)> = Vec::new();
+        for (j, o) in a.outputs.iter().enumerate() {
+            if InlineAsm::is_indirect(&o.constraint) {
+                out_ops.push(self.lower_lvalue(&o.expr));
+                outputs.push(AsmOutput { constraint: o.constraint.clone(), name: o.name.clone(), ty: None });
+                continue;
+            }
+            let ty = self.ir_of(&o.expr.ty);
+            let addr = match &o.expr.kind {
+                TExprKind::BitField { .. } => None,
+                _ => Some(self.lower_lvalue(&o.expr)),
+            };
+            if o.constraint.starts_with('+') {
+                let v = match addr {
+                    Some(p) => {
+                        let align = self.lvalue_align(&o.expr);
+                        self.load_access(&o.expr.ty, p, o.expr.quals, align)
+                    }
+                    None => self.lower_rvalue(&o.expr),
+                };
+                out_ops.push(v);
+            }
+            outputs.push(AsmOutput { constraint: o.constraint.clone(), name: o.name.clone(), ty: Some(ty) });
+            writes.push((j, &o.expr, addr));
+        }
+        let mut inputs = Vec::with_capacity(a.inputs.len());
+        let mut in_ops = Vec::with_capacity(a.inputs.len());
+        for i in &a.inputs {
+            let v = if InlineAsm::is_indirect(&i.constraint) {
+                if i.expr.is_lvalue() {
+                    self.lower_lvalue(&i.expr)
+                } else {
+                    let ty = self.ir_of(&i.expr.ty);
+                    let v = self.lower_rvalue(&i.expr);
+                    let tmp = self.b.alloca(ty);
+                    self.store_access(&i.expr.ty, tmp, v, Quals::default(), align_of(&i.expr.ty));
+                    tmp
+                }
+            } else {
+                self.lower_rvalue(&i.expr)
+            };
+            in_ops.push(v);
+            inputs.push(AsmInput { constraint: i.constraint.clone(), name: i.name.clone() });
+        }
+        let asm = InlineAsm {
+            template: a.template.clone(),
+            outputs,
+            inputs,
+            clobbers: a.clobbers.clone(),
+            volatile: a.volatile,
+        };
+        let first = asm.result_output();
+        let types: Vec<Option<TypeId>> = asm.outputs.iter().map(|o| o.ty).collect();
+        out_ops.extend(in_ops);
+        let res = self.b.inline_asm(asm, &out_ops);
+        for (j, lv, addr) in writes {
+            let res = res.expect("an asm with a register output has a result");
+            let v = if first == Some(j) {
+                res
+            } else {
+                let ty = types[j].expect("a register output has a type");
+                self.b.asm_output(res, j as u32, ty)
+            };
+            match (&lv.kind, addr) {
+                (TExprKind::BitField { base, offset, bits }, _) => {
+                    let unit = self.bitfield_unit_addr(base, *offset);
+                    self.bitfield_write_at(unit, bits, v, lv.quals.volatile);
+                }
+                (_, Some(p)) => {
+                    let align = self.lvalue_align(lv);
+                    self.store_access(&lv.ty, p, v, lv.quals, align)
+                }
+                (_, None) => unreachable!("a non-bit-field output has an address"),
+            }
+        }
+    }
+
     fn lower_lvalue(&mut self, e: &TExpr) -> ValueId {
         match &e.kind {
             TExprKind::Obj(id) => self.slots[*id],

@@ -322,6 +322,9 @@ fn compile_program(
         verify_or(&module, "optimized")?;
     }
 
+    // A bad inline asm statement (constraint, clobber, template) is reported
+    // here, naming its function, rather than as a backend failure.
+    x86_64::check_inline_asm(&module, &syms).map_err(BuildError::Backend)?;
     let cg = CodegenOptions::default().with_reloc_model(cfg.reloc_model);
     let mut obj = if debug {
         let comp_dir = std::env::current_dir()

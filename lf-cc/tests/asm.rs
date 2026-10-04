@@ -1,6 +1,6 @@
 //! GNU `asm` support: asm labels on declarations (the glibc `__REDIRECT`
-//! mechanism), asm statements inside functions (only the empty compiler
-//! barrier is accepted), and file-scope asm (collected, assembled with our own
+//! mechanism), asm statements inside functions (see
+//! `inline_asm.rs` for those with operands), and file-scope asm (collected, assembled with our own
 //! assembler, and linked beside the C object).
 //!
 //! Tests that link against the host C library use `qld` through
@@ -366,22 +366,22 @@ fn compiler_barriers_are_accepted() {
 
 #[test]
 fn full_extended_asm_syntax_parses() {
-    // Real-world extended asm parses (named operands, multiple sections, asm
-    // goto with labels); it is then rejected with a clear diagnostic.
+    // Real-world extended asm parses (named operands, multiple sections) and
+    // compiles (see `tests/inline_asm.rs` for execution); `asm goto` parses
+    // and is then rejected with a clear diagnostic.
     for body in [
-        "int r, a = 1; asm(\"addl %1, %0\" : \"=r\"(r) : \"r\"(a), \"0\"(r));",
+        "int r = 0, a = 1; asm(\"addl %1, %0\" : \"=r\"(r) : \"r\"(a), \"0\"(r));",
         "int r, a = 1; __asm__ __volatile__ (\"mov %[in], %[out]\" : [out] \"=r\" (r) : [in] \"r\" (a) : \"cc\");",
-        "int a = 1; asm goto (\"jmp %l[done]\" : : \"r\"(a) : \"memory\" : done); done: ;",
         "asm volatile (\"nop\");",
         "asm (\"pause\" \"\\n\\t\" \"pause\");",
     ] {
         let src = format!("int main(void){{ {body} return 0; }}");
-        let msg = frontend_error(&src, "gnu17");
-        assert!(
-            msg.contains("inline assembly with operands/instructions is not supported yet"),
-            "{body}: {msg}"
-        );
+        lf_cc::compile_object_with(&src, "t.c", &pp("gnu17"), OptLevel::O0, false)
+            .unwrap_or_else(|e| panic!("{body}: {e:?}"));
     }
+    let src = "int main(void){ int a = 1; asm goto (\"jmp %l[done]\" : : \"r\"(a) : \"memory\" : done); done: return 0; }";
+    let msg = frontend_error(src, "gnu17");
+    assert!(msg.contains("`asm goto` is not supported"), "{msg}");
 }
 
 // --- file-scope asm --------------------------------------------------------

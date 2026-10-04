@@ -63,8 +63,9 @@ struct Letters {
     mem: bool,
     imm: bool,
     sym: bool,
-    /// A register its letter names (`a`, `b`, ...).
-    fixed: Option<u16>,
+    /// A register its letter names (`a`, `b`, ...) or a `{reg}` constraint
+    /// (how a front end passes a GNU register-asm variable's register).
+    fixed: Option<PReg>,
     /// A set its letter restricts to (`Q`, `R`).
     subset: Option<&'static [u16]>,
     /// The range an immediate letter allows (inclusive).
@@ -110,12 +111,12 @@ fn letters(c: &str) -> Result<Letters, String> {
                 l.gpr = true;
                 l.subset = Some(&[RAX, RBX, RCX, RDX, RSI, RDI]);
             }
-            'a' => l.fixed = Some(RAX),
-            'b' => l.fixed = Some(RBX),
-            'c' => l.fixed = Some(RCX),
-            'd' => l.fixed = Some(RDX),
-            'S' => l.fixed = Some(RSI),
-            'D' => l.fixed = Some(RDI),
+            'a' => l.fixed = Some(regs::gpr(RAX)),
+            'b' => l.fixed = Some(regs::gpr(RBX)),
+            'c' => l.fixed = Some(regs::gpr(RCX)),
+            'd' => l.fixed = Some(regs::gpr(RDX)),
+            'S' => l.fixed = Some(regs::gpr(RSI)),
+            'D' => l.fixed = Some(regs::gpr(RDI)),
             'x' | 'v' => l.xmm = true,
             'm' | 'o' | 'V' => l.mem = true,
             'g' | 'X' => {
@@ -147,7 +148,17 @@ fn letters(c: &str) -> Result<Letters, String> {
             'f' | 't' | 'u' => return Err(format!("constraint `{c}`: x87 register constraints are not supported")),
             'y' => return Err(format!("constraint `{c}`: MMX register constraints are not supported")),
             'Y' => return Err(format!("constraint `{c}`: the `Y` constraints are not supported")),
-            '{' => return Err(format!("constraint `{c}`: explicit `{{reg}}` constraints are not GCC syntax")),
+            '{' => {
+                let name: String = chars.by_ref().take_while(|&d| d != '}').collect();
+                let r = match clobber_reg(&name) {
+                    Ok(Some(r)) => r,
+                    _ => return Err(format!("constraint `{c}`: `{name}` is not a register an operand can use")),
+                };
+                if r.class == RegClass::Gpr && matches!(r.num, 4 | 5) {
+                    return Err(format!("constraint `{c}`: `{name}` is the stack or frame pointer"));
+                }
+                l.fixed = Some(r);
+            }
             other => return Err(format!("constraint `{c}`: unknown constraint letter `{other}`")),
         }
     }
@@ -363,7 +374,7 @@ fn plan(asm: &InlineAsm, infos: &[OpInfo]) -> Result<Plan, String> {
         } else if l.sym && matches!(info.value, OpValue::Global(_) | OpValue::Func(_)) {
             Place::Sym
         } else if let Some(r) = l.fixed {
-            Place::Fixed(regs::gpr(r))
+            Place::Fixed(r)
         } else if l.gpr && l.subset.is_none() && !(info.fp && l.xmm) {
             Place::Gpr
         } else if l.gpr && l.subset.is_some() {
@@ -637,7 +648,9 @@ fn operand_text(placed: &Placed, bits: u32, modifier: Option<char>) -> Result<St
         }
         (Placed::Mem(r), None | Some('a' | 'b' | 'w' | 'k' | 'q' | 'c' | 'P' | 'p')) => format!("({})", reg_name(*r, 64)),
         (Placed::Mem(r), Some('H')) => format!("8({})", reg_name(*r, 64)),
-        (Placed::Imm(v), None) => format!("${v}"),
+        // A size modifier leaves a constant as it is (`inb %w1` with a
+        // constant port prints `$128`).
+        (Placed::Imm(v), None | Some('b' | 'w' | 'k' | 'q' | 'h')) => format!("${v}"),
         (Placed::Imm(v), Some('c' | 'P' | 'p' | 'a')) => v.to_string(),
         (Placed::Imm(v), Some('n')) => (-v).to_string(),
         (Placed::Sym(s), None) => format!("${s}"),
@@ -918,7 +931,11 @@ impl X86_64Target {
             }
         }
 
-        // The fixed-register moves, as one run right before the asm.
+        // The fixed-register moves, as one run right before the asm. A move
+        // into `r10` or `xmm13` (the first spill-reload scratch of its class,
+        // nameable by a `{reg}` constraint) goes last, so no reload feeding a
+        // later move overwrites it (as for `syscall`).
+        fixed_moves.sort_by_key(|&(r, _)| r == regs::gpr(10) || r == regs::xmm(13));
         for (r, src) in fixed_moves {
             lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(r), use_v(src)]));
         }
@@ -1108,7 +1125,7 @@ mod tests {
         assert_eq!(s("mov %1, %0"), "mov %rcx, %eax");
         assert_eq!(s("%k1 %w1 %b1 %q0 %h0"), "%ecx %cx %cl %rax %ah");
         assert_eq!(s("add %[k], %[out]"), "add $-5, %eax");
-        assert_eq!(s("%c2 %n2 %c4 %4"), "-5 5 foo $foo");
+        assert_eq!(s("%c2 %n2 %c4 %4 %w2"), "-5 5 foo $foo $-5");
         assert_eq!(s("incl %3; mov%z0 %H3"), "incl (%rdx); movl 8(%rdx)");
         assert_eq!(s("1: jmp 1b; .L%=: %%rax"), "1: jmp 1b; .L42: %rax");
         assert_eq!(s("{movl %1, %0|mov %0, %1}"), "movl %rcx, %eax");
@@ -1122,7 +1139,10 @@ mod tests {
     #[test]
     fn constraint_letters() {
         let l = letters("=&a").unwrap();
-        assert!(l.early && l.fixed == Some(RAX));
+        assert!(l.early && l.fixed == Some(gpr(RAX)));
+        assert_eq!(letters("{r10}").unwrap().fixed, Some(gpr(10)));
+        assert_eq!(letters("={xmm3}").unwrap().fixed, Some(regs::xmm(3)));
+        assert!(letters("{rsp}").is_err() && letters("{bogus}").is_err());
         assert!(letters("+rm").unwrap().gpr);
         assert_eq!(letters("0").unwrap().tied.as_deref(), Some("0"));
         assert_eq!(letters("[x]").unwrap().tied.as_deref(), Some("[x]"));

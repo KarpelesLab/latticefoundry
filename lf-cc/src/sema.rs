@@ -265,6 +265,55 @@ pub enum TStmt {
         /// The scalar stores, each already converted to its field/element type.
         stores: Vec<AggStore>,
     },
+    /// A GNU `asm` statement inside a function (lowered to the IR's
+    /// `inline_asm`).
+    Asm(TAsm),
+}
+
+/// A typed GNU `asm` statement. A basic asm becomes a volatile, operand-less
+/// one whose template has its `%` signs escaped.
+#[derive(Clone, Debug)]
+pub struct TAsm {
+    /// The assembler template.
+    pub template: String,
+    /// `volatile` (given, or implied by having no outputs).
+    pub volatile: bool,
+    /// The output operands: `expr` is the lvalue written.
+    pub outputs: Vec<TAsmOperand>,
+    /// The input operands: `expr` is the value, or for a memory constraint
+    /// the object (an lvalue, or a value lowering spills to a temporary).
+    pub inputs: Vec<TAsmOperand>,
+    /// The clobber list.
+    pub clobbers: Vec<String>,
+    /// The statement's source span.
+    pub span: Span,
+}
+
+/// One operand of a [`TAsm`].
+#[derive(Clone, Debug)]
+pub struct TAsmOperand {
+    /// The `[name]` the template may use.
+    pub name: Option<String>,
+    /// The constraint (a register-asm variable's becomes `{reg}`).
+    pub constraint: String,
+    /// The operand expression (see [`TAsm`]).
+    pub expr: TExpr,
+}
+
+/// Whether a value of C type `ty` can live in a register as an asm operand
+/// (a scalar or a vector, not an aggregate).
+fn asm_register_type(ty: &CType) -> bool {
+    ty.is_integer() || ty.is_pointer() || ty.is_float() || ty.is_vector()
+}
+
+/// Whether `te` is an address constant an `i` asm operand may name: a
+/// function, or the address of (or decayed) global object.
+fn asm_symbol_operand(te: &TExpr) -> bool {
+    match &te.kind {
+        TExprKind::FuncPtr(_) => true,
+        TExprKind::AddrOf(inner) | TExprKind::Decay(inner) => matches!(inner.kind, TExprKind::Global(_)),
+        _ => false,
+    }
 }
 
 /// A typed expression: a [`TExprKind`], its C type, and its source span.
@@ -1294,6 +1343,7 @@ impl Checker {
             switch_depth: 0,
             switches: Vec::new(),
             labels,
+            reg_vars: HashMap::new(),
         };
         // Parameters become objects with storage in the outermost scope.
         for p in &f.params {
@@ -1366,30 +1416,148 @@ impl Checker {
 
     // --- statements --------------------------------------------------------
 
-    /// Check a GNU `asm` statement. The backends encode machine code directly
-    /// (no textual assembly in the function pipeline), so the only form accepted
-    /// inside a function is the *compiler barrier*: an empty template with no
-    /// outputs and no goto labels, e.g. `__asm__ volatile ("" ::: "memory")` or
-    /// `asm("" : : "r"(x))`. It emits no instructions; its input operands are
-    /// evaluated for their side effects. (The current optimizer never moves
-    /// memory operations across statements in a way this barrier would forbid,
-    /// so treating it as a no-op is sound for now.) Everything else is rejected
-    /// with a clear diagnostic.
+    /// Check a GNU `asm` statement inside a function. An extended asm's
+    /// outputs must be lvalues (`=`/`+` constraints); a memory-constraint
+    /// operand is its object (a memory input that is not an lvalue is spilled
+    /// to a temporary by lowering), an immediate-only one must be a constant
+    /// or an address constant, and a matching input is converted to its
+    /// output's type. A register-asm variable used as an operand gets its
+    /// register as the constraint (`{r10}`). A basic asm (no colon) takes its
+    /// template literally: it becomes a volatile asm without operands that
+    /// clobbers memory, its `%` signs escaped. An asm without outputs is
+    /// volatile, as in GCC. Constraint letters, clobbers and the template are
+    /// checked by the backend (`x86_64::check_inline_asm`). `asm goto` is
+    /// rejected.
     fn check_asm(&mut self, ctx: &mut FnCtx, asm: &AsmStmt, span: Span) -> Option<TStmt> {
-        let barrier = asm.template.trim().is_empty()
-            && asm.outputs.is_empty()
-            && asm.labels.is_empty()
-            && !asm.is_goto;
-        if !barrier {
-            self.error(span, "inline assembly with operands/instructions is not supported yet");
+        use latticefoundry::ir::InlineAsm;
+        if asm.is_goto || !asm.labels.is_empty() {
+            self.error(span, "`asm goto` is not supported");
             return None;
         }
-        let mut out = Vec::with_capacity(asm.inputs.len());
-        for op in &asm.inputs {
-            let te = self.check_expr(ctx, &op.expr)?;
-            out.push(TStmt::Expr(Some(te)));
+        if !asm.extended {
+            return Some(TStmt::Asm(TAsm {
+                template: asm.template.replace('%', "%%"),
+                volatile: true,
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+                clobbers: vec!["memory".to_owned()],
+                span,
+            }));
         }
-        Some(TStmt::Block(out))
+        // A register-asm variable named directly as a register operand.
+        let pinned = |ctx: &FnCtx, te: &TExpr, c: &str| -> Option<String> {
+            let TExprKind::Obj(id) = te.kind else { return None };
+            let reg = ctx.reg_vars.get(&id)?;
+            if InlineAsm::is_indirect(c) || InlineAsm::is_immediate_only(c) {
+                return None;
+            }
+            let prefix: String = c.chars().take_while(|ch| matches!(ch, '=' | '+' | '&')).collect();
+            Some(format!("{prefix}{{{}}}", reg.trim_start_matches('%')))
+        };
+        let mut ok = true;
+        let mut outputs = Vec::with_capacity(asm.outputs.len());
+        for op in &asm.outputs {
+            let c = &op.constraint;
+            let Some(te) = self.check_expr(ctx, &op.expr) else {
+                ok = false;
+                continue;
+            };
+            if !(c.starts_with('=') || c.starts_with('+')) {
+                self.error(te.span, format!("asm output constraint \"{c}\" must start with '=' or '+'"));
+                ok = false;
+                continue;
+            }
+            if !te.is_lvalue() {
+                self.error(te.span, "asm output operand is not an lvalue");
+                ok = false;
+                continue;
+            }
+            let indirect = InlineAsm::is_indirect(c);
+            if indirect && matches!(te.kind, TExprKind::BitField { .. }) {
+                self.error(te.span, "a bit-field cannot be a memory asm operand");
+                ok = false;
+                continue;
+            }
+            if !indirect && !asm_register_type(&te.ty) {
+                self.error(te.span, format!("asm output of type '{}' needs a memory constraint", te.ty));
+                ok = false;
+                continue;
+            }
+            let constraint = pinned(ctx, &te, c).unwrap_or_else(|| c.clone());
+            outputs.push(TAsmOperand { name: op.name.clone(), constraint, expr: te });
+        }
+        let mut inputs = Vec::with_capacity(asm.inputs.len());
+        for op in &asm.inputs {
+            let c = &op.constraint;
+            if c.starts_with('=') || c.starts_with('+') {
+                self.error(op.expr.span, format!("asm input constraint \"{c}\" may not start with '=' or '+'"));
+                ok = false;
+                continue;
+            }
+            let Some(te) = self.check_expr(ctx, &op.expr) else {
+                ok = false;
+                continue;
+            };
+            let expr = if InlineAsm::is_indirect(c) {
+                if matches!(te.kind, TExprKind::BitField { .. }) {
+                    self.error(te.span, "a bit-field cannot be a memory asm operand");
+                    ok = false;
+                    continue;
+                }
+                // The object itself (an array is not decayed).
+                te
+            } else if InlineAsm::is_immediate_only(c) {
+                let span = te.span;
+                let te = self.decay(te);
+                match self.const_eval(&op.expr) {
+                    Some(v) if te.ty.is_integer() || te.ty.is_pointer() => {
+                        TExpr::new(TExprKind::Const(v), te.ty.clone(), span)
+                    }
+                    _ if asm_symbol_operand(&te) => te,
+                    _ => {
+                        self.error(span, format!("asm operand with constraint \"{c}\" must be a constant"));
+                        ok = false;
+                        continue;
+                    }
+                }
+            } else {
+                let te = self.decay(te);
+                if !asm_register_type(&te.ty) {
+                    self.error(te.span, format!("asm input of type '{}' needs a memory constraint", te.ty));
+                    ok = false;
+                    continue;
+                }
+                // A matching input takes its output's type.
+                let tied = InlineAsm::constraint_body(c);
+                let target = if tied.chars().all(|ch| ch.is_ascii_digit()) && !tied.is_empty() {
+                    tied.parse::<usize>().ok()
+                } else {
+                    tied.strip_prefix('[')
+                        .and_then(|n| n.strip_suffix(']'))
+                        .and_then(|n| outputs.iter().position(|o: &TAsmOperand| o.name.as_deref() == Some(n)))
+                };
+                match target.and_then(|j| outputs.get(j)).map(|o| o.expr.ty.clone()) {
+                    Some(oty) if (oty.is_integer() || oty.is_pointer()) && (te.ty.is_integer() || te.ty.is_pointer()) => {
+                        self.convert(te, &oty)
+                    }
+                    Some(oty) if oty.is_float() && (te.ty.is_float() || te.ty.is_integer()) => self.convert(te, &oty),
+                    _ => te,
+                }
+            };
+            let constraint = pinned(ctx, &expr, c).unwrap_or_else(|| c.clone());
+            inputs.push(TAsmOperand { name: op.name.clone(), constraint, expr });
+        }
+        if !ok {
+            return None;
+        }
+        Some(TStmt::Asm(TAsm {
+            template: asm.template.clone(),
+            volatile: asm.is_volatile || asm.outputs.is_empty(),
+            outputs,
+            inputs,
+            clobbers: asm.clobbers.clone(),
+            span,
+        }))
     }
 
     fn check_stmt(&mut self, ctx: &mut FnCtx, stmt: &Stmt) -> Option<TStmt> {
@@ -1736,6 +1904,11 @@ impl Checker {
             let align = d.align.or((natural > 8).then_some(natural));
             let id = ctx.add_object_aligned(&d.name, ty.clone().qualified(quals), align);
             ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Local(id));
+            // An automatic variable with an asm label is a GNU register-asm
+            // variable: the label names the register its asm operands use.
+            if let Some(reg) = &d.asm_label {
+                ctx.reg_vars.insert(id, reg.clone());
+            }
             let init_built = match &d.init {
                 Some(init) => self.build_init(ctx, &ty, init, d.span),
                 None => None,
@@ -3656,6 +3829,9 @@ struct FnCtx {
     switches: Vec<SwitchCollector>,
     /// Function-wide label names → label id (labels have their own namespace).
     labels: HashMap<String, u32>,
+    /// The register a GNU register-asm variable (`register long r10
+    /// asm("r10")`) names, by object: honored when it is an asm operand.
+    reg_vars: HashMap<ObjId, String>,
 }
 
 impl FnCtx {

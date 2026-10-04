@@ -427,10 +427,6 @@ fn unsupported_constructs_are_rejected_clearly() {
         ("double _Complex csqrt(double _Complex); int main(void) { csqrt(1.0); return 0; }", "_Complex"),
         ("int main(void) { _Complex int ci; return 0; }", "complex integer"),
         ("typedef int bad __attribute__((mode(V4SI))); int main(void){return 0;}", "machine mode"),
-        (
-            "static inline int u(void) { __asm__(\"nop\"); return 0; } int main(void) { return u(); }",
-            "inline assembly",
-        ),
     ];
     for (src, needle) in cases {
         let errs = check_errors(src);
