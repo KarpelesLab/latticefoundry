@@ -64,6 +64,8 @@ mod win64_tests;
 mod vector_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod asm_tests;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod codesize_tests;
 
 pub use encode::{
     DebugSource, compile_function, compile_module, compile_module_debug, compile_module_debug_with,
