@@ -26,6 +26,17 @@
 //! Linux (the kernel switches to its own stack), so they add nothing; they are
 //! still reported ([`StackUsage::syscalls`]).
 //!
+//! When no bound exists, [`StackReport::analyze_from`] lists **every** reason
+//! ([`StackBlocker`]: each recursive group once, with its members; each
+//! indirect caller, `dyn_alloca` user and unknown callee), each with a
+//! shortest call path from the root, in a deterministic order (that of a
+//! depth-first walk, callees in call order; the first is what
+//! [`StackReport::worst_case_depth`] returns). Only the functions reachable
+//! from the root count, so obstacles in dead code are ignored;
+//! [`StackReport::reachable`], [`StackReport::reachable_from`] and
+//! [`StackReport::call_path`] expose that reachability (e.g. to print the
+//! table without dead functions, as `lf build --stack-usage` does).
+//!
 //! Not counted: the x86-64 System V red zone (LF never uses it), and anything
 //! the kernel pushes to deliver a signal on the same stack (a handler's frame is
 //! a separate root to analyze, plus the kernel's signal frame).
@@ -56,7 +67,7 @@
 //! larger; the main thread's guard gap is 1 MiB by default), so no probe
 //! sequence can skip the guard.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::codegen::mir::{MachineFunction, MachineOperand, Opcode};
@@ -305,32 +316,382 @@ impl StackReport {
     /// calls indirectly, uses `dyn_alloca`, or calls an undefined function
     /// without a corresponding [`StackAssumptions`] entry. When several such
     /// problems exist, the first one met in a depth-first walk (callees in call
-    /// order) is reported.
+    /// order) is reported: the first of [`StackAnalysis::blockers`] of
+    /// [`StackReport::analyze_from`], which lists them all with their paths.
     pub fn worst_case_depth(
         &self,
         root: &str,
         assume: &StackAssumptions,
     ) -> Result<StackBound, StackBoundError> {
-        if self.get(root).is_none() {
-            return Err(StackBoundError::UnknownRoot(root.to_owned()));
-        }
-        let index: BTreeMap<&str, &StackUsage> =
-            self.functions.iter().map(|u| (u.name.as_str(), u)).collect();
-        let mut memo: BTreeMap<String, Solved> = BTreeMap::new();
-        let mut active: Vec<String> = Vec::new();
-        let depth = solve(root, &index, assume, &mut memo, &mut active)?;
-
-        let mut path = vec![root.to_owned()];
-        let mut cur = root.to_owned();
-        while let Some(next) = memo.get(&cur).and_then(|s| s.next.clone()) {
-            path.push(next.clone());
-            if !index.contains_key(next.as_str()) {
-                break; // an external or indirect leaf
-            }
-            cur = next;
-        }
-        Ok(StackBound { bytes: depth, path })
+        self.analyze_from(root, assume).into_result()
     }
+
+    /// Analyze the stack depth of a call to `root`: either the worst-case
+    /// bound with its deepest path (as [`StackReport::worst_case_depth`]), or
+    /// **every** reason no bound exists, each with a shortest call path from
+    /// `root` ([`StackBlocker`]).
+    ///
+    /// Only the functions reachable from `root` through direct calls count, so
+    /// a recursion, indirect call, `dyn_alloca`, or unknown callee in dead code
+    /// does not block the bound. The reasons come in a deterministic order —
+    /// the order a depth-first walk from `root` (callees in call order) meets
+    /// them — and each strongly connected group of mutually recursive functions
+    /// is reported once.
+    pub fn analyze_from(&self, root: &str, assume: &StackAssumptions) -> StackAnalysis {
+        let index = self.index();
+        let Some((&root_key, _)) = index.get_key_value(root) else {
+            return StackAnalysis {
+                root: root.to_owned(),
+                reachable: Vec::new(),
+                result: Err(vec![StackBlocker {
+                    error: StackBoundError::UnknownRoot(root.to_owned()),
+                    path: Vec::new(),
+                    members: Vec::new(),
+                }]),
+            };
+        };
+        let (order, parent) = breadth_first(&index, root_key);
+        let reachable: Vec<String> = order.iter().map(|n| (*n).to_owned()).collect();
+        let path_to = |name: &str| -> Vec<String> {
+            let mut path = vec![name.to_owned()];
+            let mut cur = name;
+            while let Some(&p) = parent.get(cur) {
+                path.push(p.to_owned());
+                cur = p;
+            }
+            path.reverse();
+            path
+        };
+
+        // Strongly connected components, to report a recursive group once.
+        let mut scc = Scc::default();
+        strong_connect(root_key, &index, &mut scc);
+        let mut walk = Walk::default();
+        find_blockers(root_key, &index, assume, &scc, &mut walk);
+
+        if walk.found.is_empty() {
+            let mut memo: BTreeMap<String, Solved> = BTreeMap::new();
+            let result = match solve(root, &index, assume, &mut memo, &mut Vec::new()) {
+                Ok(depth) => Ok(StackBound { bytes: depth, path: deepest_path(root, &index, &memo) }),
+                // Unreachable: the walk above finds every problem `solve` can.
+                Err(error) => Err(vec![StackBlocker { error, path: Vec::new(), members: Vec::new() }]),
+            };
+            return StackAnalysis { root: root.to_owned(), reachable, result };
+        }
+
+        let position: BTreeMap<&str, usize> = order.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        let blockers = walk
+            .found
+            .into_iter()
+            .map(|error| {
+                let (path, members) = match &error {
+                    StackBoundError::Recursion { cycle } => {
+                        let comp = scc.comp[cycle[0].as_str()];
+                        let mut members: Vec<&str> =
+                            scc.comp.iter().filter(|&(_, &c)| c == comp).map(|(n, _)| *n).collect();
+                        members.sort_by_key(|n| position[n]);
+                        (path_to(&cycle[0]), members.into_iter().map(str::to_owned).collect())
+                    }
+                    StackBoundError::IndirectCall { function } | StackBoundError::DynamicAlloca { function } => {
+                        (path_to(function), Vec::new())
+                    }
+                    StackBoundError::UnknownCallee { caller, callee } => {
+                        let mut path = path_to(caller);
+                        path.push(callee.clone());
+                        (path, Vec::new())
+                    }
+                    StackBoundError::UnknownRoot(_) => (Vec::new(), Vec::new()),
+                };
+                StackBlocker { error, path, members }
+            })
+            .collect();
+        StackAnalysis { root: root.to_owned(), reachable, result: Err(blockers) }
+    }
+
+    /// The functions of the report reachable from `root` through direct calls
+    /// (`root` included), nearest first: breadth-first, callees in call order.
+    /// Empty when `root` is not in the report. Indirect calls are not followed
+    /// (their targets are unknown).
+    pub fn reachable(&self, root: &str) -> Vec<String> {
+        let index = self.index();
+        match index.get_key_value(root) {
+            Some((&root, _)) => breadth_first(&index, root).0.into_iter().map(str::to_owned).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// This report restricted to the functions reachable from `root` (see
+    /// [`StackReport::reachable`]), in definition order: e.g. to print the
+    /// table without dead functions.
+    pub fn reachable_from(&self, root: &str) -> StackReport {
+        let live: BTreeSet<String> = self.reachable(root).into_iter().collect();
+        StackReport { functions: self.functions.iter().filter(|u| live.contains(&u.name)).cloned().collect() }
+    }
+
+    /// A shortest call path from `root` to `target` (both included) through
+    /// direct calls, or `None` when `target` is not reachable from `root`. Of
+    /// several shortest paths, the one met first breadth-first (callees in
+    /// call order) is returned.
+    pub fn call_path(&self, root: &str, target: &str) -> Option<Vec<String>> {
+        let index = self.index();
+        let (&root, _) = index.get_key_value(root)?;
+        let (_, parent) = breadth_first(&index, root);
+        if target != root && !parent.contains_key(target) {
+            return None;
+        }
+        let mut path = vec![target.to_owned()];
+        let mut cur = target;
+        while let Some(&p) = parent.get(cur) {
+            path.push(p.to_owned());
+            cur = p;
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    /// The functions by name (a later duplicate replaces an earlier one).
+    fn index(&self) -> BTreeMap<&str, &StackUsage> {
+        self.functions.iter().map(|u| (u.name.as_str(), u)).collect()
+    }
+}
+
+/// The result of [`StackReport::analyze_from`]: the bound, or every reason
+/// there is none, plus what is reachable from the root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StackAnalysis {
+    /// The analyzed root function.
+    pub root: String,
+    /// The functions of the report reachable from the root through direct
+    /// calls, root first, nearest first (see [`StackReport::reachable`]).
+    pub reachable: Vec<String>,
+    /// The worst-case bound with one deepest path, or every reason no bound
+    /// exists (never empty), in a deterministic order.
+    pub result: Result<StackBound, Vec<StackBlocker>>,
+}
+
+impl StackAnalysis {
+    /// The proven bound, if there is one.
+    pub fn bound(&self) -> Option<&StackBound> {
+        self.result.as_ref().ok()
+    }
+
+    /// Every reason no bound exists (empty when there is a bound).
+    pub fn blockers(&self) -> &[StackBlocker] {
+        match &self.result {
+            Ok(_) => &[],
+            Err(blockers) => blockers,
+        }
+    }
+
+    /// Whether `name` is reachable from the root.
+    pub fn is_reachable(&self, name: &str) -> bool {
+        self.reachable.iter().any(|n| n == name)
+    }
+
+    /// The bound, or the first reason there is none (what
+    /// [`StackReport::worst_case_depth`] returns).
+    pub fn into_result(self) -> Result<StackBound, StackBoundError> {
+        self.result.map_err(|blockers| {
+            blockers.into_iter().next().map(|b| b.error).unwrap_or(StackBoundError::UnknownRoot(self.root))
+        })
+    }
+}
+
+impl fmt::Display for StackAnalysis {
+    /// One line with the bound and its deepest path, or a header line followed
+    /// by one indented line per reason:
+    ///
+    /// ```text
+    /// worst-case stack from 'main': no bound (1 reason):
+    ///   main -> main.main -> main.fib: 'main.fib' calls itself
+    /// ```
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let root = &self.root;
+        match &self.result {
+            Ok(bound) => {
+                write!(f, "worst-case stack from '{root}': {} bytes ({})", bound.bytes, bound.path.join(" -> "))
+            }
+            Err(blockers) => {
+                let n = blockers.len();
+                write!(f, "worst-case stack from '{root}': no bound ({n} reason{}):", if n == 1 { "" } else { "s" })?;
+                for b in blockers {
+                    write!(f, "\n  {b}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// One reason a stack bound does not exist, with how the root reaches it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StackBlocker {
+    /// What blocks the bound. A [`StackBoundError::Recursion`] cycle is the one
+    /// the depth-first walk closed first; [`StackBlocker::members`] has the
+    /// whole recursive group.
+    pub error: StackBoundError,
+    /// A shortest call path from the root, root first, to the function at
+    /// fault: the recursion's first cycle function, the indirect caller, the
+    /// `dyn_alloca` user, or (for an unknown callee) the caller followed by the
+    /// unknown callee. Empty for [`StackBoundError::UnknownRoot`].
+    pub path: Vec<String>,
+    /// For a recursion: every function of its strongly connected component
+    /// (the functions that can reach each other), nearest to the root first.
+    /// Empty otherwise.
+    pub members: Vec<String>,
+}
+
+impl fmt::Display for StackBlocker {
+    /// `path: reason`, e.g. `main -> main.main -> main.fib: 'main.fib' calls
+    /// itself` or `main -> f: recursion f -> g -> f`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.path.is_empty() {
+            write!(f, "{}: ", self.path.join(" -> "))?;
+        }
+        match &self.error {
+            StackBoundError::Recursion { cycle } if cycle.len() == 2 && self.members.len() <= 1 => {
+                write!(f, "'{}' calls itself", cycle[0])
+            }
+            StackBoundError::Recursion { cycle } => {
+                write!(f, "recursion {}", cycle.join(" -> "))?;
+                if self.members.len() + 1 > cycle.len() {
+                    write!(f, " (recursive group: {})", self.members.join(", "))?;
+                }
+                Ok(())
+            }
+            other => write!(f, "{other}"),
+        }
+    }
+}
+
+/// The functions reachable from `root`, breadth-first (callees in call order),
+/// and each one's predecessor on the first shortest path found.
+fn breadth_first<'a>(
+    index: &BTreeMap<&'a str, &'a StackUsage>,
+    root: &'a str,
+) -> (Vec<&'a str>, BTreeMap<&'a str, &'a str>) {
+    let mut order = vec![root];
+    let mut parent: BTreeMap<&'a str, &'a str> = BTreeMap::new();
+    let mut i = 0;
+    while let Some(&cur) = order.get(i) {
+        i += 1;
+        for callee in &index[cur].direct_callees {
+            let Some((&callee, _)) = index.get_key_value(callee.as_str()) else { continue };
+            if callee != root && !parent.contains_key(callee) {
+                parent.insert(callee, cur);
+                order.push(callee);
+            }
+        }
+    }
+    (order, parent)
+}
+
+/// Tarjan's strongly-connected-components state.
+#[derive(Default)]
+struct Scc<'a> {
+    counter: usize,
+    num: BTreeMap<&'a str, usize>,
+    low: BTreeMap<&'a str, usize>,
+    stack: Vec<&'a str>,
+    on_stack: BTreeSet<&'a str>,
+    /// Each visited function's component number.
+    comp: BTreeMap<&'a str, usize>,
+    comps: usize,
+}
+
+fn strong_connect<'a>(v: &'a str, index: &BTreeMap<&'a str, &'a StackUsage>, s: &mut Scc<'a>) {
+    let n = s.counter;
+    s.counter += 1;
+    s.num.insert(v, n);
+    s.low.insert(v, n);
+    s.stack.push(v);
+    s.on_stack.insert(v);
+    for callee in &index[v].direct_callees {
+        let Some((&w, _)) = index.get_key_value(callee.as_str()) else { continue };
+        if !s.num.contains_key(w) {
+            strong_connect(w, index, s);
+            let low = s.low[v].min(s.low[w]);
+            s.low.insert(v, low);
+        } else if s.on_stack.contains(w) {
+            let low = s.low[v].min(s.num[w]);
+            s.low.insert(v, low);
+        }
+    }
+    if s.low[v] == s.num[v] {
+        while let Some(w) = s.stack.pop() {
+            s.on_stack.remove(w);
+            s.comp.insert(w, s.comps);
+            if w == v {
+                break;
+            }
+        }
+        s.comps += 1;
+    }
+}
+
+/// The depth-first walk collecting every blocker.
+#[derive(Default)]
+struct Walk<'a> {
+    visited: BTreeSet<&'a str>,
+    active: Vec<&'a str>,
+    reported_comps: BTreeSet<usize>,
+    found: Vec<StackBoundError>,
+}
+
+/// Walk from `name` exactly as [`solve`] does, but record every problem
+/// instead of stopping at the first (so the first recorded is `solve`'s).
+fn find_blockers<'a>(
+    name: &'a str,
+    index: &BTreeMap<&'a str, &'a StackUsage>,
+    assume: &StackAssumptions,
+    scc: &Scc<'a>,
+    w: &mut Walk<'a>,
+) {
+    w.visited.insert(name);
+    w.active.push(name);
+    let u = index[name];
+    if u.dynamic_alloca && !assume.dynamic.contains_key(name) {
+        w.found.push(StackBoundError::DynamicAlloca { function: name.to_owned() });
+    }
+    if u.indirect_calls && !assume.indirect.contains_key(name) {
+        w.found.push(StackBoundError::IndirectCall { function: name.to_owned() });
+    }
+    for callee in &u.direct_callees {
+        match index.get_key_value(callee.as_str()) {
+            Some((&callee, _)) => {
+                if let Some(pos) = w.active.iter().position(|a| *a == callee) {
+                    if w.reported_comps.insert(scc.comp[callee]) {
+                        let mut cycle: Vec<String> = w.active[pos..].iter().map(|a| (*a).to_owned()).collect();
+                        cycle.push(callee.to_owned());
+                        w.found.push(StackBoundError::Recursion { cycle });
+                    }
+                } else if !w.visited.contains(callee) {
+                    find_blockers(callee, index, assume, scc, w);
+                }
+            }
+            None if !assume.external.contains_key(callee) => {
+                w.found.push(StackBoundError::UnknownCallee { caller: name.to_owned(), callee: callee.clone() });
+            }
+            None => {}
+        }
+    }
+    w.active.pop();
+}
+
+/// The deepest path from `root` that [`solve`] chose, root first.
+fn deepest_path(root: &str, index: &BTreeMap<&str, &StackUsage>, memo: &BTreeMap<String, Solved>) -> Vec<String> {
+    let mut path = vec![root.to_owned()];
+    let mut cur = root.to_owned();
+    while let Some(next) = memo.get(&cur).and_then(|s| s.next.clone()) {
+        path.push(next.clone());
+        if !index.contains_key(next.as_str()) {
+            break; // an external or indirect leaf
+        }
+        cur = next;
+    }
+    path
 }
 
 fn solve(
@@ -513,5 +874,197 @@ mod tests {
         let t = r.to_string();
         assert!(t.contains("main") && t.contains("sys") && t.contains("<syscall>"), "{t}");
         assert_eq!(r.get("sys").unwrap().frame_size, 16);
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Lode's recursive program from issue #6, plus a dead library function.
+    fn fib_report() -> StackReport {
+        report(vec![
+            usage("main", 16, &["main.main"]),
+            usage("main.fib", 32, &["main.fib"]),
+            usage("main.main", 80, &["main.fib"]),
+            usage("std/io.eprint", 48, &["write"]),
+        ])
+    }
+
+    #[test]
+    fn the_issue_example_names_the_path_to_the_recursion() {
+        let r = fib_report();
+        let a = r.analyze_from("main", &StackAssumptions::new());
+        assert_eq!(a.reachable, ["main", "main.main", "main.fib"]);
+        assert!(!a.is_reachable("std/io.eprint"));
+        assert_eq!(
+            a.blockers(),
+            [StackBlocker {
+                error: StackBoundError::Recursion { cycle: names(&["main.fib", "main.fib"]) },
+                path: names(&["main", "main.main", "main.fib"]),
+                members: names(&["main.fib"]),
+            }]
+        );
+        assert_eq!(
+            a.to_string(),
+            "worst-case stack from 'main': no bound (1 reason):\n  \
+             main -> main.main -> main.fib: 'main.fib' calls itself"
+        );
+        // The old API still reports the cycle.
+        assert_eq!(
+            r.worst_case_depth("main", &StackAssumptions::new()),
+            Err(StackBoundError::Recursion { cycle: names(&["main.fib", "main.fib"]) })
+        );
+        // The table restricted to the root drops the dead function.
+        let t = r.reachable_from("main").to_string();
+        assert!(t.contains("main.fib") && !t.contains("std/io.eprint"), "{t}");
+        assert!(r.to_string().contains("std/io.eprint"));
+    }
+
+    #[test]
+    fn every_blocker_is_reported_with_its_path() {
+        let mut ind = usage("ind", 16, &[]);
+        ind.indirect_calls = true;
+        let mut dy = usage("dy", 16, &[]);
+        dy.dynamic_alloca = true;
+        let r = report(vec![
+            usage("main", 16, &["a", "r1", "ind", "dy", "ext"]),
+            usage("a", 16, &["r2"]),
+            usage("r1", 16, &["r1"]),
+            usage("r2", 16, &["r3"]),
+            usage("r3", 16, &["r2"]),
+            ind,
+            dy,
+        ]);
+        let a = r.analyze_from("main", &StackAssumptions::new());
+        assert!(a.bound().is_none());
+        let b = a.blockers();
+        assert_eq!(b.len(), 5, "{a}");
+        assert_eq!(b[0].error, StackBoundError::Recursion { cycle: names(&["r2", "r3", "r2"]) });
+        assert_eq!(b[0].path, ["main", "a", "r2"]);
+        assert_eq!(b[0].members, ["r2", "r3"]);
+        assert_eq!(b[1].error, StackBoundError::Recursion { cycle: names(&["r1", "r1"]) });
+        assert_eq!(b[1].path, ["main", "r1"]);
+        assert_eq!(b[2].error, StackBoundError::IndirectCall { function: "ind".into() });
+        assert_eq!(b[2].path, ["main", "ind"]);
+        assert_eq!(b[3].error, StackBoundError::DynamicAlloca { function: "dy".into() });
+        assert_eq!(b[3].path, ["main", "dy"]);
+        assert_eq!(b[4].error, StackBoundError::UnknownCallee { caller: "main".into(), callee: "ext".into() });
+        assert_eq!(b[4].path, ["main", "ext"]);
+        let lines: Vec<String> = b.iter().map(|b| b.to_string()).collect();
+        assert_eq!(
+            lines,
+            [
+                "main -> a -> r2: recursion r2 -> r3 -> r2",
+                "main -> r1: 'r1' calls itself",
+                "main -> ind: 'ind' makes an indirect call with no assumed bound",
+                "main -> dy: 'dy' uses dyn_alloca with no assumed bound",
+                "main -> ext: 'main' calls 'ext', whose stack usage is unknown",
+            ]
+        );
+        assert!(a.to_string().starts_with("worst-case stack from 'main': no bound (5 reasons):\n  main -> a"));
+        // The old API returns the first of them.
+        assert_eq!(r.worst_case_depth("main", &StackAssumptions::new()), Err(b[0].error.clone()));
+        // Assumptions remove the blockers they bound; recursion stays.
+        let assume = StackAssumptions::new().indirect("ind", 64).dynamic("dy", 64).external("ext", 64);
+        let a = r.analyze_from("main", &assume);
+        assert_eq!(a.blockers().len(), 2, "{a}");
+    }
+
+    #[test]
+    fn blockers_in_dead_code_are_ignored() {
+        let mut ind = usage("dead_ind", 16, &[]);
+        ind.indirect_calls = true;
+        let mut dy = usage("dead_dy", 16, &[]);
+        dy.dynamic_alloca = true;
+        let r = report(vec![
+            usage("dead_rec", 16, &["dead_rec", "main"]),
+            usage("main", 32, &["leaf"]),
+            ind,
+            usage("leaf", 48, &[]),
+            dy,
+            usage("dead_ext", 16, &["ext", "dead_ind", "dead_dy"]),
+        ]);
+        let a = r.analyze_from("main", &StackAssumptions::new());
+        assert_eq!(a.bound(), Some(&StackBound { bytes: 80, path: names(&["main", "leaf"]) }));
+        assert!(a.blockers().is_empty());
+        assert_eq!(a.to_string(), "worst-case stack from 'main': 80 bytes (main -> leaf)");
+        assert_eq!(r.reachable("main"), ["main", "leaf"]);
+        let live = r.reachable_from("main");
+        assert_eq!(live.functions().iter().map(|u| u.name.as_str()).collect::<Vec<_>>(), ["main", "leaf"]);
+        // From another root, the same functions block.
+        assert_eq!(r.analyze_from("dead_ext", &StackAssumptions::new()).blockers().len(), 3);
+        assert_eq!(r.reachable("dead_rec"), ["dead_rec", "main", "leaf"]);
+        assert!(r.reachable("nope").is_empty());
+        assert_eq!(r.call_path("dead_rec", "leaf"), Some(names(&["dead_rec", "main", "leaf"])));
+        assert_eq!(r.call_path("main", "main"), Some(names(&["main"])));
+        assert_eq!(r.call_path("main", "dead_rec"), None);
+    }
+
+    #[test]
+    fn mutual_recursion_is_one_cycle_with_its_members() {
+        let r = report(vec![
+            usage("main", 16, &["f", "g"]),
+            usage("f", 16, &["g"]),
+            usage("g", 16, &["f", "h"]),
+            usage("h", 16, &["g", "f"]),
+        ]);
+        let a = r.analyze_from("main", &StackAssumptions::new());
+        let b = a.blockers();
+        assert_eq!(b.len(), 1, "{a}");
+        assert_eq!(b[0].error, StackBoundError::Recursion { cycle: names(&["f", "g", "f"]) });
+        assert_eq!(b[0].path, ["main", "f"]);
+        assert_eq!(b[0].members, ["f", "g", "h"]);
+        assert_eq!(b[0].to_string(), "main -> f: recursion f -> g -> f (recursive group: f, g, h)");
+        // A two-function cycle needs no group.
+        let r = report(vec![usage("main", 16, &["f"]), usage("f", 16, &["g"]), usage("g", 16, &["f"])]);
+        let a = r.analyze_from("main", &StackAssumptions::new());
+        assert_eq!(a.blockers().len(), 1);
+        assert_eq!(a.blockers()[0].members, ["f", "g"]);
+        assert_eq!(a.blockers()[0].to_string(), "main -> f: recursion f -> g -> f");
+    }
+
+    #[test]
+    fn blockers_come_in_a_deterministic_order() {
+        let build = |order: &[&str]| {
+            let mut us = vec![usage("main", 16, order)];
+            for n in ["x", "y", "z"] {
+                let mut u = usage(n, 16, &[]);
+                u.dynamic_alloca = true;
+                us.push(u);
+            }
+            report(us)
+        };
+        let functions = |r: &StackReport| -> Vec<String> {
+            r.analyze_from("main", &StackAssumptions::new())
+                .blockers()
+                .iter()
+                .map(|b| b.path.last().unwrap().clone())
+                .collect()
+        };
+        let r = build(&["y", "z", "x"]);
+        assert_eq!(functions(&r), ["y", "z", "x"]);
+        assert_eq!(r.analyze_from("main", &StackAssumptions::new()), r.analyze_from("main", &StackAssumptions::new()));
+        assert_eq!(functions(&build(&["x", "y", "z"])), ["x", "y", "z"]);
+    }
+
+    #[test]
+    fn the_old_api_matches_the_analysis() {
+        let r = report(vec![
+            usage("main", 32, &["a", "b"]),
+            usage("a", 100, &["leaf"]),
+            usage("b", 16, &["leaf"]),
+            usage("leaf", 48, &[]),
+        ]);
+        let none = StackAssumptions::new();
+        let a = r.analyze_from("main", &none);
+        assert_eq!(a.bound(), r.worst_case_depth("main", &none).ok().as_ref());
+        assert_eq!(a.clone().into_result(), r.worst_case_depth("main", &none));
+        let unknown = r.analyze_from("nope", &none);
+        assert!(unknown.reachable.is_empty());
+        assert_eq!(
+            unknown.to_string(),
+            "worst-case stack from 'nope': no bound (1 reason):\n  no function 'nope' in the stack report"
+        );
+        assert_eq!(unknown.into_result(), Err(StackBoundError::UnknownRoot("nope".into())));
     }
 }

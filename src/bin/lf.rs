@@ -89,14 +89,17 @@ fn print_usage() {
     println!(
         "  lf build <inputs...> [-o <out>] [-O0|-O1|-O2|-O3] [--entry <name>] [-g] [--lto] [--no-verify]"
     );
-    println!("           [--stack-usage] [--no-stack-probes] [--target <triple>] [-c [--format <fmt>]]");
+    println!("           [--stack-usage[=all]] [--no-stack-probes] [--target <triple>] [-c [--format <fmt>]]");
     println!("           [--oformat elf|binary|ihex] [--base <addr>]");
     println!("           [--shared [-soname <name>] | --pie | -c [--pic|--pie]] [-L<dir>] [-l<lib>]");
     println!("  lf --version | --help\n");
     println!("  -O0..-O3       optimization level (default: -O0)");
     println!("  -g / --debug   emit DWARF debug info (source lines, symbols)");
     println!("  --lto          link-time optimize across inputs (implied by 2+ inputs)");
-    println!("  --stack-usage  print each function's stack frame and the worst-case depth");
+    println!("  --stack-usage  print the frame of each function reachable from the entry and the");
+    println!("                 worst-case stack depth, or every reason there is no bound (recursion,");
+    println!("                 indirect call, dyn_alloca, unknown callee) with its call path;");
+    println!("                 --stack-usage=all lists the unreachable functions too");
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
     println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
     println!("                 aarch64-linux, aarch64-windows, aarch64-apple-darwin, riscv64-linux,");
@@ -131,6 +134,8 @@ struct BuildOptions {
     opt: OptLevel,
     lto: bool,
     stack_usage: bool,
+    /// `--stack-usage=all`: list the unreachable functions too.
+    stack_usage_all: bool,
     stack_probes: bool,
     target: Triple,
     /// The AVR device named by `--target` (for an AVR target).
@@ -281,7 +286,7 @@ fn build(args: &[String]) -> Result<(), String> {
                 report.extend(member.stack);
             }
         }
-        print_stack_usage(&report, &entry);
+        print_stack_usage(&report, &entry, opts.stack_usage_all);
     }
     let obj = compiled.object;
     let stem = default_output(&opts.inputs[0]);
@@ -357,7 +362,7 @@ fn build_wasm(opts: &BuildOptions, module: &Module, syms: &StrInterner, cg: &Cod
     }
     let mut compiled = target::wasm32::compile(module, syms, cg).map_err(|e| e.to_string())?;
     if opts.stack_usage {
-        print_stack_usage(&compiled.stack, opts.entry.as_deref().unwrap_or("main"));
+        print_stack_usage(&compiled.stack, opts.entry.as_deref().unwrap_or("main"), opts.stack_usage_all);
     }
     let stem = default_output(&opts.inputs[0]);
     let (bytes, ext) = if opts.output_kind == OutputKind::Object {
@@ -497,17 +502,23 @@ fn link_pe(obj: &ObjectModule, triple: Triple, entry: &str, output: &str, base: 
 }
 
 /// Print the `--stack-usage` table and the worst-case stack depth from `entry`
-/// (counted from `_start`'s stack pointer just before it calls `entry`).
-fn print_stack_usage(report: &StackReport, entry: &str) {
-    print!("{report}");
-    match report.worst_case_depth(entry, &StackAssumptions::new()) {
-        Ok(bound) => println!(
-            "worst-case stack from '{entry}': {} bytes ({})",
-            bound.bytes,
-            bound.path.join(" -> ")
-        ),
-        Err(why) => println!("worst-case stack from '{entry}': unbounded: {why}"),
+/// (counted from `_start`'s stack pointer just before it calls `entry`). The
+/// table lists the functions reachable from `entry` (all of them with
+/// `--stack-usage=all`, or when `entry` is not in the report); with no bound,
+/// every reason follows, each with a shortest call path from `entry`.
+fn print_stack_usage(report: &StackReport, entry: &str, all: bool) {
+    let analysis = report.analyze_from(entry, &StackAssumptions::new());
+    if all || analysis.reachable.is_empty() {
+        print!("{report}");
+    } else {
+        let live = report.reachable_from(entry);
+        print!("{live}");
+        let hidden = report.functions().len() - live.functions().len();
+        if hidden > 0 {
+            println!("({hidden} function(s) not reachable from '{entry}' not shown; --stack-usage=all lists them)");
+        }
     }
+    println!("{analysis}");
 }
 
 /// Verify `module`, rendering any error diagnostics and returning a driver error
@@ -532,6 +543,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
     let mut opt = OptLevel::O0;
     let mut lto = false;
     let mut stack_usage = false;
+    let mut stack_usage_all = false;
     let mut stack_probes = true;
     let mut target = Triple::default_target();
     let mut device = None;
@@ -554,6 +566,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
             "-g" | "--debug" => debug = true,
             "--lto" => lto = true,
             "--stack-usage" => stack_usage = true,
+            "--stack-usage=all" => (stack_usage, stack_usage_all) = (true, true),
             "--no-stack-probes" => stack_probes = false,
             "--target" => {
                 let t = it.next().ok_or("--target requires a triple")?;
@@ -663,6 +676,7 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         opt,
         lto,
         stack_usage,
+        stack_usage_all,
         stack_probes,
         target,
         device,

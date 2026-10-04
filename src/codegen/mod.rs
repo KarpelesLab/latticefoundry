@@ -55,7 +55,9 @@ pub mod vtarget;
 
 pub use mir::MachineFunction;
 pub use options::{CodegenOptions, CompiledModule, RelocModel};
-pub use stack::{StackAssumptions, StackBound, StackBoundError, StackReport, StackUsage};
+pub use stack::{
+    StackAnalysis, StackAssumptions, StackBlocker, StackBound, StackBoundError, StackReport, StackUsage,
+};
 pub use target::MachineTarget;
 pub use vtarget::VirtualTarget;
 

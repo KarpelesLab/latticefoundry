@@ -621,7 +621,10 @@ programs.
 x86-64 execution-tested, freestanding) ✅, per-function stack usage
 (`codegen::stack`: exact static frame sizes read off each target's frame
 layout, callees / indirect calls / syscalls / `dyn_alloca`, and
-`StackReport::worst_case_depth` over the call graph with caller-supplied bounds;
+`StackReport::worst_case_depth` over the call graph with caller-supplied bounds,
+`StackReport::analyze_from` listing every obstacle (recursive groups, indirect
+calls, `dyn_alloca`, unknown callees) with its call path from the root and
+ignoring dead code, reachability queries;
 `compile_module_with` on all three targets, `lf build --stack-usage`) ✅, stack
 probes (`CodegenOptions::stack_probes`, default on: frames and every
 `dyn_alloca` move `sp` one 4 KiB page at a time and touch each step, so an
