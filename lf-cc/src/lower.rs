@@ -644,6 +644,26 @@ impl FnLower<'_> {
         }
     }
 
+    /// The alignment an access to lvalue `e` may declare: its type's, lowered
+    /// for a member of a packed (or otherwise under-aligned) record to what
+    /// the member's offset guarantees, so the IR never promises an alignment
+    /// the address lacks.
+    fn lvalue_align(&self, e: &TExpr) -> u32 {
+        let at = self.addr_align(e);
+        align_of(&e.ty).min(u32::try_from(at).unwrap_or(u32::MAX))
+    }
+
+    /// The alignment lvalue `e`'s address is known to have.
+    fn addr_align(&self, e: &TExpr) -> u64 {
+        match &e.kind {
+            TExprKind::Field { base, offset } => {
+                let base_align = self.addr_align(base);
+                if *offset == 0 { base_align } else { base_align.min(1 << offset.trailing_zeros().min(63)) }
+            }
+            _ => layout::align_of(self.records, &e.ty).max(1),
+        }
+    }
+
     /// The flags of integer `op` on C type `ty`: `nsw` on a signed `+ - *`
     /// of at least `int`'s rank when signed overflow is checked (narrower
     /// types are promoted first, so their arithmetic cannot overflow), and on
@@ -707,7 +727,7 @@ impl FnLower<'_> {
                 let slot = self.slots[*id];
                 // Initialization is not an atomic access, but it is a volatile one.
                 let quals = Quals { atomic: false, ..self.locals[*id].quals };
-                self.store_access(&ty, slot, val, quals);
+                self.store_access(&ty, slot, val, quals, align_of(&ty));
             }
             TStmt::CopyInit { obj, src, size } => {
                 self.set_line(src.span);
@@ -1186,7 +1206,8 @@ impl FnLower<'_> {
             | TExprKind::Field { .. }
             | TExprKind::CompoundLiteral { .. } => {
                 let addr = self.lower_lvalue(e);
-                self.load_access(&e.ty, addr, e.quals)
+                let align = self.lvalue_align(e);
+                self.load_access(&e.ty, addr, e.quals, align)
             }
             TExprKind::BitField { base, offset, bits } => {
                 let addr = self.bitfield_unit_addr(base, *offset);
@@ -1320,7 +1341,8 @@ impl FnLower<'_> {
                 } else {
                     let addr = self.lower_lvalue(lval);
                     let v = self.lower_rvalue(rval);
-                    self.store_access(&lval.ty, addr, v, lval.quals);
+                    let align = self.lvalue_align(lval);
+                    self.store_access(&lval.ty, addr, v, lval.quals, align);
                     v
                 }
             }
@@ -1669,10 +1691,11 @@ impl FnLower<'_> {
         if lvalue.quals.atomic {
             return self.lower_atomic_compound(&lvalue.ty, addr, rhs, op, compute_ty);
         }
-        let old = self.load_access(&lvalue.ty, addr, lvalue.quals);
+        let align = self.lvalue_align(lvalue);
+        let old = self.load_access(&lvalue.ty, addr, lvalue.quals, align);
         let rv0 = self.lower_rvalue(rhs);
         let new = self.compound_value(old, rv0, &lvalue.ty, &rhs.ty, op, compute_ty);
-        self.store_access(&lvalue.ty, addr, new, lvalue.quals);
+        self.store_access(&lvalue.ty, addr, new, lvalue.quals, align);
         // The value of a compound assignment is the new value in the lvalue type.
         let _ = result_ty;
         new
@@ -1848,12 +1871,11 @@ impl FnLower<'_> {
     /// Load a C `ty` value from `addr` through an lvalue qualified by `quals`:
     /// a `seq_cst` atomic load for `_Atomic`, a volatile load for `volatile`,
     /// else a plain load.
-    fn load_access(&mut self, ty: &CType, addr: ValueId, quals: Quals) -> ValueId {
+    fn load_access(&mut self, ty: &CType, addr: ValueId, quals: Quals, align: u32) -> ValueId {
         if quals.atomic {
             return self.atomic_load_c(ty, addr, AtomicOrdering::SeqCst);
         }
         let ity = self.ir_of(ty);
-        let align = align_of(ty);
         // The IR has no volatile vector access (it could be split into lanes):
         // a vector is accessed as a whole, which a volatile one is anyway.
         if quals.volatile && !ty.is_vector() {
@@ -1865,12 +1887,11 @@ impl FnLower<'_> {
 
     /// Store the C `ty` value `v` to `addr` through an lvalue qualified by
     /// `quals` (see [`Self::load_access`]).
-    fn store_access(&mut self, ty: &CType, addr: ValueId, v: ValueId, quals: Quals) {
+    fn store_access(&mut self, ty: &CType, addr: ValueId, v: ValueId, quals: Quals, align: u32) {
         if quals.atomic {
             return self.atomic_store_c(ty, addr, v, AtomicOrdering::SeqCst);
         }
         let ity = self.ir_of(ty);
-        let align = align_of(ty);
         if quals.volatile && !ty.is_vector() {
             self.b.store_volatile(ity, addr, v, align);
         } else {
@@ -1899,9 +1920,10 @@ impl FnLower<'_> {
         if target.quals.atomic {
             return self.lower_atomic_incdec(&target.ty, addr, inc, post, scale);
         }
-        let old = self.load_access(&target.ty, addr, target.quals);
+        let align = self.lvalue_align(target);
+        let old = self.load_access(&target.ty, addr, target.quals, align);
         let new = self.step_value(old, &target.ty, inc, scale);
-        self.store_access(&target.ty, addr, new, target.quals);
+        self.store_access(&target.ty, addr, new, target.quals, align);
         if post { old } else { new }
     }
 

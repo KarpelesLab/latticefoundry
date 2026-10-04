@@ -8,6 +8,8 @@
 //! only the lf-cc half runs. (`-fsanitize=unreachable` has nothing to check in
 //! lf-cc's C: it lowers `__builtin_unreachable()` to no code at all.)
 
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use std::collections::BTreeSet;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -340,4 +342,74 @@ fn signed_arithmetic_carries_nsw_only_when_checked() {
     let checked = emit(&["-fsanitize=signed-integer-overflow"]);
     assert!(checked.contains("add nsw"), "{checked}");
     assert!(!checked.contains("mul nsw"), "unsigned arithmetic stays unflagged:\n{checked}");
+}
+
+/// A benchmark-ish program: an LCG-filled array sorted by quicksort, a matrix
+/// product and a byte histogram, folded into one checksum.
+const BENCH: &str = r#"
+#define N 60000
+#define M 48
+static int data[N];
+static long a[M][M], b[M][M], c[M][M];
+static unsigned char bytes[N];
+static int hist[256];
+
+static void sort(int *v, int lo, int hi) {
+    while (lo < hi) {
+        int p = v[(lo + hi) / 2], i = lo, j = hi;
+        while (i <= j) {
+            while (v[i] < p) i++;
+            while (v[j] > p) j--;
+            if (i <= j) { int t = v[i]; v[i] = v[j]; v[j] = t; i++; j--; }
+        }
+        if (j - lo < hi - i) { sort(v, lo, j); lo = i; } else { sort(v, i, hi); hi = j; }
+    }
+}
+
+int main(void) {
+    unsigned s = 12345;
+    for (int i = 0; i < N; i++) {
+        s = s * 1103515245u + 12345u;
+        data[i] = (int)(s >> 1) % 1000000 - 500000;
+        bytes[i] = (unsigned char)(s >> 16);
+    }
+    sort(data, 0, N - 1);
+    for (int i = 1; i < N; i++) if (data[i - 1] > data[i]) return 1;
+    for (int i = 0; i < M; i++)
+        for (int j = 0; j < M; j++) { a[i][j] = i * 3 - j; b[i][j] = (i ^ j) % 17 - 8; }
+    for (int i = 0; i < M; i++)
+        for (int j = 0; j < M; j++) {
+            long t = 0;
+            for (int k = 0; k < M; k++) t += a[i][k] * b[k][j];
+            c[i][j] = t;
+        }
+    for (int i = 0; i < N; i++) hist[bytes[i]]++;
+    long sum = data[N / 3] + data[N / 2];
+    for (int i = 0; i < M; i++) sum += c[i][(i * 7) % M];
+    for (int i = 0; i < 256; i++) sum += hist[i] * (i % 5);
+    return (int)(((sum % 251) + 251) % 251);
+}
+"#;
+
+#[test]
+fn a_checked_benchmark_computes_the_same_result() {
+    let dir = Scratch::new("bench");
+    let src = dir.path("bench.c");
+    std::fs::write(&src, BENCH).unwrap();
+    let mut results = Vec::new();
+    for flags in [&["-O2"][..], &["-O0", "-fsanitize=undefined"], &["-O2", "-fsanitize=undefined"], &["-O2", "-fsanitize=undefined", "-fsanitize-trap"]] {
+        let exe = dir.path("bench");
+        compile(LF_CC, &src, &exe, flags).unwrap();
+        let start = std::time::Instant::now();
+        let out = run(&exe);
+        let took = start.elapsed();
+        assert!(out.stderr.is_empty(), "{flags:?}: {}", String::from_utf8_lossy(&out.stderr));
+        eprintln!("bench {flags:?}: exit {:?} in {took:?}", out.status.code());
+        results.push(out.status.code());
+    }
+    assert!(results.iter().all(|r| *r == results[0] && r.is_some_and(|c| c != 1)), "{results:?}");
+    let exe = dir.path("bench-gcc");
+    if compile("gcc", &src, &exe, &["-O2"]).is_ok() {
+        assert_eq!(run(&exe).status.code(), results[0], "gcc agrees");
+    }
 }
