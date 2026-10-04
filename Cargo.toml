@@ -34,6 +34,11 @@ rsasm = { version = "0.1.3", default-features = false, features = ["x86", "aarch
 # No `plugin` feature: that is qld's only FFI (dlopen of a GCC/LLVM LTO plugin).
 qld = { version = "0.1.0", default-features = false }
 
+# Tests only: rsasm's Thumb backend re-assembles the Thumb disassembler's
+# output (the encode∘decode round trip). Not part of the library build.
+[dev-dependencies]
+rsasm = { version = "0.1.3", default-features = false, features = ["x86", "aarch64", "riscv", "arm"] }
+
 [lints.rust]
 unsafe_code = "warn"
 unreachable_pub = "warn"
