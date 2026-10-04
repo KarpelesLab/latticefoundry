@@ -195,10 +195,11 @@ Coverage includes GNU attributes in every position, statement expressions,
 computed goto, case ranges, `__builtin_*`, and the System V struct ABI, so
 objects mix with gcc-compiled code. Also covered: `volatile`, C11 atomics
 (`_Atomic`, `<stdatomic.h>`, `__atomic_*`/`__sync_*`), GCC vector types,
-symbol visibility and weak symbols, and `-fPIC`/`-shared`/`-pie` output.
-Known gaps: `long double` is `double`, and there is no TLS or
-`__int128`/`_Float128` arithmetic. The next goal is a bootstrap-capable
-compiler.
+thread-local storage (`__thread`/`_Thread_local`/`thread_local`),
+`__int128` arithmetic with gcc's ABI and layout, symbol visibility and
+weak symbols, and `-fPIC`/`-shared`/`-pie` output.
+Known gaps: `long double` is `double`, and there is no `_Float128` or
+`_Complex` arithmetic. The next goal is a bootstrap-capable compiler.
 
 Build and test `lf-cc` from inside its own directory (`cd lf-cc && cargo test`).
 The root `cargo build` does not touch it.

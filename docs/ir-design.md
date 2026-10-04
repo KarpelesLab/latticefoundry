@@ -208,7 +208,7 @@ Integers wider than 128 bits have no register convention and are rejected at
 the boundary, as are wide atomics and wide values under the Microsoft x64
 convention. (The LP64 layout keeps aligning `i128` to 8 bytes; a front end
 matching gcc's 16-byte `__int128` alignment declares `i128:128` in its
-`datalayout`.)
+`datalayout`, as lf-cc does.)
 
 **The ABI boundary stays wide.** The pass keeps function signatures: a wide
 entry parameter, call argument or result, return value, and the operands and

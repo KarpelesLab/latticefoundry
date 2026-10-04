@@ -692,11 +692,26 @@ atomics (a two-thread program loses no update). GCC vector types lower to IR
 `<N x T>` vectors and cross calls in XMM registers like gcc's. C99 plain
 `inline` definitions no longer emit an external symbol.
 
+Thread-local storage works in all three spellings (`__thread`,
+`_Thread_local`, C23 `thread_local`). Such objects become IR `thread_local`
+globals (ir-design §4c) in `.tdata`/`.tbss`. Executables and PIEs reach them
+with local-exec or initial-exec code, and shared libraries with
+general-dynamic code. The C constraints are enforced: block scope requires
+`static`/`extern`, and no static initializer may take a thread-local's
+address. `__int128` and `unsigned __int128` compute as IR `i128`
+(ir-design §3b), with gcc's register-pair ABI in both directions. The
+module datalayout declares `i128:128`, so structs and stack slots match
+gcc's 16-byte alignment. Division and float conversions call libgcc, which
+`-shared` links too. Integer constant expressions now fold with their C
+types (promotions, usual conversions, unsigned semantics, exact to 128
+bits).
+
 Each package exposed a handful of real gaps: K&R functions, implicit int,
 GNU keyword aliases, wide literals and `alloca`, plus a few miscompiles. All of
 them were fixed at the source, and every fix also counts toward M9.
 
-Remaining C niche items: `_BitInt` wider than 64 bits, a true 80-bit
+Remaining C niche items: `_BitInt` wider than 64 bits (and `__int128`
+bit-fields), a true 80-bit
 `long double`, `_Complex`, VLAs, flexible array members, and gcc object-ABI
 compatibility for struct-by-value. Whole-program struct-by-value is already
 correct; the gap is only in mixing `lf-cc` objects with gcc-compiled ones.
@@ -706,18 +721,18 @@ correct; the gap is only in mixing `lf-cc` objects with gcc-compiled ones.
 *Status (2026-09-29):* **reached.** `/usr/include` is searched by default, and
 the ~120 glibc headers tested (the 28 core ones plus ~95 more) all compile.
 gzip, bzip2, Lua and SQLite build against them with output byte-identical
-to gcc's. Remaining, each with a clear error today unless noted:
-- `__thread`/TLS (the root backend has x86-64 thread-locals, ir-design §4c;
-  lf-cc does not emit them yet);
-- `__int128`/`_Float128`/`_Complex` *values* (declarations work; the root
-  x86-64 backend now compiles `i128` with gcc's `__int128` ABI, ir-design
-  §3b, so `__int128` needs only the lf-cc hookup);
+to gcc's. `__thread`/`_Thread_local` and `__int128` values are done (see
+above). Remaining, each with a clear error today unless noted:
+- `_Float128`/`_Complex` *values* (declarations work);
+- the address of a block-scope `static` object in another `static`
+  object's initializer (`static int y; static int *p = &y;`);
 - a true 80-bit `long double`;
 - `__label__`, `__auto_type` and range designators (so gcc's own
   `<stdatomic.h>`, which uses `__auto_type`, compiles only through lf-cc's
   builtin one);
 - `tgmath.h`;
-- `_Atomic` structs and unions, and 16-byte atomics;
+- `_Atomic` structs and unions, and 16-byte atomics (including `_Atomic
+  __int128`);
 - `__builtin_shuffle` with a non-constant mask;
 - SSE classification for float-only unions and packed structs, and for a
   struct wrapping a 16-byte vector. The backend splits such a struct into two
