@@ -868,6 +868,19 @@ fn symbol_addr(e: &mut Emitter, d: u8, sym: String, via_got: bool) {
     e.reference(kind, Ref::Symbol(sym), 0);
 }
 
+/// `cmp r, value` for any 64-bit `value`: `cmp r, imm32` when it
+/// sign-extends from 32 bits, else through the `r11` scratch.
+fn cmp_r_u64(e: &mut Emitter, r: u8, value: u64) {
+    match i32::try_from(value as i64) {
+        Ok(v) => cmp_ri(e, r, v, true),
+        Err(_) => {
+            let tmp = regs::R11 as u8;
+            mov_ri(e, tmp, value);
+            alu_rr(e, 0x39, r, tmp, true); // cmp r, r11
+        }
+    }
+}
+
 /// `mov d, fs:[0]` (`64 REX.W 8B /r` with an absolute `disp32` of 0): the
 /// thread pointer, read from the self pointer at the start of the thread
 /// control block (x86-64 TLS ABI).
@@ -1221,6 +1234,35 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 }
                 e.reference(RelocKind::TpOff32, Ref::Symbol(sym), 0);
             }
+        }
+        X86Op::MulWide => {
+            // mul b  (rdx:rax = rax * b, unsigned)
+            let b = rnum(&ops[3]);
+            e.u8(rex(true, false, false, b >= 8));
+            e.u8(0xF7);
+            e.u8(modrm(3, 4, b));
+        }
+        X86Op::Switch128 => {
+            let (lo_r, hi_r) = (rnum(&ops[0]), rnum(&ops[1]));
+            let default = label_index(&ops[2]);
+            let mut i = 3;
+            while i + 2 < ops.len() {
+                let (vlo, vhi) = (uimm(&ops[i]), uimm(&ops[i + 1]));
+                let case = label_index(&ops[i + 2]);
+                let next = e.create_label();
+                cmp_r_u64(e, lo_r, vlo);
+                e.u8(0x0F);
+                e.u8(0x85); // jne next
+                e.pcrel32(Ref::Label(next), 0);
+                cmp_r_u64(e, hi_r, vhi);
+                e.u8(0x0F);
+                e.u8(0x84); // je case
+                e.pcrel32(Ref::Label(ctx.labels[case]), 0);
+                e.bind_label(next);
+                i += 3;
+            }
+            e.u8(0xE9);
+            e.pcrel32(Ref::Label(ctx.labels[default]), 0);
         }
         X86Op::TlsGd => {
             let MachineOperand::Global(g) = ops[0] else { panic!("TlsGd expects a global operand") };
@@ -1778,7 +1820,9 @@ fn compile_function_full(
 /// isel → register allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
     let legal = legalized(module, &Sse2Legality);
-    compile_function_full(&legal, func, syms, &CodegenOptions::default(), false).emitted
+    let wide = super::prepared_if_wide(&legal, syms);
+    let (module, syms) = wide.as_ref().map_or((&*legal, syms), |(m, s)| (m, s));
+    compile_function_full(module, func, syms, &CodegenOptions::default(), false).emitted
 }
 
 /// Compile every defined function of `module` into a relocatable
@@ -1811,7 +1855,9 @@ pub fn compile_function_lines(
     syms: &StrInterner,
 ) -> (Emitted, Vec<(u64, u32)>) {
     let legal = legalized(module, &Sse2Legality);
-    let out = compile_function_full(&legal, func, syms, &CodegenOptions::default(), true);
+    let wide = super::prepared_if_wide(&legal, syms);
+    let (module, syms) = wide.as_ref().map_or((&*legal, syms), |(m, s)| (m, s));
+    let out = compile_function_full(module, func, syms, &CodegenOptions::default(), true);
     (out.emitted, out.rows)
 }
 
@@ -1859,9 +1905,11 @@ fn build_module(
 ) -> CompiledModule {
     use crate::mc::dwarf::{DebugUnit, FuncDebug};
 
-    // Vector code the SSE2 baseline cannot hold or select is scalarized first.
+    // Vector code the SSE2 baseline cannot hold or select is scalarized first,
+    // then integers wider than 64 bits are split (all but their ABI boundary).
     let legal = legalized(module, &Sse2Legality);
-    let module: &Module = &legal;
+    let wide = super::prepared_if_wide(&legal, syms);
+    let (module, syms): (&Module, &StrInterner) = wide.as_ref().map_or((&*legal, syms), |(m, s)| (m, s));
 
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));

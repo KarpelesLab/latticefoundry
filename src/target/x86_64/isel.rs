@@ -97,14 +97,19 @@ use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{FuncId, InstData, Module, ValueId};
-use crate::support::StrInterner;
+use crate::support::{DetHashMap, StrInterner};
 
 use puremp::Int;
+use std::cell::RefCell;
 
 use super::regs::{self, RegFile};
 use crate::target::{CallConvKind, TargetOs, Triple};
 
+mod wide;
 mod win64;
+
+pub use wide::MUL128_PSEUDO;
+pub(crate) use wide::float_helper;
 
 pub(crate) mod vector;
 pub use vector::Sse2Legality;
@@ -342,6 +347,15 @@ pub enum X86Op {
     /// the exact form a linker may relax), leaving the address in `rax`. A
     /// call: every caller-saved register is a def.
     TlsGd = 74,
+
+    // --- 128-bit integer support (see the `wide` submodule) ------------------
+    /// `[Def rax, Def rdx, Use rax, Use b]` — `mul b` (`REX.W F7 /4`): the
+    /// full unsigned 128-bit product of `rax` and `b` in `rdx:rax`.
+    MulWide = 75,
+    /// `[Use lo, Use hi, Label default, (Imm case_lo, Imm case_hi, Label case)...]`
+    /// — a multi-way branch on a 128-bit scrutinee: per case, `cmp lo, case_lo;
+    /// jne next; cmp hi, case_hi; je case`, then `jmp default`.
+    Switch128 = 76,
 }
 
 impl X86Op {
@@ -368,7 +382,7 @@ impl X86Op {
             _ => 0,
         };
         match self {
-            X86Op::BrCond | X86Op::Switch | X86Op::RmwLoop | X86Op::DynAlloca => true,
+            X86Op::BrCond | X86Op::Switch | X86Op::Switch128 | X86Op::RmwLoop | X86Op::DynAlloca => true,
             X86Op::CvtSi2f => flags(3) & 0b100 != 0,
             X86Op::CvtF2si => flags(3) & 0b10 != 0,
             // The SSE2 vector ops are straight-line data movement and
@@ -390,7 +404,7 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 75] = [
+        const TABLE: [X86Op; 77] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
@@ -398,7 +412,7 @@ impl X86Op {
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
             Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm, VOp,
             VUnary, VShiftI, VLoad, VStore, LoadVConst, MovGprToX, MovXToGpr, Pinsrw, Pextrw,
-            TlsAddr, TlsGd,
+            TlsAddr, TlsGd, MulWide, Switch128,
         ];
         TABLE[op.0 as usize]
     }
@@ -622,6 +636,9 @@ pub struct X86_64Target {
     /// The relocation model, which picks the TLS access model
     /// ([`crate::codegen::linkage::tls_model`]).
     reloc_model: RelocModel,
+    /// The higher 64-bit parts of each integer wider than 64 bits of the
+    /// function being lowered, by value index (see the `wide` submodule).
+    wide: RefCell<DetHashMap<usize, Vec<VReg>>>,
 }
 
 impl Default for X86_64Target {
@@ -633,7 +650,7 @@ impl Default for X86_64Target {
 impl X86_64Target {
     /// Construct the x86-64 target with its fixed register file and SysV ABI.
     pub fn new() -> X86_64Target {
-        X86_64Target { rf: RegFile::new(), win64: false, reloc_model: RelocModel::Static }
+        X86_64Target { rf: RegFile::new(), win64: false, reloc_model: RelocModel::Static, wide: RefCell::default() }
     }
 
     /// Construct the x86-64 target for the calling convention `cc`:
@@ -641,7 +658,7 @@ impl X86_64Target {
     /// [`isel`](self) module docs); anything else is System V.
     pub fn with_call_conv(cc: CallConvKind) -> X86_64Target {
         if cc == CallConvKind::Win64 {
-            X86_64Target { rf: RegFile::win64(), win64: true, reloc_model: RelocModel::Static }
+            X86_64Target { rf: RegFile::win64(), win64: true, reloc_model: RelocModel::Static, wide: RefCell::default() }
         } else {
             X86_64Target::new()
         }
@@ -667,6 +684,7 @@ impl X86_64Target {
 
     /// Lower function `func` of `module` to MIR over this target.
     pub fn select(&self, module: &Module, func: crate::ir::FuncId) -> crate::codegen::mir::MachineFunction {
+        self.wide.borrow_mut().clear();
         crate::codegen::isel::select(self, module, func)
     }
 
@@ -679,6 +697,7 @@ impl X86_64Target {
         func: crate::ir::FuncId,
         syms: &StrInterner,
     ) -> crate::codegen::mir::MachineFunction {
+        self.wide.borrow_mut().clear();
         crate::codegen::isel::select_with_syms(self, module, func, syms)
     }
 
@@ -1075,13 +1094,24 @@ impl X86_64Target {
     /// `xmm0`/`xmm1` and is stored into a fresh result slot; a MEMORY-class result
     /// uses a hidden `sret` pointer (a caller-allocated slot passed in `rdi`).
     fn lower_call(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
-        if self.win64 {
-            return self.lower_call_win64(lo, inst);
-        }
-        let cc = &self.rf.cc;
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
+        let wide_ret = inst.result().and_then(|r| Self::wide_val(lo, r));
+        // The legalizer's 128-bit multiply is not a real call.
+        if lo.callee_name(callee) == Some(MUL128_PSEUDO) {
+            return self.lower_mul128(lo, inst);
+        }
+        if wide_ret.is_some_and(|n| n != 2) || args.iter().any(|&a| Self::wide_val(lo, a).is_some_and(|n| n != 2)) {
+            panic!("x86-64 backend: integers wider than 128 bits cannot be passed or returned");
+        }
+        if self.win64 {
+            if wide_ret.is_some() || args.iter().any(|&a| Self::wide_val(lo, a).is_some()) {
+                panic!("x86-64 backend: 128-bit integer arguments are not supported under the Microsoft x64 convention");
+            }
+            return self.lower_call_win64(lo, inst);
+        }
+        let cc = &self.rf.cc;
 
         // System V variadic frame-address intrinsics. A `call` to one of these
         // specially-named external functions is not a real call: it materializes
@@ -1184,6 +1214,22 @@ impl X86_64Target {
                 let dst = self.lea_rsp(lo, stack_off);
                 self.emit_memcpy(lo, dst, ptr, size);
                 stack_off += align_up_u64(size, 8);
+            } else if Self::wide_val(lo, arg).is_some() {
+                // An `i128`: two integer registers, or a 16-aligned stack slot
+                // when fewer than two are left (System V, as gcc's __int128).
+                let p = self.parts(lo, arg);
+                if int_i + 2 <= cc.arg_regs.len() {
+                    reg_moves.push((cc.arg_regs[int_i], p[0]));
+                    reg_moves.push((cc.arg_regs[int_i + 1], p[1]));
+                    int_i += 2;
+                } else {
+                    stack_off = align_up_u64(stack_off, 16);
+                    for (k, &v) in p.iter().enumerate() {
+                        let dp = self.lea_rsp(lo, stack_off + 8 * k as u64);
+                        lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
+                    }
+                    stack_off += 16;
+                }
             } else {
                 // Scalar / pointer / float argument.
                 let v = self.oper(lo, arg);
@@ -1297,6 +1343,12 @@ impl X86_64Target {
                     let dp = self.add_off(lo, d, 8 * k as u64);
                     lo.emit(MachineInst::new(X86Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
                 }
+            }
+            None if wide_ret.is_some() => {
+                // An `i128` result in rax:rdx.
+                let p = self.parts(lo, inst.result().unwrap());
+                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(p[0]), use_p(ret_reg)]));
+                lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(p[1]), use_p(regs::gpr(regs::RDX))]));
             }
             None => {
                 if inst.result().is_some() {
@@ -1485,9 +1537,30 @@ impl X86_64Target {
             int_i = 1;
         }
 
+        let param_vals: Vec<ValueId> = lo.func().block(lo.func().entry().expect("an entry")).params().to_vec();
         let mut stack_in = 16u64; // first incoming stack arg, above the return address
         for (i, &pv) in param_vregs.iter().enumerate() {
             let ty = sig_params[i];
+            if let Some(n) = Self::wide_ty(lo, ty) {
+                // An `i128` parameter: two integer registers, or a 16-aligned
+                // stack slot (see `lower_call`).
+                assert_eq!(n, 2, "x86-64 backend: integers wider than 128 bits cannot be passed");
+                let p = self.parts(lo, param_vals[i]);
+                if int_i + 2 <= cc.arg_regs.len() {
+                    for (k, &v) in p.iter().enumerate() {
+                        lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(v), use_p(cc.arg_regs[int_i + k])]));
+                    }
+                    int_i += 2;
+                } else {
+                    stack_in = align_up_u64(stack_in, 16);
+                    for (k, &v) in p.iter().enumerate() {
+                        let a = self.lea_rbp(lo, stack_in + 8 * k as u64);
+                        lo.emit(MachineInst::new(X86Op::Load.opcode(), vec![def_v(v), use_v(a), imm(8)]));
+                    }
+                    stack_in += 16;
+                }
+                continue;
+            }
             if is_aggregate(lo.types(), ty) {
                 let size = lo.byte_size(ty);
                 let align = lo.types().align_of(ty).max(8);
@@ -1692,7 +1765,10 @@ impl MachineTarget for X86_64Target {
 }
 
 impl TargetIsel for X86_64Target {
+    /// A constant wider than 64 bits keeps its low 64 bits: part 0 of a wide
+    /// value (the `wide` submodule materializes all of its parts).
     fn li(&self, dst: VReg, value: Int) -> MachineInst {
+        let value = if value.to_u64().is_some() || value.to_i64().is_some() { value } else { value.mod_2k(64) };
         MachineInst::new(X86Op::MovRI.opcode(), vec![def_v(dst), MachineOperand::Imm(value)])
     }
 
@@ -1759,6 +1835,14 @@ impl TargetIsel for X86_64Target {
 
     fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
         if self.win64 {
+            let sig = lo.func().sig;
+            let wide = match lo.types().get(sig) {
+                Type::Func(ft) => ft.params.iter().chain([&ft.ret]).any(|&t| Self::wide_ty(lo, t).is_some()),
+                _ => false,
+            };
+            if wide {
+                panic!("x86-64 backend: 128-bit integer parameters and results are not supported under the Microsoft x64 convention");
+            }
             self.lower_prologue_win64(lo);
         } else {
             self.lower_prologue_x86(lo);
@@ -1766,6 +1850,11 @@ impl TargetIsel for X86_64Target {
     }
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        // What the wide-integer legalization left of integers wider than 64
+        // bits (see the `wide` submodule).
+        if self.lower_wide(lo, inst) {
+            return;
+        }
         // SSE2 vector code (legalized for `Sse2Legality` beforehand).
         if self.lower_vector(lo, inst) {
             return;
@@ -1964,6 +2053,12 @@ impl TargetIsel for X86_64Target {
                             }
                         }
                     }
+                } else if let Some(&v) = inst.operands().first().filter(|&&v| Self::wide_val(lo, v).is_some()) {
+                    // An `i128` in rax:rdx.
+                    assert_eq!(Self::wide_val(lo, v), Some(2), "x86-64 backend: integers wider than 128 bits cannot be returned");
+                    let p = self.parts(lo, v);
+                    lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(cc.ret_reg), use_v(p[0])]));
+                    lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(regs::gpr(regs::RDX)), use_v(p[1])]));
                 } else if let Some(&v) = inst.operands().first() {
                     let r = self.oper(lo, v);
                     // A float return goes in xmm0, an integer/pointer return in rax.
@@ -1993,6 +2088,29 @@ impl TargetIsel for X86_64Target {
                     X86Op::BrCond.opcode(),
                     vec![use_v(cond), MachineOperand::Label(te), MachineOperand::Label(fe)],
                 ));
+            }
+            InstKind::Switch(data) if Self::wide_val(lo, inst.operands()[0]).is_some() => {
+                // A 128-bit scrutinee: both halves compared per case.
+                let p = self.parts(lo, inst.operands()[0]);
+                assert_eq!(p.len(), 2, "x86-64 backend: a switch wider than 128 bits");
+                let ops = inst.operands();
+                let mut idx = 1usize;
+                let dcount = data.default_args as usize;
+                let default_vals: Vec<_> = ops[idx..idx + dcount].to_vec();
+                idx += dcount;
+                let de = lo.edge_to(data.default, &default_vals);
+                let mut operands = vec![use_v(p[0]), use_v(p[1]), MachineOperand::Label(de)];
+                for case in &data.cases.clone() {
+                    let n = case.args as usize;
+                    let cvals: Vec<_> = ops[idx..idx + n].to_vec();
+                    idx += n;
+                    let ce = lo.edge_to(case.target, &cvals);
+                    let v = case.value.mod_2k(128);
+                    operands.push(imm(v.mod_2k(64).to_u64().unwrap_or(0)));
+                    operands.push(imm(v.div_2k_trunc(64).to_u64().unwrap_or(0)));
+                    operands.push(MachineOperand::Label(ce));
+                }
+                lo.emit(MachineInst::new(X86Op::Switch128.opcode(), operands));
             }
             InstKind::Switch(data) => {
                 // Cases are compared as 64-bit values: sign-extend the scrutinee

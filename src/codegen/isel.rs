@@ -336,6 +336,12 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
         }
     }
 
+    /// The module's symbol interner, when it was threaded through
+    /// [`select_with_syms`] (a target resolving a helper function by name).
+    pub fn syms(&self) -> Option<&StrInterner> {
+        self.syms
+    }
+
     /// Record the stack slot holding this variadic function's register save area
     /// (see [`Lower::va_reg_save`]).
     pub fn set_va_reg_save(&mut self, slot: StackSlot) {

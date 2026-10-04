@@ -416,6 +416,12 @@ emits `PT_TLS`, relaxes initial-exec/general-dynamic to local-exec, and its
 `_start` builds the TLS block and sets `%fs` without libc; execution-tested
 statically, with two pthreads against glibc (qld, non-PIE and PIE), and in a
 `dlopen`ed shared library. Other targets reject `thread_local` clearly.
+**128-bit integers** on x86-64 ([ir-design §3b](docs/ir-design.md)): `i128`
+is legalized into 64-bit parts (branch-free), multiplied inline, divided and
+converted to/from floats through libgcc, and passed exactly like gcc's
+`__int128` (register pairs, 16-aligned stack slots, `rax:rdx`); checked
+against the reference evaluator on 1,104 random cases at `-O0` and `-O2` and
+in ABI round trips with gcc in both directions.
 
 *Non-64-bit foundation* ✅ (for wasm32, Arm Cortex-M and AVR; see
 [ir-design §3a/§3b](docs/ir-design.md)): modules carry a per-target
@@ -653,7 +659,9 @@ gzip, bzip2, Lua and SQLite build against them with output byte-identical
 to gcc's. Remaining, each with a clear error today:
 - GCC vector types, `_Atomic`, `__thread`/TLS (the root backend has x86-64
   thread-locals, ir-design §4c; lf-cc does not emit them yet);
-- `__int128`/`_Float128`/`_Complex` *values* (declarations work);
+- `__int128`/`_Float128`/`_Complex` *values* (declarations work; the root
+  x86-64 backend now compiles `i128` with gcc's `__int128` ABI, ir-design
+  §3b, so `__int128` needs only the lf-cc hookup);
 - a true 80-bit `long double`;
 - `__label__`, `__auto_type` and range designators;
 - `tgmath.h` and `stdatomic.h`;

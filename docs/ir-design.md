@@ -187,8 +187,28 @@ the widest native width) as `N` parts of type `iW`, least significant first:
   `si`/`ti` forms) unless the caller supplies other names; missing helpers are
   declared. AVR has no hardware multiplier at all, so this is the right default.
 
-Flags are dropped (the expansion refines: flags only add poison). wasm32 needs
-none of this (`i64` is native); Thumb uses `W = 32`; AVR `W = 8` or `16`.
+Flags are dropped (the expansion refines: flags only add poison). Thumb uses
+`W = 32`; AVR `W = 8` or `16`; wasm32 and x86-64 use `W = 64` for `i128`.
+
+**x86-64 `i128`** (`target::x86_64::prepare_module`): min/max are expanded
+and the float↔`i128` helpers declared, then the module is legalized at
+`W = 64`, so every operation is a straight-line part computation (carry
+chains as compares, shifts as funnel shifts plus a `select` ladder — `cmov`,
+compares lexicographically) and nothing branches on data. Two operations
+avoid libgcc: the 128-bit `mul` libcall is a placeholder name the isel
+expands inline (`mul` for the low product, two `imul`s for the cross terms),
+and `switch` on an `i128` compares both halves per case. Division and the
+float conversions call libgcc (`__divti3`, `__udivti3`, `__modti3`,
+`__umodti3`, `__floattidf`, `__floatuntisf`, `__fixdfti`, `__fixunssfti`, …).
+At the boundary an `i128` lives in a register pair and follows the System V
+convention exactly as gcc's `__int128`: the next two integer argument
+registers (low half first), else a 16-byte-aligned stack slot (later integer
+arguments still take the remaining registers), and `rax:rdx` for a result.
+Integers wider than 128 bits have no register convention and are rejected at
+the boundary, as are wide atomics and wide values under the Microsoft x64
+convention. (The LP64 layout keeps aligning `i128` to 8 bytes; a front end
+matching gcc's 16-byte `__int128` alignment declares `i128:128` in its
+`datalayout`.)
 
 **The ABI boundary stays wide.** The pass keeps function signatures: a wide
 entry parameter, call argument or result, return value, and the operands and

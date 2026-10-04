@@ -126,8 +126,15 @@ impl<'m> Exec<'m> {
             return;
         }
         let size = types.size_of(ty);
+        if let SemValue::Int { bits, .. } = v {
+            // Any width: byte `i` is bits `8i..8i+8` (little-endian).
+            for i in 0..size {
+                let b = bits.div_2k_trunc(8 * i as u32).mod_2k(8).to_u64().unwrap_or(0) as u8;
+                self.mem.insert(addr + i, Some(b));
+            }
+            return;
+        }
         let raw: Option<u64> = match v {
-            SemValue::Int { bits, .. } => bits.to_u64(),
             SemValue::Float(FloatBits::F16(b)) => Some(u64::from(*b)),
             SemValue::Float(FloatBits::F32(b)) => Some(u64::from(*b)),
             SemValue::Float(FloatBits::F64(b)) => Some(*b),
@@ -148,24 +155,29 @@ impl<'m> Exec<'m> {
             return Ok(SemValue::Vector(lanes));
         }
         let size = types.size_of(ty);
-        let mut raw = 0u64;
+        let mut raw = 0u128;
         for i in 0..size {
             match self.mem.get(&(addr + i)) {
                 None => return Err(ExecError::Ub(format!("load from unallocated address {:#x}", addr + i))),
                 Some(None) => return Ok(SemValue::Poison),
                 Some(Some(b)) => {
-                    if i < 8 {
-                        raw |= u64::from(*b) << (8 * i);
+                    if i < 16 {
+                        raw |= u128::from(*b) << (8 * i);
                     }
                 }
             }
         }
+        let wide_int = matches!(types.get(ty), Type::Int(w) if *w > 128);
+        if wide_int {
+            return Err(ExecError::Unsupported("a load of an integer wider than 128 bits".into()));
+        }
+        let raw64 = raw as u64;
         Ok(match types.get(ty) {
-            Type::Int(w) => SemValue::int(*w, Int::from_u64(raw)),
-            Type::Float(FloatKind::F16) => SemValue::Float(FloatBits::F16(raw as u16)),
-            Type::Float(FloatKind::F32) => SemValue::Float(FloatBits::F32(raw as u32)),
-            Type::Float(FloatKind::F64) => SemValue::Float(FloatBits::F64(raw)),
-            Type::Ptr => SemValue::ptr(Int::from_u64(raw)),
+            Type::Int(w) => SemValue::int(*w, Int::from_u128(raw)),
+            Type::Float(FloatKind::F16) => SemValue::Float(FloatBits::F16(raw64 as u16)),
+            Type::Float(FloatKind::F32) => SemValue::Float(FloatBits::F32(raw64 as u32)),
+            Type::Float(FloatKind::F64) => SemValue::Float(FloatBits::F64(raw64)),
+            Type::Ptr => SemValue::ptr(Int::from_u64(raw64)),
             _ => return Err(ExecError::Unsupported("load of an aggregate".into())),
         })
     }

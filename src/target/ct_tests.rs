@@ -455,6 +455,57 @@ entry ^0(%s: i64):
     }
 }
 
+/// 128-bit integers on x86-64 (legalized into 64-bit parts, with an inline
+/// multiply and register pairs at the boundary) stay branch-free: adds with
+/// carry chains, shifts by a secret amount (funnel shifts and a `select`
+/// ladder), lexicographic compares and selects all lower to straight-line
+/// code, which the constant-time verifier accepts on the prepared module too.
+#[test]
+fn i128_lowering_adds_no_branches() {
+    let src = r#"module "w"
+func @ops(secret i128, secret i128, i128) -> secret i128 {
+entry ^0(%a: i128, %b: i128, %p: i128):
+  %add = add %a, %b : i128
+  %sub = sub %add, %p : i128
+  %mul = mul %sub, %b : i128
+  %and = and %mul, %a : i128
+  %xor = xor %and, %p : i128
+  %sh = and %b, i128 127 : i128
+  %shl = shl %xor, %sh : i128
+  %lshr = lshr %shl, %sh : i128
+  %ashr = ashr %lshr, %sh : i128
+  %eq = icmp eq %a, %b : i1
+  %ult = icmp ult %ashr, %p : i1
+  %slt = icmp slt %a, %ashr : i1
+  %s1 = select %eq, %a, %b : i128
+  %s2 = select %ult, %s1, %ashr : i128
+  %s3 = select %slt, %s2, %p : i128
+  %t = trunc %s3 : i64
+  %x = sext %t : i128
+  %r = add %x, %s3 : i128
+  ret %r
+}
+"#;
+    let (m, syms) = parse(src);
+    let f = FuncId::from_index(0);
+    assert!(ct_violations(&m, f, CtPolicy::DEFAULT).is_empty());
+    let (p, names) = super::x86_64::prepare_module(&m, &syms).expect("prepare");
+    let pf = (0..p.function_count()).map(FuncId::from_index).find(|&g| names.resolve(p.function(g).name) == "ops").unwrap();
+    let v = ct_violations(&p, pf, CtPolicy::DEFAULT);
+    assert!(v.is_empty(), "{v:?}");
+    assert_eq!(ir_branches(&p, pf), 0);
+    let mf = X86_64Target::new().select_with_syms(&p, pf, &names);
+    let n = mir_branches(&mf, |mi| X86Op::decode(mi.opcode).may_branch_on_data(&mi.operands));
+    assert_eq!(n, 0);
+    let obj = super::x86_64::compile_module(&m, &syms);
+    let text = &obj.sections().iter().find(|s| s.name == ".text").unwrap().bytes;
+    if let Some(asm) = x86_disasm(text) {
+        let jcc: Vec<&str> =
+            asm.lines().map(str::trim).filter(|l| l.starts_with('j') && !l.starts_with("jmp")).collect();
+        assert!(jcc.is_empty(), "conditional jumps {jcc:?}:\n{asm}");
+    }
+}
+
 #[test]
 fn select_lowers_branchless_on_every_target() {
     let src = r#"module "sel"
