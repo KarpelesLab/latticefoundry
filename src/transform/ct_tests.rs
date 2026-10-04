@@ -13,8 +13,8 @@ use crate::transform::pipeline::{OptLevel, pass_by_name, pipeline_for};
 use crate::verify::{CtPolicy, ct_violations, verify_module};
 
 /// Every individual pass `pass_by_name` knows.
-pub(crate) const PASSES: [&str; 7] =
-    ["mem2reg", "sccp", "simplify_cfg", "dce", "egraph", "licm", "inline"];
+pub(crate) const PASSES: [&str; 8] =
+    ["mem2reg", "sccp", "simplify_cfg", "dce", "egraph", "licm", "inline", "dfe"];
 
 /// A conditional swap of two `n`-limb numbers by a secret bit (the core of a
 /// Montgomery ladder), a ladder driving it bit by bit over a secret scalar,
@@ -199,6 +199,48 @@ entry ^0(%a: ptr, %b: ptr):
 }
 "#;
 
+/// Secret code for the post-inlining clean-up: an internal secret helper
+/// inlined into its caller and then deleted, a never-called internal one, a
+/// secret global's address threaded into the inlined body, and a loop whose
+/// header keeps a dead secret parameter after `mem2reg`.
+pub(crate) const CLEANUP_LF: &str = r#"
+module "cleanup"
+
+global internal constant secret @key : [4 x i8] = [4 x i8] (i8 75, i8 69, i8 89, i8 83)
+
+func internal @mix(secret i64, ptr) -> secret i64 {
+entry ^0(%x: i64, %p: ptr):
+  %k = load secret %p align 1 : i8
+  %w = zext %k : i64
+  %r = xor %x, %w : i64
+  ret %r
+}
+
+func internal @never(secret i64) -> secret i64 {
+entry ^0(%x: i64):
+  ret %x
+}
+
+func @run(secret i64, i64) -> secret i64 {
+entry ^0(%s: i64, %n: i64):
+  %slot = alloca i64 : ptr
+  store secret %s, %slot align 8 : i64
+  br ^1(i64 0, %s)
+^1(%i: i64, %acc: i64):
+  %c = icmp ult %i, %n : i1
+  cond_br %c, ^2, ^3
+^2:
+  %v = load secret %slot align 8 : i64
+  %m = call @mix(%v, @key) : i64
+  store secret %m, %slot align 8 : i64
+  %i2 = add %i, i64 1 : i64
+  br ^1(%i2, %m)
+^3:
+  %out = load secret %slot align 8 : i64
+  ret %out
+}
+"#;
+
 fn parse(src: &str) -> (Module, StrInterner) {
     let mut syms = StrInterner::new();
     let m = crate::ir::text::parse_module(src, FileId::new(0), &mut syms)
@@ -228,7 +270,25 @@ fn run_checked(src: &str, passes: Vec<Box<dyn ModulePass>>, what: &str) -> (Modu
 }
 
 fn fixtures() -> Vec<(&'static str, String)> {
-    vec![("ladder", LADDER_LF.to_owned()), ("mixed", MIXED_LF.to_owned())]
+    vec![
+        ("ladder", LADDER_LF.to_owned()),
+        ("mixed", MIXED_LF.to_owned()),
+        ("cleanup", CLEANUP_LF.to_owned()),
+    ]
+}
+
+#[test]
+fn the_post_inlining_clean_up_happens_under_secrets() {
+    // O2 inlines @mix, deletes it and @never, and drops the dead `%acc`
+    // header parameter, all while the constant-time check keeps passing.
+    let (m, syms) = run_checked(CLEANUP_LF, pipeline_for(OptLevel::O2), "cleanup/O2");
+    let text = crate::ir::text::print_module(&m, &syms);
+    assert_eq!(m.function_count(), 1, "{text}");
+    assert!(!text.contains("call"), "{text}");
+    let f = m.function(FuncId::from_index(0));
+    let params: usize = f.blocks().filter(|&(b, _)| Some(b) != f.entry()).map(|(_, b)| b.params().len()).sum();
+    assert!(params <= 2, "the dead header parameter goes:\n{text}");
+    assert!(ct_violations(&m, FuncId::from_index(0), CtPolicy::DEFAULT).is_empty());
 }
 
 #[test]

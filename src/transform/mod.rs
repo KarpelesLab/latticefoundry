@@ -16,12 +16,17 @@
 //!   frontiers (our block-argument analog of φ-placement, `docs/ir-design.md`
 //!   §2) and renaming loads to their reaching definitions.
 //! - [`Dce`] — dead-code elimination: drop side-effect-free instructions whose
-//!   results are unused, iterated to a fixpoint.
+//!   results are unused and block parameters nothing uses (with their edge
+//!   arguments), iterated to a fixpoint.
+//!
+//! [`DeadFunctionElim`] is the module-level counterpart: it deletes the
+//! internal functions nothing reaches (e.g. a callee inlined everywhere).
 //!
 //! A [`FunctionTransform`] is adapted to the module-level [`ModulePass`] pipeline
 //! (and its analysis-invalidation) by [`FunctionTransformPass`].
 
 pub mod dce;
+pub mod dead_functions;
 pub mod egraph;
 pub mod inline;
 pub mod licm;
@@ -34,6 +39,8 @@ pub mod superopt;
 pub mod yield_points;
 
 #[cfg(test)]
+mod cleanup_tests;
+#[cfg(test)]
 pub(crate) mod ct_tests;
 #[cfg(test)]
 mod tests;
@@ -41,6 +48,7 @@ mod tests;
 mod vector_tests;
 
 pub use dce::Dce;
+pub use dead_functions::DeadFunctionElim;
 pub use egraph::EqSat;
 pub use inline::Inline;
 pub use licm::Licm;
@@ -153,6 +161,22 @@ pub(crate) fn rebuild_terminator(
     builder: &mut FunctionBuilder<'_>,
     new_block: &[BlockId],
     bb: BlockId,
+    extra: impl FnMut(&mut FunctionBuilder<'_>, BlockId, &mut Vec<ValueId>),
+) {
+    rebuild_terminator_keeping(vmap, old, builder, new_block, bb, |_, _| true, extra);
+}
+
+/// [`rebuild_terminator`], dropping edge arguments: an edge into old block `t`
+/// keeps its `k`-th argument only when `keep(t, k)` holds (the arguments of the
+/// target's removed parameters are never remapped). `extra` then appends to
+/// the kept list.
+pub(crate) fn rebuild_terminator_keeping(
+    vmap: &mut [Option<ValueId>],
+    old: &Function,
+    builder: &mut FunctionBuilder<'_>,
+    new_block: &[BlockId],
+    bb: BlockId,
+    keep: impl Fn(BlockId, usize) -> bool,
     mut extra: impl FnMut(&mut FunctionBuilder<'_>, BlockId, &mut Vec<ValueId>),
 ) {
     let Some(t) = old.block(bb).terminator() else {
@@ -173,8 +197,10 @@ pub(crate) fn rebuild_terminator(
         InstKind::Br(target) => {
             let target = *target;
             let mut args = Vec::with_capacity(ops.len());
-            for &o in ops {
-                args.push(remap_value(vmap, old, builder, o));
+            for (k, &o) in ops.iter().enumerate() {
+                if keep(target, k) {
+                    args.push(remap_value(vmap, old, builder, o));
+                }
             }
             extra(builder, target, &mut args);
             builder.br(new_block[target.index()], &args);
@@ -186,12 +212,16 @@ pub(crate) fn rebuild_terminator(
             let cond = remap_value(vmap, old, builder, ops[0]);
             let mut targs = Vec::with_capacity(ta);
             for k in 0..ta {
-                targs.push(remap_value(vmap, old, builder, ops[1 + k]));
+                if keep(if_true, k) {
+                    targs.push(remap_value(vmap, old, builder, ops[1 + k]));
+                }
             }
             extra(builder, if_true, &mut targs);
             let mut fargs = Vec::with_capacity(fa);
             for k in 0..fa {
-                fargs.push(remap_value(vmap, old, builder, ops[1 + ta + k]));
+                if keep(if_false, k) {
+                    fargs.push(remap_value(vmap, old, builder, ops[1 + ta + k]));
+                }
             }
             extra(builder, if_false, &mut fargs);
             builder.cond_br(
@@ -208,7 +238,9 @@ pub(crate) fn rebuild_terminator(
             let default = data.default;
             let mut dargs = Vec::with_capacity(da);
             for k in 0..da {
-                dargs.push(remap_value(vmap, old, builder, ops[1 + k]));
+                if keep(default, k) {
+                    dargs.push(remap_value(vmap, old, builder, ops[1 + k]));
+                }
             }
             extra(builder, default, &mut dargs);
             let mut cases = Vec::with_capacity(data.cases.len());
@@ -217,7 +249,9 @@ pub(crate) fn rebuild_terminator(
                 let ca = c.args as usize;
                 let mut cargs = Vec::with_capacity(ca);
                 for k in 0..ca {
-                    cargs.push(remap_value(vmap, old, builder, ops[off + k]));
+                    if keep(c.target, k) {
+                        cargs.push(remap_value(vmap, old, builder, ops[off + k]));
+                    }
                 }
                 extra(builder, c.target, &mut cargs);
                 cases.push((c.value.clone(), new_block[c.target.index()], cargs));
@@ -228,6 +262,35 @@ pub(crate) fn rebuild_terminator(
         // A non-terminator in the terminator slot is a malformed input the
         // verifier rejects; nothing to rebuild.
         _ => {}
+    }
+}
+
+/// The block-argument slice of successor edge `si` of terminator `term` (in
+/// [`InstData::successors`](crate::ir::InstData::successors) order), matching
+/// the target block's parameter list positionally. Empty for a non-branch.
+pub(crate) fn edge_args(term: &crate::ir::InstData, si: usize) -> &[ValueId] {
+    let ops = term.operands();
+    match &term.kind {
+        InstKind::Br(_) => ops,
+        InstKind::CondBr { true_args, false_args, .. } => {
+            let ta = *true_args as usize;
+            let fa = *false_args as usize;
+            if si == 0 { &ops[1..1 + ta] } else { &ops[1 + ta..1 + ta + fa] }
+        }
+        InstKind::Switch(data) => {
+            let da = data.default_args as usize;
+            if si == 0 {
+                &ops[1..1 + da]
+            } else {
+                let mut off = 1 + da;
+                for c in &data.cases[..si - 1] {
+                    off += c.args as usize;
+                }
+                let len = data.cases[si - 1].args as usize;
+                &ops[off..off + len]
+            }
+        }
+        _ => &[],
     }
 }
 

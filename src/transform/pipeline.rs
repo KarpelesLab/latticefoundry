@@ -17,21 +17,27 @@
 //! ## The pipelines
 //!
 //! - **O0** — nothing (the caller still verifies; this is the identity).
-//! - **O1** — `mem2reg → sccp → simplify_cfg → dce`: promote memory to SSA, fold
-//!   constants and prune dead edges, tidy the CFG, and drop the dead code that
-//!   exposes.
+//! - **O1** — `mem2reg → sccp → simplify_cfg → dce → dfe`: promote memory to
+//!   SSA, fold constants and prune dead edges, tidy the CFG, drop the dead code
+//!   that exposes, and delete the internal functions nothing references.
 //! - **O2** — `mem2reg`, then the clean-up group
 //!   `sccp → egraph → simplify_cfg → dce → licm` iterated twice, then one round of
-//!   `inline`, then `sccp → egraph → dce` to clean up after inlining (so
-//!   cross-call constants fold).
+//!   `inline`, `dfe` to delete the callees inlined everywhere, and
+//!   `sccp → egraph → simplify_cfg → dce` to clean up after inlining (so
+//!   cross-call constants fold and the split call blocks merge back).
 //! - **O3** — O2 with a deeper fixpoint (three clean-up rounds), a second
 //!   inlining round, and more post-inline clean-up — the level where interprocedural
 //!   work (including cross-module inlining after LTO) pays off most.
+//!
+//! `dfe` ([`DeadFunctionElim`]) is the only pass that removes functions; it
+//! renumbers the surviving [`FuncId`](crate::ir::FuncId)s (see
+//! [`Module::remove_functions`]), so a driver must not hold function ids across
+//! [`optimize`] (look them up by name afterwards).
 
 use crate::ir::Module;
 use crate::pass::{ModulePass, PassManager};
 use crate::transform::{
-    Dce, FunctionTransformPass, Inline, Licm, Mem2Reg, SimplifyCfg,
+    Dce, DeadFunctionElim, FunctionTransformPass, Inline, Licm, Mem2Reg, SimplifyCfg,
     egraph::EqSatPass, sccp::SccpPass,
 };
 
@@ -82,7 +88,8 @@ impl OptLevel {
 /// is unknown. Drives `lf-opt -p pass,pass,...` and the pipeline builders below.
 ///
 /// Recognized names: `mem2reg`, `sccp`, `simplify_cfg` (aka `simplifycfg`,
-/// `scfg`), `dce`, `egraph` (aka `eqsat`), `licm`, `inline`.
+/// `scfg`), `dce`, `egraph` (aka `eqsat`), `licm`, `inline`, `dfe` (aka
+/// `dead_functions`, `globaldce`).
 pub fn pass_by_name(name: &str) -> Option<Box<dyn ModulePass>> {
     let pass: Box<dyn ModulePass> = match name {
         "mem2reg" => Box::new(FunctionTransformPass::new(Mem2Reg)),
@@ -94,6 +101,7 @@ pub fn pass_by_name(name: &str) -> Option<Box<dyn ModulePass>> {
         "egraph" | "eqsat" => Box::new(EqSatPass),
         "licm" => Box::new(FunctionTransformPass::new(Licm)),
         "inline" => Box::new(Inline::new()),
+        "dfe" | "dead_functions" | "globaldce" => Box::new(DeadFunctionElim::new()),
         _ => return None,
     };
     Some(pass)
@@ -114,7 +122,7 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
     match level {
         OptLevel::O0 => {}
         OptLevel::O1 => {
-            for n in ["mem2reg", "sccp", "simplify_cfg", "dce"] {
+            for n in ["mem2reg", "sccp", "simplify_cfg", "dce", "dfe"] {
                 out.push(pass_by_name(n).expect("known pass"));
             }
         }
@@ -123,8 +131,7 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
             for _ in 0..2 {
                 cleanup(&mut out);
             }
-            out.push(pass_by_name("inline").expect("known pass"));
-            for n in ["sccp", "egraph", "dce"] {
+            for n in ["inline", "dfe", "sccp", "egraph", "simplify_cfg", "dce"] {
                 out.push(pass_by_name(n).expect("known pass"));
             }
         }
@@ -134,11 +141,11 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
                 cleanup(&mut out);
             }
             out.push(pass_by_name("inline").expect("known pass"));
+            out.push(pass_by_name("dfe").expect("known pass"));
             for _ in 0..2 {
                 cleanup(&mut out);
             }
-            out.push(pass_by_name("inline").expect("known pass"));
-            for n in ["sccp", "egraph", "simplify_cfg", "dce"] {
+            for n in ["inline", "dfe", "sccp", "egraph", "simplify_cfg", "dce"] {
                 out.push(pass_by_name(n).expect("known pass"));
             }
         }

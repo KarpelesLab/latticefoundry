@@ -70,7 +70,10 @@ macro_rules! id_newtype {
 }
 
 id_newtype!(
-    /// Handle to a [`Function`] within a [`Module`].
+    /// Handle to a [`Function`] within a [`Module`]: a dense index into its
+    /// function list. Ids are stable until a function is removed
+    /// ([`Module::remove_functions`], or the `dfe` pass of the `-O` pipelines),
+    /// which compacts the list and renumbers the later functions.
     FuncId
 );
 id_newtype!(
@@ -575,7 +578,214 @@ impl Module {
     pub fn swap_function(&mut self, id: FuncId, func: Function) -> Function {
         std::mem::replace(&mut self.functions[id.index()], func)
     }
+
+    // --- function enumeration, references and removal -----------------------
+
+    /// The id of every function, in definition order (`0..function_count()`).
+    pub fn func_ids(&self) -> impl Iterator<Item = FuncId> + use<> {
+        (0..self.functions.len()).map(FuncId::from_index)
+    }
+
+    /// The first function named `name`, if any.
+    pub fn function_by_name(&self, name: Sym) -> Option<FuncId> {
+        self.functions.iter().position(|f| f.name == name).map(FuncId::from_index)
+    }
+
+    /// The functions the body of `id` references, ascending and without
+    /// duplicates: every `func_ref` value with at least one use (a direct call
+    /// target or an address taken), and every function named by an address
+    /// constant the body uses. A declaration references nothing.
+    ///
+    /// Together with [`Module::global_referenced_functions`] this is the whole
+    /// IR-level reference graph, which a frontend can walk from its entry point
+    /// to find the functions it may [remove](Module::remove_functions).
+    /// References by *symbol name* outside the IR (a global or data relocation
+    /// naming the function, an inline-asm template) are not seen.
+    pub fn referenced_functions(&self, id: FuncId) -> Vec<FuncId> {
+        let f = &self.functions[id.index()];
+        let mut out = Vec::new();
+        for (v, val) in f.values.iter().enumerate() {
+            if f.uses[v].is_empty() {
+                continue;
+            }
+            match val.def {
+                ValueDef::Func(g) => out.push(g),
+                ValueDef::Const(c) => self.const_func_addrs(c, &mut out),
+                _ => {}
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The functions whose address the initializer of global `id` contains
+    /// (through [`Const::Addr`], at any aggregate depth), ascending and without
+    /// duplicates.
+    pub fn global_referenced_functions(&self, id: GlobalId) -> Vec<FuncId> {
+        let mut out = Vec::new();
+        if let Some(init) = self.globals[id.index()].init {
+            self.const_func_addrs(init, &mut out);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Push every function an (aggregate) constant addresses onto `out`.
+    fn const_func_addrs(&self, c: ConstId, out: &mut Vec<FuncId>) {
+        let mut stack = vec![c];
+        while let Some(c) = stack.pop() {
+            match self.consts.get(c) {
+                Const::Addr { target: AddrTarget::Func(f), .. } => out.push(*f),
+                Const::Aggregate { elems, .. } => stack.extend(elems.iter().copied()),
+                _ => {}
+            }
+        }
+    }
+
+    /// Remove one function; see [`Module::remove_functions`].
+    pub fn remove_function(&mut self, id: FuncId) -> Result<Vec<Option<FuncId>>, RemoveFunctionError> {
+        self.remove_functions(&[id])
+    }
+
+    /// Remove the functions `ids` from the module and **compact** the function
+    /// list, returning the renumbering: `remap[old.index()]` is the new id of a
+    /// surviving function, `None` for a removed one.
+    ///
+    /// [`FuncId`]s are dense indices into the function list, so removal shifts
+    /// every later function down: **any `FuncId` held outside the module must be
+    /// translated through the returned map** (or re-looked-up, e.g. with
+    /// [`Module::function_by_name`]). Inside the module the renumbering is
+    /// complete — every `func_ref` value and every function-address constant is
+    /// rewritten — so the module stays well-formed and the relative order of the
+    /// surviving functions is unchanged. Duplicates in `ids` are fine; an empty
+    /// `ids` is a no-op returning the identity map.
+    ///
+    /// Removal is refused, leaving the module untouched, if an id is out of
+    /// range or a removed function is still referenced by a surviving function
+    /// (a `func_ref` value with uses, or a used address constant; see
+    /// [`Module::referenced_functions`]) or by any global initializer.
+    /// References *among* the removed functions do not count, so a dead cycle
+    /// can be removed in one call. A stale, use-less reference to a removed
+    /// function in a surviving body, or an address constant naming it that
+    /// nothing uses, is tombstoned to a `poison` of the same pointer type.
+    pub fn remove_functions(&mut self, ids: &[FuncId]) -> Result<Vec<Option<FuncId>>, RemoveFunctionError> {
+        let n = self.functions.len();
+        let mut dead = vec![false; n];
+        for &id in ids {
+            if id.index() >= n {
+                return Err(RemoveFunctionError::OutOfRange(id));
+            }
+            dead[id.index()] = true;
+        }
+        // Every reference to a removed function must come from a removed one.
+        for f in self.func_ids() {
+            if dead[f.index()] {
+                continue;
+            }
+            if let Some(&g) = self.referenced_functions(f).iter().find(|g| dead[g.index()]) {
+                return Err(RemoveFunctionError::StillReferenced { func: g, by: Referrer::Function(f) });
+            }
+        }
+        for gi in 0..self.globals.len() {
+            let gid = GlobalId::from_index(gi);
+            if let Some(&g) = self.global_referenced_functions(gid).iter().find(|g| dead[g.index()]) {
+                return Err(RemoveFunctionError::StillReferenced { func: g, by: Referrer::Global(gid) });
+            }
+        }
+
+        let mut remap: Vec<Option<FuncId>> = Vec::with_capacity(n);
+        let mut next = 0;
+        for &d in &dead {
+            if d {
+                remap.push(None);
+            } else {
+                remap.push(Some(FuncId::from_index(next)));
+                next += 1;
+            }
+        }
+        if next == n {
+            return Ok(remap);
+        }
+
+        // Drop the removed bodies, then renumber what references functions.
+        let mut i = 0;
+        self.functions.retain(|_| {
+            let keep = !dead[i];
+            i += 1;
+            keep
+        });
+        self.consts.remap_func_addrs(&remap);
+        let Module { functions, consts, .. } = self;
+        for f in functions.iter_mut() {
+            let mut touched = false;
+            for v in 0..f.values.len() {
+                let ValueDef::Func(g) = f.values[v].def else {
+                    continue;
+                };
+                touched = true;
+                f.values[v].def = match remap[g.index()] {
+                    Some(ng) => ValueDef::Func(ng),
+                    // Unused (checked above): tombstone it.
+                    None => ValueDef::Const(consts.intern(Const::Poison(f.values[v].ty))),
+                };
+            }
+            if touched {
+                // Rebuild the reference dedup table; the first value with a
+                // given definition wins, as it did when the cache was filled.
+                f.value_cache.clear();
+                for (v, val) in f.values.iter().enumerate() {
+                    if matches!(val.def, ValueDef::Const(_) | ValueDef::Global(_) | ValueDef::Func(_)) {
+                        f.value_cache.entry(val.def.clone()).or_insert(ValueId::from_index(v));
+                    }
+                }
+            }
+        }
+        Ok(remap)
+    }
 }
+
+/// What holds a reference that keeps a function from being removed
+/// ([`RemoveFunctionError::StillReferenced`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Referrer {
+    /// The body of a surviving function.
+    Function(FuncId),
+    /// The initializer of a global.
+    Global(GlobalId),
+}
+
+/// Why [`Module::remove_functions`] refused to remove a set of functions.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RemoveFunctionError {
+    /// The id does not name a function of the module.
+    OutOfRange(FuncId),
+    /// Function `func` is still referenced by `by`, which is not removed.
+    StillReferenced {
+        /// The function that was to be removed.
+        func: FuncId,
+        /// What still references it.
+        by: Referrer,
+    },
+}
+
+impl std::fmt::Display for RemoveFunctionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveFunctionError::OutOfRange(id) => write!(f, "function id {} is out of range", id.index()),
+            RemoveFunctionError::StillReferenced { func, by } => {
+                write!(f, "function {} is still referenced by ", func.index())?;
+                match by {
+                    Referrer::Function(g) => write!(f, "function {}", g.index()),
+                    Referrer::Global(g) => write!(f, "the initializer of global {}", g.index()),
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoveFunctionError {}
 
 /// A function definition or declaration.
 ///

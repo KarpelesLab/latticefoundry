@@ -30,6 +30,19 @@
 //! be `poison` to a `poison` literal is sound (poison refines poison), and the
 //! side-effect guard keeps observable behavior intact.
 //!
+//! ## Symbol addresses through block parameters
+//!
+//! The constant lattice treats a global or function reference (`@g`) as ⊤:
+//! an address is a link-time constant, not a scalar it can fold. But a block
+//! parameter that receives the **same** reference on every feasible incoming
+//! edge (typically left by inlining a call whose argument was `@g`) is just
+//! another name for it. A small optimistic fixpoint over the parameters
+//! (⊥ → one symbol → ⊤, meeting over the feasible edges the constant analysis
+//! found) finds those, and the rebuild rewires the parameter's uses to the
+//! reference itself, exactly as it does for a parameter proven constant. Every
+//! execution that reaches the block passes that address, so the substitution
+//! is an identity (a refinement); it changes no branch.
+//!
 //! ## Consuming the analysis under the rebuild's borrows
 //!
 //! A [`FunctionTransform`] runs inside
@@ -46,12 +59,12 @@ use crate::analysis::domains::ConstLattice;
 use crate::analysis::cfg::{ControlFlowGraph, Dominators};
 use crate::analysis::solver::{FixpointResult, solve};
 use crate::ir::builder::FunctionBuilder;
-use crate::ir::inst::{InstData, InstKind};
+use crate::ir::inst::InstKind;
 use crate::ir::types::{TypeContext, TypeId};
 use crate::ir::value::{Const, ConstPool, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, Module};
 use crate::pass::{Changed, ModulePass};
-use crate::transform::{FunctionTransform, dom_preorder, rebuild_terminator, remap_value};
+use crate::transform::{FunctionTransform, dom_preorder, edge_args, rebuild_terminator, remap_value};
 
 /// The SCCP constant-folding transform (see the module documentation).
 ///
@@ -157,6 +170,9 @@ struct Plan {
     reachable: Vec<bool>,
     /// Per-block terminator rewrite.
     term_choice: Vec<TermChoice>,
+    /// `param_ref[v]` is `Some(def)` when block parameter `v` receives the same
+    /// global or function reference `def` on every feasible incoming edge.
+    param_ref: Vec<Option<ValueDef>>,
     /// Whether applying this plan changes the function at all (drives `Changed`
     /// and keeps the pass idempotent).
     changed: bool,
@@ -210,8 +226,12 @@ impl Plan {
             })
             .collect();
 
+        // Block parameters that always receive the same symbol address.
+        let param_ref = symbol_params(func, &value_const, &reachable, &term_choice);
+
         // A change is any pruned edge, any dropped (unreachable) block, any folded
-        // instruction, or any folded parameter that actually has uses to rewire.
+        // instruction, or any folded (or symbol-rewired) parameter that actually
+        // has uses to rewire.
         // Excluding use-less parameter folds is what makes the pass idempotent: a
         // parameter proven constant persists across the rebuild, but after its
         // uses are rewired there is nothing left to change on a second run.
@@ -224,10 +244,125 @@ impl Plan {
             let v = ValueId::from_index(i);
             matches!(func.value(v).def, ValueDef::Inst(_)) || !func.uses_of(v).is_empty()
         });
-        let changed = pruned || dropped || folded;
+        let rewired = param_ref.iter().enumerate().any(|(i, r)| {
+            r.is_some() && !func.uses_of(ValueId::from_index(i)).is_empty()
+        });
+        let changed = pruned || dropped || folded || rewired;
 
-        Plan { value_const, reachable, term_choice, changed }
+        Plan { value_const, reachable, term_choice, param_ref, changed }
     }
+}
+
+/// The lattice of [`symbol_params`]: what one block parameter can be.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum SymRef {
+    /// No feasible incoming value seen yet.
+    Bottom,
+    /// Always this global / function reference.
+    Sym(ValueDef),
+    /// Anything else.
+    Top,
+}
+
+impl SymRef {
+    fn meet(&self, other: &SymRef) -> SymRef {
+        match (self, other) {
+            (SymRef::Bottom, x) | (x, SymRef::Bottom) => x.clone(),
+            (SymRef::Sym(a), SymRef::Sym(b)) if a == b => SymRef::Sym(a.clone()),
+            _ => SymRef::Top,
+        }
+    }
+}
+
+/// For every block parameter, the global or function reference it receives on
+/// every feasible incoming edge, if there is one (see the module docs). An
+/// edge is feasible when its source block is reachable and the source's
+/// terminator keeps it; entry parameters (the function's arguments) and
+/// parameters already folded to a constant are never rewired.
+fn symbol_params(
+    func: &Function,
+    value_const: &[Option<Const>],
+    reachable: &[bool],
+    term_choice: &[TermChoice],
+) -> Vec<Option<ValueDef>> {
+    let nv = func.value_count();
+    let mut out: Vec<Option<ValueDef>> = vec![None; nv];
+    let Some(entry) = func.entry() else {
+        return out;
+    };
+    // The feasible incoming argument lists of every block.
+    let mut incoming: Vec<Vec<&[ValueId]>> = vec![Vec::new(); func.block_count()];
+    for (b, blk) in func.blocks() {
+        if !reachable[b.index()] {
+            continue;
+        }
+        let Some(t) = blk.terminator() else {
+            continue;
+        };
+        let term = func.inst(t);
+        for (si, succ) in term.successors().into_iter().enumerate() {
+            let feasible = match term_choice[b.index()] {
+                TermChoice::KeepAll => true,
+                TermChoice::Single(e) => e == si,
+            };
+            if feasible && reachable[succ.index()] {
+                incoming[succ.index()].push(edge_args(term, si));
+            }
+        }
+    }
+    let candidate = |b: BlockId, p: ValueId| {
+        b != entry && reachable[b.index()] && value_const[p.index()].is_none()
+    };
+    let mut state: Vec<SymRef> = vec![SymRef::Top; nv];
+    let mut any = false;
+    for (b, blk) in func.blocks() {
+        for &p in blk.params() {
+            if candidate(b, p) {
+                state[p.index()] = SymRef::Bottom;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return out;
+    }
+    // Optimistic fixpoint: each parameter only descends ⊥ → symbol → ⊤.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (b, blk) in func.blocks() {
+            for (k, &p) in blk.params().iter().enumerate() {
+                if !candidate(b, p) || state[p.index()] == SymRef::Top {
+                    continue;
+                }
+                let ty = func.value_type(p);
+                let mut acc = SymRef::Bottom;
+                for args in &incoming[b.index()] {
+                    let a = args[k];
+                    let r = match &func.value(a).def {
+                        _ if func.value_type(a) != ty => SymRef::Top,
+                        d @ (ValueDef::Global(_) | ValueDef::Func(_)) => SymRef::Sym(d.clone()),
+                        ValueDef::Param(..) => state[a.index()].clone(),
+                        _ => SymRef::Top,
+                    };
+                    acc = acc.meet(&r);
+                    if acc == SymRef::Top {
+                        break;
+                    }
+                }
+                if acc != state[p.index()] {
+                    state[p.index()] = acc;
+                    changed = true;
+                }
+            }
+        }
+    }
+    for (v, s) in state.into_iter().enumerate() {
+        if let SymRef::Sym(d) = s {
+            out[v] = Some(d);
+        }
+    }
+    out
 }
 
 /// Decide how a reachable block's terminator is rewritten, given the fixpoint.
@@ -318,6 +453,12 @@ fn rebuild(old: &Function, plan: &Plan, builder: &mut FunctionBuilder<'_>, entry
         for (i, &p) in old.block(bb).params().iter().enumerate() {
             if let Some(c) = &plan.value_const[p.index()] {
                 vmap[p.index()] = Some(materialize(builder, c));
+            } else if let Some(d) = &plan.param_ref[p.index()] {
+                vmap[p.index()] = Some(match d {
+                    ValueDef::Global(g) => builder.global_ref(*g),
+                    ValueDef::Func(f) => builder.func_ref(*f),
+                    _ => unreachable!("only symbol references are recorded"),
+                });
             } else {
                 vmap[p.index()] = Some(new_params[i]);
             }
@@ -388,34 +529,6 @@ fn emit_single_edge(
     }
     let target = new_block[succ.index()].expect("a feasible edge targets a reachable block");
     builder.br(target, &mapped);
-}
-
-/// The block-argument slice of successor edge `si` of `term`, matching the target
-/// block's parameter list positionally (the layout the solver documents).
-fn edge_args(term: &InstData, si: usize) -> &[ValueId] {
-    let ops = term.operands();
-    match &term.kind {
-        InstKind::Br(_) => ops,
-        InstKind::CondBr { true_args, false_args, .. } => {
-            let ta = *true_args as usize;
-            let fa = *false_args as usize;
-            if si == 0 { &ops[1..1 + ta] } else { &ops[1 + ta..1 + ta + fa] }
-        }
-        InstKind::Switch(data) => {
-            let da = data.default_args as usize;
-            if si == 0 {
-                &ops[1..1 + da]
-            } else {
-                let mut off = 1 + da;
-                for c in &data.cases[..si - 1] {
-                    off += c.args as usize;
-                }
-                let len = data.cases[si - 1].args as usize;
-                &ops[off..off + len]
-            }
-        }
-        _ => &[],
-    }
 }
 
 /// Materialize an interned scalar constant as a value in the function being built.

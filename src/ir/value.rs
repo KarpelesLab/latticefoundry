@@ -223,4 +223,47 @@ impl ConstPool {
     pub fn iter(&self) -> impl Iterator<Item = &Const> {
         self.consts.iter()
     }
+
+    /// Renumber the function targets of every address constant after the
+    /// module's function list was compacted ([`crate::ir::Module::remove_functions`]):
+    /// `remap[old]` is the function's new id, or `None` if it was removed.
+    ///
+    /// Every [`ConstId`] stays valid. An address constant naming a *removed*
+    /// function (which the caller has proven unreferenced) becomes a tombstone,
+    /// a `poison` of the same pointer type. The renumbering is injective on the
+    /// surviving functions, so no two live constants collide; the dedup table
+    /// is rebuilt so that equal constants still intern to one handle, the
+    /// pre-existing entry winning over a tombstone.
+    pub(crate) fn remap_func_addrs(&mut self, remap: &[Option<FuncId>]) {
+        let mut tombstones: Vec<usize> = Vec::new();
+        let mut touched = false;
+        for (i, c) in self.consts.iter_mut().enumerate() {
+            if let Const::Addr { ty, target: AddrTarget::Func(f), .. } = c {
+                touched = true;
+                match remap[f.index()] {
+                    Some(nf) => *f = nf,
+                    None => {
+                        *c = Const::Poison(*ty);
+                        tombstones.push(i);
+                    }
+                }
+            }
+        }
+        if !touched {
+            return;
+        }
+        let mut dedup: HashMap<Const, ConstId> = HashMap::with_capacity(self.consts.len());
+        let mut t = 0;
+        for (i, c) in self.consts.iter().enumerate() {
+            if t < tombstones.len() && tombstones[t] == i {
+                t += 1;
+                continue;
+            }
+            dedup.entry(c.clone()).or_insert(ConstId::from_index(i));
+        }
+        for &i in &tombstones {
+            dedup.entry(self.consts[i].clone()).or_insert(ConstId::from_index(i));
+        }
+        self.dedup = dedup;
+    }
 }

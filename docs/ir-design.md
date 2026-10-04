@@ -942,7 +942,12 @@ The audit covered every transform:
   and promote slots. `declassify` is pure, so it can be hoisted or removed
   when dead, but no pass replaces it by its operand. A pass may only lose
   taint, and only where the value really is public: a folded constant, or a
-  promoted slot whose stored value was public.
+  promoted slot whose stored value was public. Dropping an unused block
+  parameter (dce) removes a data flow nothing reads, and SCCP's rewiring of a
+  parameter that always receives the same symbol address substitutes a
+  public link-time constant.
+- **dfe** (dead-function elimination): deletes whole unreachable internal
+  functions and touches no instruction of a surviving one.
 - **egraph** (B4): the rules introduce no branch, no division, and no variable
   shift amount (`x*2^k → x<<k` shifts by a constant). Extraction also compares
   `(tainted, cost)` lexicographically, so in every e-class a representative

@@ -61,7 +61,8 @@ latticefoundry/
 │   │                    (constants, ranges, known-bits, nullness)
 │   ├── pass/            pass & analysis manager
 │   ├── transform/       mem2reg, DCE, simplify-cfg, SCCP, LICM, inlining,
-│   │                    e-graph equality saturation, superoptimizer, -O pipeline
+│   │                    dead-function elimination, e-graph equality
+│   │                    saturation, superoptimizer, -O pipeline
 │   ├── codegen/         machine IR, instruction selection, register allocation,
 │   │                    MIR interpreter
 │   ├── mc/              encoding + fixups, ELF64 / PE-COFF / Mach-O objects,
