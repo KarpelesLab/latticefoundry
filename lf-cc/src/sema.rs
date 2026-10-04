@@ -13,8 +13,9 @@ use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
     AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, RecordId, Records,
-    Stmt, StmtKind, Storage, StrKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    Stmt, StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
+use latticefoundry::ir::Visibility;
 use crate::cstd::CStd;
 use crate::layout;
 
@@ -91,6 +92,15 @@ pub struct FuncSig {
     pub defined: bool,
     /// Whether the function has internal linkage (`static`): its symbol is local.
     pub is_static: bool,
+    /// An explicit `visibility` attribute on any declaration of the function.
+    pub visibility: Option<Visibility>,
+    /// Whether any declaration carries `__attribute__((weak))`.
+    pub weak: bool,
+    /// Whether the definition is a C99 *inline definition* (every file-scope
+    /// declaration is `inline` without `extern`): it provides no external
+    /// definition, so it is emitted as a private copy that only this
+    /// translation unit's calls use.
+    pub inline_def: bool,
 }
 
 /// A global variable (or an anonymous string-literal object). Its initializer is
@@ -113,6 +123,10 @@ pub struct TGlobal {
     pub defined: bool,
     /// Whether the object has internal linkage (`static`): its symbol is local.
     pub is_static: bool,
+    /// An explicit `visibility` attribute on any declaration of the object.
+    pub visibility: Option<Visibility>,
+    /// Whether any declaration carries `__attribute__((weak))`.
+    pub weak: bool,
     /// Whether the current definition is only *tentative* (a definition without
     /// an initializer). A tentative definition may be superseded by a later
     /// initialized definition; two initialized definitions collide.
@@ -556,6 +570,8 @@ impl Checker {
             readonly: true,
             defined: true,
             is_static: true,
+            visibility: None,
+            weak: false,
             tentative: false,
             relocs: Vec::new(),
         });
@@ -567,7 +583,8 @@ impl Checker {
         // idiom (`__bswap_32`, `__uint16_identity`, ...) — are dropped, as gcc
         // drops them: they would contribute no code, and their bodies may use
         // constructs this compiler does not implement.
-        let unused_inline = unused_static_inlines(unit);
+        let inline_defs = c99_inline_definitions(unit, self.std);
+        let unused_inline = unused_static_inlines(unit, &inline_defs);
         // Pass 1: register every signature and global so bodies can forward- and
         // mutually-reference them.
         for (i, item) in unit.items.iter().enumerate() {
@@ -587,6 +604,7 @@ impl Checker {
                         p.asm_label.as_deref(),
                         p.span,
                     );
+                    self.apply_sig_attrs(&p.name, p.attrs);
                 }
                 TopLevel::Func(f) => {
                     let params = f.params.iter().map(|pp| pp.ty.clone()).collect();
@@ -600,6 +618,12 @@ impl Checker {
                         f.asm_label.as_deref(),
                         f.span,
                     );
+                    self.apply_sig_attrs(&f.name, f.attrs);
+                    if inline_defs.contains(f.name.as_str())
+                        && let Some(&idx) = self.sig_index.get(&f.name)
+                    {
+                        self.sigs[idx].inline_def = true;
+                    }
                 }
                 TopLevel::Global(g) => self.register_global(g),
                 TopLevel::Asm(text) => self.toplevel_asm.push(text.clone()),
@@ -612,6 +636,19 @@ impl Checker {
             {
                 self.check_func(f);
             }
+        }
+    }
+
+    /// Merge a declaration's symbol attributes into the signature registered
+    /// for the C name `name`: a `visibility` attribute (the last one wins) and
+    /// `weak`.
+    fn apply_sig_attrs(&mut self, name: &str, attrs: SymAttrs) {
+        if let Some(&idx) = self.sig_index.get(name) {
+            let sig = &mut self.sigs[idx];
+            if attrs.visibility.is_some() {
+                sig.visibility = attrs.visibility;
+            }
+            sig.weak |= attrs.weak;
         }
     }
 
@@ -673,7 +710,17 @@ impl Checker {
             return;
         }
         let idx = self.sigs.len();
-        self.sigs.push(FuncSig { name: symbol.to_owned(), ret, params, variadic, defined, is_static });
+        self.sigs.push(FuncSig {
+            name: symbol.to_owned(),
+            ret,
+            params,
+            variadic,
+            defined,
+            is_static,
+            visibility: None,
+            weak: false,
+            inline_def: false,
+        });
         self.sig_index.insert(name.to_owned(), idx);
         self.sig_by_symbol.insert(symbol.to_owned(), idx);
     }
@@ -742,6 +789,10 @@ impl Checker {
             if is_static {
                 self.globals[idx].is_static = true;
             }
+            if g.attrs.visibility.is_some() {
+                self.globals[idx].visibility = g.attrs.visibility;
+            }
+            self.globals[idx].weak |= g.attrs.weak;
             return;
         }
 
@@ -761,6 +812,8 @@ impl Checker {
             readonly: false,
             defined: !is_decl_only,
             is_static,
+            visibility: g.attrs.visibility,
+            weak: g.attrs.weak,
             tentative: !has_init && !is_decl_only,
             relocs,
         });
@@ -1454,6 +1507,10 @@ impl Checker {
                     if ty_is_more_complete(&ty, &self.globals[i].ty) {
                         self.globals[i].ty = ty.clone();
                     }
+                    if d.attrs.visibility.is_some() {
+                        self.globals[i].visibility = d.attrs.visibility;
+                    }
+                    self.globals[i].weak |= d.attrs.weak;
                     i
                 } else {
                     let i = self.globals.len();
@@ -1466,6 +1523,8 @@ impl Checker {
                         readonly: false,
                         defined: false,
                         is_static: false,
+                        visibility: d.attrs.visibility,
+                        weak: d.attrs.weak,
                         tentative: false,
                         relocs: Vec::new(),
                     });
@@ -1555,6 +1614,8 @@ impl Checker {
             readonly: false,
             defined: true,
             is_static: true,
+            visibility: None,
+            weak: false,
             tentative: false,
             relocs,
         });
@@ -3576,17 +3637,49 @@ fn write_string_bytes(bytes: &mut [u8], off: u64, s: &[u8], limit: u64) {
     }
 }
 
+/// The names of the functions whose definition in `unit` is a C99 *inline
+/// definition* (C11 6.7.4p7): a non-`static` function every file-scope
+/// declaration of which carries `inline` and none `extern`. Such a definition
+/// provides no external definition of the function. Under GNU89 inline
+/// semantics (`-std=gnu89`/`c89`, or the `gnu_inline` attribute) a plain
+/// `inline` definition is an ordinary external definition instead.
+fn c99_inline_definitions(unit: &TranslationUnit, std: CStd) -> HashSet<String> {
+    if !std.is_c99() {
+        return HashSet::new();
+    }
+    // name -> (has an inline definition, every declaration is inline and not extern)
+    let mut state: HashMap<&str, (bool, bool)> = HashMap::new();
+    for item in &unit.items {
+        let (name, inline_only, def) = match item {
+            TopLevel::Func(f) if !f.is_static => {
+                let c99 = f.is_inline && !f.is_extern && !f.attrs.gnu_inline;
+                (f.name.as_str(), c99, c99)
+            }
+            TopLevel::Proto(p) if !p.is_static => (p.name.as_str(), p.is_inline && !p.is_extern, false),
+            _ => continue,
+        };
+        let e = state.entry(name).or_insert((false, true));
+        e.0 |= def;
+        e.1 &= inline_only;
+    }
+    state.into_iter().filter(|(_, (def, only))| *def && *only).map(|(n, _)| n.to_owned()).collect()
+}
+
 /// The indices (in `unit.items`) of the `static inline` function definitions
-/// that nothing in the translation unit refers to. References are found by
-/// name from every other function body and global initializer, then
-/// transitively through the bodies of referenced inline functions.
-fn unused_static_inlines(unit: &TranslationUnit) -> HashSet<usize> {
+/// (and of the C99 inline definitions named in `inline_defs`) that nothing in
+/// the translation unit refers to. References are found by name from every
+/// other function body and global initializer, then transitively through the
+/// bodies of referenced inline functions.
+fn unused_static_inlines(unit: &TranslationUnit, inline_defs: &HashSet<String>) -> HashSet<usize> {
+    let is_candidate = |f: &crate::ast::FuncDef| {
+        (f.is_static && f.is_inline) || (!f.is_static && inline_defs.contains(&f.name))
+    };
     let candidates: HashMap<&str, usize> = unit
         .items
         .iter()
         .enumerate()
         .filter_map(|(i, item)| match item {
-            TopLevel::Func(f) if f.is_static && f.is_inline => Some((f.name.as_str(), i)),
+            TopLevel::Func(f) if is_candidate(f) => Some((f.name.as_str(), i)),
             _ => None,
         })
         .collect();
@@ -3596,7 +3689,7 @@ fn unused_static_inlines(unit: &TranslationUnit) -> HashSet<usize> {
     let mut names: HashSet<String> = HashSet::new();
     for item in &unit.items {
         match item {
-            TopLevel::Func(f) if !(f.is_static && f.is_inline) => {
+            TopLevel::Func(f) if !is_candidate(f) => {
                 for s in &f.body {
                     idents_in_stmt(s, &mut names);
                 }

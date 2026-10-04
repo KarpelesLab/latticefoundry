@@ -87,6 +87,12 @@ pub struct PpOptions {
     /// Optimization is enabled (`-O1` and up): predefines `__OPTIMIZE__` once the
     /// parser accepts the statement expressions C library headers then use.
     pub optimize: bool,
+    /// The position-independent-code level, predefined as `__pic__`/`__PIC__`:
+    /// 0 for none, 1 for `-fpic`/`-fpie`, 2 for `-fPIC`/`-fPIE`.
+    pub pic: u8,
+    /// Code for a position-independent *executable* (`-fpie`/`-fPIE`): also
+    /// predefines `__pie__`/`__PIE__` at the [`pic`](Self::pic) level.
+    pub pie: bool,
 }
 
 impl Default for PpOptions {
@@ -103,6 +109,8 @@ impl Default for PpOptions {
             builtin_headers: true,
             hosted: false,
             optimize: false,
+            pic: 0,
+            pie: false,
         }
     }
 }
@@ -602,8 +610,8 @@ impl Pp {
     /// headers keyed on them include `<*intrin.h>`), `__GCC_ATOMIC_*` and
     /// `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_*` (no `__atomic_*`/`__sync_*`
     /// builtins), `__STDC_UTF_16__` (`u""` literals are not UTF-16-encoded
-    /// beyond the BMP), `__STDC_EMBED_*__` (no `__has_embed`), and
-    /// `__PIC__`/`__PIE__`.
+    /// beyond the BMP), and `__STDC_EMBED_*__` (no `__has_embed`).
+    /// `__PIC__`/`__PIE__` follow [`PpOptions::pic`]/[`PpOptions::pie`].
     fn define_predefined(&mut self, opts: &PpOptions) {
         let gnu = self.std.is_gnu();
         self.define_object("__STDC__", "1");
@@ -790,6 +798,15 @@ impl Pp {
         // offering them when optimizing is safe.
         if !(opts.optimize && STATEMENT_EXPRESSIONS) {
             self.define_object("__NO_INLINE__", "1");
+        }
+        if opts.pic > 0 {
+            let level = opts.pic.to_string();
+            self.define_object("__pic__", &level);
+            self.define_object("__PIC__", &level);
+            if opts.pie {
+                self.define_object("__pie__", &level);
+                self.define_object("__PIE__", &level);
+            }
         }
 
         if gnu {

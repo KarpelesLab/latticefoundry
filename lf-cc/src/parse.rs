@@ -14,11 +14,12 @@ use latticefoundry::support::diagnostics::{Diagnostic, Span};
 use crate::ast::{
     AsmOperand, AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, Field, FloatTy, FuncDef, FuncProto, FuncType,
     GenericAssoc, Init, InitItem, IntTy, Param, RecordDef, RecordId, RecordKind, Records, Stmt,
-    StmtKind, Storage, StrKind, TopLevel, TranslationUnit, UnaryOp, VarDecl,
+    StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use crate::cstd::CStd;
 use crate::layout;
 use crate::lex::{Keyword, Punct, Token, TokenKind};
+use latticefoundry::ir::Visibility;
 
 type PResult<T> = Result<T, Diagnostic>;
 
@@ -150,6 +151,10 @@ struct Attrs {
     transparent_union: bool,
     /// `vector_size(N)`: GCC vector types are not supported.
     vector_size: bool,
+    /// `visibility("default"|"hidden"|"protected"|"internal")`.
+    visibility: Option<Visibility>,
+    /// `weak`.
+    weak: bool,
 }
 
 /// The declaration-wide properties shared by every declarator of one
@@ -195,6 +200,15 @@ impl Attrs {
         self.gnu_inline |= other.gnu_inline;
         self.transparent_union |= other.transparent_union;
         self.vector_size |= other.vector_size;
+        if other.visibility.is_some() {
+            self.visibility = other.visibility;
+        }
+        self.weak |= other.weak;
+    }
+
+    /// The symbol attributes (visibility, weak) among these attributes.
+    fn sym(&self) -> SymAttrs {
+        SymAttrs { visibility: self.visibility, weak: self.weak, gnu_inline: self.gnu_inline }
     }
 }
 
@@ -390,8 +404,12 @@ impl Parser {
     fn parse_unit(&mut self) -> PResult<Vec<TopLevel>> {
         let mut items = Vec::new();
         while !self.at_eof() {
-            // An attribute specifier sequence may precede a top-level declaration.
-            self.skip_attributes()?;
+            // An attribute specifier sequence may precede a top-level declaration
+            // (`__attribute__((visibility("hidden"))) int f(void);`); it applies
+            // to the declaration's specifiers.
+            self.pending_attrs = Attrs::default();
+            let leading = self.parse_attributes()?;
+            self.pending_attrs.merge(leading);
             if self.at_eof() {
                 break;
             }
@@ -422,6 +440,7 @@ impl Parser {
             let r = self.parse_top_level();
             self.extension -= u32::from(ext);
             items.extend(r?);
+            self.pending_attrs = Attrs::default();
         }
         Ok(items)
     }
@@ -567,8 +586,10 @@ impl Parser {
                     variadic: ft.variadic,
                     is_static: decl.storage == Storage::Static,
                     is_inline: self.spec_inline,
+                    is_extern: decl.storage == Storage::Extern,
                     body: body?,
                     asm_label,
+                    attrs: attrs.sym(),
                     span,
                 })]);
             }
@@ -637,8 +658,10 @@ impl Parser {
                 variadic: false,
                 is_static,
                 is_inline,
+                is_extern: decl.storage == Storage::Extern,
                 body,
                 asm_label: None,
+                attrs: decl.sattrs.sym(),
                 span: name_span,
             }));
         }
@@ -673,7 +696,10 @@ impl Parser {
                     params,
                     variadic,
                     is_static,
+                    is_inline,
+                    is_extern: true,
                     asm_label,
+                    attrs: attrs.sym(),
                     span: name_span,
                 }));
             }
@@ -684,8 +710,10 @@ impl Parser {
                 variadic,
                 is_static,
                 is_inline,
+                is_extern: decl.storage == Storage::Extern,
                 body,
                 asm_label,
+                attrs: attrs.sym(),
                 span: name_span,
             }));
         }
@@ -697,7 +725,10 @@ impl Parser {
             params,
             variadic,
             is_static,
+            is_inline,
+            is_extern: decl.storage == Storage::Extern,
             asm_label,
+            attrs: attrs.sym(),
             span: name_span,
         }))
     }
@@ -737,7 +768,10 @@ impl Parser {
                 params,
                 variadic: ft.variadic,
                 is_static: decl.storage == Storage::Static,
+                is_inline: self.spec_inline,
+                is_extern: decl.storage == Storage::Extern,
                 asm_label,
+                attrs: attrs.sym(),
                 span,
             }));
         }
@@ -754,6 +788,7 @@ impl Parser {
             storage: decl.storage,
             asm_label,
             thread_local: self.spec_thread,
+            attrs: attrs.sym(),
             span,
         }))
     }
@@ -942,11 +977,31 @@ impl Parser {
                 "packed" => attrs.packed = true,
                 "gnu_inline" => attrs.gnu_inline = true,
                 "transparent_union" => attrs.transparent_union = true,
+                "weak" => attrs.weak = true,
                 _ => {}
             }
             return Ok(());
         }
         match bare.as_str() {
+            "visibility" => {
+                self.bump(); // (
+                let sp = self.peek_span();
+                let v = self.parse_asm_string("a visibility")?;
+                attrs.visibility = Some(match v.as_str() {
+                    "default" => Visibility::Default,
+                    // ELF `STV_INTERNAL` is `STV_HIDDEN` plus a processor-specific
+                    // promise; as gcc does on x86-64, treat it as hidden.
+                    "hidden" | "internal" => Visibility::Hidden,
+                    "protected" => Visibility::Protected,
+                    _ => {
+                        return Err(Diagnostic::error(format!(
+                            "unknown visibility '{v}' (expected default, hidden, protected or internal)"
+                        ))
+                        .with_span(sp));
+                    }
+                });
+                self.expect_punct(Punct::RParen, "')' after the visibility")?;
+            }
             "mode" => {
                 self.bump(); // (
                 let (m, sp) = self.expect_ident()?;
@@ -1304,6 +1359,7 @@ impl Parser {
                     storage: Storage::None,
                     asm_label: None,
                     thread_local: false,
+                    attrs: SymAttrs::default(),
                     span,
                 }]),
                 span,
@@ -2715,6 +2771,7 @@ impl Parser {
                 storage,
                 asm_label,
                 thread_local,
+                attrs: attrs.sym(),
                 span: name_span,
             });
             if !self.eat_punct(Punct::Comma) {

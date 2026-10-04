@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use latticefoundry::ir::Visibility;
 use latticefoundry::support::diagnostics::Span;
 
 /// A C type in the subset: `void`, `_Bool`, the integer types (tracked as an
@@ -765,6 +766,20 @@ pub enum Storage {
     Static,
 }
 
+/// The symbol attributes a GNU `__attribute__` gives a function or object
+/// declaration: its ELF visibility and whether it is weak.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SymAttrs {
+    /// `__attribute__((visibility("...")))`, if given.
+    pub visibility: Option<Visibility>,
+    /// `__attribute__((weak))`: a weak definition, or a weak (possibly
+    /// unresolved) reference.
+    pub weak: bool,
+    /// `__attribute__((gnu_inline))` on a function: GNU89 `inline` semantics
+    /// (a plain `inline` definition is an external definition).
+    pub gnu_inline: bool,
+}
+
 /// A single declared variable (in a local declaration or a global).
 #[derive(Clone, Debug)]
 pub struct VarDecl {
@@ -783,6 +798,8 @@ pub struct VarDecl {
     pub asm_label: Option<String>,
     /// Whether the object is thread-local (`_Thread_local` / GNU `__thread`).
     pub thread_local: bool,
+    /// The GNU symbol attributes (visibility, weak).
+    pub attrs: SymAttrs,
     /// The source span of the declarator.
     pub span: Span,
 }
@@ -815,10 +832,15 @@ pub struct FuncDef {
     /// unreferenced `static inline` definition (the header idiom) is not
     /// compiled at all, as gcc does not emit one either.
     pub is_inline: bool,
+    /// Whether the definition carries the `extern` storage-class specifier
+    /// (which, for an `inline` function, makes it an external definition).
+    pub is_extern: bool,
     /// The function body (a list of statements).
     pub body: Vec<Stmt>,
     /// A GNU asm label (`T f(...) asm("sym") { ... }`) naming the emitted symbol.
     pub asm_label: Option<String>,
+    /// The GNU symbol attributes (visibility, weak).
+    pub attrs: SymAttrs,
     /// The source span of the function's declarator (its name).
     pub span: Span,
 }
@@ -836,9 +858,15 @@ pub struct FuncProto {
     pub variadic: bool,
     /// Whether the function has internal linkage (`static`).
     pub is_static: bool,
+    /// Whether the declaration carries the `inline` function specifier.
+    pub is_inline: bool,
+    /// Whether the declaration carries the `extern` storage-class specifier.
+    pub is_extern: bool,
     /// A GNU asm label (`T f(...) __asm__("sym");`): the assembler symbol calls
     /// and references to `f` use instead of its C name (glibc's `__REDIRECT`).
     pub asm_label: Option<String>,
+    /// The GNU symbol attributes (visibility, weak).
+    pub attrs: SymAttrs,
     /// The source span of the declarator.
     pub span: Span,
 }

@@ -14,14 +14,18 @@ use latticefoundry::ir::builder::FunctionBuilder;
 use latticefoundry::ir::inst::{BinOp, CastOp, Flags, FloatPred, IntPred};
 use latticefoundry::ir::types::{Type, TypeContext, TypeId};
 use latticefoundry::ir::value::{FloatBits, ValueId};
-use latticefoundry::ir::{BlockId, Const, FuncId, GlobalId, Global, Module};
+use latticefoundry::codegen::RelocModel;
+use latticefoundry::ir::{
+    BlockId, Const, FuncAttrs, FuncId, GlobalAttrs, GlobalId, Global, Linkage, Module, Visibility,
+};
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::puremp;
 
 use crate::ast::{BinaryOp, CType, FloatTy, Records};
 use crate::layout;
 use crate::layout::BitPlacement;
-use crate::sema::{AggStore, LocalInfo, Program, TExpr, TExprKind, TFunc, TStmt};
+use crate::sema::{AggStore, FuncSig, LocalInfo, Program, TExpr, TExprKind, TFunc, TGlobal, TStmt};
+use crate::CodegenConfig;
 
 /// The size in bytes of a System V `__va_list_tag` (`va_copy` copies this many).
 const VA_LIST_SIZE: u64 = 24;
@@ -95,6 +99,58 @@ impl LineMap {
 /// symbol interner whose handles the module's names refer to (the codegen and
 /// linker need the same interner).
 pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) -> (Module, StrInterner) {
+    lower_with(program, source, module_name, debug, &CodegenConfig::default())
+}
+
+/// The IR symbol name of a function: its symbol, except that a C99 inline
+/// definition (which provides no external definition) is emitted as a private
+/// copy under a name of its own, so the external symbol stays free for the
+/// translation unit that defines it.
+pub fn func_symbol(sig: &FuncSig) -> String {
+    if sig.inline_def { format!("{}.inline", sig.name) } else { sig.name.clone() }
+}
+
+/// The ELF visibility of a function: its `visibility` attribute, else the
+/// `-fvisibility=` default for a definition (a declaration keeps `default`).
+pub fn func_visibility(sig: &FuncSig, cfg: &CodegenConfig) -> Visibility {
+    match sig.visibility {
+        Some(v) => v,
+        None if sig.defined && !sig.is_static => cfg.default_visibility,
+        None => Visibility::Default,
+    }
+}
+
+/// The ELF visibility of a global object (see [`func_visibility`]).
+pub fn global_visibility(g: &TGlobal, cfg: &CodegenConfig) -> Visibility {
+    match g.visibility {
+        Some(v) => v,
+        None if g.defined && !g.is_static => cfg.default_visibility,
+        None => Visibility::Default,
+    }
+}
+
+/// The IR linkage of a function definition: `static` functions and C99 inline
+/// definitions are internal, `weak` ones weak.
+fn func_linkage(sig: &FuncSig) -> Linkage {
+    if sig.is_static || sig.inline_def {
+        Linkage::Internal
+    } else if sig.weak {
+        Linkage::Weak
+    } else {
+        Linkage::External
+    }
+}
+
+/// Like [`lower`], under the code-generation configuration `cfg` (symbol
+/// visibility defaults and the relocation model the symbol attributes are
+/// chosen for).
+pub fn lower_with(
+    program: &Program,
+    source: &str,
+    module_name: &str,
+    debug: bool,
+    cfg: &CodegenConfig,
+) -> (Module, StrInterner) {
     let mut module = Module::new(module_name.to_owned());
     let mut syms = StrInterner::new();
     let linemap = LineMap::new(source);
@@ -135,8 +191,10 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             tys.of(&sig.ret)
         };
         let ft = module.types_mut().func(params, ret, sig.variadic);
-        let name = syms.intern(&sig.name);
-        func_ids.push(module.declare_function(name, ft));
+        let name = syms.intern(&func_symbol(sig));
+        let fid = module.declare_function(name, ft);
+        module.set_func_attrs(fid, FuncAttrs::new(func_linkage(sig), func_visibility(sig, cfg)));
+        func_ids.push(fid);
     }
 
     // The System V variadic frame-address intrinsics, declared once as external
@@ -152,6 +210,11 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
 
     // Add globals. Their storage bytes are emitted by the driver's
     // `emit_globals`; the IR init here exists only so each global is well-typed.
+    // The globals stay `detached` (the backend emits nothing for them); their
+    // attributes only steer how code addresses them: a `static` object, or under
+    // PIE any object defined here, binds locally (a PC-relative `lea`), and a
+    // hidden one does too.
+    let pie = cfg.reloc_model == RelocModel::Pie;
     let mut global_ids: Vec<GlobalId> = Vec::with_capacity(program.globals.len());
     for g in &program.globals {
         let ty = layout::ir_type(module.types_mut(), &program.records, &g.ty);
@@ -173,7 +236,16 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
             module.intern_const(Const::Poison(ty))
         };
         let name = syms.intern(&g.name);
-        global_ids.push(module.add_global(Global { name, ty, init: Some(init) }));
+        let linkage = if g.is_static || (pie && g.defined) {
+            Linkage::Internal
+        } else if g.weak {
+            Linkage::Weak
+        } else {
+            Linkage::External
+        };
+        let attrs =
+            GlobalAttrs { linkage, visibility: global_visibility(g, cfg), ..GlobalAttrs::DETACHED };
+        global_ids.push(module.define_global(Global { name, ty, init: Some(init) }, attrs));
     }
 
     // For each function, an externally-defined ("init: None") global aliasing its
@@ -183,11 +255,26 @@ pub fn lower(program: &Program, source: &str, module_name: &str, debug: bool) ->
     // — it only honours `func_ref` as a direct call target. The synthetic global
     // is never emitted as data (it is not in `program.globals`), so at link time
     // the reference resolves to the function definition of the same name.
+    //
+    // A C99 inline definition's address is that of the *external* function
+    // (defined in some other translation unit), so its alias names the external
+    // symbol, not the private copy direct calls use.
     let ptr_ty = tys.ptr;
     let mut func_addr_globals: Vec<GlobalId> = Vec::with_capacity(program.sigs.len());
     for sig in &program.sigs {
         let name = syms.intern(&sig.name);
-        func_addr_globals.push(module.add_global(Global { name, ty: ptr_ty, init: None }));
+        let local = sig.is_static || (pie && sig.defined && !sig.inline_def);
+        let visibility = if sig.inline_def {
+            sig.visibility.unwrap_or_default()
+        } else {
+            func_visibility(sig, cfg)
+        };
+        let attrs = GlobalAttrs {
+            linkage: if local { Linkage::Internal } else { Linkage::External },
+            visibility,
+            ..GlobalAttrs::DETACHED
+        };
+        func_addr_globals.push(module.define_global(Global { name, ty: ptr_ty, init: None }, attrs));
     }
 
     // Precompute the interned IR type of every local/parameter aggregate, so the

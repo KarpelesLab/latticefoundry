@@ -23,7 +23,8 @@ pub mod sema;
 pub use cstd::CStd;
 pub use preprocess::{MacroOp, PpOptions, SourceLocation, SourceMap, default_system_include_dirs};
 
-use latticefoundry::ir::Module;
+use latticefoundry::codegen::{CodegenOptions, RelocModel};
+use latticefoundry::ir::{Module, Visibility};
 use latticefoundry::link::{self, ImageOptions};
 use latticefoundry::mc::asm::{self as mcasm, AsmOptions, AsmSource};
 use latticefoundry::mc::object::{
@@ -37,6 +38,18 @@ use latticefoundry::transform::pipeline::{self, OptLevel};
 use latticefoundry::verify;
 
 use sema::{FuncSig, TGlobal};
+
+/// Code-generation choices that do not change a program's meaning but shape
+/// its object: the relocation model (`-fPIC`/`-fPIE`) and the default symbol
+/// visibility of definitions (`-fvisibility=`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodegenConfig {
+    /// How position-independent the code must be (default: static).
+    pub reloc_model: RelocModel,
+    /// The visibility of every definition without a `visibility` attribute
+    /// (default: `default`).
+    pub default_visibility: Visibility,
+}
 
 /// Compile C source text all the way to a lowered IR [`Module`] plus the symbol
 /// interner its names live in. Returns the collected diagnostics on any lex,
@@ -127,6 +140,7 @@ pub fn build_image_with(
     debug: bool,
 ) -> Result<Vec<u8>, BuildError> {
     let program = check_source_mapped(source, opts).map_err(|(d, m)| BuildError::Frontend(d, m))?;
+    let cfg = CodegenConfig::default();
     if !program.toplevel_asm.is_empty() {
         // The self-contained linker consumes only our own object modules; the
         // assembled file-scope asm is a separate ELF object that needs the
@@ -135,7 +149,7 @@ pub fn build_image_with(
             "file-scope asm needs the object path (compile_object_with + an ELF link)".to_owned(),
         ));
     }
-    let obj = compile_program(&program, source, input_name, opt, debug)?;
+    let obj = compile_program(&program, source, input_name, opt, debug, &cfg)?;
     link_image(vec![obj], debug)
 }
 
@@ -161,8 +175,21 @@ pub fn compile_module_with(
     opt: OptLevel,
     debug: bool,
 ) -> Result<CompiledModule, BuildError> {
+    compile_module_cfg(source, input_name, opts, opt, debug, &CodegenConfig::default())
+}
+
+/// Like [`compile_module_with`], under the code-generation configuration `cfg`
+/// (relocation model, default visibility).
+pub fn compile_module_cfg(
+    source: &str,
+    input_name: &str,
+    opts: &PpOptions,
+    opt: OptLevel,
+    debug: bool,
+    cfg: &CodegenConfig,
+) -> Result<CompiledModule, BuildError> {
     let program = check_source_mapped(source, opts).map_err(|(d, m)| BuildError::Frontend(d, m))?;
-    let module = compile_program(&program, source, input_name, opt, debug)?;
+    let module = compile_program(&program, source, input_name, opt, debug, cfg)?;
     Ok(CompiledModule { module, toplevel_asm: program.toplevel_asm })
 }
 
@@ -224,7 +251,20 @@ pub fn compile_object_with(
     opt: OptLevel,
     debug: bool,
 ) -> Result<CompiledObject, BuildError> {
-    let compiled = compile_module_with(source, input_name, opts, opt, debug)?;
+    compile_object_cfg(source, input_name, opts, opt, debug, &CodegenConfig::default())
+}
+
+/// Like [`compile_object_with`], under the code-generation configuration `cfg`
+/// (e.g. position-independent code for a shared library).
+pub fn compile_object_cfg(
+    source: &str,
+    input_name: &str,
+    opts: &PpOptions,
+    opt: OptLevel,
+    debug: bool,
+    cfg: &CodegenConfig,
+) -> Result<CompiledObject, BuildError> {
+    let compiled = compile_module_cfg(source, input_name, opts, opt, debug, cfg)?;
     Ok(CompiledObject {
         object: latticefoundry::mc::elf::write(&compiled.module),
         toplevel_asm: compiled.toplevel_asm,
@@ -261,8 +301,9 @@ fn compile_program(
     input_name: &str,
     opt: OptLevel,
     debug: bool,
+    cfg: &CodegenConfig,
 ) -> Result<ObjectModule, BuildError> {
-    let (mut module, syms) = lower::lower(program, source, input_name, debug);
+    let (mut module, syms) = lower::lower_with(program, source, input_name, debug, cfg);
 
     verify_or(&module, "lowered")?;
     pipeline::optimize(&mut module, opt);
@@ -270,34 +311,37 @@ fn compile_program(
         verify_or(&module, "optimized")?;
     }
 
+    let cg = CodegenOptions::default().with_reloc_model(cfg.reloc_model);
     let mut obj = if debug {
         let comp_dir = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(str::to_owned))
             .unwrap_or_default();
         let source_desc = x86_64::DebugSource { file_name: input_name.to_owned(), comp_dir };
-        x86_64::compile_module_debug(&module, &syms, &source_desc)
+        x86_64::compile_module_debug_with(&module, &syms, &source_desc, &cg).object
     } else {
-        x86_64::compile_module(&module, &syms)
+        x86_64::compile_module_with(&module, &syms, &cg).object
     };
-    emit_globals(&mut obj, &program.globals);
-    apply_static_linkage(&mut obj, &program.sigs);
+    emit_globals(&mut obj, &program.globals, cfg);
+    apply_weak_references(&mut obj, &program.sigs, &program.globals);
     Ok(obj)
 }
 
-/// Give each `static` function definition internal linkage by rebinding its
-/// object symbol from `Global` to `Local` (the code backend always emits
-/// functions as global). This lets several translation units each define their
-/// own file-scope `static` helper of the same name without colliding at link.
-fn apply_static_linkage(obj: &mut ObjectModule, sigs: &[FuncSig]) {
-    for sig in sigs {
-        if sig.is_static
-            && sig.defined
-            && let Some(id) = obj.symbol_id(&sig.name)
-        {
+/// Bind the undefined references to `weak`-declared functions and objects
+/// weakly (`STB_WEAK`), so they resolve to address 0 when nothing defines
+/// them. (Weak *definitions* get their binding from the IR linkage.)
+fn apply_weak_references(obj: &mut ObjectModule, sigs: &[FuncSig], globals: &[TGlobal]) {
+    let weak_refs = sigs
+        .iter()
+        .filter(|s| s.weak && !s.defined)
+        .map(|s| s.name.as_str())
+        .chain(globals.iter().filter(|g| g.weak && !g.defined).map(|g| g.name.as_str()));
+    let names: Vec<String> = weak_refs.map(str::to_owned).collect();
+    for name in names {
+        if let Some(id) = obj.symbol_id(&name) {
             let mut sym = obj.symbol(id).clone();
-            if sym.binding != SymbolBinding::Local {
-                sym.binding = SymbolBinding::Local;
+            if sym.is_undefined() && sym.binding != SymbolBinding::Weak {
+                sym.binding = SymbolBinding::Weak;
                 obj.add_symbol(sym);
             }
         }
@@ -323,7 +367,7 @@ fn verify_or(module: &Module, stage: &str) -> Result<(), BuildError> {
 /// contributed here). Writable globals go in `.data`; read-only objects (string
 /// literals) in `.rodata`. Each global's fully-materialized initializer image is
 /// copied verbatim.
-fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal]) {
+fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal], cfg: &CodegenConfig) {
     if globals.is_empty() {
         return;
     }
@@ -365,21 +409,18 @@ fn emit_globals(obj: &mut ObjectModule, globals: &[TGlobal]) {
         // is bound *weakly*: the linker then merges the duplicates, and a strong
         // (initialized) definition elsewhere wins. This matches the traditional
         // `-fcommon` behavior that pre-C99-era sources such as make-3.82 rely on.
+        // `__attribute__((weak))` makes any definition weak.
         let binding = if g.is_static {
             SymbolBinding::Local
-        } else if g.tentative {
+        } else if g.tentative || g.weak {
             SymbolBinding::Weak
         } else {
             SymbolBinding::Global
         };
-        obj.add_symbol(Symbol::defined(
-            g.name.clone(),
-            binding,
-            SymbolType::Object,
-            sec,
-            off,
-            g.bytes.len() as u64,
-        ));
+        let mut sym =
+            Symbol::defined(g.name.clone(), binding, SymbolType::Object, sec, off, g.bytes.len() as u64);
+        sym.visibility = lower::global_visibility(g, cfg).into();
+        obj.add_symbol(sym);
         for r in &g.relocs {
             pending.push((sec, off + r.offset, r.symbol.clone(), r.addend));
         }

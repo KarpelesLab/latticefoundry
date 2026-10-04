@@ -19,14 +19,22 @@
 //!   C source (without file-scope asm) this is done entirely in memory by the
 //!   framework's own linker core; otherwise `qld` links statically. This is also the
 //!   fallback when no host C runtime is found.
+//! * `-shared` links a **shared library** (`link::gnu::shared_library_args`,
+//!   with `DT_SONAME` from `-Wl,-soname,<name>`), and `-pie` a
+//!   **position-independent executable** (`host_c_pie_link_args`). Sources
+//!   compiled for them default to `-fPIC` / `-fPIE` code.
+//! * `-fPIC`/`-fpic` and `-fPIE`/`-fpie` select position-independent code
+//!   (`CodegenOptions::with_reloc_model`); `-fvisibility=` sets the default
+//!   ELF visibility of definitions.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use latticefoundry::ir::text;
+use latticefoundry::codegen::RelocModel;
+use latticefoundry::ir::{Visibility, text};
 use latticefoundry::link;
-use latticefoundry::link::gnu::{HostCrt, host_c_link_args, link_gnu};
+use latticefoundry::link::gnu::{HostCrt, host_c_link_args, host_c_pie_link_args, link_gnu, shared_library_args};
 use latticefoundry::mc::asm::{AsmOptions, AsmSource, assemble, assemble_file};
 use latticefoundry::mc::elf;
 use latticefoundry::mc::object::ObjectModule;
@@ -34,7 +42,7 @@ use latticefoundry::support::diagnostics::Diagnostic;
 use latticefoundry::target::TargetArch;
 use latticefoundry::transform::pipeline::OptLevel;
 
-use lf_cc::{BuildError, CStd, MacroOp, PpOptions, SourceMap};
+use lf_cc::{BuildError, CStd, CodegenConfig, MacroOp, PpOptions, SourceMap};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -84,6 +92,15 @@ struct Options {
     /// `-ffreestanding`: `__STDC_HOSTED__` is 0 and the builtin headers do not
     /// layer over the C library's.
     freestanding: bool,
+    /// An explicit `-fPIC`/`-fpic`/`-fPIE`/`-fpie`/`-fno-pic` choice:
+    /// `(relocation model, __PIC__ level)`.
+    pic: Option<(RelocModel, u8)>,
+    /// `-shared`: link a shared library.
+    shared: bool,
+    /// `-pie`: link a position-independent executable.
+    pie: bool,
+    /// `-fvisibility=`: the default visibility of definitions.
+    visibility: Visibility,
 }
 
 impl Options {
@@ -102,7 +119,22 @@ impl Options {
             builtin_headers: !self.nostdinc,
             hosted: !self.freestanding,
             optimize: self.opt != OptLevel::O0,
+            pic: self.pic.map_or(0, |(_, level)| level),
+            pie: matches!(self.pic, Some((RelocModel::Pie, _))),
         }
+    }
+
+    /// The code-generation configuration: the explicit `-f[no-]pic`/`-fpie`
+    /// choice, else position-independent code for what is being linked
+    /// (`-shared` → PIC, `-pie` → PIE), else position-dependent code.
+    fn codegen(&self) -> CodegenConfig {
+        let reloc_model = match self.pic {
+            Some((model, _)) => model,
+            None if self.shared => RelocModel::Pic,
+            None if self.pie => RelocModel::Pie,
+            None => RelocModel::Static,
+        };
+        CodegenConfig { reloc_model, default_visibility: self.visibility }
     }
 
     /// The translation units to compile (C and assembly sources), in order.
@@ -140,7 +172,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 .to_owned();
             let program = lf_cc::check_source_mapped(&source, &opts.pp_options(input))
                 .map_err(|(diags, map)| render_diags(&map, &diags))?;
-            let (module, syms) = lf_cc::lower::lower(&program, &source, &module_name, opts.debug);
+            let (module, syms) =
+                lf_cc::lower::lower_with(&program, &source, &module_name, opts.debug, &opts.codegen());
             let out = text::print_module(&module, &syms);
             match (&opts.output, n_sources) {
                 (Some(path), _) => {
@@ -182,10 +215,14 @@ fn run(args: &[String]) -> Result<(), String> {
 
     // Link. Freestanding when asked for (or when the host has no C runtime).
     let output = opts.output.clone().unwrap_or_else(|| match opts.items.as_slice() {
+        [Item::Source(input)] if opts.shared => format!("lib{}.so", stem(input)),
         [Item::Source(input)] => stem(input),
         _ => "a.out".to_owned(),
     });
     let crt = if opts.nostdlib { None } else { HostCrt::discover() };
+    if opts.pie && crt.is_none() {
+        return Err("-pie links against the host C library, but no host C runtime was found".to_owned());
+    }
 
     let mut units: Vec<Option<Unit>> = Vec::with_capacity(opts.items.len());
     for item in &opts.items {
@@ -198,7 +235,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // Pure path: only C sources (without file-scope asm) and no libc — the
     // framework's own in-memory linker core.
     let all_pure_c = units.iter().all(|u| matches!(u, Some(Unit::C { asm: None, .. })));
-    if crt.is_none() && all_pure_c {
+    if crt.is_none() && all_pure_c && !opts.shared {
         let modules = units
             .into_iter()
             .map(|u| match u {
@@ -230,8 +267,13 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
     let mut extra: Vec<String> = opts.lib_dirs.iter().map(|d| format!("-L{d}")).collect();
+    let soname = if opts.shared { take_soname(&mut link_items) } else { None };
     extra.extend(link_items);
     let argv: Vec<OsString> = match &crt {
+        _ if opts.shared => {
+            shared_library_args(crt.as_ref(), &[], soname.as_deref(), &extra, Path::new(&output))
+        }
+        Some(crt) if opts.pie => host_c_pie_link_args(crt, &[], &extra, Path::new(&output)),
         Some(crt) => host_c_link_args(crt, &[], &extra, Path::new(&output)),
         None => {
             // Freestanding static link: our own crt0 (a weak `_start`, so a
@@ -245,6 +287,27 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     };
     link_gnu("lf-cc", &argv).map_err(|e| format!("link failed: {e}"))
+}
+
+/// Remove a `-soname <name>` (or `-h <name>`, `-soname=<name>`) linker option
+/// from `args` — the form `-Wl,-soname,<name>` produces — and return the name,
+/// which the shared-library link records as `DT_SONAME`.
+fn take_soname(args: &mut Vec<String>) -> Option<String> {
+    let mut soname = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if let Some(v) = a.strip_prefix("-soname=").or_else(|| a.strip_prefix("--soname=")) {
+            soname = Some(v.to_owned());
+            args.remove(i);
+        } else if matches!(a, "-soname" | "--soname" | "-h") && i + 1 < args.len() {
+            soname = Some(args[i + 1].clone());
+            args.drain(i..i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    soname
 }
 
 /// One compiled translation unit.
@@ -290,9 +353,15 @@ fn compile_item(opts: &Options, item: &Item) -> Result<Unit, String> {
     match item {
         Item::Source(input) => {
             let source = read_source(input)?;
-            let compiled =
-                lf_cc::compile_module_with(&source, input, &opts.pp_options(input), opts.opt, opts.debug)
-                    .map_err(|e| build_error(input, e))?;
+            let compiled = lf_cc::compile_module_cfg(
+                &source,
+                input,
+                &opts.pp_options(input),
+                opts.opt,
+                opts.debug,
+                &opts.codegen(),
+            )
+            .map_err(|e| build_error(input, e))?;
             let asm = lf_cc::assemble_toplevel_asm(&compiled.toplevel_asm, input)
                 .map_err(|e| build_error(input, e))?;
             Ok(Unit::C { module: compiled.module, asm })
@@ -390,12 +459,11 @@ impl Drop for TempDir {
 /// the program lf-cc produces: warning controls, tuning, and code-generation
 /// knobs whose effect is already lf-cc's behavior (`-fwrapv`: signed arithmetic
 /// wraps; `-fno-strict-aliasing`: no type-based alias analysis; `-fsigned-char`:
-/// `char` is signed on x86-64; `-fPIC`: executables only).
+/// `char` is signed on x86-64).
 fn is_ignored_flag(arg: &str) -> bool {
     const EXACT: &[&str] = &[
-        "-pipe", "-m64", "-w", "-pedantic", "-pedantic-errors", "-no-pie", "-nopie",
-        "-fno-common", "-fcommon", "-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
-        "-fno-pie", "-fno-PIE", "-fwrapv", "-fno-strict-aliasing", "-fstrict-aliasing",
+        "-pipe", "-m64", "-w", "-pedantic", "-pedantic-errors",
+        "-fno-common", "-fcommon", "-fwrapv", "-fno-strict-aliasing", "-fstrict-aliasing",
         "-fomit-frame-pointer", "-fno-omit-frame-pointer", "-fsigned-char", "-fno-unsigned-char",
         "-fexceptions", "-fno-exceptions", "-fasynchronous-unwind-tables",
         "-fno-asynchronous-unwind-tables", "-funwind-tables", "-fno-unwind-tables",
@@ -406,7 +474,7 @@ fn is_ignored_flag(arg: &str) -> bool {
         "-fno-strict-overflow",
     ];
     const PREFIX: &[&str] = &[
-        "-march=", "-mtune=", "-fdiagnostics-", "-fmessage-length=", "-fvisibility=",
+        "-march=", "-mtune=", "-fdiagnostics-", "-fmessage-length=",
         "-fno-builtin-", "-fcf-protection", "-fmax-errors=", "-fno-diagnostics-",
         "-fcolor-diagnostics", "-fno-color-diagnostics",
     ];
@@ -435,6 +503,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         nostdinc: false,
         nostdlib: false,
         freestanding: false,
+        pic: None,
+        shared: false,
+        pie: false,
+        visibility: Visibility::Default,
     };
 
     let mut it = args.iter();
@@ -466,6 +538,22 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-idirafter" => opts.after_dirs.push(PathBuf::from(value(arg)?)),
             "-ffreestanding" => opts.freestanding = true,
             "-fhosted" => opts.freestanding = false,
+            "-fPIC" => opts.pic = Some((RelocModel::Pic, 2)),
+            "-fpic" => opts.pic = Some((RelocModel::Pic, 1)),
+            "-fPIE" => opts.pic = Some((RelocModel::Pie, 2)),
+            "-fpie" => opts.pic = Some((RelocModel::Pie, 1)),
+            "-fno-pic" | "-fno-PIC" | "-fno-pie" | "-fno-PIE" => opts.pic = Some((RelocModel::Static, 0)),
+            "-shared" => opts.shared = true,
+            "-pie" => opts.pie = true,
+            "-no-pie" | "-nopie" => opts.pie = false,
+            _ if arg.starts_with("-fvisibility=") => {
+                opts.visibility = match &arg["-fvisibility=".len()..] {
+                    "default" => Visibility::Default,
+                    "hidden" | "internal" => Visibility::Hidden,
+                    "protected" => Visibility::Protected,
+                    v => return Err(format!("unknown -fvisibility value '{v}'")),
+                };
+            }
             "-D" => opts.cmdline.push(MacroOp::Define(value("-D")?)),
             "-U" => opts.cmdline.push(MacroOp::Undef(value("-U")?)),
             "-L" => opts.lib_dirs.push(value("-L")?),
@@ -538,7 +626,14 @@ fn print_usage() {
     println!("  -l <lib>       link against lib<lib> (.so or .a)");
     println!("  -Wl,<a>,<b>    pass arguments to the linker (also -Xlinker <a>)");
     println!("  -nostdlib      freestanding link: static, no libc, LatticeFoundry's own crt0");
-    println!("                 (_start calls main and exits with its result)\n");
+    println!("                 (_start calls main and exits with its result)");
+    println!("  -shared        link a shared library (sources default to -fPIC code;");
+    println!("                 -Wl,-soname,<name> sets its DT_SONAME)");
+    println!("  -pie           link a position-independent executable (sources default to -fPIE)");
+    println!("  -fPIC/-fpic    position-independent code for a shared library");
+    println!("  -fPIE/-fpie    position-independent code for an executable");
+    println!("  -fvisibility=<default|hidden|protected>");
+    println!("                 the ELF visibility of definitions without a visibility attribute\n");
     println!("Linking is hosted by default: the host C runtime (crt1.o, libc) is linked in");
     println!("with qld, LatticeFoundry's own linker. Without a host C runtime lf-cc falls");
     println!("back to the -nostdlib link. Warning flags (-W...), -pipe, -m64, -march=,");
