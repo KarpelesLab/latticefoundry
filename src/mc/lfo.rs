@@ -352,6 +352,8 @@ fn reloc_kind_code(k: RelocKind) -> u8 {
         RelocKind::AvrHi8Ldi => 18,
         RelocKind::AvrLo8LdiPm => 19,
         RelocKind::AvrHi8LdiPm => 20,
+        RelocKind::Aarch64AdrGotPage => 21,
+        RelocKind::Aarch64Ld64GotLo12Nc => 22,
         // TLS kinds take high codes, clear of the next per-target additions.
         RelocKind::TpOff32 => 96,
         RelocKind::GotTpOff => 97,
@@ -382,6 +384,8 @@ fn reloc_kind_from(c: u8) -> Result<RelocKind, DecodeError> {
         18 => RelocKind::AvrHi8Ldi,
         19 => RelocKind::AvrLo8LdiPm,
         20 => RelocKind::AvrHi8LdiPm,
+        21 => RelocKind::Aarch64AdrGotPage,
+        22 => RelocKind::Aarch64Ld64GotLo12Nc,
         96 => RelocKind::TpOff32,
         97 => RelocKind::GotTpOff,
         98 => RelocKind::TlsGd,

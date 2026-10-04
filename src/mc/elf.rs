@@ -131,6 +131,8 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         RelocKind::Aarch64Call26
         | RelocKind::Aarch64AdrPrelPgHi21
         | RelocKind::Aarch64AddAbsLo12Nc
+        | RelocKind::Aarch64AdrGotPage
+        | RelocKind::Aarch64Ld64GotLo12Nc
         | RelocKind::ThumbCall
         | RelocKind::ThumbMovwAbsNc
         | RelocKind::ThumbMovtAbs
@@ -305,6 +307,19 @@ impl ElfTarget {
         reloc_format: RelocFormat::Rela,
         reloc_type: x86_64_reloc_type,
     };
+
+    /// AArch64 (the Arm 64-bit architecture, LP64): ELF64, little-endian,
+    /// `EM_AARCH64`, no `e_flags`, `RELA` relocations (the AArch64 ELF ABI
+    /// uses `RELA` throughout; an instruction field stays zero and the addend
+    /// lives in the entry).
+    pub const AARCH64: ElfTarget = ElfTarget {
+        class: ElfClass::Elf64,
+        endian: Endian::Little,
+        machine: EM_AARCH64,
+        flags: 0,
+        reloc_format: RelocFormat::Rela,
+        reloc_type: aarch64_reloc_type,
+    };
 }
 
 /// [`x86_64_reloc`] as a total mapping (`None` for the instruction kinds of
@@ -314,6 +329,45 @@ fn x86_64_reloc_type(kind: RelocKind) -> Option<u32> {
         return None;
     }
     Some(x86_64_reloc(kind))
+}
+
+/// The `e_machine` value for AArch64.
+pub const EM_AARCH64: u16 = 183;
+
+// AArch64 relocation type numbers ("ELF for the Arm 64-bit Architecture",
+// "Relocation codes": static data, PC-relative address generation, control
+// flow and GOT-relative relocations).
+const R_AARCH64_ABS64: u32 = 257;
+const R_AARCH64_ABS32: u32 = 258;
+const R_AARCH64_ABS16: u32 = 259;
+const R_AARCH64_PREL64: u32 = 260;
+const R_AARCH64_PREL32: u32 = 261;
+const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
+const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+const R_AARCH64_CALL26: u32 = 283;
+const R_AARCH64_ADR_GOT_PAGE: u32 = 311;
+const R_AARCH64_LD64_GOT_LO12_NC: u32 = 312;
+
+/// The AArch64 relocation number of a generic kind: the data kinds
+/// (`R_AARCH64_ABS64`/`ABS32`/`ABS16`, `PREL64`/`PREL32`), the `bl` branch
+/// (`R_AARCH64_CALL26`; the linker routes a preemptible callee through a PLT
+/// entry), the `adrp`+`add` pair (`ADR_PREL_PG_HI21` + `ADD_ABS_LO12_NC`) and
+/// the `adrp`+`ldr` GOT load (`ADR_GOT_PAGE` + `LD64_GOT_LO12_NC`). `None` for
+/// the x86-64, Thumb and AVR instruction kinds.
+fn aarch64_reloc_type(kind: RelocKind) -> Option<u32> {
+    Some(match kind {
+        RelocKind::Abs64 => R_AARCH64_ABS64,
+        RelocKind::Abs32 => R_AARCH64_ABS32,
+        RelocKind::Abs16 => R_AARCH64_ABS16,
+        RelocKind::Pc64 => R_AARCH64_PREL64,
+        RelocKind::Pc32 => R_AARCH64_PREL32,
+        RelocKind::Aarch64Call26 => R_AARCH64_CALL26,
+        RelocKind::Aarch64AdrPrelPgHi21 => R_AARCH64_ADR_PREL_PG_HI21,
+        RelocKind::Aarch64AddAbsLo12Nc => R_AARCH64_ADD_ABS_LO12_NC,
+        RelocKind::Aarch64AdrGotPage => R_AARCH64_ADR_GOT_PAGE,
+        RelocKind::Aarch64Ld64GotLo12Nc => R_AARCH64_LD64_GOT_LO12_NC,
+        _ => return None,
+    })
 }
 
 /// The `e_machine` value for 32-bit Arm.
@@ -1195,6 +1249,42 @@ mod tests {
     #[test]
     fn x86_64_target_matches_write() {
         assert_eq!(write_with(&tiny_object(), &ElfTarget::X86_64).unwrap(), write(&tiny_object()));
+    }
+
+    #[test]
+    fn aarch64_target_maps_its_relocations() {
+        for (kind, ty) in [
+            (RelocKind::Abs64, R_AARCH64_ABS64),
+            (RelocKind::Abs32, R_AARCH64_ABS32),
+            (RelocKind::Abs16, R_AARCH64_ABS16),
+            (RelocKind::Pc64, R_AARCH64_PREL64),
+            (RelocKind::Pc32, R_AARCH64_PREL32),
+            (RelocKind::Aarch64Call26, R_AARCH64_CALL26),
+            (RelocKind::Aarch64AdrPrelPgHi21, R_AARCH64_ADR_PREL_PG_HI21),
+            (RelocKind::Aarch64AddAbsLo12Nc, R_AARCH64_ADD_ABS_LO12_NC),
+            (RelocKind::Aarch64AdrGotPage, R_AARCH64_ADR_GOT_PAGE),
+            (RelocKind::Aarch64Ld64GotLo12Nc, R_AARCH64_LD64_GOT_LO12_NC),
+        ] {
+            assert_eq!(aarch64_reloc_type(kind), Some(ty), "{kind:?}");
+        }
+        for kind in [RelocKind::Plt32, RelocKind::GotPcRel, RelocKind::ThumbCall, RelocKind::AvrCall] {
+            assert_eq!(aarch64_reloc_type(kind), None, "{kind:?}");
+        }
+        // The GOT kinds are AArch64-only instruction fields.
+        assert!(RelocKind::Aarch64AdrGotPage.is_instruction_field() && RelocKind::Aarch64AdrGotPage.is_pcrel());
+        assert!(RelocKind::Aarch64Ld64GotLo12Nc.is_instruction_field());
+        assert_eq!(x86_64_reloc_type(RelocKind::Aarch64AdrGotPage), None);
+        // Header: ELF64, little-endian, EM_AARCH64, no flags; RELA entries.
+        let b = write_with(&data_object(), &ElfTarget::AARCH64).unwrap();
+        assert_eq!((b[4], b[5], rd_u16(&b, 18), rd_u32(&b, 48)), (ELFCLASS64, ELFDATA2LSB, EM_AARCH64, 0));
+        let rela = parse_shdrs(&b).into_iter().find(|s| s.kind == SHT_RELA).unwrap();
+        assert_eq!(rela.entsize, RELA_SIZE);
+        let e = rela.offset as usize;
+        // (offset, type, addend) of both entries; the data keeps zero fields.
+        assert_eq!((rd_u64(&b, e), rd_u64(&b, e + 8) as u32, rd_i64(&b, e + 16)), (0, R_AARCH64_ABS32, 8));
+        assert_eq!((rd_u64(&b, e + 24), rd_u64(&b, e + 32) as u32, rd_i64(&b, e + 40)), (4, R_AARCH64_ABS16, 2));
+        // An x86-64 kind is refused, not mistranslated.
+        assert_eq!(write_with(&tiny_object(), &ElfTarget::AARCH64), Err(ElfError::UnsupportedReloc(RelocKind::Plt32)));
     }
 
     /// `readelf` accepts both ELF32 objects and decodes their relocations by

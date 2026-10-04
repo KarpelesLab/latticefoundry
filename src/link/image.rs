@@ -719,6 +719,8 @@ pub fn link_executable(
                 | RelocKind::Aarch64Call26
                 | RelocKind::Aarch64AdrPrelPgHi21
                 | RelocKind::Aarch64AddAbsLo12Nc
+                | RelocKind::Aarch64AdrGotPage
+                | RelocKind::Aarch64Ld64GotLo12Nc
                 | RelocKind::ThumbCall
                 | RelocKind::ThumbMovwAbsNc
                 | RelocKind::ThumbMovtAbs

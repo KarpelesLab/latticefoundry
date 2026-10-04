@@ -55,7 +55,7 @@ pub fn write_object(obj: &ObjectModule, triple: Triple) -> Result<Vec<u8>, Objec
 /// # Errors
 ///
 /// Returns an error when the format has no writer for `arch` (ELF is written
-/// for x86-64, 32-bit Arm Thumb and AVR; COFF and Mach-O for x86-64 and
+/// for x86-64, AArch64, 32-bit Arm Thumb and AVR; COFF and Mach-O for x86-64 and
 /// AArch64; wasm for wasm32 only), or when the module holds a relocation the
 /// format cannot express.
 pub fn write_object_as(
@@ -68,12 +68,16 @@ pub fn write_object_as(
             crate::mc::elf::write_with(obj, &crate::mc::elf::ElfTarget::ARM)
                 .map_err(|e| ObjectWriteError::new(format!("Arm ELF object: {e}")))
         }
+        ObjectFormat::Elf if arch == TargetArch::AArch64 => {
+            crate::mc::elf::write_with(obj, &crate::mc::elf::ElfTarget::AARCH64)
+                .map_err(|e| ObjectWriteError::new(format!("AArch64 ELF object: {e}")))
+        }
         ObjectFormat::Elf if arch == TargetArch::Avr => crate::target::avr::write_elf(obj)
             .map_err(|e| ObjectWriteError::new(format!("cannot write an AVR ELF object: {e}"))),
         ObjectFormat::Elf => {
             if arch != TargetArch::X86_64 {
                 return Err(ObjectWriteError::new(format!(
-                    "no ELF object writer for {} yet (ELF output is x86-64 only)",
+                    "no ELF object writer for {} yet",
                     arch.name()
                 )));
             }
@@ -169,6 +173,9 @@ mod tests {
         assert_eq!(&coff[..2], &0xaa64u16.to_le_bytes());
         let macho = write_object(&m, Triple::new(TargetArch::X86_64, TargetOs::Darwin)).unwrap();
         assert_eq!(&macho[..4], &0xfeed_facfu32.to_le_bytes());
+        // AArch64 Linux: ELF64 with e_machine = EM_AARCH64 (183).
+        let elf = write_object(&m, Triple::new(TargetArch::AArch64, TargetOs::Linux)).unwrap();
+        assert_eq!((&elf[..4], elf[4], u16::from_le_bytes([elf[18], elf[19]])), (&b"\x7fELF"[..], 2, 183));
     }
 
     #[test]
@@ -176,7 +183,7 @@ mod tests {
         let m = tiny();
         let e = write_object(&m, Triple::new(TargetArch::Riscv64, TargetOs::Windows)).unwrap_err();
         assert!(e.message().contains("riscv64"), "{e}");
-        let e = write_object(&m, Triple::new(TargetArch::AArch64, TargetOs::Linux)).unwrap_err();
+        let e = write_object_as(&m, TargetArch::Wasm32, ObjectFormat::Elf).unwrap_err();
         assert!(e.message().contains("ELF"), "{e}");
 
         let mut m = tiny();

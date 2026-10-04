@@ -322,6 +322,14 @@ pub enum RelocKind {
     /// AArch64 `R_AARCH64_ADD_ABS_LO12_NC`: the low 12 bits of `S + A` for the
     /// `add` that completes an `adrp`+`add` address materialization.
     Aarch64AddAbsLo12Nc,
+    /// AArch64 `R_AARCH64_ADR_GOT_PAGE`: the page-relative high 21 bits of the
+    /// address of the symbol's global-offset-table entry, for the `adrp` of an
+    /// `adrp`+`ldr` GOT load (position-independent code).
+    Aarch64AdrGotPage,
+    /// AArch64 `R_AARCH64_LD64_GOT_LO12_NC`: the low 12 bits of the address of
+    /// the symbol's GOT entry, scaled by 8, into the `imm12` of the `ldr` that
+    /// completes an `adrp`+`ldr` GOT load.
+    Aarch64Ld64GotLo12Nc,
     /// Arm `R_ARM_THM_CALL`: a Thumb-2 `bl` to `S + A`, field = `S + A - P`
     /// (halfword-scaled, ±16 MiB) split across the two halfwords of the
     /// instruction (see [`write_thumb_field`]). A `bl` at `P` lands at
@@ -392,6 +400,8 @@ impl RelocKind {
             | RelocKind::Aarch64Call26
             | RelocKind::Aarch64AdrPrelPgHi21
             | RelocKind::Aarch64AddAbsLo12Nc
+            | RelocKind::Aarch64AdrGotPage
+            | RelocKind::Aarch64Ld64GotLo12Nc
             | RelocKind::ThumbCall
             | RelocKind::ThumbMovwAbsNc
             | RelocKind::ThumbMovtAbs => 4,
@@ -424,6 +434,7 @@ impl RelocKind {
                 | RelocKind::TlsGd
                 | RelocKind::Aarch64Call26
                 | RelocKind::Aarch64AdrPrelPgHi21
+                | RelocKind::Aarch64AdrGotPage
                 | RelocKind::ThumbCall
                 | RelocKind::Avr13Pcrel
         )
@@ -454,6 +465,8 @@ impl RelocKind {
             RelocKind::Aarch64Call26
                 | RelocKind::Aarch64AdrPrelPgHi21
                 | RelocKind::Aarch64AddAbsLo12Nc
+                | RelocKind::Aarch64AdrGotPage
+                | RelocKind::Aarch64Ld64GotLo12Nc
                 | RelocKind::ThumbCall
                 | RelocKind::ThumbMovwAbsNc
                 | RelocKind::ThumbMovtAbs
