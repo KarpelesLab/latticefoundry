@@ -2332,7 +2332,7 @@ fn encode_function_inner(
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
     got: GotQuery<'_>,
-    mut lines: Option<&mut Vec<(u64, u32)>>,
+    lines: Option<&mut Vec<(u64, u32)>>,
     mut marks: Option<(usize, &mut UnwindMarks)>,
 ) -> Emitted {
     let mut e = Emitter::new();
@@ -2391,7 +2391,7 @@ fn encode_function_inner(
     }
     let (emitted, at) = e.finish_with_labels().expect("intra-function branch resolution never overflows");
     let at = |l: Label| at[l.index()].expect("a bound label");
-    if let Some(out) = lines.as_deref_mut() {
+    if let Some(out) = lines {
         out.extend(rows.iter().map(|&(l, line)| (at(l), line)));
     }
     if let Some((_, m)) = marks.as_mut() {

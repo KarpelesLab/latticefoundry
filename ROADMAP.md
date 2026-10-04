@@ -426,7 +426,10 @@ Concrete backends. x86-64 is the bring-up target.
 for the target's ABI; encodings match the architecture manual.
 
 *Progress:* x86-64 ✅ (integer, SSE, full System V ABI incl. struct-by-value
-and variadics; executes natively). AArch64 ✅ integer + scalar FP + AAPCS64
+and variadics; executes natively; compare-and-branch fusion, fall-through
+block layout, relaxed rel8 branches, immediate forms, a precise allocator
+with register hints and copy coalescing, frame-pointer-less leaves and
+shared epilogues). AArch64 ✅ integer + scalar FP + AAPCS64
 aggregates + variadics (the `va_list` register save area; Darwin's
 stack-passed anonymous arguments) + `DynAlloca` + PIC, ELF objects linked by
 qld into Linux executables and shared libraries (validated vs `llvm-mc`, an

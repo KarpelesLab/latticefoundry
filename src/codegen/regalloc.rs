@@ -316,7 +316,9 @@ fn fixed_ranges(
     // with whether that point defines and/or uses the register, and the vreg
     // on the other side when the point is a register copy. Instructions are
     // walked in point order, so each register's list is already sorted.
-    let mut events: DetHashMap<PReg, Vec<(usize, bool, bool, Option<VReg>)>> = DetHashMap::default();
+    // (point, defines, uses, copy partner)
+    type Event = (usize, bool, bool, Option<VReg>);
+    let mut events: DetHashMap<PReg, Vec<Event>> = DetHashMap::default();
     for &b in &liveness.order {
         let bid = block_id(b);
         let base = liveness.block_start(b);

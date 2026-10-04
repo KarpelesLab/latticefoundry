@@ -95,8 +95,8 @@ pub struct StackUsage {
     /// RISC-V, whose calls leave the return address in a register).
     pub return_address: u64,
     /// Bytes holding saved registers: the frame pointer and link register
-    /// (`rbp`; `x29`/`x30`; `ra` when the function calls) plus the callee-saved
-    /// registers the allocation used.
+    /// (`rbp`, unless an x86-64 leaf omits it; `x29`/`x30`; `ra` when the
+    /// function calls) plus the callee-saved registers the allocation used.
     pub saved_registers: u64,
     /// The explicit stack-pointer adjustment of the prologue in bytes — the `N`
     /// of `sub rsp, N` (x86-64), `sub sp, sp, #N` (AArch64, below the `x29`/`x30`
