@@ -54,6 +54,8 @@ mod fd_tests;
 #[cfg(test)]
 mod link_tests;
 #[cfg(test)]
+mod dyn_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod stack_tests;

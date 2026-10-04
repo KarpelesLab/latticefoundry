@@ -50,7 +50,7 @@
 //!
 //! ```text
 //! addi t0, n, 15 ; andi t0, t0, -16 ; (add t0, t0, outgoing + slack)
-//! sd zero, 0(sp) ; lui t1, 1
+//! ld zero, 0(sp) ; lui t1, 1
 //! L: bltu t0, t1, done ; sub sp, sp, t1 ; sd zero, 0(sp) ; sub t0, t0, t1 ; j L
 //! done: sub sp, sp, t0 ; addi d, sp, outgoing ; (round d up to the alignment)
 //! ```
@@ -1147,9 +1147,11 @@ fn encode_dyn_alloca(b: &mut RvBuf, ops: &[MachineOperand], layout: &FrameLayout
         }
     }
     if layout.probes {
-        // Touch the current top, then step down a page at a time, touching
-        // each step, until less than a page remains.
-        b.word(store(8, zero, sp, 0));
+        // Touch the current top — with a load, as `0(sp)` may hold a saved
+        // register (a load into `x0` still accesses memory, and faults) —
+        // then step down a page at a time, touching each step, until less
+        // than a page remains.
+        b.word(load(8, zero, sp, 0));
         b.word(lui(t1, (STACK_PROBE_INTERVAL >> 12) as u32)); // t1 = 4096
         b.word(bcmp(6, t0, t1, 20)); // L: bltu t0, t1, done
         b.word(sub(sp, sp, t1));

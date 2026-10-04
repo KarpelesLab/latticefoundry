@@ -340,8 +340,9 @@ pub(super) struct Cpu<'h> {
     pub(super) guard: Option<StackGuard>,
     /// The lowest `sp` seen.
     pub(super) min_sp: u64,
-    /// Every store's address, when recording (for the probe invariant).
-    pub(super) stores: Option<Vec<u64>>,
+    /// Every load's and store's address, when recording (for the probe
+    /// invariant: a load touches the stack as a store does).
+    pub(super) touches: Option<Vec<u64>>,
     /// Instructions executed.
     pub(super) steps: u64,
     /// Compressed (16-bit) instructions executed.
@@ -369,7 +370,7 @@ impl<'h> Cpu<'h> {
             syscall: None,
             guard: None,
             min_sp: STACK_TOP,
-            stores: None,
+            touches: None,
             steps: 0,
             compressed: 0,
         }
@@ -418,15 +419,18 @@ impl<'h> Cpu<'h> {
         Ok(())
     }
 
-    fn load(&self, a: u64, size: u64) -> Result<u64, Fault> {
+    fn load(&mut self, a: u64, size: u64) -> Result<u64, Fault> {
         self.check_access(a)?;
+        if let Some(t) = &mut self.touches {
+            t.push(a);
+        }
         Ok(self.mem.read(a, size))
     }
 
     fn store(&mut self, a: u64, size: u64, v: u64) -> Result<(), Fault> {
         self.check_access(a)?;
-        if let Some(s) = &mut self.stores {
-            s.push(a);
+        if let Some(t) = &mut self.touches {
+            t.push(a);
         }
         self.mem.write(a, size, v);
         Ok(())
