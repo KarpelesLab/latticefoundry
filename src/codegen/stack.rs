@@ -50,8 +50,8 @@
 //! an adjustment of at least the interval moves the stack pointer one interval
 //! at a time and writes to the new top after each step (unrolled for a few
 //! pages, a counted loop beyond), then applies the sub-interval remainder. On
-//! x86-64 a `dyn_alloca` does the same at run time (touching the current top
-//! first, then every interval of the requested size). An interval of 4096 bytes
+//! x86-64 and AArch64 a `dyn_alloca` does the same at run time (touching the
+//! current top first, then every interval of the requested size). An interval of 4096 bytes
 //! is at most the guard size on every Linux configuration (4 KiB pages or
 //! larger; the main thread's guard gap is 1 MiB by default), so no probe
 //! sequence can skip the guard.

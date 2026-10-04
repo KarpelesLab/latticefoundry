@@ -413,6 +413,15 @@ entry ^0(%s: i64):
             None => eprintln!("skipping the {what} byte scan: no llvm-mc"),
         }
     }
+    // AArch64 under PIC/PIE: `adrp`+`ldr` GOT loads, still no branch.
+    for model in [RelocModel::Pic, RelocModel::Pie] {
+        let obj = super::aarch64::compile_module_with(&m, &syms, &CodegenOptions::default().with_reloc_model(model)).object;
+        let text = &obj.sections().iter().find(|s| s.name == ".text").unwrap().bytes;
+        let bad: Vec<u32> = words(text).filter(|&w| a64_is_cond_branch(w)).collect();
+        assert!(bad.is_empty(), "aarch64 {model:?}: conditional branches {bad:08x?}");
+        assert!(obj.relocations().iter().any(|r| r.kind == crate::mc::object::RelocKind::Aarch64Ld64GotLo12Nc)
+            || model == RelocModel::Pie);
+    }
 }
 
 /// Thread-local addressing (`docs/ir-design.md` §4c) is straight-line under
@@ -699,6 +708,7 @@ fn branchy_lowerings_are_rejected_on_secrets() {
         ("division", "i64", "  %r = udiv i64 1000, %x : i64\n  ret %r\n"),
     ];
     let x86 = X86_64Target::new();
+    let a64 = AArch64Target::new();
     for (what, ty, body) in cases {
         for secret in [false, true] {
             let kw = if secret { "secret " } else { "" };
@@ -720,6 +730,13 @@ fn branchy_lowerings_are_rejected_on_secrets() {
                         X86Op::decode(mi.opcode).may_branch_on_data(&mi.operands)
                     });
                     assert!(n > 0, "{what}: the x86-64 audit knows this lowering branches");
+                }
+                // AArch64 converts with single instructions; its `dyn_alloca`
+                // probe loop and exclusive-monitor loops branch.
+                if matches!(what, "dyn_alloca" | "atomic rmw") {
+                    let mf = a64.select_with_syms(&m, f, &syms);
+                    let n = mir_branches(&mf, |mi| A64Op::decode(mi.opcode).may_branch_on_data(&mi.operands));
+                    assert!(n > 0, "{what}: the aarch64 audit knows this lowering branches");
                 }
             }
         }

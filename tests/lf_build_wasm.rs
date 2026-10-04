@@ -124,7 +124,7 @@ fn options_that_do_not_apply_to_wasm32() {
     let dir = scratch("errors");
     for (args, want) in [
         (&["--target", "wasm32", "--oformat", "binary"][..], "do not apply to wasm32"),
-        (&["--target", "wasm32", "-g"][..], "x86-64 only"),
+        (&["--target", "wasm32", "-g"][..], "aarch64 only"),
         (&["--target", "wasm32", "--shared"][..], "x86-64 ELF"),
         (&["--target", "wasm32", "-c", "--format", "elf"][..], "wasm format"),
         (&["--target", "wasm32-linux"][..], "unknown target"),

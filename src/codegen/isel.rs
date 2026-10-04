@@ -91,6 +91,15 @@ pub trait TargetIsel: MachineTarget + Sized {
         lo.emit(self.global_addr(dst, g));
     }
 
+    /// Build "materialize the address of function `f` into `dst`", for a
+    /// function used as a value (its address stored, passed, or called
+    /// through). The default is a zero placeholder, for targets that resolve
+    /// function values themselves (x86-64) or not yet at all; a direct call
+    /// never comes here (see [`Lower::callee_func`]).
+    fn func_addr(&self, dst: VReg, _f: u32) -> MachineInst {
+        self.li(dst, Int::ZERO)
+    }
+
     /// Build "materialize the floating-point constant with raw IEEE bit pattern
     /// `bits` (a `width`-bit value) into the floating-point register `dst`".
     ///
@@ -198,7 +207,8 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
                 }
             }
         }
-        let entry = func.entry().map(|e| block_map[e.index()]).unwrap_or(block_map[0]);
+        // A declaration has no blocks (and is never lowered): any id will do.
+        let entry = func.entry().map_or(MBlockId::from_index(0), |e| block_map[e.index()]);
         if let Some(e) = func.entry() {
             mf.set_entry(block_map[e.index()]);
             mf.set_num_params(func.block(e).params().len());
@@ -453,9 +463,9 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
                 Const::Addr { .. } => target.li(d, Int::ZERO),
             },
             ValueDef::Global(_) => unreachable!("handled above"),
-            // A function used as a plain value (not a direct call target): a zero
-            // placeholder address (real symbol handling is Phase 6/7).
-            ValueDef::Func(_) => target.li(d, Int::ZERO),
+            // A function used as a plain value (not a direct call target): its
+            // address, as the target materializes it.
+            ValueDef::Func(f) => target.func_addr(d, f.index() as u32),
             ValueDef::Inst(_) | ValueDef::Param(_, _) => unreachable!(),
         };
         self.emit(inst);

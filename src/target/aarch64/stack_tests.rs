@@ -490,3 +490,196 @@ fn spills_beyond_a_large_frame() {
         assert_eq!(run.max_depth, u.frame_size);
     }
 }
+
+// ---------------------------------------------------------------------------
+// `dyn_alloca`: semantics, a moving `sp`, and run-time stack probes
+// ---------------------------------------------------------------------------
+
+/// `@fill(n)` keeps a local and 24 values live across two `dyn_alloca`s (one
+/// of `n` bytes, one 64-byte aligned) and a call with stack arguments, so
+/// the frame is addressed from `x29` while `sp` moves and the outgoing area
+/// follows `sp`. It returns `1310 + 24n + 276`, plus a million if the
+/// aligned block is misaligned.
+fn dyn_program(sizes: &[u64]) -> String {
+    let mut s = String::from(
+        "module \"dyn\"\n\
+         func @sum10(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 {\n\
+         entry ^0(%a0: i64, %a1: i64, %a2: i64, %a3: i64, %a4: i64, %a5: i64, %a6: i64, %a7: i64, %a8: i64, %a9: i64):\n",
+    );
+    s.push_str("  %s1 = add %a0, %a1 : i64\n");
+    for k in 2..10 {
+        s.push_str(&format!("  %s{k} = add %s{}, %a{k} : i64\n", k - 1));
+    }
+    s.push_str("  ret %s9\n}\n");
+    s.push_str(
+        "func @fill(i64) -> i64 {\nentry ^0(%n: i64):\n  %keep = alloca i64 : ptr\n  store i64 1234, %keep align 8 : i64\n",
+    );
+    for k in 0..24 {
+        s.push_str(&format!("  %v{k} = add %n, i64 {k} : i64\n"));
+    }
+    s.push_str(
+        "  %p = dyn_alloca %n align 16 : ptr
+  store i8 7, %p align 1 : i8
+  %last = sub %n, i64 1 : i64
+  %q = ptr_add %p, %last : ptr
+  store i8 9, %q align 1 : i8
+  %r = dyn_alloca i64 24 align 64 : ptr
+  %ri = ptrtoint %r : i64
+  %mis = and %ri, i64 63 : i64
+  store i64 5, %r align 8 : i64
+  %s = call @sum10(i64 1, i64 2, i64 3, i64 4, i64 5, i64 6, i64 7, i64 8, i64 9, i64 10) : i64
+  %k = load %keep align 8 : i64
+  %a = load %p align 1 : i8
+  %b = load %q align 1 : i8
+  %c = load %r align 8 : i64
+  %az = zext %a : i64
+  %bz = zext %b : i64
+  %t0 = add %k, %az : i64
+  %t1 = add %t0, %bz : i64
+  %t2 = add %t1, %c : i64
+  %t3 = add %t2, %s : i64
+  %m = mul %mis, i64 1000000 : i64
+  %u0 = add %t3, %m : i64
+",
+    );
+    for k in 0..24 {
+        s.push_str(&format!("  %u{} = add %u{k}, %v{k} : i64\n", k + 1));
+    }
+    s.push_str("  ret %u24\n}\n");
+    s.push_str("func @main() -> i32 {\nentry ^0:\n");
+    let mut acc = "i32 0".to_owned();
+    for (k, &n) in sizes.iter().enumerate() {
+        let want = 1310 + 24 * n + 276;
+        s.push_str(&format!(
+            "  %f{k} = call @fill(i64 {n}) : i64\n  %bad{k} = icmp ne %f{k}, i64 {want} : i1\n  \
+             %z{k} = zext %bad{k} : i32\n  %sh{k} = shl %z{k}, i32 {k} : i32\n  %acc{k} = or {acc}, %sh{k} : i32\n"
+        ));
+        acc = format!("%acc{k}");
+    }
+    s.push_str(&format!("  ret {acc}\n}}\n"));
+    s
+}
+
+const DYN_SIZES: [u64; 7] = [2, 15, 100, 4095, 4096, 70_000, 1 << 20];
+
+#[test]
+fn dyn_alloca_semantics_on_the_interpreter() {
+    let (m, syms) = prepare(&dyn_program(&DYN_SIZES));
+    let target = super::isel::AArch64Target::new();
+    let funcs: Vec<_> = (0..m.functions().count())
+        .map(|i| target.select_with_syms(&m, crate::ir::FuncId::from_index(i), &syms))
+        .collect();
+    let main = m.functions().position(|f| syms.resolve(f.name) == "main").unwrap();
+    let v = super::interp::run(&target, &funcs, main, &[]).unwrap().unwrap();
+    assert_eq!(v.to_u64(), Some(0), "failing sizes (bitmask)");
+}
+
+#[test]
+fn dyn_alloca_runs_linked_with_and_without_probes() {
+    let (m, syms) = prepare(&dyn_program(&DYN_SIZES));
+    let dir = std::env::temp_dir().join(format!("lf-a64-dyn-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for probes in [true, false] {
+        let out = compile_module_with(&m, &syms, &CodegenOptions::default().with_stack_probes(probes));
+        let fill = out.stack.get("fill").unwrap();
+        assert!(fill.dynamic_alloca && fill.probed == probes);
+        // The spills of the 24 live values are reached from `x29`
+        // (`sub x16, x29, #k`), and the epilogue resets `sp` from it.
+        let words: Vec<u32> =
+            func_bytes(&out.object, "fill").chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert!(words.iter().any(|&w| w & 0xFFC0_03FF == 0xD100_03B0), "x29-relative slot access");
+        assert!(words.iter().any(|&w| w & 0xFFC0_03FF == 0xD100_03BF), "sub sp, x29, #extra");
+        let exe = dir.join(format!("dyn-{probes}"));
+        super::link::link_executable(vec![out.object], "main", &[], &exe).expect("qld links");
+        let (code, _) = super::emu::run_executable(&std::fs::read(&exe).unwrap()).unwrap();
+        assert_eq!(code, 0, "failing sizes (bitmask), probes {probes}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A leaf that allocates `n` bytes and writes the first word of the block.
+const DYN_LEAF: &str = r#"
+module "leaf"
+func @leaf(i64) -> i64 {
+entry ^0(%n: i64):
+  %p = dyn_alloca %n align 16 : ptr
+  store i64 1, %p align 8 : i64
+  %v = load %p align 8 : i64
+  %r = add %v, %n : i64
+  ret %r
+}
+"#;
+
+#[test]
+fn dyn_alloca_probes_hit_the_guard() {
+    use super::emu::{Emu, Stop};
+    let (m, syms) = prepare(DYN_LEAF);
+    let top = 0x7000_0000_0000u64;
+    let run = |probes: bool, n: u64, stack: u64| {
+        let out = compile_module_with(&m, &syms, &CodegenOptions::default().with_stack_probes(probes));
+        let code = func_bytes(&out.object, "leaf");
+        let mut emu = Emu::new();
+        emu.map(0x1_0000, code.len() as u64);
+        emu.poke(0x1_0000, code);
+        emu.map_stack(top, stack, true);
+        let stop = emu.call(0x1_0000, &[n], 10_000_000).unwrap();
+        (stop, emu)
+    };
+    // A roomy stack: the block is allocated, written, and `sp` comes back.
+    for probes in [true, false] {
+        for n in [8, 5000, 200_000] {
+            let (stop, emu) = run(probes, n, 1 << 20);
+            assert_eq!(stop, Stop::Returned, "n {n}, probes {probes}");
+            assert_eq!(emu.x[0], n + 1);
+            assert_eq!(emu.sp, top, "sp restored");
+            if probes {
+                // No store lands more than one interval below every earlier
+                // one (counting from the caller's `sp`).
+                let mut deepest = top;
+                for &a in &emu.stack_writes {
+                    assert!(deepest - a.min(deepest) <= STACK_PROBE_INTERVAL, "store at {a:#x} skips from {deepest:#x}");
+                    deepest = deepest.min(a);
+                }
+            }
+        }
+    }
+    // 1 MiB on a 64 KiB stack: probed, the guard page faults; unprobed, the
+    // first store lands below it.
+    assert_eq!(run(true, 1 << 20, 64 << 10).0, Stop::Guard);
+    assert_eq!(run(false, 1 << 20, 64 << 10).0, Stop::Skipped);
+}
+
+#[test]
+fn dyn_alloca_sequence_matches_llvm_mc() {
+    let probed = "add x0, x1, #47\nlsr x0, x0, #4\nlsl x0, x0, #4\nldr xzr, [sp]\n\
+                  cmp x0, #1, lsl #12\nb.lo #20\nsub sp, sp, #1, lsl #12\nstr xzr, [sp]\n\
+                  sub x0, x0, #1, lsl #12\nb #-20\nsub sp, sp, x0\nstr xzr, [sp]\nadd x0, sp, #32\n";
+    let Some(want) = llvm_mc(probed) else {
+        eprintln!("skipping dyn_alloca_sequence_matches_llvm_mc: no llvm-mc");
+        return;
+    };
+    assert_eq!(super::encode::dyn_alloca_for_test(0, 1, 16, 32, true), want);
+    // Unprobed, 64-byte aligned (64 bytes of slack), no outgoing area.
+    let aligned = "add x2, x3, #79\nlsr x2, x2, #4\nlsl x2, x2, #4\nsub sp, sp, x2\nadd x2, sp, #0\n\
+                   add x2, x2, #63\nlsr x2, x2, #6\nlsl x2, x2, #6\n";
+    assert_eq!(super::encode::dyn_alloca_for_test(2, 3, 64, 0, false), llvm_mc(aligned).unwrap());
+    // The epilogue's `sub sp, x29, #extra` and the frame-pointer slot access.
+    let w = |s: &str| llvm_mc(s).unwrap();
+    assert_eq!(super::encode::sub_imm(1, 31, 29, 48).to_le_bytes().to_vec(), w("sub sp, x29, #48"));
+    assert_eq!(super::encode::sub_imm(1, 16, 29, 40).to_le_bytes().to_vec(), w("sub x16, x29, #40"));
+}
+
+#[test]
+fn dyn_alloca_report_needs_a_bound() {
+    use crate::codegen::stack::StackBoundError;
+    let (m, syms) = prepare(DYN_LEAF);
+    let out = compile_module_with(&m, &syms, &CodegenOptions::default());
+    let u = out.stack.get("leaf").unwrap();
+    assert!(u.dynamic_alloca);
+    assert_eq!(
+        out.stack.worst_case_depth("leaf", &StackAssumptions::new()),
+        Err(StackBoundError::DynamicAlloca { function: "leaf".into() })
+    );
+    let b = out.stack.worst_case_depth("leaf", &StackAssumptions::new().dynamic("leaf", 4096)).unwrap();
+    assert_eq!(b.bytes, u.frame_size + 4096);
+}

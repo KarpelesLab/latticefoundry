@@ -21,6 +21,68 @@
 //! prologue moves incoming parameters out of the argument registers (framework
 //! prologue). A64 has a hardware divide, so `sdiv`/`udiv` lower directly and
 //! remainder is `sdiv` followed by `msub` — no fixed-register `rax`/`rdx` dance.
+//!
+//! A function used as a value is [`A64Op::FuncAddr`] (`adrp`+`add`, or a GOT
+//! load under position-independent code; the encoder decides per symbol), so
+//! function pointers can be stored, passed and called through (`blr`).
+//!
+//! ## Variadic functions (AAPCS64)
+//!
+//! As on x86-64, the backend implements the calling convention and a front
+//! end lowers `va_start`/`va_arg`/`va_copy` itself as ordinary IR over the
+//! `va_list` struct, with two frame-address hooks.
+//!
+//! **Callers** need nothing special on Linux: AAPCS64 passes anonymous
+//! arguments exactly like named ones (`x0`–`x7`, `v0`–`v7`, then 8-byte stack
+//! slots), so a variadic call is an ordinary call. **Darwin** arm64
+//! ([`AArch64Target::for_os`] with [`TargetOs::Darwin`]) passes every
+//! anonymous argument of a call to a (direct) variadic callee on the stack,
+//! each in a slot of its size rounded up to 8 bytes (16-aligned for a 16-byte
+//! vector; an aggregate over 16 bytes as a pointer to a copy). (Windows on
+//! Arm, which passes anonymous floating-point values in general registers,
+//! is not implemented: it gets the base rules.)
+//!
+//! **`va_list`** is a 32-byte, 8-aligned struct:
+//!
+//! | offset | field       | type    |
+//! |--------|-------------|---------|
+//! | 0      | `__stack`   | `void*` |
+//! | 8      | `__gr_top`  | `void*` |
+//! | 16     | `__vr_top`  | `void*` |
+//! | 24     | `__gr_offs` | `i32`   |
+//! | 28     | `__vr_offs` | `i32`   |
+//!
+//! **Register save area** — the prologue of a function whose signature is
+//! variadic reserves [`VA_SAVE_AREA_SIZE`] (192) bytes, 16-aligned, and saves
+//! `x0`–`x7` at offsets `0, 8, .., 56` and the whole 128-bit `q0`–`q7` at
+//! [`VA_SAVE_VR_OFFSET`]` + 16 k` (`64, 80, .., 176`). Every register is
+//! saved; `va_start`'s offsets skip the named ones.
+//!
+//! **Frontend hooks** — calls to these externally declared functions are not
+//! calls; they materialize addresses, and are valid only in a variadic
+//! function:
+//!
+//! - `ptr @__lf_va_reg_save_area()` → the base of the register save area
+//!   (null on Darwin, which has none);
+//! - `ptr @__lf_va_overflow_area()` → the first anonymous stack argument,
+//!   `x29 + 16 +` the bytes of named stack arguments.
+//!
+//! The front end's `va_start` then sets, for `gr` named general-register and
+//! `vr` named SIMD/FP-register arguments:
+//! `__stack = __lf_va_overflow_area()`;
+//! `__gr_top = __lf_va_reg_save_area() + 64`;
+//! `__vr_top = __lf_va_reg_save_area() + 192`;
+//! `__gr_offs = -8 * (8 - gr)`; `__vr_offs = -16 * (8 - vr)`. Its `va_arg`
+//! of a general-register type reads `offs = __gr_offs`: if `offs >= 0` the
+//! value is on the stack; else `__gr_offs = offs + 8` (or the register count
+//! of the type times 8), and if that is still `<= 0` the value is at
+//! `__gr_top + offs`, otherwise on the stack. A floating-point (or HFA,
+//! vector) type does the same with `__vr_offs`, `__vr_top` and 16 per
+//! register. A stack argument is read at `__stack`, which then advances by
+//! the argument's size rounded up to 8 (aligned first for a 16-byte type).
+//! `va_copy` copies the 32 bytes. On Darwin `va_list` is a plain pointer
+//! initialized to `__lf_va_overflow_area()` and advanced 8 bytes per
+//! argument.
 
 use crate::codegen::isel::{Lower, TargetIsel};
 use crate::codegen::mir::{
@@ -30,7 +92,9 @@ use crate::codegen::target::{CallConv, MachineTarget};
 use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ValueDef};
-use crate::ir::{InstData, Module, ValueId};
+use crate::ir::{FuncId, InstData, Module, ValueId};
+use crate::support::StrInterner;
+use crate::target::TargetOs;
 
 use puremp::Int;
 
@@ -247,6 +311,26 @@ pub enum A64Op {
     /// instruction at three register operands, which the three spill scratches
     /// always cover.
     CselNe = 74,
+
+    // --- function addresses, dynamic stack allocation ----------------------
+    /// `[Def d, Func f]` — the address of function `f`: `adrp d, f; add d, d,
+    /// :lo12:f`, or under position-independent code, for a function that may
+    /// be preempted, a load from its GOT entry (`adrp d, :got:f; ldr d, [d,
+    /// :got_lo12:f]`). (A direct call needs no address: it is a `bl`.)
+    FuncAddr = 75,
+    /// `[Def d, Use n, Imm align]` — dynamic (runtime-sized) stack allocation
+    /// (`dyn_alloca`): moves `sp` down by `n` bytes (rounded up to 16, plus
+    /// the outgoing-argument area it relocates below the new block and any
+    /// alignment slack) and returns an `align`-aligned pointer into the fresh
+    /// region in `d`. With stack probes the move is one probed page at a time,
+    /// a loop over the size (see `super::encode`). A function containing one
+    /// addresses its frame slots from `x29` and restores `sp` from `x29` in its
+    /// epilogue.
+    DynAlloca = 76,
+    /// `[Imm extra]` — `sub sp, x29, #extra` (epilogue of a function with a
+    /// [`A64Op::DynAlloca`]): put `sp` back where the prologue left it, below
+    /// the fixed frame, before the callee-saved restores.
+    SpFromFp = 77,
 }
 
 impl A64Op {
@@ -259,29 +343,35 @@ impl A64Op {
     /// Whether an instruction of this opcode may execute a conditional branch
     /// whose direction depends on a register operand — the constant-time
     /// audit of the lowering (`docs/ir-design.md` §6d): the terminators
-    /// `BrCond`/`Switch` and the exclusive-monitor retry loops of `AtomicRmw`
-    /// and `CmpXchg` (which also compares the loaded value). Everything else
+    /// `BrCond`/`Switch`, the exclusive-monitor retry loops of `AtomicRmw`
+    /// and `CmpXchg` (which also compares the loaded value), and `DynAlloca`,
+    /// whose stack-probe loop runs over its size. Everything else
     /// — in particular `CmpZero` + `CselNe` (a `select`), `Csel`, `CmpCset`,
     /// the variable shifts,
     /// `Mul`, `Sbfx`/`Ubfx`, the float conversions, and every NEON op
     /// (`NeonOp3` … `NeonConst`: a vector `select` is an `and`/`bic`/`orr`
-    /// blend) — is straight-line code. (The prologue's probe loop counts a
-    /// constant frame size.)
+    /// blend), and the GOT loads of `GlobalAddr`/`FuncAddr` — is
+    /// straight-line code. (The prologue's probe loop counts a constant frame
+    /// size.)
     pub fn may_branch_on_data(self, _operands: &[MachineOperand]) -> bool {
-        matches!(self, A64Op::BrCond | A64Op::Switch | A64Op::AtomicRmw | A64Op::CmpXchg)
+        matches!(
+            self,
+            A64Op::BrCond | A64Op::Switch | A64Op::AtomicRmw | A64Op::CmpXchg | A64Op::DynAlloca
+        )
     }
 
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 75] = [
+        const TABLE: [A64Op; 78] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
             AddSp, SaveReg, RestoreReg, FAdd, FSub, FMul, FDiv, FNeg, Fcmp, LoadFConst, Fcvt,
             Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc, Sbfx, Ubfx, LoadAcq, StoreRel,
             Dmb, AtomicRmw, CmpXchg, NeonOp3, NeonOp2, NeonShift, NeonDup, NeonDupLane, NeonUmov,
-            NeonInsGpr, NeonInsElem, NeonLoad, NeonStore, NeonConst, CmpZero, CselNe,
+            NeonInsGpr, NeonInsElem, NeonLoad, NeonStore, NeonConst, CmpZero, CselNe, FuncAddr,
+            DynAlloca, SpFromFp,
         ];
         TABLE[op.0 as usize]
     }
@@ -392,6 +482,35 @@ impl Combine {
         }
     }
 }
+
+/// A variadic frame-address intrinsic: a call to one of these specially-named
+/// external functions materializes an address `va_start` needs instead of
+/// calling anything (see the module docs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VaHook {
+    /// `ptr @__lf_va_reg_save_area()`: the base of the register save area.
+    RegSaveArea,
+    /// `ptr @__lf_va_overflow_area()`: the first anonymous stack argument.
+    OverflowArea,
+}
+
+impl VaHook {
+    fn from_name(name: &str) -> Option<VaHook> {
+        match name {
+            "__lf_va_reg_save_area" => Some(VaHook::RegSaveArea),
+            "__lf_va_overflow_area" => Some(VaHook::OverflowArea),
+            _ => None,
+        }
+    }
+}
+
+/// The size of the AAPCS64 register save area of a variadic function: the
+/// general registers `x0`–`x7` (64 bytes) followed by the SIMD/FP registers
+/// `q0`–`q7` (128 bytes).
+pub const VA_SAVE_AREA_SIZE: u64 = 192;
+/// The offset of the SIMD/FP half (`q0`–`q7`) in the register save area; it
+/// is also where the general-register half ends (`__gr_top`).
+pub const VA_SAVE_VR_OFFSET: u64 = 64;
 
 /// The floating-point "ptype" field (0 = single/`s`, 1 = double/`d`) for a width.
 #[inline]
@@ -512,6 +631,9 @@ fn align_up_u64(v: u64, align: u64) -> u64 {
 #[derive(Debug)]
 pub struct AArch64Target {
     rf: RegFile,
+    /// Darwin's variant of AAPCS64: anonymous (variadic) arguments go on the
+    /// stack and `va_list` is a plain pointer (see the module docs).
+    darwin: bool,
 }
 
 impl Default for AArch64Target {
@@ -523,7 +645,14 @@ impl Default for AArch64Target {
 impl AArch64Target {
     /// Construct the AArch64 target with its fixed register file and AAPCS64 ABI.
     pub fn new() -> AArch64Target {
-        AArch64Target { rf: RegFile::new() }
+        AArch64Target { rf: RegFile::new(), darwin: false }
+    }
+
+    /// Construct the AArch64 target for `os`: the AAPCS64 base standard, with
+    /// Darwin's handling of variadic calls on [`TargetOs::Darwin`] (anonymous
+    /// arguments on the stack). Every other OS gets the base (Linux) rules.
+    pub fn for_os(os: TargetOs) -> AArch64Target {
+        AArch64Target { rf: RegFile::new(), darwin: os == TargetOs::Darwin }
     }
 
     /// Lower function `func` of `module` to MIR over this target.
@@ -533,6 +662,29 @@ impl AArch64Target {
         func: crate::ir::FuncId,
     ) -> crate::codegen::mir::MachineFunction {
         crate::codegen::isel::select(self, module, func)
+    }
+
+    /// Like [`AArch64Target::select`], but threads the module's symbol interner
+    /// so the variadic frame-address intrinsics (`__lf_va_reg_save_area` /
+    /// `__lf_va_overflow_area`) are recognized by name at their call sites.
+    pub fn select_with_syms(
+        &self,
+        module: &Module,
+        func: crate::ir::FuncId,
+        syms: &StrInterner,
+    ) -> crate::codegen::mir::MachineFunction {
+        crate::codegen::isel::select_with_syms(self, module, func, syms)
+    }
+
+    /// The parameter count of a direct callee whose signature is variadic, or
+    /// `None` (a fixed-arity callee, or an indirect call, whose signature is
+    /// unknown here: the front end calls variadic functions directly).
+    fn variadic_callee_params(lo: &Lower<'_, Self>, callee: ValueId) -> Option<usize> {
+        let fid = FuncId::from_index(lo.callee_func(callee)? as usize);
+        match lo.types().get(lo.module().function(fid).sig) {
+            Type::Func(ft) if ft.variadic => Some(ft.params.len()),
+            _ => None,
+        }
     }
 
     /// If `v` is an integer constant operand, its value.
@@ -977,6 +1129,40 @@ impl AArch64Target {
         at + align_up_u64(size, 8)
     }
 
+    /// Darwin: place the anonymous argument `arg` of a variadic call on the
+    /// stack at `stack_off` (each in a slot of its size rounded up to 8 bytes,
+    /// 8-aligned, or 16-aligned for a 16-byte vector; an aggregate over 16
+    /// bytes as a pointer to a caller copy, as when it is named) and return the
+    /// new running stack offset.
+    fn anon_arg_on_stack(&self, lo: &mut Lower<'_, Self>, arg: ValueId, ty: TypeId, stack_off: u64) -> u64 {
+        if is_aggregate(lo.types(), ty) {
+            if classify_aggregate(lo.types(), ty) != AbiClass::Reference {
+                return self.arg_on_stack(lo, arg, ty, stack_off);
+            }
+            let size = lo.byte_size(ty);
+            let align = lo.types().align_of(ty).max(8);
+            let slot = lo.new_slot(align_up_u64(size.max(8), 8), align);
+            let copy = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(self.frame_addr(copy, slot));
+            let src = lo.reg(arg);
+            self.emit_memcpy(lo, copy, src, size);
+            let dp = self.lea_sp(lo, stack_off);
+            lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(dp), use_v(copy), imm(8)]));
+            return stack_off + 8;
+        }
+        let v = lo.reg(arg);
+        if lo.types().is_vector(ty) {
+            let at = align_up_u64(stack_off, 16);
+            let dp = self.lea_sp(lo, at);
+            lo.emit(MachineInst::new(A64Op::NeonStore.opcode(), vec![use_v(dp), use_v(v)]));
+            return at + 16;
+        }
+        let size = lo.byte_size(ty);
+        let dp = self.lea_sp(lo, stack_off);
+        lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(size)]));
+        stack_off + align_up_u64(size, 8)
+    }
+
     /// Lower a `call`, implementing the AAPCS64 ABI for by-value struct arguments
     /// and returns on top of the existing scalar/float handling.
     ///
@@ -993,6 +1179,30 @@ impl AArch64Target {
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
+
+        // The variadic frame-address intrinsics are not calls: each
+        // materializes an address `va_start` needs (see the module docs).
+        if let Some(hook) = lo.callee_name(callee).and_then(VaHook::from_name) {
+            let d = lo.result_reg(inst);
+            match hook {
+                VaHook::RegSaveArea => match lo.va_reg_save() {
+                    Some(slot) => lo.emit(self.frame_addr(d, slot)),
+                    // Darwin has no register save area: `va_list` walks the stack.
+                    None if self.darwin => lo.emit(self.li(d, Int::ZERO)),
+                    None => panic!("__lf_va_reg_save_area called outside a variadic function"),
+                },
+                VaHook::OverflowArea => {
+                    let off = lo
+                        .va_overflow_off()
+                        .expect("__lf_va_overflow_area called outside a variadic function");
+                    lo.emit(MachineInst::new(A64Op::LeaFpOff.opcode(), vec![def_v(d), imm(off)]));
+                }
+            }
+            return;
+        }
+        // Darwin passes every anonymous argument of a variadic call on the
+        // stack; the base standard (Linux) treats them like named ones.
+        let anon_from = if self.darwin { Self::variadic_callee_params(lo, callee) } else { None };
 
         // Return classification.
         let ret_ty = inst.result().map(|r| lo.func().value_type(r));
@@ -1023,8 +1233,12 @@ impl AArch64Target {
             reg_moves.push((regs::gpr(regs::X8), ptr));
         }
 
-        for &arg in args {
+        for (k, &arg) in args.iter().enumerate() {
             let ty = lo.func().value_type(arg);
+            if anon_from.is_some_and(|n| k >= n) {
+                stack_off = self.anon_arg_on_stack(lo, arg, ty, stack_off);
+                continue;
+            }
             if is_aggregate(lo.types(), ty) {
                 match classify_aggregate(lo.types(), ty) {
                     AbiClass::Hfa { width, count } => {
@@ -1244,12 +1458,19 @@ impl AArch64Target {
         let cc = &self.rf.cc;
         let entry = lo.mf().entry().expect("a function being lowered has an entry block");
         let param_vregs: Vec<VReg> = lo.mf().block(entry).params.clone();
-        let (sig_params, ret_ty) = match lo.types().get(lo.func().sig) {
-            Type::Func(ft) => (ft.params.clone(), ft.ret),
-            _ => (Vec::new(), lo.func().sig),
+        let (sig_params, ret_ty, variadic) = match lo.types().get(lo.func().sig) {
+            Type::Func(ft) => (ft.params.clone(), ft.ret, ft.variadic),
+            _ => (Vec::new(), lo.func().sig, false),
         };
         let indirect_ret = is_aggregate(lo.types(), ret_ty)
             && matches!(classify_aggregate(lo.types(), ret_ty), AbiClass::Reference);
+
+        // A variadic function saves its argument registers so `va_arg` can
+        // walk them (not on Darwin, where every anonymous argument is on the
+        // stack).
+        if variadic && !self.darwin {
+            self.spill_va_regs(lo);
+        }
 
         let mut int_i = 0usize;
         let mut fp_i = 0usize;
@@ -1370,6 +1591,55 @@ impl AArch64Target {
                 }
             }
         }
+
+        // `__stack` (Darwin: the whole `va_list`) starts just past the named
+        // stack arguments, at `[x29 + stack_in]`.
+        if variadic {
+            lo.set_va_overflow_off(stack_in);
+        }
+    }
+
+    /// Save a variadic function's incoming argument registers into the
+    /// AAPCS64 register save area ([`VA_SAVE_AREA_SIZE`] bytes, 16-aligned) and
+    /// record its slot for `__lf_va_reg_save_area`: `x0`–`x7` at offsets
+    /// `0, 8, .., 56`, then the whole 128-bit `q0`–`q7` at `64, 80, .., 176`.
+    /// Every register is saved, named or not: `va_start` points `__gr_offs` /
+    /// `__vr_offs` past the named ones, so `va_arg` never reads those.
+    ///
+    /// Each register is first copied into a fresh vreg at the very top of the
+    /// prologue, while it still holds the incoming argument; the stores follow.
+    fn spill_va_regs(&self, lo: &mut Lower<'_, Self>) {
+        let cc = &self.rf.cc;
+        let gprs: Vec<VReg> = cc
+            .arg_regs
+            .iter()
+            .map(|&r| {
+                let v = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
+                v
+            })
+            .collect();
+        let vrs: Vec<VReg> = cc
+            .fp_arg_regs
+            .iter()
+            .map(|&r| {
+                let v = lo.fresh_vreg(RegClass::Fp);
+                lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
+                v
+            })
+            .collect();
+        let save = lo.new_slot(VA_SAVE_AREA_SIZE, 16);
+        lo.set_va_reg_save(save);
+        let base = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(self.frame_addr(base, save));
+        for (i, v) in gprs.into_iter().enumerate() {
+            let dp = self.add_off(lo, base, 8 * i as u64);
+            lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
+        }
+        for (i, v) in vrs.into_iter().enumerate() {
+            let dp = self.add_off(lo, base, VA_SAVE_VR_OFFSET + 16 * i as u64);
+            lo.emit(MachineInst::new(A64Op::NeonStore.opcode(), vec![use_v(dp), use_v(v)]));
+        }
     }
 
     /// Whether the function being lowered holds any vector value.
@@ -1476,6 +1746,10 @@ impl TargetIsel for AArch64Target {
         MachineInst::new(A64Op::GlobalAddr.opcode(), vec![def_v(dst), MachineOperand::Global(g)])
     }
 
+    fn func_addr(&self, dst: VReg, f: u32) -> MachineInst {
+        MachineInst::new(A64Op::FuncAddr.opcode(), vec![def_v(dst), MachineOperand::Func(f)])
+    }
+
     fn float_const(&self, dst: VReg, bits: u64, width: u32) -> MachineInst {
         MachineInst::new(
             A64Op::LoadFConst.opcode(),
@@ -1527,11 +1801,17 @@ impl TargetIsel for AArch64Target {
                 let slot = lo.new_slot(size, align);
                 lo.emit(self.frame_addr(d, slot));
             }
-            // Dynamic (runtime-sized) stack allocation is implemented and
-            // execution-tested only on x86-64 so far; the aarch64 sp-adjust
-            // lowering is deferred (like other target-specific gaps here).
-            InstKind::DynAlloca { .. } => {
-                panic!("aarch64 backend: dynamic `dyn_alloca` is not yet supported")
+            // Runtime-sized stack allocation: the encoder moves `sp` (probing
+            // each page) and relocates the outgoing-argument area below the
+            // new block (see [`A64Op::DynAlloca`]). The size is read as a whole
+            // register, so a narrow one is zero-extended first.
+            InstKind::DynAlloca { align } => {
+                let d = lo.result_reg(inst);
+                let n = self.extend64(lo, inst.operands()[0], false);
+                lo.emit(MachineInst::new(
+                    A64Op::DynAlloca.opcode(),
+                    vec![def_v(d), use_v(n), imm(u64::from(*align))],
+                ));
             }
             InstKind::Load { ty, .. } => {
                 let d = lo.result_reg(inst);

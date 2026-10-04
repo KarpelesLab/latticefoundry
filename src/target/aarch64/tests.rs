@@ -258,6 +258,23 @@ fn differential_encoding_matches_llvm_mc() {
         // aggregate-ABI stack addressing (A64Op::LeaSpOff / LeaFpOff)
         (add_imm(1, 0, 31, 16), "add x0, sp, #16"),
         (add_imm(1, 1, 29, 24), "add x1, x29, #24"),
+        // GOT loads (the `ldr` of `adrp`+`ldr`, its imm12 filled by the
+        // linker), `dyn_alloca` and the frames whose `sp` moves
+        (ldst_uimm(true, 3, 3, 3, 0), "ldr x3, [x3]"),
+        (sub_sp_reg(5), "sub sp, sp, x5"),
+        (cmp_page(5), "cmp x5, #1, lsl #12"),
+        (ldst_uimm(true, 3, 31, 31, 0), "ldr xzr, [sp]"),
+        (ldst_uimm(false, 3, 31, 31, 0), "str xzr, [sp]"),
+        (b_cond(0x3, 5), "b.lo #20"),
+        (sub_imm(1, 31, 29, 32), "sub sp, x29, #32"),
+        (sub_imm(1, 16, 29, 24), "sub x16, x29, #24"),
+        (sub_imm(1, 7, 29, 4088), "sub x7, x29, #4088"),
+        // variadic register save area: the whole `q` register
+        (q_ldst_uimm(false, 7, 2, 0), "str q7, [x2]"),
+        // the `_start` of a linked executable
+        (movz(1, 29, 0, 0), "mov x29, #0"),
+        (movz(1, 8, 93, 0), "mov x8, #93"),
+        (svc(0), "svc #0"),
     ];
 
     if llvm_mc("ret").is_none() {
@@ -1493,7 +1510,17 @@ fn run_lf_main(src: &str) -> u64 {
     let v = interp::run(&target, &funcs, main, &[])
         .expect("interpretation succeeds")
         .expect("main returns a value");
-    v.to_u64().expect("a 64-bit pattern")
+    let v = v.to_u64().expect("a 64-bit pattern");
+    // The same program compiled, linked by qld and run on the A64 emulator
+    // computes the same `main` result (the exit status is all of `x0`).
+    let obj = compile_module(&m, &syms);
+    let exe = std::env::temp_dir().join(format!("lf-a64-main-{}-{:x}", std::process::id(), src.len() ^ v as usize));
+    super::link::link_executable(vec![obj], "main", &[], &exe).expect("qld links");
+    let elf = std::fs::read(&exe).unwrap();
+    let _ = std::fs::remove_file(&exe);
+    let (code, _) = super::emu::run_executable(&elf).expect("the program runs");
+    assert_eq!(code, v, "machine code and MIR interpreter agree");
+    v
 }
 
 /// The names of the checks whose bit is set in `code`.

@@ -42,6 +42,24 @@
 //! function body or at its entry, so it serves as this module's
 //! large-offset/loop scratch.
 //!
+//! **Dynamic stack allocation.** A `dyn_alloca` ([`A64Op::DynAlloca`]) moves
+//! `sp` at run time: probed, one page at a time, like the prologue (see
+//! `encode_dyn_alloca`). Its function addresses every frame slot from `x29`
+//! instead (`x16 = x29 - (extra - off)`, as `x29 - extra` is where `sp` stood
+//! after the prologue), keeps the outgoing-argument area at the new bottom of
+//! the stack, and restores `sp` from `x29` before its epilogue.
+//!
+//! **Position-independent code.** Under [`RelocModel::Pic`] / `Pie`
+//! ([`CodegenOptions::reloc_model`]), the address of a global or function that
+//! may be preempted is loaded from its GOT entry (`adrp`+`ldr`,
+//! `R_AARCH64_ADR_GOT_PAGE` + `R_AARCH64_LD64_GOT_LO12_NC`); a locally bound
+//! one (internal, hidden, or any definition in a PIE) is formed directly
+//! (`adrp`+`add`). Calls stay `bl` (`R_AARCH64_CALL26`: the linker adds a PLT
+//! entry for a preemptible callee). With [`compile_module_debug_with`] the
+//! object also carries DWARF line tables.
+//!
+//! [`RelocModel::Pic`]: crate::codegen::RelocModel::Pic
+//!
 //! The encoding tables are implemented from the published ARM A64 instruction
 //! encodings (tenet T1), not copied from any assembler.
 
@@ -529,7 +547,8 @@ pub(crate) fn fp_ldst_uimm(load: bool, size: u32, rt: u32, rn: u32, imm12: u32) 
 
 /// The stack-frame layout of one function, computed after allocation. All slot
 /// offsets are `sp`-relative and non-negative: `sp` is fixed for the whole body
-/// (no dynamic stack growth), so `[sp, #off]` addressing is stable.
+/// of a function without `dyn_alloca`, so `[sp, #off]` addressing is stable
+/// (a function with one reaches the same bytes from `x29`; see `dynamic`).
 #[derive(Clone, Debug)]
 pub struct FrameLayout {
     /// `sp`-relative byte offset of each stack slot (by slot index).
@@ -543,8 +562,13 @@ pub struct FrameLayout {
     extra: u32,
     /// The outgoing stack-argument area at the bottom of the frame (bytes).
     outgoing: u64,
-    /// Whether the prologue's `sub sp` emits stack probes.
+    /// Whether the prologue's `sub sp` (and every `DynAlloca`) emits stack
+    /// probes.
     probes: bool,
+    /// Whether the function moves `sp` at run time (it has a `DynAlloca`): its
+    /// slots are then addressed from `x29` (`x29 - extra + off`), and its
+    /// epilogue first puts `sp` back at `x29 - extra`.
+    dynamic: bool,
 }
 
 impl FrameLayout {
@@ -558,7 +582,12 @@ impl FrameLayout {
         mf: &MachineFunction,
         func_name: &dyn Fn(u32) -> String,
     ) -> StackUsage {
-        let scan = scan_calls(mf, A64Op::Call.opcode(), A64Op::Svc.opcode(), None);
+        let scan = scan_calls(
+            mf,
+            A64Op::Call.opcode(),
+            A64Op::Svc.opcode(),
+            Some(A64Op::DynAlloca.opcode()),
+        );
         let extra = u64::from(self.extra);
         StackUsage {
             name: func_name(mf.info().source),
@@ -640,8 +669,11 @@ pub fn layout_frame_with(
         off += align_up(info.size.max(1), 8);
     }
     let extra = align_up(off, 16) as u32;
+    let dynamic = mf
+        .block_ids()
+        .any(|b| mf.block(b).insts.iter().any(|i| A64Op::decode(i.opcode) == A64Op::DynAlloca));
 
-    FrameLayout { slot_off, cs_regs, cs_off, extra, outgoing, probes: opts.stack_probes }
+    FrameLayout { slot_off, cs_regs, cs_off, extra, outgoing, probes: opts.stack_probes, dynamic }
 }
 
 fn def_preg(r: PReg) -> MachineOperand {
@@ -687,6 +719,13 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
         let mut new_insts = Vec::with_capacity(old.len());
         for inst in old {
             if A64Op::decode(inst.opcode) == A64Op::Ret {
+                if layout.dynamic {
+                    // `sp` moved below the fixed frame: put it back first.
+                    new_insts.push(MachineInst::new(
+                        A64Op::SpFromFp.opcode(),
+                        vec![imm_op(u64::from(layout.extra))],
+                    ));
+                }
                 for (&cs, &off) in layout.cs_regs.iter().zip(&layout.cs_off) {
                     new_insts.push(MachineInst::new(
                         A64Op::RestoreReg.opcode(),
@@ -833,6 +872,35 @@ struct EncodeCtx<'a> {
     layout: &'a FrameLayout,
     func_name: &'a dyn Fn(u32) -> String,
     global_name: &'a dyn Fn(u32) -> String,
+    got: GotQuery<'a>,
+}
+
+/// Which symbols position-independent code reaches through the GOT: those
+/// that may be preempted (see [`crate::codegen::linkage`]), by function and
+/// global index.
+#[derive(Clone, Copy)]
+struct GotQuery<'a> {
+    func: &'a dyn Fn(u32) -> bool,
+    global: &'a dyn Fn(u32) -> bool,
+}
+
+impl GotQuery<'static> {
+    /// Position-dependent code: no symbol goes through the GOT.
+    const NONE: GotQuery<'static> = GotQuery { func: &|_| false, global: &|_| false };
+}
+
+/// The address of symbol `sym` into `d`: `adrp d, sym; add d, d, :lo12:sym`
+/// (`R_AARCH64_ADR_PREL_PG_HI21` + `R_AARCH64_ADD_ABS_LO12_NC`), or with
+/// `via_got` the load of its GOT entry, `adrp d, :got:sym; ldr d, [d,
+/// :got_lo12:sym]` (`R_AARCH64_ADR_GOT_PAGE` + `R_AARCH64_LD64_GOT_LO12_NC`).
+fn symbol_addr(b: &mut A64Buf, d: u32, sym: String, via_got: bool) {
+    if via_got {
+        b.reloc(adrp(d), sym.clone(), RelocKind::Aarch64AdrGotPage);
+        b.reloc(ldst_uimm(true, SIZE_DWORD, d, d, 0), sym, RelocKind::Aarch64Ld64GotLo12Nc);
+    } else {
+        b.reloc(adrp(d), sym.clone(), RelocKind::Aarch64AdrPrelPgHi21);
+        b.reloc(add_imm(1, d, d, 0), sym, RelocKind::Aarch64AddAbsLo12Nc);
+    }
 }
 
 /// The `ldst` `size` field (log2 access width) for a byte count.
@@ -997,14 +1065,26 @@ pub(crate) fn q_ldst_uimm(load: bool, rt: u32, rn: u32, imm12: u32) -> u32 {
     base | ((imm12 & 0xFFF) << 10) | (rn << 5) | rt
 }
 
-/// A spill/reload of a whole `q` register at `[sp, #off]` (`off` 16-aligned).
-fn frame_q_ldst(b: &mut A64Buf, load: bool, rt: u32, off: u32) {
+/// A spill/reload of a whole `q` register at `[base, #off]` (`off` 16-aligned).
+fn frame_q_ldst(b: &mut A64Buf, load: bool, rt: u32, base: u32, off: u32) {
     if off / 16 < 4096 {
-        b.word(q_ldst_uimm(load, rt, SP.into(), off / 16));
+        b.word(q_ldst_uimm(load, rt, base, off / 16));
         return;
     }
-    addsub_any(b, false, IP0, SP.into(), u64::from(off & !0xFFF));
+    addsub_any(b, false, IP0, base, u64::from(off & !0xFFF));
     b.word(q_ldst_uimm(load, rt, IP0, (off & 0xFFF) / 16));
+}
+
+/// The base register and offset that reach the frame slot at (static,
+/// `sp`-relative) offset `off`: `[sp, #off]` in a fixed frame; in a frame
+/// whose `sp` moves (a `DynAlloca`), `x16 = x29 - (extra - off)` then
+/// `[x16, #0]`.
+fn slot_base(b: &mut A64Buf, layout: &FrameLayout, off: u32) -> (u32, u32) {
+    if !layout.dynamic {
+        return (SP.into(), off);
+    }
+    addsub_any(b, true, IP0, FP.into(), u64::from(layout.extra - off));
+    (IP0, 0)
 }
 
 /// A free FP scratch (`v29..v31`, never allocated) not named in `avoid`.
@@ -1221,24 +1301,21 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         A64Op::FrameAddr => {
             let d = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            addsub_any(b, false, d, SP.into(), u64::from(off));
+            if ctx.layout.dynamic {
+                addsub_any(b, true, d, FP.into(), u64::from(ctx.layout.extra - off));
+            } else {
+                addsub_any(b, false, d, SP.into(), u64::from(off));
+            }
         }
         // A spilled FP/SIMD register may hold a vector: the whole `q` register
         // goes to its 16-byte, 16-aligned slot.
-        A64Op::StoreFrame => {
-            let src = rnum(&ops[0]);
-            let off = ctx.layout.slot_off[slot_index(&ops[1])];
+        A64Op::StoreFrame | A64Op::LoadFrame => {
+            let load = A64Op::decode(inst.opcode) == A64Op::LoadFrame;
+            let r = rnum(&ops[0]);
+            let (base, off) = slot_base(b, ctx.layout, ctx.layout.slot_off[slot_index(&ops[1])]);
             match rclass(&ops[0]) {
-                RegClass::Fp => frame_q_ldst(b, false, src, off),
-                RegClass::Gpr => frame_ldst_any(b, RegClass::Gpr, false, src, off),
-            }
-        }
-        A64Op::LoadFrame => {
-            let dst = rnum(&ops[0]);
-            let off = ctx.layout.slot_off[slot_index(&ops[1])];
-            match rclass(&ops[0]) {
-                RegClass::Fp => frame_q_ldst(b, true, dst, off),
-                RegClass::Gpr => frame_ldst_any(b, RegClass::Gpr, true, dst, off),
+                RegClass::Fp => frame_q_ldst(b, load, r, base, off),
+                RegClass::Gpr => frame_ldst_any(b, RegClass::Gpr, load, r, base, off),
             }
         }
         A64Op::GlobalAddr => {
@@ -1247,10 +1324,18 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 MachineOperand::Global(g) => g,
                 _ => panic!("GlobalAddr expects a global operand"),
             };
-            let name = (ctx.global_name)(g);
-            b.reloc(adrp(d), name.clone(), RelocKind::Aarch64AdrPrelPgHi21);
-            b.reloc(add_imm(1, d, d, 0), name, RelocKind::Aarch64AddAbsLo12Nc);
+            symbol_addr(b, d, (ctx.global_name)(g), (ctx.got.global)(g));
         }
+        A64Op::FuncAddr => {
+            let d = rnum(&ops[0]);
+            let f = match ops[1] {
+                MachineOperand::Func(f) => f,
+                _ => panic!("FuncAddr expects a function operand"),
+            };
+            symbol_addr(b, d, (ctx.func_name)(f), (ctx.got.func)(f));
+        }
+        A64Op::DynAlloca => encode_dyn_alloca(b, ops, ctx.layout),
+        A64Op::SpFromFp => addsub_any(b, true, SP.into(), FP.into(), uimm(&ops[0])),
         A64Op::Call => match &ops[0] {
             MachineOperand::Func(idx) => {
                 b.reloc(bl(0), (ctx.func_name)(*idx), RelocKind::Aarch64Call26);
@@ -1302,12 +1387,12 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         A64Op::SaveReg => {
             let r = rnum(&ops[0]);
             let off = uimm(&ops[1]) as u32;
-            frame_ldst_any(b, rclass(&ops[0]), false, r, off);
+            frame_ldst_any(b, rclass(&ops[0]), false, r, SP.into(), off);
         }
         A64Op::RestoreReg => {
             let r = rnum(&ops[0]);
             let off = uimm(&ops[1]) as u32;
-            frame_ldst_any(b, rclass(&ops[0]), true, r, off);
+            frame_ldst_any(b, rclass(&ops[0]), true, r, SP.into(), off);
         }
 
         // --- scalar floating-point ----------------------------------------
@@ -1420,13 +1505,13 @@ fn fcvt_dst_ptype(dst_w: u32) -> u32 {
     u32::from(dst_w >= 64)
 }
 
-/// A frame (spill/reload/callee-save) `ldr`/`str` of a whole 64-bit lane, using
-/// the GPR (`x`) or FP (`d`) form per the register class. `off` is a byte offset;
-/// the encoded unsigned immediate is `off / 8`.
-fn frame_ldst(class: RegClass, load: bool, rt: u32, off: u32) -> u32 {
+/// A frame (spill/reload/callee-save) `ldr`/`str` of a whole 64-bit lane at
+/// `[base, #off]`, using the GPR (`x`) or FP (`d`) form per the register
+/// class. `off` is a byte offset; the encoded unsigned immediate is `off / 8`.
+fn frame_ldst(class: RegClass, load: bool, rt: u32, base: u32, off: u32) -> u32 {
     match class {
-        RegClass::Gpr => ldst_uimm(load, SIZE_DWORD, rt, SP.into(), off / 8),
-        RegClass::Fp => fp_ldst_uimm(load, SIZE_DWORD, rt, SP.into(), off / 8),
+        RegClass::Gpr => ldst_uimm(load, SIZE_DWORD, rt, base, off / 8),
+        RegClass::Fp => fp_ldst_uimm(load, SIZE_DWORD, rt, base, off / 8),
     }
 }
 
@@ -1455,15 +1540,15 @@ fn addsub_any(b: &mut A64Buf, sub: bool, rd: u32, rn: u32, amount: u64) {
     }
 }
 
-/// A 64-bit spill/reload `[sp, #off]` for any `off` (8-aligned): the scaled
-/// `imm12` form when it reaches, else `x16 = sp + (off & !0xFFF)` and the
+/// A 64-bit spill/reload `[base, #off]` for any `off` (8-aligned): the scaled
+/// `imm12` form when it reaches, else `x16 = base + (off & !0xFFF)` and the
 /// remainder as the immediate.
-fn frame_ldst_any(b: &mut A64Buf, class: RegClass, load: bool, rt: u32, off: u32) {
+fn frame_ldst_any(b: &mut A64Buf, class: RegClass, load: bool, rt: u32, base: u32, off: u32) {
     if off / 8 < 4096 {
-        b.word(frame_ldst(class, load, rt, off));
+        b.word(frame_ldst(class, load, rt, base, off));
         return;
     }
-    addsub_any(b, false, IP0, SP.into(), u64::from(off & !0xFFF));
+    addsub_any(b, false, IP0, base, u64::from(off & !0xFFF));
     let imm12 = (off & 0xFFF) / 8;
     b.word(match class {
         RegClass::Gpr => ldst_uimm(load, SIZE_DWORD, rt, IP0, imm12),
@@ -1501,6 +1586,92 @@ fn sub_sp(b: &mut A64Buf, amount: u64, probe: bool) {
     if rem > 0 {
         b.word(sub_imm(1, SP.into(), SP.into(), rem as u32));
     }
+}
+
+/// `sub sp, sp, Xm, uxtx` (extended-register form, which accepts `sp`).
+pub(crate) fn sub_sp_reg(rm: u32) -> u32 {
+    0xCB20_6000 | (rm << 16) | (u32::from(SP) << 5) | u32::from(SP)
+}
+
+/// `cmp Xn, #1, lsl #12` (`subs xzr, Xn, #4096`).
+pub(crate) fn cmp_page(rn: u32) -> u32 {
+    addsub_imm(0x7100_0000, 1, XZR.into(), rn, 1) | (1 << 22)
+}
+
+/// Expand [`A64Op::DynAlloca`] `[d, n, align]`. `d` is the size scratch, then
+/// the result; `C = outgoing + slack` (`slack = align` when `align > 16`, so
+/// the pointer can round up inside the block), a multiple of 16:
+///
+/// ```text
+/// add  d, n, #(15 + C) ; lsr d, d, #4 ; lsl d, d, #4   // round16(n) + C
+/// ldr  xzr, [sp]                                     // probes: touch the top
+/// L: cmp d, #1, lsl #12 ; b.lo done                  //   while d >= 4096:
+///    sub sp, sp, #1, lsl #12 ; str xzr, [sp]         //     one probed page
+///    sub d, d, #1, lsl #12 ; b L
+/// done:
+/// sub  sp, sp, d, uxtx                               // the remainder
+/// str  xzr, [sp]                                     // probes: touch it
+/// add  d, sp, #outgoing                              // above the new outgoing area
+/// add  d, d, #(align - 1) ; lsr ; lsl                // align > 16 only
+/// ```
+///
+/// The outgoing-argument area stays at the bottom of the frame
+/// (`[sp, sp + outgoing)`): the block handed back starts above it, so
+/// `LeaSpOff` addressing of stack arguments is unchanged. The current top is
+/// probed with a load (it may hold a callee-saved register's save slot or a
+/// local), the fresh pages with stores; so with probes `sp` never moves more
+/// than one interval below the deepest access (see [`crate::codegen::stack`]).
+fn encode_dyn_alloca(b: &mut A64Buf, ops: &[MachineOperand], layout: &FrameLayout) {
+    let (d, n) = (rnum(&ops[0]), rnum(&ops[1]));
+    let align = uimm(&ops[2]).max(1);
+    let slack = if align > 16 { align } else { 0 };
+    let c = layout.outgoing + slack;
+    addsub_any(b, false, d, n, 15 + c);
+    b.word(lsr_imm(1, d, d, 4));
+    b.word(lsl_imm(1, d, d, 4));
+    if layout.probes {
+        b.word(ldst_uimm(true, SIZE_DWORD, XZR.into(), SP.into(), 0)); // ldr xzr, [sp]
+        b.word(cmp_page(d));
+        b.word(b_cond(0x3, 5)); // b.lo done
+        b.word(addsub_imm(0x5100_0000, 1, SP.into(), SP.into(), 1) | (1 << 22)); // sub sp, #4096
+        b.word(ldst_uimm(false, SIZE_DWORD, XZR.into(), SP.into(), 0)); // str xzr, [sp]
+        b.word(addsub_imm(0x5100_0000, 1, d, d, 1) | (1 << 22)); // sub d, d, #4096
+        b.word(b_uncond(-5)); // b L
+    }
+    b.word(sub_sp_reg(d));
+    if layout.probes {
+        b.word(ldst_uimm(false, SIZE_DWORD, XZR.into(), SP.into(), 0)); // str xzr, [sp]
+    }
+    addsub_any(b, false, d, SP.into(), layout.outgoing);
+    if align > 16 {
+        let k = align.trailing_zeros();
+        addsub_any(b, false, d, d, align - 1);
+        b.word(lsr_imm(1, d, d, k));
+        b.word(lsl_imm(1, d, d, k));
+    }
+}
+
+/// Test hook: the expansion of an allocated `DynAlloca` `[x<d>, x<n>,
+/// align]` in a frame with `outgoing` bytes of outgoing-argument area.
+#[cfg(test)]
+pub(crate) fn dyn_alloca_for_test(d: u16, n: u16, align: u64, outgoing: u64, probes: bool) -> Vec<u8> {
+    let layout = FrameLayout {
+        slot_off: Vec::new(),
+        cs_regs: Vec::new(),
+        cs_off: Vec::new(),
+        extra: 0,
+        outgoing,
+        probes,
+        dynamic: true,
+    };
+    let ops = [
+        MachineOperand::Def(Reg::Physical(super::regs::gpr(d))),
+        MachineOperand::Use(Reg::Physical(super::regs::gpr(n))),
+        imm_op(align),
+    ];
+    let mut b = A64Buf::new();
+    encode_dyn_alloca(&mut b, &ops, &layout);
+    b.bytes
 }
 
 /// Materialize a 64-bit constant into `rd` with a minimal `movz`/`movn`/`movk`
@@ -1543,15 +1714,30 @@ fn encode_movri(b: &mut A64Buf, rd: u32, value: u64) {
 // ===========================================================================
 
 /// Encode an allocated, prologue-inserted machine function into bytes and the
-/// relocations its external references produced.
+/// relocations its external references produced (position-dependent: every
+/// symbol is addressed directly).
 pub fn encode_function(
     mf: &MachineFunction,
     layout: &FrameLayout,
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
 ) -> Emitted {
+    encode_function_inner(mf, layout, func_name, global_name, GotQuery::NONE, None)
+}
+
+/// [`encode_function`] with the GOT choice per symbol, collecting the
+/// `(offset, source line)` statement rows of a `.debug_line` program when
+/// `lines` is given (a row wherever the line changes).
+fn encode_function_inner(
+    mf: &MachineFunction,
+    layout: &FrameLayout,
+    func_name: &dyn Fn(u32) -> String,
+    global_name: &dyn Fn(u32) -> String,
+    got: GotQuery<'_>,
+    mut lines: Option<&mut Vec<(u64, u32)>>,
+) -> Emitted {
     let mut b = A64Buf::new();
-    let ctx = EncodeCtx { layout, func_name, global_name };
+    let ctx = EncodeCtx { layout, func_name, global_name, got };
 
     // Emit the entry block first (so the function symbol at offset 0 is the
     // entry), then the remaining blocks in arena order.
@@ -1566,6 +1752,12 @@ pub fn encode_function(
     for &bid in &order {
         block_off[bid.index()] = b.offset();
         for inst in &mf.block(bid).insts {
+            if let Some(rows) = lines.as_deref_mut()
+                && inst.line != 0
+                && rows.last().map(|&(_, l)| l) != Some(inst.line)
+            {
+                rows.push((b.offset(), inst.line));
+            }
             encode_inst(&mut b, inst, &ctx);
         }
     }
@@ -1573,17 +1765,27 @@ pub fn encode_function(
     Emitted { bytes: b.bytes, relocations: b.relocs }
 }
 
+/// One function's compile output: bytes + relocations, the `.debug_line`
+/// statement rows (when requested), and its stack usage.
+struct FunctionOutput {
+    emitted: Emitted,
+    rows: Vec<(u64, u32)>,
+    stack: StackUsage,
+}
+
 /// Run isel → register allocation → frame layout → prologue/epilogue →
-/// encoding for one function under `opts`, returning the code and its stack
-/// usage (`syms` names the callees).
+/// encoding for one function under `opts` (its OS selects the variadic
+/// convention, its relocation model the GOT use), returning the code, the
+/// line rows if `lines`, and its stack usage (`syms` names the callees).
 fn compile_function_full(
     module: &Module,
     func: crate::ir::FuncId,
     syms: &StrInterner,
     opts: &CodegenOptions,
-) -> (Emitted, StackUsage) {
-    let target = AArch64Target::new();
-    let mut mf = target.select(module, func);
+    lines: bool,
+) -> FunctionOutput {
+    let target = AArch64Target::for_os(opts.os);
+    let mut mf = target.select_with_syms(module, func, syms);
     regalloc::allocate(&mut mf, &target);
     let layout = layout_frame_with(&mf, &target, opts);
     insert_prologue_epilogue(&mut mf, &layout);
@@ -1594,14 +1796,30 @@ fn compile_function_full(
         syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
     };
     let stack = layout.stack_usage(&mf, &func_name);
-    (encode_function(&mf, &layout, &func_name, &global_name), stack)
+    let model = opts.reloc_model;
+    let got_func = |idx: u32| {
+        !crate::codegen::linkage::func_binds_locally(module, crate::ir::FuncId::from_index(idx as usize), model)
+    };
+    let got_global = |idx: u32| {
+        !crate::codegen::linkage::global_binds_locally(module, crate::ir::GlobalId::from_index(idx as usize), model)
+    };
+    let mut rows = Vec::new();
+    let emitted = encode_function_inner(
+        &mf,
+        &layout,
+        &func_name,
+        &global_name,
+        GotQuery { func: &got_func, global: &got_global },
+        if lines { Some(&mut rows) } else { None },
+    );
+    FunctionOutput { emitted, rows, stack }
 }
 
 /// Compile one function of `module` to its encoded bytes and relocations. Runs
 /// isel → register allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
     let legal = crate::codegen::legalize::legalized(module, &NeonLegality);
-    compile_function_full(&legal, func, syms, &CodegenOptions::default()).0
+    compile_function_full(&legal, func, syms, &CodegenOptions::default(), false).emitted
 }
 
 /// Compile every defined function of `module` into a relocatable
@@ -1616,34 +1834,63 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
 /// Like [`compile_module`], under `opts`, and also returning every defined
 /// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
 ///
-/// # Panics
-///
-/// If `opts` asks for position-independent code
-/// ([`RelocModel::is_pic`](crate::codegen::RelocModel::is_pic)): the AArch64
-/// backend does not generate it yet. Use
-/// [`crate::target::compile_module_for`] to get that as an error instead.
+/// Under a position-independent [`RelocModel`](crate::codegen::RelocModel)
+/// (`Pic`/`Pie`), the address of a symbol that may be preempted is loaded
+/// from its GOT entry (`adrp`+`ldr`, `R_AARCH64_ADR_GOT_PAGE` +
+/// `R_AARCH64_LD64_GOT_LO12_NC`), a locally bound one is formed directly
+/// (`adrp`+`add`), calls stay `R_AARCH64_CALL26` (the linker adds a PLT entry
+/// for a preemptible callee), and constants holding an address move to
+/// `.data.rel.ro`: the object needs no text relocation.
 pub fn compile_module_with(
     module: &Module,
     syms: &StrInterner,
     opts: &CodegenOptions,
 ) -> CompiledModule {
-    if let Err(e) = crate::target::check_options(crate::target::TargetArch::AArch64, opts) {
-        panic!("{e}");
-    }
+    build_module(module, syms, opts, None)
+}
+
+/// The source file a debug build describes (`DW_AT_name` / `DW_AT_comp_dir`).
+pub use crate::target::x86_64::DebugSource;
+
+/// [`compile_module_with`] plus DWARF: `.debug_abbrev`/`.debug_info`/
+/// `.debug_str`/`.debug_line` describing every defined function (name,
+/// address range, source-line table), their address fields
+/// `R_AARCH64_ABS64` relocations against the function symbols.
+pub fn compile_module_debug_with(
+    module: &Module,
+    syms: &StrInterner,
+    source: &DebugSource,
+    opts: &CodegenOptions,
+) -> CompiledModule {
+    build_module(module, syms, opts, Some(source))
+}
+
+/// The shared module driver behind [`compile_module_with`] and
+/// [`compile_module_debug_with`] (DWARF when `debug` is given).
+fn build_module(
+    module: &Module,
+    syms: &StrInterner,
+    opts: &CodegenOptions,
+    debug: Option<&DebugSource>,
+) -> CompiledModule {
+    use crate::mc::dwarf::{DebugUnit, FuncDebug};
+
     // Vector code NEON cannot hold or select is scalarized first.
     let legal = crate::codegen::legalize::legalized(module, &NeonLegality);
     let module: &Module = &legal;
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
     let mut stack = StackReport::new();
+    let mut funcs: Vec<FuncDebug> = Vec::new();
 
     for (i, f) in module.functions().enumerate() {
         if f.is_declaration() {
             continue;
         }
         let fid = crate::ir::FuncId::from_index(i);
-        let (emitted, usage) = compile_function_full(module, fid, syms, opts);
-        stack.push(usage);
+        let out = compile_function_full(module, fid, syms, opts, debug.is_some());
+        let emitted = out.emitted;
+        stack.push(out.stack);
         // 4-align this function's start within .text (A64 instructions are words).
         {
             let sec = obj.section_mut(text);
@@ -1657,7 +1904,7 @@ pub fn compile_module_with(
 
         let name = syms.resolve(f.name).to_owned();
         obj.add_symbol(Symbol::defined(
-            name,
+            name.clone(),
             SymbolBinding::Global,
             SymbolType::Func,
             text,
@@ -1674,10 +1921,47 @@ pub fn compile_module_with(
                 addend: r.addend,
             });
         }
+
+        if debug.is_some() {
+            // A function-entry row at the declaration line, then the
+            // statement rows (dropping runs of the same line).
+            let decl_line = f.decl_line.unwrap_or(1);
+            let mut rows = vec![(0u64, decl_line)];
+            for (roff, line) in out.rows {
+                if rows.last().map(|&(_, l)| l) != Some(line) {
+                    rows.push((roff, line));
+                }
+            }
+            funcs.push(FuncDebug { name, decl_line, size: len, rows });
+        }
     }
     // Every defined global's storage, as on x86-64 (the `adrp`+`add` above
-    // address these symbols).
-    crate::codegen::data::emit_globals(module, syms, &mut obj, crate::mc::object::RelocKind::Abs64);
+    // address these symbols). Under PIC, pointer-holding constants go to
+    // `.data.rel.ro`, and the object says it needs no executable stack.
+    let pic = opts.reloc_model.is_pic();
+    crate::codegen::data::emit_globals_with(module, syms, &mut obj, RelocKind::Abs64, pic);
     crate::codegen::linkage::apply_symbol_attrs(module, syms, &mut obj);
+    if pic {
+        obj.add_section(Section::new(".note.GNU-stack", SectionKind::Debug, 1));
+    }
+
+    if let Some(source) = debug {
+        let text_size = obj.section(text).bytes.len() as u64;
+        let unit = DebugUnit {
+            file_name: source.file_name.clone(),
+            comp_dir: source.comp_dir.clone(),
+            producer: "LatticeFoundry".to_owned(),
+            text_size,
+            funcs,
+        };
+        let dw = crate::mc::dwarf::build_with_address_size(&unit, 8);
+        for (name, bytes) in [(".debug_abbrev", dw.abbrev), (".debug_str", dw.str)] {
+            let mut s = Section::new(name, SectionKind::Debug, 1);
+            s.bytes = bytes;
+            obj.add_section(s);
+        }
+        obj.add_emitted_section(".debug_info", SectionKind::Debug, 1, dw.info);
+        obj.add_emitted_section(".debug_line", SectionKind::Debug, 1, dw.line);
+    }
     CompiledModule { object: obj, stack }
 }

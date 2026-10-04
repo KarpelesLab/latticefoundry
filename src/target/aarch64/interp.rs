@@ -36,6 +36,15 @@
 //!   registers `x0`/`x1`/`v0..v3`, copied back. So a small aggregate returned in
 //!   `x0`/`x1`, an HFA returned in `v0..v3`, and a large aggregate written
 //!   through the `x8` slot are all reproduced abstractly.
+//! - **The stack-argument areas.** Each activation also gets an
+//!   outgoing-argument area in the shared memory (the MIR's reserved
+//!   `outgoing` size): `LeaSpOff` addresses it, and the callee's `LeaFpOff`
+//!   (`x29 + 16 + k`, `x29 + 16` being the caller's `sp`) addresses the
+//!   caller's area. So stack-passed arguments, and a variadic callee's
+//!   `__stack` walk past the named ones, are modeled.
+//! - **Function addresses and dynamic allocation.** A function's address
+//!   ([`A64Op::FuncAddr`]) is a tag ([`FUNC_TAG`] plus its index), which an
+//!   indirect call resolves; a `dyn_alloca` bump-allocates fresh memory.
 
 use crate::codegen::mir::{
     MachineFunction, MachineInst, MachineOperand, PReg, Reg, RegClass, StackSlot,
@@ -51,6 +60,10 @@ use super::regs::{fp, gpr};
 
 /// A cap on executed instructions, so a miscompiled loop fails fast.
 const STEP_BUDGET: u64 = 5_000_000;
+
+/// The modeled address of function `i` is `FUNC_TAG + i` (far above any
+/// address of the shared memory).
+pub(super) const FUNC_TAG: u64 = 0xF000_0000_0000;
 
 /// The physical registers a call returns results in: `x0`/`x1` (small aggregate
 /// or scalar) and `v0..v3` (HFA or scalar float).
@@ -114,7 +127,8 @@ pub(super) fn run_with_syscalls<'a>(
         };
         inputs.push((areg, val.clone()));
     }
-    Ok(m.call(entry, &inputs)?.ret_val)
+    let incoming = m.alloc(256, 16);
+    Ok(m.call(entry, &inputs, incoming)?.ret_val)
 }
 
 /// The whole-program interpreter state: a shared flat address space plus the
@@ -143,6 +157,10 @@ struct Frame {
     ret_val: Option<Int>,
     /// The function this activation runs (for its virtual registers' classes).
     fidx: usize,
+    /// The base of this activation's outgoing-argument area (its `sp`).
+    sp: u64,
+    /// The caller's `sp`: `x29 + 16`, where the incoming stack arguments start.
+    incoming: u64,
     /// The `Z` flag's complement as `CmpZero` left it (the only flag state a
     /// following `CselNe` reads).
     flag_ne: bool,
@@ -186,10 +204,23 @@ enum Flow {
 }
 
 impl Machine<'_> {
-    /// Invoke function `fidx` with `inputs` pre-loaded into physical registers,
-    /// running it to its `ret` and returning the primary scalar value plus the
+    /// Bump-allocate `size` zeroed bytes aligned to `align` from the shared
+    /// memory.
+    fn alloc(&mut self, size: u64, align: u64) -> u64 {
+        let at = align_up(self.heap, align.max(16));
+        self.heap = align_up(at + size.max(1), 16);
+        let need = self.heap as usize + 32;
+        if need > self.mem.len() {
+            self.mem.resize(need + 64, 0);
+        }
+        at
+    }
+
+    /// Invoke function `fidx` with `inputs` pre-loaded into physical registers
+    /// and its stack arguments at `incoming` (the caller's `sp`), running it to
+    /// its `ret` and returning the primary scalar value plus the
     /// return-register snapshot.
-    fn call(&mut self, fidx: usize, inputs: &[(PReg, Int)]) -> Result<CallOut, String> {
+    fn call(&mut self, fidx: usize, inputs: &[(PReg, Int)], incoming: u64) -> Result<CallOut, String> {
         let mf = self.funcs.get(fidx).ok_or_else(|| format!("no function #{fidx}"))?;
         let entry = mf.entry().ok_or("call into a body-less function")?;
 
@@ -205,10 +236,7 @@ impl Machine<'_> {
             base += info.size.max(1);
         }
         self.heap = align_up(base, 16);
-        let need = self.heap as usize + 32;
-        if need > self.mem.len() {
-            self.mem.resize(need + 64, 0);
-        }
+        let sp = self.alloc(frame.outgoing(), 16);
 
         let mut fr = Frame {
             regs: DetHashMap::default(),
@@ -216,6 +244,8 @@ impl Machine<'_> {
             slot_val: DetHashMap::default(),
             ret_val: None,
             fidx,
+            sp,
+            incoming,
             flag_ne: false,
         };
         for (p, v) in inputs {
@@ -430,13 +460,33 @@ impl Machine<'_> {
                 return Ok(Flow::Goto(target));
             }
             A64Op::GlobalAddr => return Err("global addressing is not modeled".into()),
+            A64Op::FuncAddr => {
+                let d = def(ops, 0)?;
+                let MachineOperand::Func(f) = ops[1] else { return Err("FuncAddr without a function".into()) };
+                fr.regs.insert(d, Int::from_u64(FUNC_TAG + u64::from(f)));
+            }
+            A64Op::DynAlloca => {
+                let d = def(ops, 0)?;
+                let n = self.rd(fr, use_reg(ops, 1)?).to_u64().unwrap_or(0);
+                let align = imm(ops, 2)?.to_u64().unwrap_or(16);
+                if n > 1 << 30 {
+                    return Err(format!("dyn_alloca of {n} bytes"));
+                }
+                let at = self.alloc(n, align);
+                fr.regs.insert(d, Int::from_u64(at));
+            }
             A64Op::Unreachable => return Err("reached an unreachable point (UB)".into()),
-            // Stack-relative addressing (`add d, sp/x29, #off`) needs a modeled
-            // stack pointer, which this pre-regalloc interpreter has none of. It
-            // only appears once the argument registers of a bank are exhausted;
-            // the fixtures stay within the register limits, so it is never reached.
-            A64Op::LeaSpOff | A64Op::LeaFpOff => {
-                return Err("stack-relative addressing is not modeled".into());
+            // `add d, sp, #off`: the outgoing-argument area; `add d, x29, #off`:
+            // the caller's, `x29 + 16` being the caller's `sp`.
+            A64Op::LeaSpOff => {
+                let d = def(ops, 0)?;
+                fr.regs.insert(d, Int::from_u64(fr.sp + imm(ops, 1)?.to_u64().unwrap_or(0)));
+            }
+            A64Op::LeaFpOff => {
+                let d = def(ops, 0)?;
+                let off = imm(ops, 1)?.to_u64().unwrap_or(0);
+                let at = (fr.incoming + off).checked_sub(16).ok_or("x29-relative address below the frame")?;
+                fr.regs.insert(d, Int::from_u64(at));
             }
 
             // --- scalar floating-point ------------------------------------
@@ -636,20 +686,23 @@ impl Machine<'_> {
             | A64Op::SubSp
             | A64Op::AddSp
             | A64Op::SaveReg
-            | A64Op::RestoreReg => {}
+            | A64Op::RestoreReg
+            | A64Op::SpFromFp => {}
         }
         Ok(Flow::Next)
     }
 
     fn exec_call(&mut self, fr: &mut Frame, inst: &MachineInst) -> Result<Flow, String> {
-        let fidx = inst
-            .operands
-            .iter()
-            .find_map(|o| match o {
-                MachineOperand::Func(f) => Some(*f as usize),
-                _ => None,
-            })
-            .ok_or("indirect calls are not modeled")?;
+        // A direct call names its callee; an indirect one reads a function
+        // address (a [`FUNC_TAG`]-tagged index) from its first operand.
+        let fidx = match &inst.operands[0] {
+            MachineOperand::Func(f) => *f as usize,
+            MachineOperand::Use(r) => {
+                let tag = self.rd(fr, *r).to_u64().unwrap_or(0);
+                tag.checked_sub(FUNC_TAG).ok_or("indirect call through a non-function address")? as usize
+            }
+            other => return Err(format!("call without a callee: {other:?}")),
+        };
         // The call's inputs are exactly its `Use(physical)` operands: the argument
         // registers (`x0..x7`/`v0..v7`) and, for a by-reference return, `x8`.
         let inputs: Vec<(PReg, Int)> = inst
@@ -660,7 +713,7 @@ impl Machine<'_> {
                 _ => None,
             })
             .collect();
-        let out = self.call(fidx, &inputs)?;
+        let out = self.call(fidx, &inputs, fr.sp)?;
         // Copy the return registers back into the caller so it can reclaim a
         // scalar (`x0`/`v0`) or an aggregate (`x0`/`x1` or `v0..v3`) result.
         for (p, v) in out.regs {

@@ -16,7 +16,12 @@
 //! floating-point (FP/SIMD): `fadd`/`fsub`/`fmul`/`fdiv`/`fneg`, `fcmp` with the
 //! ordered/unordered condition mapping, the `fcvt`/`fcvtz*`/`scvtf`/`ucvtf`
 //! conversions, gpr-materialized float constants, and the AAPCS64 float ABI
-//! (`v0`–`v7` args, `v0` return). Packed SIMD/vector ops are deferred.
+//! (`v0`–`v7` args, `v0` return), the aggregate ABI, NEON vectors, atomics,
+//! variadic functions (the AAPCS64 `va_list` and register save area; Darwin's
+//! stack-passed anonymous arguments), `dyn_alloca` with stack probes, and
+//! position-independent code (GOT loads) for shared libraries. Objects are
+//! written as ELF (`EM_AARCH64`), COFF or Mach-O; [`link`] links Linux
+//! executables and shared libraries with `qld`.
 //!
 //! Submodules:
 //!
@@ -26,13 +31,18 @@
 //! - [`runtime`] — the green-thread context-switching runtime (save/restore/
 //!   switch/init), emitted as machine code for a front end to link in;
 //! - [`encode`] — the fixed-width bitfield encoder, frame layout +
-//!   prologue/epilogue, and the `compile_function`/`compile_module` drivers.
+//!   prologue/epilogue, and the `compile_function`/`compile_module` drivers;
+//! - [`link`] — linking static Linux executables and shared libraries with
+//!   `qld` (ELF `EM_AARCH64` objects).
 
 pub mod encode;
 pub mod isel;
+pub mod link;
 pub mod runtime;
 pub(crate) mod regs;
 
+#[cfg(test)]
+mod emu;
 #[cfg(test)]
 mod interp;
 #[cfg(test)]
@@ -43,6 +53,10 @@ mod stack_tests;
 mod runtime_tests;
 #[cfg(test)]
 mod vector_tests;
+#[cfg(test)]
+mod va_tests;
+#[cfg(test)]
+mod link_tests;
 
-pub use encode::{compile_function, compile_module, compile_module_with};
+pub use encode::{DebugSource, compile_function, compile_module, compile_module_debug_with, compile_module_with};
 pub use isel::{A64Op, AArch64Target, NeonLegality};

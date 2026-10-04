@@ -26,6 +26,12 @@
 //! called by the C runtime), and `-c --pic`/`-c --pie` pick an object's
 //! relocation model.
 //!
+//! For AArch64 Linux (`--target aarch64-linux`), `-c` writes an ELF64
+//! `EM_AARCH64` object (`--pic`/`--pie` as above), the default output is a
+//! static executable linked by `qld` (a generated `_start` calls the entry
+//! function and exits with its result), `--shared` a shared library, and `-g`
+//! adds DWARF line tables.
+//!
 //! `--target wasm32` (or `wasm32-unknown-unknown`) builds a self-contained
 //! **WebAssembly module** (`.wasm`: memory, stack pointer, function table and
 //! data included; undefined functions imported from `"env"`), and with `-c` a
@@ -87,7 +93,7 @@ fn print_usage() {
     println!("  --stack-usage  print each function's stack frame and the worst-case depth");
     println!("  --no-stack-probes  omit stack probes (only with a proven stack bound)");
     println!("  --target T     x86_64-linux (default), x86_64-windows, x86_64-apple-darwin,");
-    println!("                 aarch64-windows, aarch64-apple-darwin, thumbv7m-none-eabi (Cortex-M),");
+    println!("                 aarch64-linux, aarch64-windows, aarch64-apple-darwin, thumbv7m-none-eabi (Cortex-M),");
     println!("                 ... (ABI + object format), wasm32 (a WebAssembly module;");
     println!("                 with -c, a wasm-ld object), avr-atmega328p (AVR firmware:");
     println!("                 --oformat ihex|binary, or -c for an ELF object)");
@@ -96,11 +102,13 @@ fn print_usage() {
     println!("  --oformat F    executable format: elf (default), binary or ihex (firmware)");
     println!("  --base ADDR    image load address (default 0x400000); for binary/ihex, where");
     println!("                 the first byte of code goes; for Cortex-M, the flash origin (default 0)");
-    println!("  --shared       build a shared library (position-independent; default lib<input>.so)");
+    println!("  --shared       build a shared library (position-independent; default lib<input>.so;");
+    println!("                 x86-64 or AArch64 Linux)");
     println!("  -soname <name> set the shared library's DT_SONAME");
     println!("  --pie          build a position-independent executable against the host C library");
     println!("  --pic          with -c: position-independent code for a shared library");
-    println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie, Cortex-M)");
+    println!("  -L<dir> -l<lib>  extra library search paths / libraries (--shared, --pie, Cortex-M,");
+    println!("                 AArch64 executables)");
     println!("`lf build` compiles one or more IR modules to a static native executable");
     println!("(for a Windows target, a PE executable whose entry point is `main`).");
     println!("With several inputs (or --lto), the modules are IR-linked into one, the");
@@ -232,7 +240,16 @@ fn build(args: &[String]) -> Result<(), String> {
             let source = target::x86_64::DebugSource { file_name, comp_dir };
             target::x86_64::compile_module_debug_with(&module, &syms, &source, &cg)
         }
-        _ if opts.debug => return Err(format!("-g is supported for x86-64 only, not {triple}")),
+        TargetArch::AArch64 if opts.debug => {
+            let comp_dir = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_owned))
+                .unwrap_or_default();
+            let file_name = opts.inputs.first().cloned().unwrap_or_default();
+            let source = target::aarch64::DebugSource { file_name, comp_dir };
+            target::aarch64::compile_module_debug_with(&module, &syms, &source, &cg)
+        }
+        _ if opts.debug => return Err(format!("-g is supported for x86-64 and aarch64 only, not {triple}")),
         TargetArch::Avr => {
             target::check_options(TargetArch::Avr, &cg).map_err(|e| e.to_string())?;
             let device = opts.device.unwrap_or(target::avr::Device::ATMEGA328P);
@@ -300,6 +317,10 @@ fn build(args: &[String]) -> Result<(), String> {
             std::fs::write(&output, bytes).map_err(|e| format!("cannot write {output}: {e}"))
         }
         (TargetArch::Thumb, ObjectFormat::Elf, format) => link_cortex_m(&opts, obj, &entry, format, &output_or),
+        (TargetArch::AArch64, ObjectFormat::Elf, None) => {
+            target::aarch64::link::link_executable(vec![obj], &entry, &opts.link_extra, Path::new(&output_or("")))
+                .map_err(|e| format!("link error: {e}"))
+        }
         (TargetArch::X86_64 | TargetArch::AArch64, ObjectFormat::Coff, None) => {
             let entry = opts.entry.as_deref().unwrap_or("main");
             link_pe(&obj, triple, entry, &output_or("exe"), opts.base)
@@ -317,7 +338,7 @@ fn build(args: &[String]) -> Result<(), String> {
 /// relocatable wasm object.
 fn build_wasm(opts: &BuildOptions, module: &Module, syms: &StrInterner, cg: &CodegenOptions) -> Result<(), String> {
     if opts.debug {
-        return Err("-g is supported for x86-64 only, not wasm32".to_owned());
+        return Err("-g is supported for x86-64 and aarch64 only, not wasm32".to_owned());
     }
     let mut compiled = target::wasm32::compile(module, syms, cg).map_err(|e| e.to_string())?;
     if opts.stack_usage {
@@ -350,6 +371,17 @@ fn link_with_qld(opts: &BuildOptions, obj: &latticefoundry::mc::object::ObjectMo
         OutputKind::Shared => format!("lib{stem}.so"),
         _ => stem.clone(),
     });
+    if opts.target.arch == TargetArch::AArch64 {
+        // A shared library (`--pie` is x86-64 only): no AArch64 C runtime on
+        // the host, so undefined symbols are left for the loader.
+        return target::aarch64::link::link_shared(
+            std::slice::from_ref(obj),
+            opts.soname.as_deref(),
+            &opts.link_extra,
+            Path::new(&output),
+        )
+        .map_err(|e| format!("link error: {e}"));
+    }
     let elf = latticefoundry::mc::elf::write(obj);
     // qld reads its inputs from files: stage the object in the temp directory.
     let tmp = std::env::temp_dir().join(format!("lf-{}-{stem}.o", std::process::id()));
@@ -561,16 +593,24 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         return Err("-soname only applies to --shared".to_owned());
     }
     let cortex_m = target.arch == TargetArch::Thumb && output_kind == OutputKind::Executable;
-    if !link_extra.is_empty() && !cortex_m && !matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
-        return Err("-L/-l only apply to --shared, --pie and Cortex-M executables".to_owned());
+    let aarch64_elf = target.arch == TargetArch::AArch64 && target.object_format() == ObjectFormat::Elf;
+    let aarch64_exe = aarch64_elf && output_kind == OutputKind::Executable;
+    if !link_extra.is_empty()
+        && !cortex_m
+        && !aarch64_exe
+        && !matches!(output_kind, OutputKind::Shared | OutputKind::Pie)
+    {
+        return Err("-L/-l only apply to --shared, --pie, Cortex-M and AArch64 executables".to_owned());
     }
     if entry.is_some() && matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
         return Err("--entry only applies to executables linked by lf (not --shared or --pie)".to_owned());
     }
-    if matches!(output_kind, OutputKind::Shared | OutputKind::Pie)
-        && (target.arch != TargetArch::X86_64 || target.object_format() != ObjectFormat::Elf)
-    {
-        return Err(format!("--shared and --pie need an x86-64 ELF target, not {target}"));
+    let x86_64_elf = target.arch == TargetArch::X86_64 && target.object_format() == ObjectFormat::Elf;
+    if output_kind == OutputKind::Shared && !x86_64_elf && !aarch64_elf {
+        return Err(format!("--shared needs an x86-64 ELF or AArch64 ELF target, not {target}"));
+    }
+    if output_kind == OutputKind::Pie && !x86_64_elf {
+        return Err(format!("--pie needs an x86-64 ELF target, not {target}"));
     }
     if (oformat.is_some() || base.is_some()) && matches!(output_kind, OutputKind::Shared | OutputKind::Pie) {
         return Err("--oformat/--base do not apply to --shared or --pie".to_owned());
