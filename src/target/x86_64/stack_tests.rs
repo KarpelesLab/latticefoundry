@@ -203,8 +203,14 @@ fn reported_frame_equals_decoded_prologue() {
                 let most = if os == TargetOs::Windows { 2 } else { 1 };
                 assert!(p.subs <= most, "{what}: {most} `sub rsp` at most without probes");
             }
-            // Every static frame keeps rsp 16-aligned at calls.
-            assert_eq!(u.frame_size % 16, 0, "{what}");
+            // Every static frame keeps rsp 16-aligned at calls; a leaf
+            // without locals (and without a frame pointer on System V)
+            // leaves it where the call put it.
+            if u.direct_callees.is_empty() && u.sp_adjust == 0 && os != TargetOs::Windows {
+                assert_eq!(u.frame_size, 8 + u.saved_registers, "{what}");
+            } else {
+                assert_eq!(u.frame_size % 16, 0, "{what}");
+            }
         }
         let huge = out.stack.get("huge").unwrap();
         assert!(huge.frame_size >= 1 << 20);
@@ -311,7 +317,8 @@ fn dyn_alloca_probe_sequence() {
     assert_eq!(find(b_on, &page), 1, "one page step inside the loop");
     assert_eq!(find(b_off, &probe), 0);
     assert_eq!(find(b_off, &page), 0);
-    assert_eq!(b_on.len(), b_off.len() + 5 + 7 + 6 + 7 + 5 + 7 + 7 + 6);
+    // probe, cmp, jb (rel8), sub, probe, sub, cmp, jae (rel8)
+    assert_eq!(b_on.len(), b_off.len() + 5 + 7 + 2 + 7 + 5 + 7 + 7 + 2);
 }
 
 // ---------------------------------------------------------------------------

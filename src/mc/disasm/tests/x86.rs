@@ -55,6 +55,13 @@ fn golden() {
         // i128: the widening multiply.
         (&[0x48, 0xf7, 0xe1], "mulq %rcx", "mul rcx"),
         (&[0x48, 0xf7, 0x20], "mulq (%rax)", "mul qword ptr [rax]"),
+        // Compare-and-branch and the immediate forms of issue #8.
+        (&[0x48, 0x83, 0xf8, 0xfc], "cmpq $-0x4, %rax", "cmp rax, -0x4"),
+        (&[0x48, 0x85, 0xd2], "testq %rdx, %rdx", "test rdx, rdx"),
+        (&[0x48, 0xc7, 0xc0, 0xfc, 0xff, 0xff, 0xff], "movq $-0x4, %rax", "mov rax, -0x4"),
+        (&[0x6b, 0xc1, 0x64], "imull $0x64, %ecx, %eax", "imul eax, ecx, 0x64"),
+        (&[0x4c, 0x8d, 0x40, 0x08], "leaq 0x8(%rax), %r8", "lea r8, [rax + 0x8]"),
+        (&[0xc9], "leave", "leave"),
     ];
     for (bytes, att, intel) in cases {
         assert_eq!(text(bytes, &ATT), *att, "{bytes:02x?}");
@@ -65,6 +72,13 @@ fn golden() {
     assert_eq!((i.text().replace('\t', " "), i.target), ("callq 0x115".to_owned(), Some(0x115)));
     let i = decode(TargetArch::X86_64, &[0x75, 0xfe], 0x40, &ATT);
     assert_eq!((i.text().replace('\t', " "), i.target), ("jne 0x40".to_owned(), Some(0x40)));
+    // Short and long forms of the relaxed branches.
+    let i = decode(TargetArch::X86_64, &[0x7c, 0x0b], 0x22, &ATT);
+    assert_eq!((i.text().replace('\t', " "), i.target), ("jl 0x2f".to_owned(), Some(0x2f)));
+    let i = decode(TargetArch::X86_64, &[0xeb, 0xda], 0x2a, &ATT);
+    assert_eq!((i.text().replace('\t', " "), i.target), ("jmp 0x6".to_owned(), Some(0x6)));
+    let i = decode(TargetArch::X86_64, &[0x0f, 0x8f, 0x00, 0x01, 0, 0], 0, &ATT);
+    assert_eq!((i.text().replace('\t', " "), i.target), ("jg 0x106".to_owned(), Some(0x106)));
     // Unknown and truncated encodings are data.
     for bad in [&[0x06u8][..], &[0x0f, 0xff], &[0x48], &[0x48, 0x8b], &[0xe8, 0, 0]] {
         let i = decode(TargetArch::X86_64, bad, 0, &ATT);
@@ -121,6 +135,25 @@ fn encoder_corpus() -> Vec<Vec<u8>> {
         out.push(emit(|e| enc::pop_r(e, a)));
         let width = [8u32, 16, 32, 64][rng.below(4) as usize];
         out.push(emit(|e| enc::cmp_rr_width(e, a, b, width)));
+        // Immediate ALU forms (imm8 or imm32), compares against an
+        // immediate at each width (`test r, r` for 0), and the sign-extended
+        // `mov r64, imm32`. (The relaxed branches are in `golden`: llvm-mc
+        // prints their displacement, not a target.)
+        let imm = match rng.below(3) {
+            0 => 0,
+            1 => rng.below(256) as i64 - 128,
+            _ => i64::from(rng.next() as i32),
+        };
+        let ext = [0u8, 1, 4, 5, 6, 7][rng.below(6) as usize];
+        out.push(emit(|e| enc::alu_ri(e, ext, a, imm as i32, w)));
+        let k = match width {
+            8 => i64::from(imm as i8),
+            16 => i64::from(imm as i16),
+            32 => i64::from(imm as i32),
+            _ => imm,
+        };
+        out.push(emit(|e| enc::cmp_ri_width(e, a, k, width)));
+        out.push(emit(|e| enc::mov_ri(e, a, (rng.below(1 << 31) as i64 - (1 << 31)) as u64)));
         // Memory forms: loads, stores, lea, SSE loads/stores.
         let disp = match rng.below(3) {
             0 => 0,

@@ -526,6 +526,9 @@ pub fn emit_eh_frame(obj: &mut ObjectModule, text: SectionId, funcs: &[FunctionF
 
 /// `UNWIND_X86_64_MODE_RBP_FRAME`.
 const UNWIND_X86_64_MODE_RBP_FRAME: u32 = 0x0100_0000;
+/// `UNWIND_X86_64_MODE_STACK_IMMD`: a frameless function whose stack size
+/// (bits 16..24, in 8-byte units, the return address included) is constant.
+const UNWIND_X86_64_MODE_STACK_IMMD: u32 = 0x0200_0000;
 /// `UNWIND_ARM64_MODE_FRAME`.
 pub const UNWIND_ARM64_MODE_FRAME: u32 = 0x0400_0000;
 
@@ -541,9 +544,14 @@ fn compact_reg(r: u8) -> Option<u32> {
 
 /// The `UNWIND_X86_64_MODE_RBP_FRAME` encoding of `f`, or `None` if its frame
 /// is not that shape (`push rbp`, `rbp` pointing at the saved `rbp`, at most
-/// five of `rbx`/`r12`–`r15` saved contiguously below it, no `xmm` saves).
+/// five of `rbx`/`r12`–`r15` saved contiguously below it, no `xmm` saves). A
+/// function with no prologue at all (a leaf without a frame) is
+/// `UNWIND_X86_64_MODE_STACK_IMMD` with only its return address on the stack.
 pub fn compact_unwind_x86_64(f: &FunctionFrame) -> Option<u32> {
     const RBP: u8 = 5;
+    if f.steps.is_empty() {
+        return Some(UNWIND_X86_64_MODE_STACK_IMMD | (1 << 16));
+    }
     let mut depth: i64 = 8; // CFA - rsp
     let mut rbp_saved_at = None; // CFA - x
     let mut rbp_at = None; // CFA - x, once set
@@ -721,5 +729,7 @@ mod tests {
         // entry 1 (rbp-8) = rbx (1).
         assert_eq!(compact_unwind_x86_64(&sysv()), Some(0x0100_0000 | (2 << 16) | 2 | (1 << 3)));
         assert_eq!(compact_unwind_x86_64(&win()), None, "rsi and xmm saves have no encoding");
+        let frameless = FunctionFrame { size: 4, ..FunctionFrame::default() };
+        assert_eq!(compact_unwind_x86_64(&frameless), Some(0x0201_0000), "a leaf without a frame");
     }
 }

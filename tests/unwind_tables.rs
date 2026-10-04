@@ -472,6 +472,12 @@ fn eh_frame_matches_the_prologues() {
         // This function's FDE: `pc=<start>...<end>`.
         let tag = format!("pc={offset:08x}...{:08x}", offset + bytes.len() as u64);
         let fde = out.split(" FDE ").find(|f| f.contains(&tag)).unwrap_or_else(|| panic!("{name}: {tag}\n{out}"));
+        if !bytes.starts_with(&[0x55]) {
+            // A leaf without a frame: the entry rule holds throughout.
+            assert_eq!(name.as_str(), "leaf");
+            assert!(fde.contains("CFA=RSP+8: RIP=[CFA-8]") && !fde.contains("RBP"), "{name}: {fde}");
+            continue;
+        }
         assert!(fde.contains("CFA=RSP+16: RBP=[CFA-16]"), "{name}: {fde}");
         // In the body the CFA is rbp-based and every push is recorded in
         // order below the saved rbp.

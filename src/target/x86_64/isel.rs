@@ -97,7 +97,7 @@ use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{FuncId, InstData, Module, ValueId};
-use crate::support::{DetHashMap, StrInterner};
+use crate::support::{DetHashMap, DetHashSet, StrInterner};
 
 use puremp::Int;
 use std::cell::RefCell;
@@ -370,6 +370,36 @@ pub enum X86Op {
     /// (it may branch on its operands). The encoder instantiates the template
     /// and splices in the bytes rsasm assembles from it.
     InlineAsm = 77,
+
+    // --- fused compares and immediate forms --------------------------------
+    /// `[Use a, Use b, Imm cc, Imm width, Label t, Label f]` — an `icmp` whose
+    /// only use is the `cond_br` that follows it: `cmp a, b; jcc t; jmp f`
+    /// (the `cmp` at `width` bits, as [`X86Op::SetccCmp`]). Block layout drops
+    /// the jump to whichever target falls through, inverting `cc` when it is
+    /// `t`.
+    CmpBr = 78,
+    /// `[Use a, Imm v, Imm cc, Imm width, Label t, Label f]` — [`X86Op::CmpBr`]
+    /// against a constant: `cmp a, v` (`test a, a` when `v` is 0). `v` is the
+    /// constant sign-extended from `width` bits; at 64 bits it fits an imm32.
+    CmpBrI = 79,
+    /// `[Def d, Use a, Imm v, Imm cc, Imm width]` — [`X86Op::SetccCmp`]
+    /// against a constant, `v` as for [`X86Op::CmpBrI`].
+    SetccCmpI = 80,
+    /// `[Def d, Use a, Imm v, Imm ext, Imm width]` — `d = a OP v` for the ALU
+    /// group-1 operation `ext` (`0` add, `1` or, `4` and, `5` sub, `6` xor)
+    /// with a sign-extended `imm8`/`imm32`: `mov d, a; OP d, v`, or
+    /// `lea d, [a + v]` for an add/sub into another register.
+    AluRI = 81,
+    /// `[Def d, Use a, Imm v, Imm width]` — `imul d, a, v` (`6B`/`69`).
+    ImulRI = 82,
+
+    // --- frame ----------------------------------------------------------------
+    /// `[]` — `leave` (`mov rsp, rbp; pop rbp`): the epilogue of a frame
+    /// with no callee-saved registers.
+    Leave = 83,
+    /// `[Imm k]` — `add rsp, k`: the epilogue of a frame without a frame
+    /// pointer.
+    AddRsp = 84,
 }
 
 impl X86Op {
@@ -396,7 +426,13 @@ impl X86Op {
             _ => 0,
         };
         match self {
-            X86Op::BrCond | X86Op::Switch | X86Op::Switch128 | X86Op::RmwLoop | X86Op::DynAlloca => true,
+            X86Op::BrCond
+            | X86Op::CmpBr
+            | X86Op::CmpBrI
+            | X86Op::Switch
+            | X86Op::Switch128
+            | X86Op::RmwLoop
+            | X86Op::DynAlloca => true,
             // An opaque template may branch on anything, unless it is empty.
             X86Op::InlineAsm => flags(1) & 1 != 0,
             X86Op::CvtSi2f => flags(3) & 0b100 != 0,
@@ -420,7 +456,7 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 78] = [
+        const TABLE: [X86Op; 85] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
@@ -428,7 +464,8 @@ impl X86Op {
             Cvtss2sd, CvtF2si, CvtSi2f, FuncAddr, Movsx, Movzx, LeaRbpOff, LeaRspOff, DynAlloca,
             Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm, VOp,
             VUnary, VShiftI, VLoad, VStore, LoadVConst, MovGprToX, MovXToGpr, Pinsrw, Pextrw,
-            TlsAddr, TlsGd, MulWide, Switch128, InlineAsm,
+            TlsAddr, TlsGd, MulWide, Switch128, InlineAsm, CmpBr, CmpBrI, SetccCmpI, AluRI, ImulRI,
+            Leave, AddRsp,
         ];
         TABLE[op.0 as usize]
     }
@@ -443,6 +480,32 @@ fn sext_case(value: &Int, width: u32) -> Int {
     let raw = value.to_i64().map(|v| v as u64).or_else(|| value.to_u64()).unwrap_or(0);
     let shift = 64 - width;
     Int::from_i64(((raw << shift) as i64) >> shift)
+}
+
+/// The predicate that compares the same way with its operands swapped
+/// (`a < b` is `b > a`).
+fn swap_pred(p: IntPred) -> IntPred {
+    match p {
+        IntPred::Eq | IntPred::Ne => p,
+        IntPred::Ugt => IntPred::Ult,
+        IntPred::Uge => IntPred::Ule,
+        IntPred::Ult => IntPred::Ugt,
+        IntPred::Ule => IntPred::Uge,
+        IntPred::Sgt => IntPred::Slt,
+        IntPred::Sge => IntPred::Sle,
+        IntPred::Slt => IntPred::Sgt,
+        IntPred::Sle => IntPred::Sge,
+    }
+}
+
+/// `value` as the immediate of an instruction operating at `width` bits: its
+/// low `width` bits sign-extended, when that fits the sign-extended imm32 of
+/// the x86 ALU forms (always, for a width up to 32).
+pub(crate) fn imm_at(value: &Int, width: u32) -> Option<i64> {
+    let bits = value.mod_2k(64).to_u64().unwrap_or(0);
+    let shift = 64 - width.clamp(1, 64);
+    let v = ((bits << shift) as i64) >> shift;
+    i32::try_from(v).is_ok().then_some(v)
 }
 
 /// Encode an [`IntPred`] as the x86 condition-code nibble used by `setcc`/`jcc`.
@@ -619,6 +682,37 @@ fn imm(v: u64) -> MachineOperand {
     MachineOperand::Imm(Int::from_u64(v))
 }
 
+/// The `icmp` results of `f` (by value index) used exactly once, by the
+/// `cond_br` ending the block that computes them: the compares
+/// [`X86Op::CmpBr`] fuses into their branch.
+fn fusable_compares(f: &crate::ir::Function) -> DetHashSet<usize> {
+    let mut uses = vec![0u32; f.value_count()];
+    for (_, b) in f.blocks() {
+        for &i in b.insts().iter().chain(b.terminator().as_ref()) {
+            for &o in f.inst(i).operands() {
+                uses[o.index()] += 1;
+            }
+        }
+    }
+    let mut out = DetHashSet::default();
+    for (_, b) in f.blocks() {
+        let Some(t) = b.terminator() else { continue };
+        let term = f.inst(t);
+        if !matches!(term.kind, InstKind::CondBr { .. }) {
+            continue;
+        }
+        let c = term.operands()[0];
+        if uses[c.index()] == 1
+            && let ValueDef::Inst(id) = f.value(c).def
+            && matches!(f.inst(id).kind, InstKind::ICmp(_))
+            && b.insts().contains(&id)
+        {
+            out.insert(c.index());
+        }
+    }
+    out
+}
+
 /// The two System V variadic frame-address intrinsics the x86-64 backend
 /// recognizes by name. The C frontend declares each as an external
 /// `ptr @name()` and calls it inside `va_start`; the backend replaces the call
@@ -659,6 +753,10 @@ pub struct X86_64Target {
     /// (asm result value index, output index), shared by the asm and its
     /// `asm_output`s (see the `inline_asm` submodule).
     asm_outs: RefCell<DetHashMap<(usize, usize), VReg>>,
+    /// The `icmp` results (by value index) of the function being lowered
+    /// whose only use is the `cond_br` ending their block: each is lowered
+    /// there, fused into an [`X86Op::CmpBr`].
+    fused: RefCell<DetHashSet<usize>>,
 }
 
 impl Default for X86_64Target {
@@ -670,7 +768,7 @@ impl Default for X86_64Target {
 impl X86_64Target {
     /// Construct the x86-64 target with its fixed register file and SysV ABI.
     pub fn new() -> X86_64Target {
-        X86_64Target { rf: RegFile::new(), win64: false, reloc_model: RelocModel::Static, wide: RefCell::default(), asm_outs: RefCell::default() }
+        X86_64Target { rf: RegFile::new(), win64: false, reloc_model: RelocModel::Static, wide: RefCell::default(), asm_outs: RefCell::default(), fused: RefCell::default() }
     }
 
     /// Construct the x86-64 target for the calling convention `cc`:
@@ -678,7 +776,7 @@ impl X86_64Target {
     /// [`isel`](self) module docs); anything else is System V.
     pub fn with_call_conv(cc: CallConvKind) -> X86_64Target {
         if cc == CallConvKind::Win64 {
-            X86_64Target { rf: RegFile::win64(), win64: true, reloc_model: RelocModel::Static, wide: RefCell::default(), asm_outs: RefCell::default() }
+            X86_64Target { rf: RegFile::win64(), win64: true, reloc_model: RelocModel::Static, wide: RefCell::default(), asm_outs: RefCell::default(), fused: RefCell::default() }
         } else {
             X86_64Target::new()
         }
@@ -706,6 +804,7 @@ impl X86_64Target {
     pub fn select(&self, module: &Module, func: crate::ir::FuncId) -> crate::codegen::mir::MachineFunction {
         self.wide.borrow_mut().clear();
         self.asm_outs.borrow_mut().clear();
+        *self.fused.borrow_mut() = fusable_compares(module.function(func));
         crate::codegen::isel::select(self, module, func)
     }
 
@@ -720,6 +819,7 @@ impl X86_64Target {
     ) -> crate::codegen::mir::MachineFunction {
         self.wide.borrow_mut().clear();
         self.asm_outs.borrow_mut().clear();
+        *self.fused.borrow_mut() = fusable_compares(module.function(func));
         crate::codegen::isel::select_with_syms(self, module, func, syms)
     }
 
@@ -762,9 +862,106 @@ impl X86_64Target {
         None
     }
 
+    /// If `v` is an integer constant or a null pointer, its value.
+    fn int_const(lo: &Lower<'_, Self>, v: ValueId) -> Option<Int> {
+        if let ValueDef::Const(c) = lo.func().value(v).def
+            && let Const::Null(_) = lo.module().consts().get(c)
+            && !lo.types().is_vector(lo.func().value_type(v))
+        {
+            return Some(Int::ZERO);
+        }
+        Self::const_of(lo, v)
+    }
+
+    /// The compare `x pred y` (scalar integers or pointers): the operands
+    /// of [`X86Op::SetccCmp`]/[`X86Op::CmpBr`] (`[Use a, Use b, Imm cc, Imm
+    /// width]`) or, against a constant that fits an immediate, of
+    /// [`X86Op::SetccCmpI`]/[`X86Op::CmpBrI`] (`[Use a, Imm v, Imm cc, Imm
+    /// width]`, a constant first operand swapping the predicate); the flag
+    /// says which.
+    fn compare(&self, lo: &mut Lower<'_, Self>, pred: IntPred, x: ValueId, y: ValueId) -> (Vec<MachineOperand>, bool) {
+        let width = lo.int_width(x);
+        // 8/16/32/64-bit compares use the matching `cmp` form; any other
+        // width is extended (by the predicate's signedness) first.
+        if matches!(width, 8 | 16 | 32 | 64) {
+            let imm_of = |v: ValueId| Self::int_const(lo, v).and_then(|c| imm_at(&c, width));
+            let (r, k, pred) = match (imm_of(y), imm_of(x)) {
+                (Some(k), _) => (x, k, pred),
+                (None, Some(k)) => (y, k, swap_pred(pred)),
+                (None, None) => {
+                    let (a, b) = (self.oper(lo, x), self.oper(lo, y));
+                    let ops = vec![use_v(a), use_v(b), imm(u64::from(cc_code(pred))), imm(u64::from(width))];
+                    return (ops, false);
+                }
+            };
+            let a = self.oper(lo, r);
+            let ops = vec![
+                use_v(a),
+                MachineOperand::Imm(Int::from_i64(k)),
+                imm(u64::from(cc_code(pred))),
+                imm(u64::from(width)),
+            ];
+            return (ops, true);
+        }
+        let signed = matches!(pred, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
+        let (a, _) = self.extended(lo, x, signed);
+        let (b, w) = self.extended(lo, y, signed);
+        (vec![use_v(a), use_v(b), imm(u64::from(cc_code(pred))), imm(u64::from(w))], false)
+    }
+
+    /// The `icmp` defining branch condition `c`, when it is fused into the
+    /// branch (see [`fusable_compares`]): its predicate and operands.
+    fn fused_compare(&self, lo: &Lower<'_, Self>, c: ValueId) -> Option<(IntPred, ValueId, ValueId)> {
+        if !self.fused.borrow().contains(&c.index()) {
+            return None;
+        }
+        let ValueDef::Inst(id) = lo.func().value(c).def else { return None };
+        let inst = lo.func().inst(id);
+        let InstKind::ICmp(pred) = inst.kind else { return None };
+        let (x, y) = (inst.operands()[0], inst.operands()[1]);
+        let ty = lo.func().value_type(x);
+        if Self::wide_val(lo, x).is_some() || lo.types().is_vector(ty) {
+            return None;
+        }
+        Some((pred, x, y))
+    }
+
     fn lower_bin(&self, lo: &mut Lower<'_, Self>, op: BinOp, inst: &InstData) {
         let d = lo.result_reg(inst);
         let width = lo.int_width(inst.operands()[0]);
+        // An ALU operation with a constant that fits an immediate.
+        let group1 = match op {
+            BinOp::Add => Some((0u64, true)),
+            BinOp::Or => Some((1, true)),
+            BinOp::And => Some((4, true)),
+            BinOp::Sub => Some((5, false)),
+            BinOp::Xor => Some((6, true)),
+            BinOp::Mul => Some((u64::MAX, true)),
+            _ => None,
+        };
+        if let Some((ext, commutative)) = group1
+            && lo.mf().vreg_class(d) == RegClass::Gpr
+        {
+            let (x, y) = (inst.operands()[0], inst.operands()[1]);
+            let imm_of = |v: ValueId| Self::int_const(lo, v).and_then(|c| imm_at(&c, width));
+            let found = match (imm_of(y), imm_of(x)) {
+                (Some(k), _) => Some((x, k)),
+                (None, Some(k)) if commutative => Some((y, k)),
+                _ => None,
+            };
+            if let Some((r, k)) = found {
+                let a = self.oper(lo, r);
+                let k = MachineOperand::Imm(Int::from_i64(k));
+                let w = imm(u64::from(width));
+                let inst = if ext == u64::MAX {
+                    MachineInst::new(X86Op::ImulRI.opcode(), vec![def_v(d), use_v(a), k, w])
+                } else {
+                    MachineInst::new(X86Op::AluRI.opcode(), vec![def_v(d), use_v(a), k, imm(ext), w])
+                };
+                lo.emit(inst);
+                return;
+            }
+        }
         let simple = match op {
             BinOp::Add => Some(X86Op::Add),
             BinOp::Sub => Some(X86Op::Sub),
@@ -1055,9 +1252,16 @@ impl X86_64Target {
         if off == 0 {
             return base;
         }
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        if let Ok(k) = i32::try_from(off) {
+            lo.emit(MachineInst::new(
+                X86Op::AluRI.opcode(),
+                vec![def_v(d), use_v(base), imm(k as u64), imm(0), imm(64)],
+            ));
+            return d;
+        }
         let k = lo.fresh_vreg(RegClass::Gpr);
         lo.emit(MachineInst::new(X86Op::MovRI.opcode(), vec![def_v(k), imm(off)]));
-        let d = lo.fresh_vreg(RegClass::Gpr);
         lo.emit(MachineInst::new(
             X86Op::Add.opcode(),
             vec![def_v(d), use_v(base), use_v(k), imm(64)],
@@ -1756,8 +1960,34 @@ impl MachineTarget for X86_64Target {
     fn is_terminator(&self, op: Opcode) -> bool {
         matches!(
             X86Op::decode(op),
-            X86Op::Jmp | X86Op::BrCond | X86Op::Switch | X86Op::Ret | X86Op::Unreachable
+            X86Op::Jmp
+                | X86Op::BrCond
+                | X86Op::CmpBr
+                | X86Op::CmpBrI
+                | X86Op::Switch
+                | X86Op::Switch128
+                | X86Op::Ret
+                | X86Op::Unreachable
         )
+    }
+
+    /// The copies and the two-address operations whose encoding is correct
+    /// with the destination equal to the first source (`mov d, a` is skipped
+    /// then): the integer and SSE ALU operations, shifts, extensions, loads,
+    /// and compares (which read their sources before writing `d`).
+    fn tied_use(&self, inst: &MachineInst) -> Option<usize> {
+        use X86Op::*;
+        match X86Op::decode(inst.opcode) {
+            // Copies between vregs (of one class: their registers are equal
+            // only then).
+            MovRR => {
+                let virt = |o: &MachineOperand| matches!(o.reg(), Some(Reg::Virtual(_)));
+                (virt(&inst.operands[0]) && virt(&inst.operands[1])).then_some(1)
+            }
+            Add | Sub | And | Or | Xor | Imul | ShlI | ShrI | SarI | ShlCl | ShrCl | SarCl | AluRI | ImulRI
+            | Movsx | Movzx | Load | SetccCmp | SetccCmpI | FAdd | FSub | FMul | FDiv => Some(1),
+            _ => None,
+        }
     }
 
     fn is_move(&self, op: Opcode) -> bool {
@@ -1890,31 +2120,17 @@ impl TargetIsel for X86_64Target {
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
             InstKind::ICmp(pred) => {
+                // A compare fused into its branch is lowered there.
+                if let Some(r) = inst.result()
+                    && self.fused_compare(lo, r).is_some()
+                {
+                    return;
+                }
                 let d = lo.result_reg(inst);
-                let width = lo.int_width(inst.operands()[0]);
-                // 8/16/32/64-bit compares use the matching `cmp` form; any other
-                // width is extended (by the predicate's signedness) first.
-                let (a, b, width) = if matches!(width, 8 | 16 | 32 | 64) {
-                    (self.oper(lo, inst.operands()[0]), self.oper(lo, inst.operands()[1]), width)
-                } else {
-                    let signed = matches!(
-                        pred,
-                        IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge
-                    );
-                    let (a, _) = self.extended(lo, inst.operands()[0], signed);
-                    let (b, w) = self.extended(lo, inst.operands()[1], signed);
-                    (a, b, w)
-                };
-                lo.emit(MachineInst::new(
-                    X86Op::SetccCmp.opcode(),
-                    vec![
-                        def_v(d),
-                        use_v(a),
-                        use_v(b),
-                        imm(u64::from(cc_code(*pred))),
-                        imm(u64::from(width)),
-                    ],
-                ));
+                let (mut ops, is_imm) = self.compare(lo, *pred, inst.operands()[0], inst.operands()[1]);
+                ops.insert(0, def_v(d));
+                let op = if is_imm { X86Op::SetccCmpI } else { X86Op::SetccCmp };
+                lo.emit(MachineInst::new(op.opcode(), ops));
             }
             InstKind::Cast(op) => self.lower_cast(lo, *op, inst),
             InstKind::Alloca { elem_ty } => {
@@ -1955,6 +2171,22 @@ impl TargetIsel for X86_64Target {
                 lo.emit(MachineInst::new(
                     X86Op::Store.opcode(),
                     vec![use_v(ptr), use_v(val), imm(size)],
+                ));
+            }
+            InstKind::PtrAdd { .. }
+                if Self::int_const(lo, inst.operands()[1])
+                    .and_then(|c| imm_at(&c, lo.int_width(inst.operands()[1])))
+                    .is_some() =>
+            {
+                // A constant offset: `add d, imm` (or `lea`), the offset
+                // sign-extended from its width.
+                let d = lo.result_reg(inst);
+                let base = self.oper(lo, inst.operands()[0]);
+                let off_w = lo.int_width(inst.operands()[1]);
+                let k = Self::int_const(lo, inst.operands()[1]).and_then(|c| imm_at(&c, off_w)).unwrap_or(0);
+                lo.emit(MachineInst::new(
+                    X86Op::AluRI.opcode(),
+                    vec![def_v(d), use_v(base), MachineOperand::Imm(Int::from_i64(k)), imm(0), imm(64)],
                 ));
             }
             InstKind::PtrAdd { .. } => {
@@ -2104,7 +2336,15 @@ impl TargetIsel for X86_64Target {
                 lo.emit(self.jump(e));
             }
             InstKind::CondBr { if_true, if_false, true_args, false_args } => {
-                let cond = self.clean_cond(lo, inst.operands()[0]);
+                // A compare used only here becomes `cmp; jcc`; any other
+                // condition is tested: `test cond, cond; jne`.
+                let (mut operands, op) = match self.fused_compare(lo, inst.operands()[0]) {
+                    Some((pred, x, y)) => {
+                        let (ops, is_imm) = self.compare(lo, pred, x, y);
+                        (ops, if is_imm { X86Op::CmpBrI } else { X86Op::CmpBr })
+                    }
+                    None => (vec![use_v(self.clean_cond(lo, inst.operands()[0]))], X86Op::BrCond),
+                };
                 let ops = inst.operands();
                 let tb = 1 + *true_args as usize;
                 let fb = tb + *false_args as usize;
@@ -2112,10 +2352,9 @@ impl TargetIsel for X86_64Target {
                 let false_vals: Vec<_> = ops[tb..fb].to_vec();
                 let te = lo.edge_to(*if_true, &true_vals);
                 let fe = lo.edge_to(*if_false, &false_vals);
-                lo.emit(MachineInst::new(
-                    X86Op::BrCond.opcode(),
-                    vec![use_v(cond), MachineOperand::Label(te), MachineOperand::Label(fe)],
-                ));
+                operands.push(MachineOperand::Label(te));
+                operands.push(MachineOperand::Label(fe));
+                lo.emit(MachineInst::new(op.opcode(), operands));
             }
             InstKind::Switch(data) if Self::wide_val(lo, inst.operands()[0]).is_some() => {
                 // A 128-bit scrutinee: both halves compared per case.

@@ -960,8 +960,8 @@ fn objdump_decodes_add() {
     assert!(out.status.success(), "objdump rejected our object");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("<lfadd>:"), "objdump did not find the lfadd symbol");
-    // The prologue and a ret should decode.
-    assert!(text.contains("push") && text.contains("ret"), "expected push/ret in disassembly");
+    // The add (a leaf needs no frame) and a ret should decode.
+    assert!((text.contains("add") || text.contains("lea")) && text.contains("ret"), "expected add/ret in disassembly:\n{text}");
 }
 
 #[test]

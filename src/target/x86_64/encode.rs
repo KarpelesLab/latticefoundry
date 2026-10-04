@@ -40,14 +40,14 @@
 //! The encoding tables are implemented from the published x86-64 instruction-set
 //! reference (tenet T1), not copied from any assembler.
 
-use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, Reg, RegClass, StackSlot};
+use crate::codegen::mir::{MBlockId, MachineFunction, MachineInst, MachineOperand, Reg, RegClass, StackSlot};
 use crate::codegen::options::{CodegenOptions, CompiledModule};
 use crate::codegen::stack::{STACK_PROBE_INTERVAL, StackReport, StackUsage, scan_calls};
 use crate::codegen::legalize::legalized;
 use crate::codegen::regalloc;
 use crate::codegen::unwind::{self, FrameOp, FrameStep, FunctionFrame, UnwindTables};
 use crate::ir::Module;
-use crate::mc::emit::{Emitted, Emitter, Ref};
+use crate::mc::emit::{Emitted, Emitter, Label, Ref};
 use crate::mc::object::{
     ObjectModule, RelocKind, Section, SectionKind, Symbol, SymbolBinding, SymbolType,
 };
@@ -114,7 +114,8 @@ pub(crate) fn neg_r(e: &mut Emitter, r: u8, w: bool) {
 }
 
 /// Emit a `mov r, imm` — `B8+r id` (zero-extending) when the value fits in 32
-/// bits, else `REX.W B8+r io` (`movabs`).
+/// bits, `REX.W C7 /0 id` (sign-extending) when it is a negative 32-bit
+/// value, else `REX.W B8+r io` (`movabs`). Never touches the flags.
 pub(crate) fn mov_ri(e: &mut Emitter, dst: u8, value: u64) {
     if value <= u64::from(u32::MAX) {
         if dst >= 8 {
@@ -122,6 +123,11 @@ pub(crate) fn mov_ri(e: &mut Emitter, dst: u8, value: u64) {
         }
         e.u8(0xB8 + (dst & 7));
         e.u32(value as u32);
+    } else if let Ok(v) = i32::try_from(value as i64) {
+        e.u8(rex(true, false, false, dst >= 8));
+        e.u8(0xC7);
+        e.u8(modrm(3, 0, dst));
+        e.u32(v as u32);
     } else {
         e.u8(rex(true, false, false, dst >= 8));
         e.u8(0xB8 + (dst & 7));
@@ -353,6 +359,85 @@ fn cmp_ri(e: &mut Emitter, reg: u8, value: i32, w: bool) {
     e.u32(value as u32);
 }
 
+/// Emit an ALU group-1 `op r, imm` (`83 /ext ib` when the value fits a
+/// sign-extended byte, else `81 /ext id`); `ext` selects add(0)/or(1)/and(4)/
+/// sub(5)/xor(6)/cmp(7).
+pub(crate) fn alu_ri(e: &mut Emitter, ext: u8, reg: u8, value: i32, w: bool) {
+    if w || reg >= 8 {
+        e.u8(rex(w, false, false, reg >= 8));
+    }
+    match i8::try_from(value) {
+        Ok(b) => {
+            e.u8(0x83);
+            e.u8(modrm(3, ext, reg));
+            e.u8(b as u8);
+        }
+        Err(_) => {
+            e.u8(0x81);
+            e.u8(modrm(3, ext, reg));
+            e.u32(value as u32);
+        }
+    }
+}
+
+/// Emit `cmp r, value` at the integer `width` (`value` sign-extended from
+/// it): `test r, r` against 0 (the same flags), else the shortest immediate
+/// form — `80 /7 ib` for a byte, `66 83 /7 ib` / `66 81 /7 iw` for a word,
+/// `83 /7 ib` / `81 /7 id` otherwise.
+pub(crate) fn cmp_ri_width(e: &mut Emitter, r: u8, value: i64, width: u32) {
+    match width {
+        0..=8 => {
+            if value == 0 {
+                if r >= 4 {
+                    e.u8(rex(false, r >= 8, false, r >= 8));
+                }
+                e.u8(0x84);
+                e.u8(modrm(3, r, r));
+            } else {
+                if r >= 4 {
+                    e.u8(rex(false, false, false, r >= 8));
+                }
+                e.u8(0x80);
+                e.u8(modrm(3, 7, r));
+                e.u8(value as u8);
+            }
+        }
+        9..=16 => {
+            e.u8(0x66);
+            if value == 0 {
+                alu_rr(e, 0x85, r, r, false);
+            } else if let Ok(b) = i8::try_from(value) {
+                alu_ri(e, 7, r, i32::from(b), false);
+            } else {
+                if r >= 8 {
+                    e.u8(rex(false, false, false, true));
+                }
+                e.u8(0x81);
+                e.u8(modrm(3, 7, r));
+                e.u16(value as u16);
+            }
+        }
+        _ => {
+            if value == 0 {
+                alu_rr(e, 0x85, r, r, width > 32);
+            } else {
+                alu_ri(e, 7, r, value as i32, width > 32);
+            }
+        }
+    }
+}
+
+/// A conditional jump `jcc` to `label` (`70+cc rel8`, or `0F 80+cc rel32`
+/// when out of reach: the emitter relaxes it).
+fn jcc(e: &mut Emitter, cc: u8, label: Label) {
+    e.branch(&[0x70 + cc], &[0x0F, 0x80 + cc], label);
+}
+
+/// An unconditional `jmp` to `label` (`EB rel8` or `E9 rel32`).
+fn jmp(e: &mut Emitter, label: Label) {
+    e.branch(&[0xEB], &[0xE9], label);
+}
+
 // --- SSE (scalar floating-point) forms -------------------------------------
 
 /// Emit an SSE register-to-register instruction: an optional mandatory prefix
@@ -492,12 +577,9 @@ fn u64tof(e: &mut Emitter, d: u8, s: u8, is_f64: bool) {
     let neg = e.create_label();
     let done = e.create_label();
     alu_rr(e, 0x85, s, s, true); // test s, s  (64-bit: SF = bit 63)
-    e.u8(0x0F);
-    e.u8(0x88); // js neg
-    e.pcrel32(Ref::Label(neg), 0);
+    jcc(e, 0x8, neg); // js neg
     sse_rr(e, pfx, true, 0x2A, d, s); // cvtsi2sd/ss d, s  (in range ⇒ exact)
-    e.u8(0xE9); // jmp done
-    e.pcrel32(Ref::Label(done), 0);
+    jmp(e, done);
     e.bind_label(neg);
     mov_rr(e, t1, s, true); // t1 = s
     shift_imm(e, 5, t1, 1, true); // t1 >>= 1  (shr)
@@ -534,12 +616,9 @@ fn fptou64(e: &mut Emitter, d: u8, s: u8, is_f64: bool) {
         sse_rr(e, 0x66, false, 0x6E, t_thresh, tmp); // movd t_thresh, r11d
     }
     sse_rr(e, ucomi_pfx, false, 0x2E, s, t_thresh); // ucomis s, 2^63
-    e.u8(0x0F);
-    e.u8(0x83); // jae big  (CF=0 ⇒ s ≥ 2^63)
-    e.pcrel32(Ref::Label(big), 0);
+    jcc(e, 0x3, big); // jae big  (CF=0 ⇒ s ≥ 2^63)
     sse_rr(e, pfx, true, 0x2C, d, s); // cvttsd2si d, s  (in range)
-    e.u8(0xE9); // jmp done
-    e.pcrel32(Ref::Label(done), 0);
+    jmp(e, done);
     e.bind_label(big);
     sse_rr(e, pfx, false, 0x10, t_val, s); // movsd/ss t_val, s
     sse_rr(e, pfx, false, 0x5C, t_val, t_thresh); // subsd/ss t_val, 2^63
@@ -602,6 +681,13 @@ pub struct FrameLayout {
     /// area plus the 8-byte pad that makes `cs_bytes + fixed` a multiple of
     /// 16); the rest of `sub_size` follows. Always 0 under System V.
     fixed: i32,
+    /// Whether the frame omits the frame pointer (see [`layout_frame_with`]):
+    /// no `push rbp`, and `slot_off` is relative to `rsp` (which stays put
+    /// after the prologue) instead of `rbp`.
+    fpo: bool,
+    /// Whether the function has a `dyn_alloca` (which moves `rsp`, so the
+    /// epilogue must restore it from `rbp`).
+    dynamic: bool,
 }
 
 impl FrameLayout {
@@ -621,7 +707,8 @@ impl FrameLayout {
             X86Op::Syscall.opcode(),
             Some(X86Op::DynAlloca.opcode()),
         );
-        let saved = 8 + self.cs_bytes as u64; // rbp + callee-saved pushes
+        // rbp (unless omitted) + callee-saved pushes
+        let saved = if self.fpo { 0 } else { 8 } + self.cs_bytes as u64;
         let sub = self.sub_size as u64;
         StackUsage {
             name: func_name(mf.info().source),
@@ -640,6 +727,59 @@ impl FrameLayout {
 }
 
 impl FrameLayout {
+    /// The register stack slots are addressed from: `rbp`, or `rsp` in a
+    /// frame without a frame pointer.
+    pub(crate) fn base(&self) -> u8 {
+        if self.fpo { RSP as u8 } else { RBP as u8 }
+    }
+
+    /// Whether the frame omits the frame pointer.
+    pub fn omits_frame_pointer(&self) -> bool {
+        self.fpo
+    }
+
+    /// The epilogue that undoes this layout's prologue, before each `ret`.
+    ///
+    /// System V restores `rsp` from `rbp` only when something moved it below
+    /// the callee-saved pushes, and a frame without callee-saved registers
+    /// ends in `leave`; one without a frame pointer pops its allocation with
+    /// `add rsp`. Windows keeps the `lea rsp, [rbp - cs]; pop ...; pop rbp`
+    /// form its unwinder recognizes.
+    fn epilogue(&self) -> Vec<MachineInst> {
+        let mut out = Vec::new();
+        for &(x, off) in &self.xmm_saves {
+            out.push(MachineInst::new(
+                X86Op::RestoreXmm.opcode(),
+                vec![
+                    MachineOperand::Def(Reg::Physical(regs::xmm(u16::from(x)))),
+                    MachineOperand::Imm(puremp::Int::from_i64(i64::from(off))),
+                ],
+            ));
+        }
+        let pops = |out: &mut Vec<MachineInst>| {
+            for &cs in self.cs_regs.iter().rev() {
+                out.push(MachineInst::new(X86Op::Pop.opcode(), vec![phys(u16::from(cs))]));
+            }
+        };
+        if self.fpo {
+            if self.sub_size > 0 {
+                out.push(MachineInst::new(X86Op::AddRsp.opcode(), vec![imm_op(self.sub_size as u64)]));
+            }
+            pops(&mut out);
+            return out;
+        }
+        if !self.windows && self.cs_regs.is_empty() {
+            out.push(MachineInst::new(X86Op::Leave.opcode(), Vec::new()));
+            return out;
+        }
+        if self.windows || self.sub_size > 0 || self.dynamic {
+            out.push(MachineInst::new(X86Op::LeaRspRbp.opcode(), vec![imm_op(self.cs_bytes as u64)]));
+        }
+        pops(&mut out);
+        out.push(MachineInst::new(X86Op::Pop.opcode(), vec![phys(RBP)]));
+        out
+    }
+
     /// The prologue built from this layout: each instruction, with what it
     /// does to the frame (for the unwind tables, see
     /// [`crate::codegen::unwind`]).
@@ -648,6 +788,12 @@ impl FrameLayout {
     ///
     /// ```text
     /// push rbp ; mov rbp, rsp ; push <callee-saved>... ; sub rsp, sub_size
+    /// ```
+    ///
+    /// Without a frame pointer (a leaf, see [`layout_frame_with`]):
+    ///
+    /// ```text
+    /// push <callee-saved>... ; sub rsp, sub_size
     /// ```
     ///
     /// Windows x64, ordered as its unwind codes require (pushes, then the
@@ -670,6 +816,13 @@ impl FrameLayout {
             )
         };
         let rbp = RBP as u8;
+        if self.fpo {
+            let mut plan: Vec<_> = self.cs_regs.iter().map(|&r| push(r)).collect();
+            if self.sub_size > 0 {
+                plan.push((sub(self.sub_size, self.probes, false), FrameOp::Alloc(self.sub_size as u32)));
+            }
+            return plan;
+        }
         let mut plan = vec![push(rbp)];
         let set_frame = |offset: i32| {
             let inst = if offset == 0 {
@@ -782,6 +935,56 @@ pub fn layout_frame_with(
         .collect();
     let fixed = if windows { pad + 16 * xmm_saves.len() as i32 } else { 0 };
 
+    // A leaf function (no call, no `dyn_alloca`, no inline asm, which could
+    // name `rbp`) needs no frame pointer: `rsp` is constant after the
+    // prologue, so slots are addressed from it. The unwind tables describe
+    // a frame on `rsp` only while nothing is saved or allocated (it is the
+    // entry state), so a frame that needs either keeps `rbp` when they are
+    // requested.
+    let mut leaf = !windows;
+    let mut dynamic = false;
+    for bid in mf.block_ids() {
+        for inst in &mf.block(bid).insts {
+            match X86Op::decode(inst.opcode) {
+                X86Op::Call | X86Op::TlsGd | X86Op::InlineAsm | X86Op::SaveXmm => leaf = false,
+                X86Op::DynAlloca => {
+                    leaf = false;
+                    dynamic = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if leaf {
+        // Slots grow upward from the final `rsp`, which is 16-byte aligned
+        // once anything is allocated (the return address and the pushes
+        // above it are accounted for).
+        let mut top = 0i64;
+        let mut slot_off = vec![0i32; mf.frame().len()];
+        for (i, off_slot) in slot_off.iter_mut().enumerate() {
+            let info = mf.frame().slot(StackSlot::from_index(i));
+            let at = align_up(top, info.align.max(1) as i64);
+            *off_slot = at as i32;
+            top = at + info.size as i64;
+        }
+        let sub_size = if top == 0 { 0 } else { (align_up(8 + cs_bytes as i64 + top, 16) - 8 - cs_bytes as i64) as i32 };
+        if opts.unwind_tables() == crate::codegen::unwind::UnwindTables::None || (cs_regs.is_empty() && sub_size == 0) {
+            return FrameLayout {
+                slot_off,
+                cs_regs,
+                xmm_saves,
+                cs_bytes,
+                sub_size,
+                outgoing: 0,
+                probes: opts.stack_probes,
+                windows,
+                fixed,
+                fpo: true,
+                dynamic,
+            };
+        }
+    }
+
     // Slot offsets grow downward from just below the callee-saved region (the
     // pushed GPRs, then any xmm save slots). The alignment is taken relative
     // to `rbp`, which the prologue leaves 16-byte aligned (`push rbp` right
@@ -814,6 +1017,8 @@ pub fn layout_frame_with(
         probes: opts.stack_probes,
         windows,
         fixed,
+        fpo: false,
+        dynamic,
     }
 }
 
@@ -853,6 +1058,9 @@ fn imm_op(v: u64) -> MachineOperand {
 }
 
 /// Splice the prologue into the entry block and an epilogue before every `ret`.
+///
+/// When several `ret`s would each repeat an epilogue longer than a short
+/// jump, they jump to one shared epilogue block instead.
 pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) {
     let entry = mf.entry().expect("a function being compiled has an entry block");
 
@@ -862,35 +1070,213 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
     prologue.extend(old);
     mf.block_mut(entry).insts = prologue;
 
-    // --- epilogue before each Ret: lea rsp,[rbp-cs]; pop callee-saved; pop rbp ---
+    // --- the epilogue before each Ret (see `FrameLayout::epilogue`) ---
+    let epilogue = layout.epilogue();
+    let rets = mf
+        .block_ids()
+        .flat_map(|b| mf.block(b).insts.iter())
+        .filter(|i| X86Op::decode(i.opcode) == X86Op::Ret)
+        .count();
+    // Its size in bytes, roughly: whether it beats a 2-byte `jmp`.
+    let size: usize = epilogue
+        .iter()
+        .map(|i| match X86Op::decode(i.opcode) {
+            X86Op::Leave => 1,
+            X86Op::Pop => 1 + usize::from(rnum(&i.operands[0]) >= 8),
+            _ => 4,
+        })
+        .sum();
+    let shared = (rets > 1 && size > 2).then(|| {
+        let b = mf.add_block();
+        let mut insts = epilogue.clone();
+        insts.push(MachineInst::new(X86Op::Ret.opcode(), Vec::new()));
+        mf.block_mut(b).insts = insts;
+        b
+    });
     let block_ids: Vec<_> = mf.block_ids().collect();
     for bid in block_ids {
+        if Some(bid) == shared {
+            continue;
+        }
         let old = std::mem::take(&mut mf.block_mut(bid).insts);
         let mut new_insts = Vec::with_capacity(old.len());
         for inst in old {
             if X86Op::decode(inst.opcode) == X86Op::Ret {
-                for &(x, off) in &layout.xmm_saves {
-                    new_insts.push(MachineInst::new(
-                        X86Op::RestoreXmm.opcode(),
-                        vec![
-                            MachineOperand::Def(Reg::Physical(regs::xmm(u16::from(x)))),
-                            MachineOperand::Imm(puremp::Int::from_i64(i64::from(off))),
-                        ],
-                    ));
+                if let Some(epi) = shared {
+                    new_insts.push(
+                        MachineInst::new(X86Op::Jmp.opcode(), vec![MachineOperand::Label(epi)]).with_line(inst.line),
+                    );
+                    continue;
                 }
-                new_insts.push(MachineInst::new(
-                    X86Op::LeaRspRbp.opcode(),
-                    vec![imm_op(layout.cs_bytes as u64)],
-                ));
-                for &cs in layout.cs_regs.iter().rev() {
-                    new_insts.push(MachineInst::new(X86Op::Pop.opcode(), vec![phys(u16::from(cs))]));
-                }
-                new_insts.push(MachineInst::new(X86Op::Pop.opcode(), vec![phys(RBP)]));
+                new_insts.extend(epilogue.iter().cloned());
             }
             new_insts.push(inst);
         }
         mf.block_mut(bid).insts = new_insts;
     }
+}
+
+// ===========================================================================
+// Block layout
+// ===========================================================================
+
+/// Drop the instructions (before allocation) that only compute values
+/// nothing reads: copies and constants left on edges into block parameters
+/// that are never used, and the arithmetic feeding only them. Only
+/// side-effect-free opcodes whose every definition is a dead vreg go;
+/// repeated until nothing changes.
+pub fn remove_dead_defs(mf: &mut MachineFunction) {
+    use X86Op::*;
+    let pure = |op: X86Op| {
+        matches!(
+            op,
+            MovRR | MovRI | Add | Sub | And | Or | Xor | Imul | ShlI | ShrI | SarI | AluRI | ImulRI | SetccCmp
+                | SetccCmpI | Movsx | Movzx | LeaFrame | GlobalAddr | FuncAddr | LeaRbpOff | LoadFConst | FAdd
+                | FSub | FMul | FDiv | FXor | Cvtsd2ss | Cvtss2sd
+        )
+    };
+    loop {
+        let live = regalloc::compute_liveness(mf);
+        let mut changed = false;
+        let block_ids: Vec<_> = mf.block_ids().collect();
+        for bid in block_ids {
+            let mut alive = live.live_out[bid.index()].clone();
+            let insts = std::mem::take(&mut mf.block_mut(bid).insts);
+            let mut kept: Vec<MachineInst> = Vec::with_capacity(insts.len());
+            for inst in insts.into_iter().rev() {
+                let dead = pure(X86Op::decode(inst.opcode))
+                    && inst.defs().next().is_some()
+                    && inst.defs().all(|d| matches!(d, Reg::Virtual(v) if !alive.contains(&v)));
+                if dead {
+                    changed = true;
+                    continue;
+                }
+                for d in inst.defs() {
+                    if let Reg::Virtual(v) = d {
+                        alive.remove(&v);
+                    }
+                }
+                for u in inst.uses() {
+                    if let Reg::Virtual(v) = u {
+                        alive.insert(v);
+                    }
+                }
+                kept.push(inst);
+            }
+            kept.reverse();
+            mf.block_mut(bid).insts = kept;
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// Drop the register copies allocation made into no-ops (`mov r, r`).
+pub fn remove_nop_moves(mf: &mut MachineFunction) {
+    let block_ids: Vec<_> = mf.block_ids().collect();
+    for bid in block_ids {
+        mf.block_mut(bid).insts.retain(|i| {
+            !(X86Op::decode(i.opcode) == X86Op::MovRR
+                && matches!(
+                    (&i.operands[0], &i.operands[1]),
+                    (MachineOperand::Def(Reg::Physical(d)), MachineOperand::Use(Reg::Physical(s))) if d == s
+                ))
+        });
+    }
+}
+
+/// Thread jumps: every branch to a block that is nothing but a `jmp` goes
+/// straight to its final target, and a conditional branch whose targets
+/// coincide becomes a `jmp`. (Copies that allocation coalesced away leave
+/// such blocks behind on the edges they were split into.)
+pub fn thread_jumps(mf: &mut MachineFunction) {
+    let n = mf.num_blocks();
+    let entry = mf.entry();
+    let jump_of = |b: MBlockId| -> Option<MBlockId> {
+        match mf.block(b).insts.as_slice() {
+            [j] if X86Op::decode(j.opcode) == X86Op::Jmp && Some(b) != entry => match j.operands[0] {
+                MachineOperand::Label(t) => Some(t),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let fin: Vec<MBlockId> = (0..n)
+        .map(|i| {
+            let mut b = MBlockId::from_index(i);
+            // A cycle of empty jumps (an infinite loop) stays as it is.
+            for _ in 0..n {
+                match jump_of(b) {
+                    Some(t) if t != b => b = t,
+                    _ => break,
+                }
+            }
+            b
+        })
+        .collect();
+    let block_ids: Vec<_> = mf.block_ids().collect();
+    for bid in block_ids {
+        for inst in &mut mf.block_mut(bid).insts {
+            for op in &mut inst.operands {
+                if let MachineOperand::Label(t) = op {
+                    *t = fin[t.index()];
+                }
+            }
+            let labels: Vec<MBlockId> = inst.labels().collect();
+            let two_way = matches!(X86Op::decode(inst.opcode), X86Op::BrCond | X86Op::CmpBr | X86Op::CmpBrI);
+            if two_way && labels[0] == labels[1] {
+                *inst = MachineInst::new(X86Op::Jmp.opcode(), vec![MachineOperand::Label(labels[0])])
+                    .with_line(inst.line);
+            }
+        }
+    }
+}
+
+/// The order blocks are laid out in: the entry first, then each block's
+/// preferred successor (a jump's target, a conditional branch's false then
+/// true target, a switch's default) right after it when still unplaced, so
+/// that branch can fall through; otherwise the next unplaced block in arena
+/// order. Blocks unreachable from the entry are left out.
+pub fn block_order(mf: &MachineFunction) -> Vec<MBlockId> {
+    let n = mf.num_blocks();
+    let Some(entry) = mf.entry() else { return Vec::new() };
+    let mut reachable = vec![false; n];
+    let mut work = vec![entry];
+    while let Some(b) = work.pop() {
+        if !reachable[b.index()] {
+            reachable[b.index()] = true;
+            work.extend(mf.block(b).successors());
+        }
+    }
+    let mut placed = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    let mut scan = 0usize;
+    let mut cur = Some(entry);
+    while let Some(b) = cur {
+        placed[b.index()] = true;
+        order.push(b);
+        let prefer: Vec<MBlockId> = match mf.block(b).insts.last() {
+            Some(t) => {
+                let labels: Vec<MBlockId> = t.labels().collect();
+                match X86Op::decode(t.opcode) {
+                    X86Op::Jmp => labels,
+                    X86Op::BrCond | X86Op::CmpBr | X86Op::CmpBrI => labels.into_iter().rev().collect(),
+                    X86Op::Switch | X86Op::Switch128 => labels.into_iter().take(1).collect(),
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+        cur = prefer.into_iter().find(|s| !placed[s.index()]);
+        if cur.is_none() {
+            while scan < n && (placed[scan] || !reachable[scan]) {
+                scan += 1;
+            }
+            cur = (scan < n).then(|| MBlockId::from_index(scan));
+        }
+    }
+    order
 }
 
 // ===========================================================================
@@ -934,6 +1320,30 @@ struct EncodeCtx<'a> {
     /// The function's own symbol name and IR index (for inline asm).
     self_name: String,
     source: u32,
+    /// The block laid out right after the one being encoded (by index): a
+    /// branch to it falls through.
+    next: Option<usize>,
+}
+
+/// A branch to block `t`, unless it is laid out next.
+fn goto(e: &mut Emitter, ctx: &EncodeCtx<'_>, t: usize) {
+    if ctx.next != Some(t) {
+        jmp(e, ctx.labels[t]);
+    }
+}
+
+/// Branch to block `t` on condition `cc` (after the flags are set), else to
+/// `f`, letting whichever of them is laid out next fall through: `jcc t`,
+/// `jncc f` (the inverse condition is `cc ^ 1`) or `jcc t; jmp f`.
+fn branch_cc(e: &mut Emitter, ctx: &EncodeCtx<'_>, cc: u8, t: usize, f: usize) {
+    if t == f {
+        goto(e, ctx, t);
+    } else if ctx.next == Some(t) {
+        jcc(e, cc ^ 1, ctx.labels[f]);
+    } else {
+        jcc(e, cc, ctx.labels[t]);
+        goto(e, ctx, f);
+    }
 }
 
 /// Per-function and per-global "address through the GOT?" predicates, by IR
@@ -1173,9 +1583,7 @@ fn encode_rmw_loop(e: &mut Emitter, ops: &[MachineOperand]) {
         }
     }
     atomic_mem_rr(e, true, &[0x0F, 0xB0], &[0x0F, 0xB1], tmp, ptr, size);
-    e.u8(0x0F);
-    e.u8(0x85); // jne top
-    e.pcrel32(Ref::Label(top), 0);
+    jcc(e, 0x5, top); // jne top
 }
 
 /// Encode one machine instruction into `e`.
@@ -1217,7 +1625,54 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 mov_rr(e, d, s, true);
             }
         }
-        X86Op::MovRI => mov_ri(e, rnum(&ops[0]), uimm(&ops[1])),
+        X86Op::MovRI => {
+            let d = rnum(&ops[0]);
+            match uimm(&ops[1]) {
+                // `xor r32, r32` (it clobbers the flags, which no MIR
+                // instruction carries across a constant's materialization).
+                0 => alu_rr(e, 0x31, d, d, false),
+                v => mov_ri(e, d, v),
+            }
+        }
+        X86Op::AluRI => {
+            let (d, a, v) = (rnum(&ops[0]), rnum(&ops[1]), iimm(&ops[2]) as i32);
+            let ext = uimm(&ops[3]) as u8;
+            let w = iimm(&ops[4]) > 32;
+            // An add/sub into another register is one `lea d, [a + v]`.
+            let disp = match ext {
+                0 => Some(v),
+                5 => v.checked_neg(),
+                _ => None,
+            };
+            match disp {
+                Some(disp) if d != a => mem(e, &[0x8D], d, a, disp, w, false),
+                _ => {
+                    if d != a {
+                        mov_rr(e, d, a, w);
+                    }
+                    alu_ri(e, ext, d, v, w);
+                }
+            }
+        }
+        X86Op::ImulRI => {
+            let (d, a, v) = (rnum(&ops[0]), rnum(&ops[1]), iimm(&ops[2]) as i32);
+            let w = iimm(&ops[3]) > 32;
+            if w || d >= 8 || a >= 8 {
+                e.u8(rex(w, d >= 8, false, a >= 8));
+            }
+            match i8::try_from(v) {
+                Ok(b) => {
+                    e.u8(0x6B);
+                    e.u8(modrm(3, d, a));
+                    e.u8(b as u8);
+                }
+                Err(_) => {
+                    e.u8(0x69);
+                    e.u8(modrm(3, d, a));
+                    e.u32(v as u32);
+                }
+            }
+        }
         X86Op::Add => {
             let w = iimm(&ops[3]) == 64;
             bin_commutative(e, 0x01, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), w);
@@ -1257,14 +1712,35 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::ZeroRdx => alu_rr(e, 0x31, regs::RDX as u8, regs::RDX as u8, false),
         X86Op::Idiv => divide(e, 7, rnum(&ops[4]), iimm(&ops[5]) == 64),
         X86Op::Div => divide(e, 6, rnum(&ops[4]), iimm(&ops[5]) == 64),
-        X86Op::SetccCmp => {
+        X86Op::SetccCmp | X86Op::SetccCmpI => {
             let d = rnum(&ops[0]);
             let a = rnum(&ops[1]);
-            let b = rnum(&ops[2]);
             let cc = uimm(&ops[3]) as u8;
-            cmp_rr_width(e, a, b, iimm(&ops[4]) as u32); // cmp a, b
+            let width = iimm(&ops[4]) as u32;
+            let imm = X86Op::decode(inst.opcode) == X86Op::SetccCmpI;
+            // `xor d, d` first when d is no source (the compare's flags must
+            // survive), else `movzx` the byte after.
+            let fresh = d != a && (imm || d != rnum(&ops[2]));
+            if fresh {
+                alu_rr(e, 0x31, d, d, false);
+            }
+            if imm {
+                cmp_ri_width(e, a, iimm(&ops[2]), width);
+            } else {
+                cmp_rr_width(e, a, rnum(&ops[2]), width); // cmp a, b
+            }
             setcc(e, cc, d);
-            movzx_byte(e, d);
+            if !fresh {
+                movzx_byte(e, d);
+            }
+        }
+        X86Op::CmpBr => {
+            cmp_rr_width(e, rnum(&ops[0]), rnum(&ops[1]), iimm(&ops[3]) as u32);
+            branch_cc(e, ctx, uimm(&ops[2]) as u8, label_index(&ops[4]), label_index(&ops[5]));
+        }
+        X86Op::CmpBrI => {
+            cmp_ri_width(e, rnum(&ops[0]), iimm(&ops[1]), iimm(&ops[3]) as u32);
+            branch_cc(e, ctx, uimm(&ops[2]) as u8, label_index(&ops[4]), label_index(&ops[5]));
         }
         X86Op::Test => {
             let r = rnum(&ops[0]);
@@ -1284,27 +1760,27 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::LeaFrame => {
             let d = rnum(&ops[0]);
             let slot = slot_index(&ops[1]);
-            mem(e, &[0x8D], d, RBP as u8, ctx.layout.slot_off[slot], true, false);
+            mem(e, &[0x8D], d, ctx.layout.base(), ctx.layout.slot_off[slot], true, false);
         }
         X86Op::StoreFrame => {
             let src = rnum(&ops[0]);
             let slot = slot_index(&ops[1]);
-            let off = ctx.layout.slot_off[slot];
+            let (base, off) = (ctx.layout.base(), ctx.layout.slot_off[slot]);
             if rclass(&ops[0]) == RegClass::Fp {
                 // The whole register (a vector or a scalar float).
-                sse_mem(e, 0xF3, 0x7F, src, RBP as u8, off); // movdqu [rbp+off], xmm
+                sse_mem(e, 0xF3, 0x7F, src, base, off); // movdqu [base+off], xmm
             } else {
-                mem(e, &[0x89], src, RBP as u8, off, true, false);
+                mem(e, &[0x89], src, base, off, true, false);
             }
         }
         X86Op::LoadFrame => {
             let dst = rnum(&ops[0]);
             let slot = slot_index(&ops[1]);
-            let off = ctx.layout.slot_off[slot];
+            let (base, off) = (ctx.layout.base(), ctx.layout.slot_off[slot]);
             if rclass(&ops[0]) == RegClass::Fp {
-                sse_mem(e, 0xF3, 0x6F, dst, RBP as u8, off); // movdqu xmm, [rbp+off]
+                sse_mem(e, 0xF3, 0x6F, dst, base, off); // movdqu xmm, [base+off]
             } else {
-                mem(e, &[0x8B], dst, RBP as u8, off, true, false);
+                mem(e, &[0x8B], dst, base, off, true, false);
             }
         }
         X86Op::GlobalAddr => {
@@ -1355,18 +1831,13 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 let case = label_index(&ops[i + 2]);
                 let next = e.create_label();
                 cmp_r_u64(e, lo_r, vlo);
-                e.u8(0x0F);
-                e.u8(0x85); // jne next
-                e.pcrel32(Ref::Label(next), 0);
+                jcc(e, 0x5, next); // jne next
                 cmp_r_u64(e, hi_r, vhi);
-                e.u8(0x0F);
-                e.u8(0x84); // je case
-                e.pcrel32(Ref::Label(ctx.labels[case]), 0);
+                jcc(e, 0x4, ctx.labels[case]); // je case
                 e.bind_label(next);
                 i += 3;
             }
-            e.u8(0xE9);
-            e.pcrel32(Ref::Label(ctx.labels[default]), 0);
+            goto(e, ctx, default);
         }
         X86Op::TlsGd => {
             let MachineOperand::Global(g) = ops[0] else { panic!("TlsGd expects a global operand") };
@@ -1430,21 +1901,13 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::Ret => e.u8(0xC3),
         X86Op::SaveXmm => sse_mem(e, 0, 0x11, rnum(&ops[0]), RBP as u8, iimm(&ops[1]) as i32),
         X86Op::RestoreXmm => sse_mem(e, 0, 0x10, rnum(&ops[0]), RBP as u8, iimm(&ops[1]) as i32),
-        X86Op::Jmp => {
-            let t = label_index(&ops[0]);
-            e.u8(0xE9);
-            e.pcrel32(Ref::Label(ctx.labels[t]), 0);
-        }
+        X86Op::Jmp => goto(e, ctx, label_index(&ops[0])),
         X86Op::BrCond => {
             let cond = rnum(&ops[0]);
             let t = label_index(&ops[1]);
             let f = label_index(&ops[2]);
             alu_rr(e, 0x85, cond, cond, false); // test cond, cond
-            e.u8(0x0F);
-            e.u8(0x85); // jne t
-            e.pcrel32(Ref::Label(ctx.labels[t]), 0);
-            e.u8(0xE9); // jmp f
-            e.pcrel32(Ref::Label(ctx.labels[f]), 0);
+            branch_cc(e, ctx, 0x5, t, f); // jne t; jmp f
         }
         X86Op::Switch => {
             let cond = rnum(&ops[0]);
@@ -1463,13 +1926,10 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                         alu_rr(e, 0x39, cond, tmp, true); // cmp cond, r11
                     }
                 }
-                e.u8(0x0F);
-                e.u8(0x84); // je case
-                e.pcrel32(Ref::Label(ctx.labels[case]), 0);
+                jcc(e, 0x4, ctx.labels[case]); // je case
                 i += 2;
             }
-            e.u8(0xE9);
-            e.pcrel32(Ref::Label(ctx.labels[default]), 0);
+            goto(e, ctx, default);
         }
         X86Op::Unreachable => {
             e.u8(0x0F);
@@ -1507,6 +1967,8 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             atomic_mem_rr(e, true, &[0x0F, 0xB0], &[0x0F, 0xB1], new, ptr, size);
         }
         X86Op::RmwLoop => encode_rmw_loop(e, ops),
+        X86Op::Leave => e.u8(0xC9),
+        X86Op::AddRsp => alu_ri(e, 0, RSP as u8, uimm(&ops[0]) as i32, true),
         X86Op::Push => push_r(e, rnum(&ops[0])),
         X86Op::Pop => pop_r(e, rnum(&ops[0])),
         X86Op::MovRbpRsp => mov_rr(e, RBP as u8, RSP as u8, true),
@@ -1524,7 +1986,13 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::LeaRbpOff => {
             let d = rnum(&ops[0]);
             let off = iimm(&ops[1]) as i32;
-            mem(e, &[0x8D], d, RBP as u8, off, true, false); // lea d, [rbp + off]
+            if ctx.layout.fpo {
+                // Where rbp would point: `rsp` plus the frame below it.
+                let k = ctx.layout.cs_bytes + ctx.layout.sub_size - 8;
+                mem(e, &[0x8D], d, RSP as u8, off + k, true, false); // lea d, [rsp + ..]
+            } else {
+                mem(e, &[0x8D], d, RBP as u8, off, true, false); // lea d, [rbp + off]
+            }
         }
         X86Op::LeaRspOff => {
             let d = rnum(&ops[0]);
@@ -1569,16 +2037,14 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 probe_rsp(e); // or qword [rsp], 0
                 alu_ri32(e, 7, d, step, true); // cmp d, 4096
                 let done = e.create_label();
-                e.bytes(&[0x0F, 0x82]); // jb done
-                e.pcrel32(Ref::Label(done), 0);
+                jcc(e, 0x2, done); // jb done
                 let top = e.create_label();
                 e.bind_label(top);
                 sub_rsp_imm(e, STACK_PROBE_INTERVAL as u32); // sub rsp, 4096
                 probe_rsp(e); // or qword [rsp], 0
                 alu_ri32(e, 5, d, step, true); // sub d, 4096
                 alu_ri32(e, 7, d, step, true); // cmp d, 4096
-                e.bytes(&[0x0F, 0x83]); // jae top
-                e.pcrel32(Ref::Label(top), 0);
+                jcc(e, 0x3, top); // jae top
                 e.bind_label(done);
             }
             alu_rr(e, 0x29, RSP as u8, d, true); // sub rsp, d
@@ -1861,7 +2327,7 @@ fn encode_function_inner(
 ) -> Emitted {
     let mut e = Emitter::new();
     let labels: Vec<_> = (0..mf.num_blocks()).map(|_| e.create_label()).collect();
-    let ctx = EncodeCtx {
+    let mut ctx = EncodeCtx {
         labels: &labels,
         layout,
         func_name,
@@ -1870,38 +2336,42 @@ fn encode_function_inner(
         asm: mf.inline_asms(),
         self_name: func_name(mf.info().source),
         source: mf.info().source,
+        next: None,
     };
 
-    // Emit the entry block first (so the function symbol at offset 0 is the
-    // entry), then the remaining blocks in arena order.
+    // The entry block comes first (so the function symbol at offset 0 is the
+    // entry), then the others as `block_order` lays them out. Branches are
+    // relaxed when the emitter finishes, which moves code: every offset
+    // recorded here is a label, read back afterwards.
     let entry = mf.entry().expect("a function being compiled has an entry block");
-    let mut order = vec![entry];
-    for bid in mf.block_ids() {
-        if bid != entry {
-            order.push(bid);
-        }
-    }
+    let order = block_order(mf);
+    let mut rows: Vec<(Label, u32)> = Vec::new();
+    let mut prologue_ends: Vec<Label> = Vec::new();
+    let mut epilogues: Vec<(Label, Label)> = Vec::new();
+    let here = |e: &mut Emitter| {
+        let l = e.create_label();
+        e.bind_label(l);
+        l
+    };
     let mut pending_pop = None;
-    for bid in order {
+    for (i, &bid) in order.iter().enumerate() {
+        ctx.next = order.get(i + 1).map(|b| b.index());
         e.bind_label(labels[bid.index()]);
         for (k, inst) in mf.block(bid).insts.iter().enumerate() {
-            if let Some(rows) = lines.as_deref_mut()
-                && inst.line != 0
-                && rows.last().map(|&(_, l)| l) != Some(inst.line)
-            {
-                rows.push((e.offset(), inst.line));
+            if lines.is_some() && inst.line != 0 && rows.last().map(|&(_, l)| l) != Some(inst.line) {
+                rows.push((here(&mut e), inst.line));
             }
             encode_inst(&mut e, inst, &ctx);
-            if let Some((prologue_len, m)) = marks.as_mut() {
-                let end = e.offset() as u32;
+            if marks.is_some() {
                 let op = X86Op::decode(inst.opcode);
-                if bid == entry && k < *prologue_len {
-                    m.prologue_ends.push(end);
-                } else if op == X86Op::Pop && rnum(&inst.operands[0]) == RBP as u8 {
-                    pending_pop = Some(end);
+                let prologue_len = marks.as_ref().map_or(0, |m| m.0);
+                if bid == entry && k < prologue_len {
+                    prologue_ends.push(here(&mut e));
+                } else if op == X86Op::Leave || (op == X86Op::Pop && rnum(&inst.operands[0]) == RBP as u8) {
+                    pending_pop = Some(here(&mut e));
                 } else if op == X86Op::Ret {
                     if let Some(pop) = pending_pop.take() {
-                        m.epilogues.push((pop, end));
+                        epilogues.push((pop, here(&mut e)));
                     }
                 } else {
                     pending_pop = None;
@@ -1909,7 +2379,16 @@ fn encode_function_inner(
             }
         }
     }
-    e.finish().expect("intra-function branch resolution never overflows")
+    let (emitted, at) = e.finish_with_labels().expect("intra-function branch resolution never overflows");
+    let at = |l: Label| at[l.index()].expect("a bound label");
+    if let Some(out) = lines.as_deref_mut() {
+        out.extend(rows.iter().map(|&(l, line)| (at(l), line)));
+    }
+    if let Some((_, m)) = marks.as_mut() {
+        m.prologue_ends.extend(prologue_ends.iter().map(|&l| at(l) as u32));
+        m.epilogues.extend(epilogues.iter().map(|&(p, r)| (at(p) as u32, at(r) as u32)));
+    }
+    emitted
 }
 
 /// One function's compile output: bytes + relocations, the `.debug_line`
@@ -1934,9 +2413,15 @@ fn compile_function_full(
 ) -> FunctionOutput {
     let target = X86_64Target::for_os(opts.os).with_reloc_model(opts.reloc_model);
     let mut mf = target.select_with_syms(module, func, syms);
-    regalloc::allocate(&mut mf, &target);
+    // Program points follow the block layout, so a value's live range does
+    // not span blocks laid out elsewhere.
+    remove_dead_defs(&mut mf);
+    let order = block_order(&mf);
+    regalloc::allocate_with(&mut mf, &target, &regalloc::AllocOptions { order: Some(order), precise: true });
+    remove_nop_moves(&mut mf);
     let layout = layout_frame_with(&mf, &target, opts);
     insert_prologue_epilogue(&mut mf, &layout);
+    thread_jumps(&mut mf);
     let func_name = |idx: u32| -> String {
         syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
     };
