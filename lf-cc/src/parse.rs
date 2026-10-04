@@ -168,6 +168,10 @@ struct Attrs {
     visibility: Option<Visibility>,
     /// `weak`.
     weak: bool,
+    /// `constructor` / `constructor(priority)` on a function.
+    constructor: bool,
+    /// `destructor` / `destructor(priority)` on a function.
+    destructor: bool,
 }
 
 /// The declaration-wide properties shared by every declarator of one
@@ -219,11 +223,19 @@ impl Attrs {
             self.visibility = other.visibility;
         }
         self.weak |= other.weak;
+        self.constructor |= other.constructor;
+        self.destructor |= other.destructor;
     }
 
     /// The symbol attributes (visibility, weak) among these attributes.
     fn sym(&self) -> SymAttrs {
-        SymAttrs { visibility: self.visibility, weak: self.weak, gnu_inline: self.gnu_inline }
+        SymAttrs {
+            visibility: self.visibility,
+            weak: self.weak,
+            gnu_inline: self.gnu_inline,
+            constructor: self.constructor,
+            destructor: self.destructor,
+        }
     }
 }
 
@@ -954,6 +966,15 @@ impl Parser {
             }
             self.expect_punct(Punct::RBracket, "']' after array size")?;
         }
+        // An object may not exceed `PTRDIFF_MAX` bytes (gcc: "size of array
+        // is too large"); `sizeof (long double) - sizeof (double) - 1` as a
+        // bound wraps to a huge unsigned value, which configure-style probes
+        // rely on being rejected.
+        let elem_size = if dims.iter().any(|&d| d > 0) { self.size_of_type(&base).max(1) } else { 1 };
+        let total = dims.iter().filter(|&&d| d > 0).try_fold(elem_size, |acc, &d| acc.checked_mul(d));
+        if total.is_none_or(|t| t > i64::MAX as u64) {
+            return self.err("size of array is too large");
+        }
         let mut ty = base;
         for &d in dims.iter().rev() {
             ty = CType::Array(Box::new(ty), d);
@@ -1060,11 +1081,23 @@ impl Parser {
                 "gnu_inline" => attrs.gnu_inline = true,
                 "transparent_union" => attrs.transparent_union = true,
                 "weak" => attrs.weak = true,
+                "constructor" => attrs.constructor = true,
+                "destructor" => attrs.destructor = true,
                 _ => {}
             }
             return Ok(());
         }
         match bare.as_str() {
+            // The priority orders constructors across a program; lf-cc runs
+            // them in link order, as for constructors without one.
+            "constructor" | "destructor" => {
+                if bare == "constructor" {
+                    attrs.constructor = true;
+                } else {
+                    attrs.destructor = true;
+                }
+                self.skip_balanced_parens()?;
+            }
             "visibility" => {
                 self.bump(); // (
                 let sp = self.peek_span();

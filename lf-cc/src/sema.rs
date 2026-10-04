@@ -107,6 +107,10 @@ pub struct FuncSig {
     /// definition, so it is emitted as a private copy that only this
     /// translation unit's calls use.
     pub inline_def: bool,
+    /// `__attribute__((constructor))` / `((destructor))` on a declaration:
+    /// the definition is listed in `.init_array` / `.fini_array`.
+    pub constructor: bool,
+    pub destructor: bool,
 }
 
 /// A global variable (or an anonymous string-literal object). Its initializer is
@@ -779,6 +783,7 @@ impl Checker {
                 TopLevel::PragmaWeak(_) => {}
             }
         }
+        self.list_constructors();
         // `#pragma weak` applies to the entity however its declarations are
         // placed around the pragma.
         for item in &unit.items {
@@ -801,6 +806,48 @@ impl Checker {
         }
     }
 
+    /// List the defined constructor and destructor functions in
+    /// `.init_array` / `.fini_array`, through the unit's file-scope asm (the
+    /// IR has no section placement). That object can only name a global
+    /// symbol, so a `static` one becomes a hidden global under a name unique
+    /// to this translation unit: still invisible outside its link unit.
+    fn list_constructors(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let mut unit_hash = std::collections::hash_map::DefaultHasher::new();
+        for s in &self.sigs {
+            s.name.hash(&mut unit_hash);
+        }
+        for g in &self.globals {
+            g.name.hash(&mut unit_hash);
+        }
+        let unit_hash = unit_hash.finish();
+        for idx in 0..self.sigs.len() {
+            let sig = &self.sigs[idx];
+            if !sig.defined || !(sig.constructor || sig.destructor) {
+                continue;
+            }
+            if sig.is_static {
+                let old = sig.name.clone();
+                let new = format!("{old}.lf_ctor.{unit_hash:016x}");
+                self.sig_by_symbol.remove(&old);
+                self.sig_by_symbol.insert(new.clone(), idx);
+                let sig = &mut self.sigs[idx];
+                sig.name = new;
+                sig.is_static = false;
+                sig.visibility = Some(Visibility::Hidden);
+            }
+            let sig = &self.sigs[idx];
+            for (wanted, section) in [(sig.constructor, ".init_array"), (sig.destructor, ".fini_array")] {
+                if wanted {
+                    self.toplevel_asm.push(format!(
+                        "\t.section {section},\"aw\"\n\t.p2align 3\n\t.quad {}\n\t.text",
+                        sig.name
+                    ));
+                }
+            }
+        }
+    }
+
     /// Merge a declaration's symbol attributes into the signature registered
     /// for the C name `name`: a `visibility` attribute (the last one wins) and
     /// `weak`.
@@ -811,6 +858,8 @@ impl Checker {
                 sig.visibility = attrs.visibility;
             }
             sig.weak |= attrs.weak;
+            sig.constructor |= attrs.constructor;
+            sig.destructor |= attrs.destructor;
         }
     }
 
@@ -886,6 +935,8 @@ impl Checker {
             visibility: None,
             weak: false,
             inline_def: false,
+            constructor: false,
+            destructor: false,
         });
         self.sig_index.insert(name.to_owned(), idx);
         self.sig_by_symbol.insert(symbol.to_owned(), idx);

@@ -868,6 +868,12 @@ pub struct SymAttrs {
     /// `__attribute__((gnu_inline))` on a function: GNU89 `inline` semantics
     /// (a plain `inline` definition is an external definition).
     pub gnu_inline: bool,
+    /// `__attribute__((constructor))`: the function runs before `main` (or
+    /// when its shared library is loaded).
+    pub constructor: bool,
+    /// `__attribute__((destructor))`: the function runs after `main` returns
+    /// (or when its shared library is unloaded).
+    pub destructor: bool,
 }
 
 /// A single declared variable (in a local declaration or a global).

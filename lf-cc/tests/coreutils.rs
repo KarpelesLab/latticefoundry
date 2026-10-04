@@ -147,6 +147,8 @@ int main(void) {
 #if 0
 # error mail bug-gnulib@gnu.org, it's broken
 #endif
+static const char msg[] = "ab\
+cd";
 int main(void) {
     int r = ADD(1,
 #ifdef TWO
@@ -162,10 +164,10 @@ int main(void) {
     default:
         break;
     }
-    return r;
+    return r + 8 * (sizeof msg == 5 && msg[2] == 'c') + 16 * (__LINE__ == 25);
 }
 "#,
-            4,
+            4 + 8 + 16,
         ),
         (
             // `#pragma weak`: an undefined weak function's address is null.
@@ -334,6 +336,10 @@ fn conflicting_redeclarations_are_rejected() {
         let errs = errors_of(src);
         assert!(errs.contains("conflicting types"), "`{src}` should conflict, got: {errs:?}");
     }
+    // A bound that wraps to a huge size (`sizeof (long double) - sizeof
+    // (double) - 1` where they are equal) is an error, not a crash.
+    let errs = errors_of("int foo[sizeof (int) - sizeof (unsigned) - 1];");
+    assert!(errs.contains("too large"), "{errs:?}");
     for src in [
         // no prototype, and the parameter's promotion (an old-style definition)
         "int f(); int f(int a, char *b);",
@@ -396,4 +402,37 @@ fn dependency_rules() {
     dir.write("s.c", "#include <stddef.h>\n#include <stdio.h>\n#include \"b.h\"\nint main(void) { return 0; }\n");
     dir.lf_cc_ok(&["-MMD", "-c", "s.c", "-o", "s.o"], None);
     assert_eq!(dir.read("s.d"), "s.o: s.c b.h\n");
+}
+
+/// `__attribute__((constructor))` / `((destructor))` functions run around
+/// `main`, static ones included (coreutils' `libstdbuf.so` is set up so).
+#[test]
+fn constructors_and_destructors_run() {
+    if latticefoundry::link::gnu::HostCrt::discover().is_none() {
+        eprintln!("skipping: no host C runtime (crt1.o) found");
+        return;
+    }
+    let dir = Scratch::new("ctor");
+    dir.write(
+        "ctor.c",
+        "#include <stdio.h>\nstatic int v;\n\
+         static void __attribute ((constructor)) init_it (void) { v = 42; }\n\
+         void __attribute__((constructor(200))) init2 (void) { v += 1; }\n\
+         static void bye (void) __attribute__((destructor));\n\
+         static void bye (void) { printf (\"bye %d\\n\", v); }\n\
+         int main (void) { printf (\"main %d\\n\", v); return 0; }\n",
+    );
+    dir.lf_cc_ok(&["-O2", "ctor.c", "-o", "ctor"], None);
+    let mut out = None;
+    for _ in 0..50 {
+        match Command::new(dir.path().join("ctor")).output() {
+            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            other => {
+                out = Some(other.expect("run ctor"));
+                break;
+            }
+        }
+    }
+    let out = out.expect("ctor stayed busy");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "main 43\nbye 43\n");
 }

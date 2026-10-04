@@ -1138,6 +1138,8 @@ impl Pp {
                 hideset: BTreeSet::new(),
             });
             bol = false;
+            // Line splices inside the token (a continued string literal).
+            line += bytes[start..pos].windows(2).filter(|w| w == b"\\\n").count() as u32;
         }
         out
     }
@@ -1269,8 +1271,12 @@ impl Pp {
 
     /// Lex a quoted literal starting at `pos` (which is on the opening `quote`).
     /// Returns the raw spelling including quotes, or `None` if unterminated.
+    /// Lex a character constant or string literal starting at the quote at
+    /// `pos`, returning its spelling. Line splices (backslash-newline) inside
+    /// it are removed (translation phase 2), so a string continued over
+    /// several lines spells as one.
     fn lex_quoted(&self, bytes: &[u8], pos: &mut usize, quote: u8) -> Option<String> {
-        let start = *pos;
+        let mut raw = vec![quote];
         *pos += 1;
         loop {
             let &c = bytes.get(*pos)?;
@@ -1278,14 +1284,21 @@ impl Pp {
                 return None;
             }
             if c == b'\\' {
-                *pos += 1;
-                bytes.get(*pos)?;
-                *pos += 1;
+                match (bytes.get(*pos + 1), bytes.get(*pos + 2)) {
+                    (Some(b'\n'), _) => *pos += 2,
+                    (Some(b'\r'), Some(b'\n')) => *pos += 3,
+                    (Some(&e), _) => {
+                        raw.extend_from_slice(&[c, e]);
+                        *pos += 2;
+                    }
+                    (None, _) => return None,
+                }
                 continue;
             }
             *pos += 1;
+            raw.push(c);
             if c == quote {
-                return Some(String::from_utf8_lossy(&bytes[start..*pos]).into_owned());
+                return Some(String::from_utf8_lossy(&raw).into_owned());
             }
         }
     }
