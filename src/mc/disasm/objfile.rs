@@ -232,13 +232,14 @@ pub fn raw(bytes: &[u8], arch: TargetArch, base: u64) -> Binary {
 
 /// The code of an in-memory [`ObjectModule`] (what `.lfo` decodes to, and
 /// what every backend produces). The architecture is `arch`, or else guessed
-/// from the relocation kinds (AArch64, Thumb and AVR have their own), or
+/// from the relocation kinds (AArch64, Thumb, AVR and RISC-V have their own), or
 /// `None`.
 pub fn from_object_module(obj: &ObjectModule, arch: Option<TargetArch>) -> Binary {
     let guessed = arch.or_else(|| {
         obj.relocations().iter().find_map(|r| match r.kind {
             k if k.is_avr() => Some(TargetArch::Avr),
             k if k.is_thumb() => Some(TargetArch::Thumb),
+            k if k.is_riscv() => Some(TargetArch::Riscv64),
             RelocKind::Aarch64Call26
             | RelocKind::Aarch64AdrPrelPgHi21
             | RelocKind::Aarch64AddAbsLo12Nc
