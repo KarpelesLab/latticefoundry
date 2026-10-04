@@ -126,7 +126,7 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         RelocKind::TpOff32 => R_X86_64_TPOFF32,
         RelocKind::GotTpOff => R_X86_64_GOTTPOFF,
         RelocKind::TlsGd => R_X86_64_TLSGD,
-        // AArch64, Thumb and AVR relocation kinds never appear in an x86-64 ELF
+        // AArch64, Thumb, AVR and RISC-V relocation kinds never appear in an x86-64 ELF
         // object (those backends do not emit through this mapping).
         RelocKind::Aarch64Call26
         | RelocKind::Aarch64AdrPrelPgHi21
@@ -142,7 +142,12 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         | RelocKind::AvrLo8Ldi
         | RelocKind::AvrHi8Ldi
         | RelocKind::AvrLo8LdiPm
-        | RelocKind::AvrHi8LdiPm => {
+        | RelocKind::AvrHi8LdiPm
+        | RelocKind::RiscvCallPlt
+        | RelocKind::RiscvPcrelHi20
+        | RelocKind::RiscvPcrelLo12I
+        | RelocKind::RiscvPcrelLo12S
+        | RelocKind::RiscvGotHi20 => {
             unreachable!("relocation kind {kind:?} in an x86-64 ELF object")
         }
     }

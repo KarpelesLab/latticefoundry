@@ -1,17 +1,17 @@
-//! The RISC-V RV64IM machine-code encoder and the compile entry points.
+//! The RISC-V RV64IMAFD machine-code encoder and the compile entry points.
 //!
 //! After instruction selection ([`super::isel`]) and register allocation
 //! ([`crate::codegen::regalloc`]) a [`MachineFunction`] holds only physical
 //! registers and [`RvOp`] opcodes. This module:
 //!
-//! 1. lays out the stack frame ([`layout_frame`]) — which callee-saved registers
-//!    (plus `ra`, when the function calls) the allocation used, the `sp`-relative
-//!    offset of every spill/`alloca` slot, and the single frame size that keeps
-//!    the stack 16-byte aligned (the RISC-V psABI requires 16-byte `sp`
-//!    alignment);
+//! 1. lays out the stack frame ([`layout_frame`]) — from `sp` up: the outgoing
+//!    stack-argument area, `ra` (when the function calls) and the callee-saved
+//!    integer and floating-point registers the allocation used, then every
+//!    spill/`alloca` slot, in a single frame size that keeps the stack 16-byte
+//!    aligned (the RISC-V psABI requires 16-byte `sp` alignment);
 //! 2. splices in the prologue/epilogue as ordinary [`RvOp`] instructions
-//!    ([`insert_prologue_epilogue`]) — `addi sp, sp, -frame` + `sd ra`/callee-saved
-//!    stores, and the mirror-image epilogue + `ret`;
+//!    ([`insert_prologue_epilogue`]) — `addi sp, sp, -frame` + `sd`/`fsd`
+//!    stores of the saved registers, and the mirror-image epilogue + `ret`;
 //! 3. encodes each instruction to a 32-bit little-endian word
 //!    ([`encode_function`]) — building each R/I/S/B/U/J bitfield by hand from the
 //!    RISC-V ISA manual, resolving intra-function branches through a local
@@ -39,28 +39,52 @@
 //! function entry). The prologue then saves `ra` at `0(sp)` in any function that
 //! calls, so the next frame starts right at a touched address.
 //!
+//! **The frame pointer.** A function that uses `dyn_alloca` moves `sp` at run
+//! time, so it reserves `s0` as a frame pointer: the prologue saves `s0` and
+//! sets `s0 = sp` after the fixed allocation, every frame slot (and incoming
+//! stack argument) is addressed from `s0`, and the epilogue restores `sp` from
+//! `s0` before reloading the saved registers. The outgoing-argument area stays
+//! at the bottom of the current `sp`: a `dyn_alloca` carves its block *above*
+//! a fresh copy of that area (`sp -= size + outgoing`, result `sp +
+//! outgoing`), and probes the stack one page at a time when probes are on:
+//!
+//! ```text
+//! addi t0, n, 15 ; andi t0, t0, -16 ; (add t0, t0, outgoing + slack)
+//! sd zero, 0(sp) ; lui t1, 1
+//! L: bltu t0, t1, done ; sub sp, sp, t1 ; sd zero, 0(sp) ; sub t0, t0, t1 ; j L
+//! done: sub sp, sp, t0 ; addi d, sp, outgoing ; (round d up to the alignment)
+//! ```
+//!
 //! The encoding tables are implemented from the published RISC-V ISA (tenet T1),
 //! not copied from any assembler.
 //!
-//! **Deferred (relocations).** RISC-V direct calls and global addresses want the
-//! `R_RISCV_CALL` / `R_RISCV_PCREL_HI20`+`LO12` relocations, whose `RelocKind`s
-//! are not modeled by the machine-code layer this backend is allowed to touch. A
-//! `call` therefore emits a self-relative `auipc`+`jalr` placeholder and a global
-//! address an `auipc`+`addi` placeholder, without a relocation; this suffices for
-//! the self-contained functions and the MIR interpreter that gate correctness.
-//! Wiring the relocations is a documented follow-up (it needs new `RelocKind`s).
+//! **Relocations** (RISC-V ELF psABI, the `medany` code model: everything is
+//! addressed PC-relatively, so the code runs at any address within ±2 GiB of
+//! its data). A direct call is `auipc ra, 0; jalr ra, 0(ra)` with one
+//! `R_RISCV_CALL_PLT` covering both words. The address of a symbol is
+//! `auipc d, 0` with `R_RISCV_PCREL_HI20` against the symbol, then
+//! `addi d, d, 0` with `R_RISCV_PCREL_LO12_I` against a **local label on the
+//! `auipc`** (`.Lpcrel_hiN`): the low part is the low 12 bits of the
+//! displacement the `auipc` computed, which the linker finds through that
+//! label. Under position-independent code a symbol that may be preempted is
+//! loaded from its GOT entry instead: `auipc d, 0` with `R_RISCV_GOT_HI20`,
+//! then `ld d, 0(d)` with `R_RISCV_PCREL_LO12_I` against the label. Data
+//! pointers are `R_RISCV_64`. No `R_RISCV_RELAX` is emitted (the code is
+//! correct unrelaxed; relaxation is an optional linker optimization).
 
 use crate::codegen::mir::{MachineFunction, MachineInst, MachineOperand, PReg, Reg, RegClass, StackSlot};
 use crate::codegen::options::{CodegenOptions, CompiledModule};
 use crate::codegen::stack::{STACK_PROBE_INTERVAL, StackReport, StackUsage, scan_calls};
 use crate::codegen::regalloc;
 use crate::ir::Module;
-use crate::mc::emit::Emitted;
-use crate::mc::object::{ObjectModule, Section, SectionKind, Symbol, SymbolBinding, SymbolType};
+use crate::mc::emit::{Emitted, EmittedReloc};
+use crate::mc::object::{
+    ObjectModule, RelocKind, Relocation, Section, SectionKind, Symbol, SymbolBinding, SymbolType,
+};
 use crate::support::StrInterner;
 
 use super::isel::{RvOp, RiscvTarget};
-use super::regs::{RA, SP, T0, T1, T2, T6, ZERO};
+use super::regs::{FP, RA, SP, T0, T1, T2, T6, ZERO};
 
 // ===========================================================================
 // 32-bit instruction-word builders (bitfields from the RISC-V ISA formats)
@@ -230,6 +254,76 @@ pub(crate) fn ebreak() -> u32 {
     0x0010_0073
 }
 
+// --- the F and D extensions ------------------------------------------------
+
+/// The dynamic rounding mode (`fcsr.frm`; round-to-nearest-even by default).
+pub(crate) const RM_DYN: u32 = 0b111;
+/// Round toward zero.
+pub(crate) const RM_RTZ: u32 = 0b001;
+/// Round to nearest, ties to even (the static form, used by the exact
+/// conversions, whose rounding mode is irrelevant).
+pub(crate) const RM_RNE: u32 = 0b000;
+
+/// The `fmt` field of a float width: 0 = single (`.s`), 1 = double (`.d`).
+#[inline]
+fn fmt(width: u32) -> u32 {
+    u32::from(width == 64)
+}
+
+/// An OP-FP word (`1010011`): `funct5 | fmt | rs2 | rs1 | rm | rd`.
+pub(crate) fn fp_op(funct5: u32, width: u32, rm: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    r_type((funct5 << 2) | fmt(width), rs2, rs1, rm, rd, 0x53)
+}
+/// `fmadd`/`fmsub`/`fnmsub`/`fnmadd` (`kind` 0..=3) `.{s,d} rd, rs1, rs2,
+/// rs3` (the R4 format, dynamic rounding).
+pub(crate) fn fmadd(kind: u32, width: u32, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> u32 {
+    let opcode = [0x43, 0x47, 0x4B, 0x4F][kind as usize & 3];
+    (rs3 << 27) | (fmt(width) << 25) | (rs2 << 20) | (rs1 << 15) | (RM_DYN << 12) | (rd << 7) | opcode
+}
+/// `fsgnj{,n,x}.{s,d}` (`funct3` 0/1/2).
+pub(crate) fn fsgnj(width: u32, funct3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    fp_op(0b00100, width, funct3, rd, rs1, rs2)
+}
+/// `feq`/`flt`/`fle` `.{s,d} rd, rs1, rs2` by `funct3` (2/1/0).
+pub(crate) fn fcmp(width: u32, funct3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    fp_op(0b10100, width, funct3, rd, rs1, rs2)
+}
+/// `fcvt.d.s` (exact) / `fcvt.s.d` (rounding).
+pub(crate) fn fcvt_ff(dst_width: u32, src_width: u32, rd: u32, rs1: u32) -> u32 {
+    let rm = if dst_width > src_width { RM_RNE } else { RM_DYN };
+    fp_op(0b01000, dst_width, rm, rd, rs1, fmt(src_width))
+}
+/// The `rs2` selector of an integer conversion: `w`, `wu`, `l`, `lu`.
+fn int_kind(signed: bool, int_width: u32) -> u32 {
+    (u32::from(int_width == 64) << 1) | u32::from(!signed)
+}
+/// `fcvt.{w,wu,l,lu}.{s,d} rd, rs1, rtz`: float to integer, truncating.
+pub(crate) fn fcvt_int_from_float(signed: bool, int_width: u32, float_width: u32, rd: u32, rs1: u32) -> u32 {
+    fp_op(0b11000, float_width, RM_RTZ, rd, rs1, int_kind(signed, int_width))
+}
+/// `fcvt.{s,d}.{w,wu,l,lu} rd, rs1`: integer to float (`fcvt.d.w[u]` is
+/// exact and uses the static mode, the rest round dynamically).
+pub(crate) fn fcvt_float_from_int(signed: bool, int_width: u32, float_width: u32, rd: u32, rs1: u32) -> u32 {
+    let rm = if float_width == 64 && int_width == 32 { RM_RNE } else { RM_DYN };
+    fp_op(0b11010, float_width, rm, rd, rs1, int_kind(signed, int_width))
+}
+/// `fmv.x.w` (sign-extending) / `fmv.x.d`.
+pub(crate) fn fmv_x_f(width: u32, rd: u32, rs1: u32) -> u32 {
+    fp_op(0b11100, width, 0, rd, rs1, 0)
+}
+/// `fmv.w.x` / `fmv.d.x`.
+pub(crate) fn fmv_f_x(width: u32, rd: u32, rs1: u32) -> u32 {
+    fp_op(0b11110, width, 0, rd, rs1, 0)
+}
+/// `flw`/`fld rd, imm(rs1)` for a byte `size` of 4 or 8.
+pub(crate) fn fload(size: u64, rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_type(imm, rs1, if size == 4 { 2 } else { 3 }, rd, 0x07)
+}
+/// `fsw`/`fsd rs2, imm(rs1)` for a byte `size` of 4 or 8.
+pub(crate) fn fstore(size: u64, rs2: u32, rs1: u32, imm: i32) -> u32 {
+    s_type(imm, rs2, rs1, if size == 4 { 2 } else { 3 }, 0x27)
+}
+
 /// A load `l{b,h,w,d}{,u} rd, imm(rs1)` for a byte `size` (unsigned for sub-word,
 /// matching the interpreter's zero-extending load model). `funct3`: `ld`=011,
 /// `lwu`=110, `lhu`=101, `lbu`=100.
@@ -363,43 +457,58 @@ fn emit_li(b: &mut RvBuf, rd: u32, val: i64) {
 // Frame layout + prologue/epilogue
 // ===========================================================================
 
-/// The stack-frame layout of one function, computed after allocation. All slot
-/// offsets are `sp`-relative and non-negative: `sp` is fixed for the whole body
-/// (no dynamic stack growth), so `off(sp)` addressing is stable.
+/// The stack-frame layout of one function, computed after allocation. All
+/// offsets are relative to the frame base: `sp` right after the prologue's
+/// allocation, which stays put for the whole body unless the function uses
+/// `dyn_alloca` — then the base is kept in the frame pointer `s0`.
 #[derive(Clone, Debug)]
 pub struct FrameLayout {
-    /// `sp`-relative byte offset of each stack slot (by slot index).
+    /// Base-relative byte offset of each stack slot (by slot index).
     slot_off: Vec<u64>,
-    /// The registers saved across the body: `ra` (when the function calls) then
-    /// the callee-saved registers the allocation used.
+    /// The registers saved across the body: `ra` (when the function calls),
+    /// then the callee-saved integer and floating-point registers the
+    /// allocation used (and `s0` in a frame-pointer function).
     saved: Vec<PReg>,
-    /// `sp`-relative byte offset each saved register is stored at.
+    /// Base-relative byte offset each saved register is stored at.
     saved_off: Vec<u64>,
     /// The total frame size subtracted from `sp` (16-byte aligned).
     size: u64,
-    /// Whether the prologue's `sp` adjustment emits stack probes.
+    /// The outgoing stack-argument area at the bottom of the frame.
+    outgoing: u64,
+    /// Whether the function addresses its frame through `s0`.
+    frame_pointer: bool,
+    /// Whether the function calls (`ra` is saved).
+    has_call: bool,
+    /// Whether the prologue's `sp` adjustment (and any `dyn_alloca`) emits
+    /// stack probes.
     probes: bool,
 }
 
 impl FrameLayout {
+    /// The register frame slots are addressed from: `s0` in a frame-pointer
+    /// function, else `sp`.
+    fn base(&self) -> u32 {
+        if self.frame_pointer { FP.into() } else { SP.into() }
+    }
+
     /// The stack usage this layout gives `mf` (whose MIR supplies the call
     /// information; `func_name` resolves a function index — the callees and `mf`
     /// itself — to its symbol name): the single `addi sp, sp, -size`, which also
-    /// covers the saved `ra`/callee-saved registers. `jal` pushes nothing.
+    /// covers the saved registers and the outgoing arguments. `jal` pushes
+    /// nothing.
     pub fn stack_usage(
         &self,
         mf: &MachineFunction,
         func_name: &dyn Fn(u32) -> String,
     ) -> StackUsage {
-        let scan = scan_calls(mf, RvOp::Call.opcode(), RvOp::Ecall.opcode(), None);
+        let scan = scan_calls(mf, RvOp::Call.opcode(), RvOp::Ecall.opcode(), Some(RvOp::DynAlloca.opcode()));
         StackUsage {
             name: func_name(mf.info().source),
             frame_size: self.size,
             return_address: 0,
             saved_registers: 8 * self.saved.len() as u64,
             sp_adjust: self.size,
-            // No stack-passed arguments on this target yet.
-            outgoing_args: 0,
+            outgoing_args: self.outgoing,
             dynamic_alloca: scan.dynamic_alloca,
             direct_callees: scan.direct.iter().map(|&f| func_name(f)).collect(),
             indirect_calls: scan.indirect,
@@ -432,7 +541,7 @@ pub fn layout_frame_with(
 
     // Which callee-saved registers does the allocation actually define, and does
     // the function contain a call (so `ra` must be preserved)?
-    let mut used = [false; 32];
+    let mut used = [[false; 32]; 2];
     let mut has_call = false;
     for bid in mf.block_ids() {
         for inst in &mf.block(bid).insts {
@@ -440,24 +549,28 @@ pub fn layout_frame_with(
                 has_call = true;
             }
             for d in inst.defs() {
-                if let Reg::Physical(p) = d
-                    && p.class == RegClass::Gpr
-                {
-                    used[p.num as usize] = true;
+                if let Reg::Physical(p) = d {
+                    used[usize::from(p.class == RegClass::Fp)][p.num as usize] = true;
                 }
             }
         }
+    }
+    let frame_pointer = target.frame_pointer();
+    if frame_pointer {
+        used[0][FP as usize] = true;
     }
 
     let mut saved: Vec<PReg> = Vec::new();
     if has_call {
         saved.push(super::regs::gpr(RA));
     }
-    saved.extend(callee.into_iter().filter(|p| used[p.num as usize]));
+    saved.extend(callee.into_iter().filter(|p| used[usize::from(p.class == RegClass::Fp)][p.num as usize]));
 
-    // Saved registers live at the bottom of the frame, 8 bytes each.
-    let saved_off: Vec<u64> = (0..saved.len()).map(|i| (i * 8) as u64).collect();
-    let mut off = (saved.len() * 8) as u64;
+    // From `sp` up: the outgoing arguments, the saved registers (8 bytes
+    // each), then the slots.
+    let outgoing = align_up(mf.frame().outgoing(), 16);
+    let saved_off: Vec<u64> = (0..saved.len()).map(|i| outgoing + (i * 8) as u64).collect();
+    let mut off = outgoing + (saved.len() * 8) as u64;
 
     // Local slots (spills/allocas) sit above the saved region, each 8-aligned.
     let mut slot_off = vec![0u64; mf.frame().len()];
@@ -470,7 +583,16 @@ pub fn layout_frame_with(
     }
     let size = align_up(off, 16);
 
-    FrameLayout { slot_off, saved, saved_off, size, probes: opts.stack_probes }
+    FrameLayout {
+        slot_off,
+        saved,
+        saved_off,
+        size,
+        outgoing,
+        frame_pointer,
+        has_call,
+        probes: opts.stack_probes,
+    }
 }
 
 fn def_preg(r: PReg) -> MachineOperand {
@@ -487,7 +609,7 @@ fn imm_op(v: i64) -> MachineOperand {
 pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) {
     let entry = mf.entry().expect("a function being compiled has an entry block");
 
-    // --- prologue: addi sp, sp, -size; sd ra/cs, off(sp) ---
+    // --- prologue: addi sp, sp, -size; sd/fsd saved, off(sp); [mv s0, sp] ---
     let mut prologue = Vec::new();
     if layout.size > 0 {
         // The second operand requests the probed form.
@@ -499,17 +621,28 @@ pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) 
     for (&r, &off) in layout.saved.iter().zip(&layout.saved_off) {
         prologue.push(MachineInst::new(RvOp::SaveReg.opcode(), vec![use_preg(r), imm_op(off as i64)]));
     }
+    // The saved `ra` sits above the outgoing area: touch the frame's bottom
+    // so a callee's probe sequence starts within one interval of a touch.
+    if layout.probes && layout.has_call && layout.outgoing > 0 {
+        prologue.push(MachineInst::new(RvOp::TouchSp.opcode(), Vec::new()));
+    }
+    if layout.frame_pointer {
+        prologue.push(MachineInst::new(RvOp::FpSetup.opcode(), Vec::new()));
+    }
     let old = std::mem::take(&mut mf.block_mut(entry).insts);
     prologue.extend(old);
     mf.block_mut(entry).insts = prologue;
 
-    // --- epilogue before each Ret: ld ra/cs; addi sp, sp, +size ---
+    // --- epilogue before each Ret: [mv sp, s0]; ld/fld saved; addi sp, sp, +size ---
     let block_ids: Vec<_> = mf.block_ids().collect();
     for bid in block_ids {
         let old = std::mem::take(&mut mf.block_mut(bid).insts);
         let mut new_insts = Vec::with_capacity(old.len());
         for inst in old {
             if RvOp::decode(inst.opcode) == RvOp::Ret {
+                if layout.frame_pointer {
+                    new_insts.push(MachineInst::new(RvOp::FpRestore.opcode(), Vec::new()));
+                }
                 for (&r, &off) in layout.saved.iter().zip(&layout.saved_off) {
                     new_insts.push(MachineInst::new(
                         RvOp::RestoreReg.opcode(),
@@ -540,6 +673,11 @@ fn rnum(op: &MachineOperand) -> u32 {
         }
         other => panic!("expected a physical register operand, found {other:?}"),
     }
+}
+
+/// Whether a register operand is a floating-point register.
+fn is_fp(op: &MachineOperand) -> bool {
+    matches!(op, MachineOperand::Def(Reg::Physical(p)) | MachineOperand::Use(Reg::Physical(p)) if p.class == RegClass::Fp)
 }
 
 fn simm(op: &MachineOperand) -> i64 {
@@ -580,15 +718,54 @@ enum FixupKind {
     JType,
 }
 
-/// The little-endian 32-bit-word buffer with a branch-fixup table.
+/// What a relocation of the encoded code refers to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum RelocTarget {
+    /// A named symbol (a function or global).
+    Symbol(String),
+    /// The `auipc` at this byte offset of the same function: the target of a
+    /// `R_RISCV_PCREL_LO12_*`, which the module driver turns into a local
+    /// `.Lpcrel_hiN` label symbol.
+    HiLabel(u64),
+}
+
+/// One relocation of an encoded function.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct RvReloc {
+    /// Byte offset of the patched instruction within the function.
+    pub(crate) offset: u64,
+    pub(crate) target: RelocTarget,
+    pub(crate) kind: RelocKind,
+}
+
+/// The little-endian 32-bit-word buffer with a branch-fixup table and the
+/// relocations of its external references.
 struct RvBuf {
     bytes: Vec<u8>,
     fixups: Vec<Fixup>,
+    relocs: Vec<RvReloc>,
 }
 
 impl RvBuf {
     fn new() -> RvBuf {
-        RvBuf { bytes: Vec::new(), fixups: Vec::new() }
+        RvBuf { bytes: Vec::new(), fixups: Vec::new(), relocs: Vec::new() }
+    }
+
+    /// Record a relocation of `kind` on the next instruction word.
+    fn reloc(&mut self, kind: RelocKind, target: RelocTarget) {
+        self.relocs.push(RvReloc { offset: self.offset(), target, kind });
+    }
+
+    /// Emit `auipc d, 0` + a low-part instruction forming the address of
+    /// `sym`: PC-relative (`addi`), or loaded from its GOT entry (`ld`) with
+    /// `got`. See the module docs for the relocations.
+    fn sym_addr(&mut self, d: u32, sym: String, got: bool) {
+        let at = self.offset();
+        let hi = if got { RelocKind::RiscvGotHi20 } else { RelocKind::RiscvPcrelHi20 };
+        self.reloc(hi, RelocTarget::Symbol(sym));
+        self.word(auipc(d, 0));
+        self.reloc(RelocKind::RiscvPcrelLo12I, RelocTarget::HiLabel(at));
+        self.word(if got { load(8, d, d, 0) } else { addi(d, d, 0) });
     }
 
     #[inline]
@@ -641,9 +818,14 @@ fn j_imm_mask() -> u32 {
     (1 << 31) | (0x3FF << 21) | (1 << 20) | (0xFF << 12)
 }
 
-/// What the encoder needs to resolve frame offsets while emitting.
+/// What the encoder needs to resolve frame offsets and symbol names while
+/// emitting.
 struct EncodeCtx<'a> {
     layout: &'a FrameLayout,
+    /// The symbol name of a module function, by index.
+    func_name: &'a dyn Fn(u32) -> String,
+    /// The symbol name of a module global, by index.
+    global_name: &'a dyn Fn(u32) -> String,
 }
 
 /// Whether a signed byte offset fits the 12-bit immediate of a load/store/`addi`.
@@ -652,22 +834,31 @@ fn fits12(off: i64) -> bool {
     (-2048..=2047).contains(&off)
 }
 
-/// Emit `sd`/`ld reg, off(sp)`, materializing a large `off` through `t6`.
-fn frame_mem(b: &mut RvBuf, is_load: bool, reg: u32, off: i64) {
-    if fits12(off) {
-        if is_load {
-            b.word(load(8, reg, SP.into(), off as i32));
-        } else {
-            b.word(store(8, reg, SP.into(), off as i32));
-        }
+/// Emit `sd`/`ld` (`fsd`/`fld` with `fp`) `reg, off(base)`, materializing a
+/// large `off` through `t6`.
+fn frame_mem(b: &mut RvBuf, is_load: bool, fp: bool, reg: u32, base: u32, off: i64) {
+    let (base, off) = if fits12(off) {
+        (base, off)
     } else {
         emit_li(b, T6.into(), off);
-        b.word(add(T6.into(), SP.into(), T6.into()));
-        if is_load {
-            b.word(load(8, reg, T6.into(), 0));
-        } else {
-            b.word(store(8, reg, T6.into(), 0));
-        }
+        b.word(add(T6.into(), base, T6.into()));
+        (T6.into(), 0)
+    };
+    b.word(match (is_load, fp) {
+        (true, false) => load(8, reg, base, off as i32),
+        (false, false) => store(8, reg, base, off as i32),
+        (true, true) => fload(8, reg, base, off as i32),
+        (false, true) => fstore(8, reg, base, off as i32),
+    });
+}
+
+/// `d = base + off`, through `t6` for a large `off`.
+fn addr_of(b: &mut RvBuf, d: u32, base: u32, off: i64) {
+    if fits12(off) {
+        b.word(addi(d, base, off as i32));
+    } else {
+        emit_li(b, T6.into(), off);
+        b.word(add(d, base, T6.into()));
     }
 }
 
@@ -714,8 +905,12 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         RvOp::Mv => {
             let d = rnum(&ops[0]);
             let s = rnum(&ops[1]);
-            if d != s {
-                b.word(mv(d, s));
+            match (is_fp(&ops[0]), is_fp(&ops[1])) {
+                (false, false) if d != s => b.word(mv(d, s)),
+                (true, true) if d != s => b.word(fsgnj(64, 0, d, s, s)),
+                (true, false) => b.word(fmv_f_x(64, d, s)),
+                (false, true) => b.word(fmv_x_f(64, d, s)),
+                _ => {}
             }
         }
         RvOp::Li => emit_li(b, rnum(&ops[0]), simm(&ops[1])),
@@ -746,34 +941,82 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let d = rnum(&ops[0]);
             let ptr = rnum(&ops[1]);
             let size = simm(&ops[2]) as u64;
-            b.word(load(size, d, ptr, 0));
+            b.word(if is_fp(&ops[0]) { fload(size, d, ptr, 0) } else { load(size, d, ptr, 0) });
         }
         RvOp::Store => {
             let ptr = rnum(&ops[0]);
             let val = rnum(&ops[1]);
             let size = simm(&ops[2]) as u64;
-            b.word(store(size, val, ptr, 0));
+            b.word(if is_fp(&ops[1]) { fstore(size, val, ptr, 0) } else { store(size, val, ptr, 0) });
         }
         RvOp::FrameAddr => {
-            let d = rnum(&ops[0]);
             let off = ctx.layout.slot_off[slot_index(&ops[1])] as i64;
-            if fits12(off) {
-                b.word(addi(d, SP.into(), off as i32));
-            } else {
-                emit_li(b, T6.into(), off);
-                b.word(add(d, SP.into(), T6.into()));
-            }
+            addr_of(b, rnum(&ops[0]), ctx.layout.base(), off);
         }
         RvOp::StoreFrame => {
             let off = ctx.layout.slot_off[slot_index(&ops[1])] as i64;
-            frame_mem(b, false, rnum(&ops[0]), off);
+            frame_mem(b, false, is_fp(&ops[0]), rnum(&ops[0]), ctx.layout.base(), off);
         }
         RvOp::LoadFrame => {
             let off = ctx.layout.slot_off[slot_index(&ops[1])] as i64;
-            frame_mem(b, true, rnum(&ops[0]), off);
+            frame_mem(b, true, is_fp(&ops[0]), rnum(&ops[0]), ctx.layout.base(), off);
         }
-        RvOp::SaveReg => frame_mem(b, false, rnum(&ops[0]), simm(&ops[1])),
-        RvOp::RestoreReg => frame_mem(b, true, rnum(&ops[0]), simm(&ops[1])),
+        RvOp::SaveReg => frame_mem(b, false, is_fp(&ops[0]), rnum(&ops[0]), SP.into(), simm(&ops[1])),
+        RvOp::RestoreReg => frame_mem(b, true, is_fp(&ops[0]), rnum(&ops[0]), SP.into(), simm(&ops[1])),
+        RvOp::LeaSp => addr_of(b, rnum(&ops[0]), SP.into(), simm(&ops[1])),
+        RvOp::LeaInArg => {
+            let off = ctx.layout.size as i64 + simm(&ops[1]);
+            addr_of(b, rnum(&ops[0]), ctx.layout.base(), off);
+        }
+        RvOp::FpSetup => b.word(mv(FP.into(), SP.into())),
+        RvOp::FpRestore => b.word(mv(SP.into(), FP.into())),
+        RvOp::TouchSp => b.word(store(8, ZERO.into(), SP.into(), 0)),
+        RvOp::DynAlloca => encode_dyn_alloca(b, ops, ctx.layout),
+        RvOp::FAdd | RvOp::FSub | RvOp::FMul | RvOp::FDiv => {
+            let f5 = match RvOp::decode(inst.opcode) {
+                RvOp::FAdd => 0b00000,
+                RvOp::FSub => 0b00001,
+                RvOp::FMul => 0b00010,
+                _ => 0b00011,
+            };
+            let w = simm(&ops[3]) as u32;
+            b.word(fp_op(f5, w, RM_DYN, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2])));
+        }
+        RvOp::FMadd => {
+            let (w, kind) = (simm(&ops[4]) as u32, simm(&ops[5]) as u32);
+            b.word(fmadd(kind, w, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), rnum(&ops[3])));
+        }
+        RvOp::FSgnj => {
+            let (w, f3) = (simm(&ops[3]) as u32, simm(&ops[4]) as u32);
+            b.word(fsgnj(w, f3, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2])));
+        }
+        RvOp::FCmp => encode_fcmp(b, ops),
+        RvOp::FLi => {
+            let (d, bits, w) = (rnum(&ops[0]), simm(&ops[1]) as u64, simm(&ops[2]) as u32);
+            if bits == 0 {
+                b.word(fmv_f_x(w, d, ZERO.into()));
+            } else {
+                // A single's pattern is materialized sign-extended (cheaper,
+                // and `fmv.w.x` reads only the low word).
+                let v = if w == 32 { i64::from(bits as u32 as i32) } else { bits as i64 };
+                emit_li(b, T0.into(), v);
+                b.word(fmv_f_x(w, d, T0.into()));
+            }
+        }
+        RvOp::FCvtFF => {
+            let (dw, sw) = (simm(&ops[2]) as u32, simm(&ops[3]) as u32);
+            b.word(fcvt_ff(dw, sw, rnum(&ops[0]), rnum(&ops[1])));
+        }
+        RvOp::FCvtFI => {
+            let (signed, iw, fw) = (simm(&ops[2]) != 0, simm(&ops[3]) as u32, simm(&ops[4]) as u32);
+            b.word(fcvt_int_from_float(signed, iw, fw, rnum(&ops[0]), rnum(&ops[1])));
+        }
+        RvOp::FCvtIF => {
+            let (signed, iw, fw) = (simm(&ops[2]) != 0, simm(&ops[3]) as u32, simm(&ops[4]) as u32);
+            b.word(fcvt_float_from_int(signed, iw, fw, rnum(&ops[0]), rnum(&ops[1])));
+        }
+        RvOp::FMvXF => b.word(fmv_x_f(simm(&ops[2]) as u32, rnum(&ops[0]), rnum(&ops[1]))),
+        RvOp::FMvFX => b.word(fmv_f_x(simm(&ops[2]) as u32, rnum(&ops[0]), rnum(&ops[1]))),
         RvOp::AddiSp => {
             let delta = simm(&ops[0]);
             let probe = ops.get(1).is_some_and(|o| simm(o) != 0);
@@ -786,15 +1029,19 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
                 b.word(add(SP.into(), SP.into(), T6.into()));
             }
         }
-        RvOp::GlobalAddr => {
-            // Placeholder (relocations deferred): auipc d, 0; addi d, d, 0.
+        RvOp::GlobalAddr | RvOp::FuncAddr => {
             let d = rnum(&ops[0]);
-            b.word(auipc(d, 0));
-            b.word(addi(d, d, 0));
+            let name = match &ops[1] {
+                MachineOperand::Global(g) => (ctx.global_name)(*g),
+                MachineOperand::Func(f) => (ctx.func_name)(*f),
+                other => panic!("an address of a non-symbol {other:?}"),
+            };
+            b.sym_addr(d, name, ops.get(2).is_some_and(|o| simm(o) != 0));
         }
         RvOp::Call => match &ops[0] {
-            // Placeholder self-relative call (relocations deferred).
-            MachineOperand::Func(_) => {
+            // auipc ra, 0; jalr ra, 0(ra) under one R_RISCV_CALL_PLT.
+            MachineOperand::Func(f) => {
+                b.reloc(RelocKind::RiscvCallPlt, RelocTarget::Symbol((ctx.func_name)(*f)));
                 b.word(auipc(RA.into(), 0));
                 b.word(jalr(RA.into(), RA.into(), 0));
             }
@@ -836,6 +1083,93 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         }
         RvOp::AtomicRmw => encode_atomic_rmw(b, ops),
         RvOp::CmpXchg => encode_cmpxchg(b, ops),
+    }
+}
+
+// ===========================================================================
+// Floating-point compares and dynamic allocation
+// ===========================================================================
+
+/// Expand [`RvOp::FCmp`] (`[Def d, Use a, Use b, Imm code, Imm width]`, see
+/// [`super::isel::fcmp_code`]): `feq`/`flt`/`fle` (with the operands
+/// swapped for `>`), `and`/`or` with a second compare into `t0` for
+/// `ord`/`one`, and an `xori d, d, 1` for the unordered (negated) codes.
+fn encode_fcmp(b: &mut RvBuf, ops: &[MachineOperand]) {
+    let (d, x, y) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]));
+    let code = simm(&ops[3]) as u32;
+    let w = simm(&ops[4]) as u32;
+    let t0: u32 = T0.into();
+    const FEQ: u32 = 2;
+    const FLT: u32 = 1;
+    const FLE: u32 = 0;
+    match code & 7 {
+        0 => b.word(fcmp(w, FEQ, d, x, y)),
+        1 => b.word(fcmp(w, FLT, d, x, y)),
+        2 => b.word(fcmp(w, FLE, d, x, y)),
+        3 => b.word(fcmp(w, FLT, d, y, x)),
+        4 => b.word(fcmp(w, FLE, d, y, x)),
+        5 => {
+            b.word(fcmp(w, FEQ, t0, x, x));
+            b.word(fcmp(w, FEQ, d, y, y));
+            b.word(and(d, d, t0));
+        }
+        _ => {
+            b.word(fcmp(w, FLT, t0, x, y));
+            b.word(fcmp(w, FLT, d, y, x));
+            b.word(or(d, d, t0));
+        }
+    }
+    if code & 8 != 0 {
+        b.word(xori(d, d, 1));
+    }
+}
+
+/// Expand [`RvOp::DynAlloca`] (`[Def d, Use n, Imm align]`; see the module
+/// docs): round the size up to 16, add room for the relocated outgoing area
+/// and any alignment slack, move `sp` down (one probed page at a time when
+/// probes are on), and return the block's (aligned) address.
+fn encode_dyn_alloca(b: &mut RvBuf, ops: &[MachineOperand], layout: &FrameLayout) {
+    let (d, n) = (rnum(&ops[0]), rnum(&ops[1]));
+    let align = (simm(&ops[2]) as u64).max(1);
+    let (t0, t1, sp, zero): (u32, u32, u32, u32) = (T0.into(), T1.into(), SP.into(), ZERO.into());
+    // Slack so the pointer can be rounded up to a large alignment inside the
+    // block; `sp` itself stays 16-aligned.
+    let extra = if align > 16 { align } else { 0 };
+    let c = (layout.outgoing + extra) as i64;
+    b.word(addi(t0, n, 15));
+    b.word(andi(t0, t0, -16));
+    if c != 0 {
+        if fits12(c) {
+            b.word(addi(t0, t0, c as i32));
+        } else {
+            emit_li(b, t1, c);
+            b.word(add(t0, t0, t1));
+        }
+    }
+    if layout.probes {
+        // Touch the current top, then step down a page at a time, touching
+        // each step, until less than a page remains.
+        b.word(store(8, zero, sp, 0));
+        b.word(lui(t1, (STACK_PROBE_INTERVAL >> 12) as u32)); // t1 = 4096
+        b.word(bcmp(6, t0, t1, 20)); // L: bltu t0, t1, done
+        b.word(sub(sp, sp, t1));
+        b.word(store(8, zero, sp, 0));
+        b.word(sub(t0, t0, t1));
+        b.word(jal(zero, -16)); // j L
+    }
+    b.word(sub(sp, sp, t0)); // done:
+    addr_of(b, d, sp, layout.outgoing as i64);
+    if align > 16 {
+        let mask = -(align as i64);
+        if fits12(align as i64 - 1) && fits12(mask) {
+            b.word(addi(d, d, (align - 1) as i32));
+            b.word(andi(d, d, mask as i32));
+        } else {
+            emit_li(b, t1, align as i64 - 1);
+            b.word(add(d, d, t1));
+            emit_li(b, t1, mask);
+            b.word(and(d, d, t1));
+        }
     }
 }
 
@@ -1132,10 +1466,42 @@ fn encode_select(b: &mut RvBuf, ops: &[MachineOperand]) {
 // Function + module drivers
 // ===========================================================================
 
-/// Encode an allocated, prologue-inserted machine function into bytes.
-pub fn encode_function(mf: &MachineFunction, layout: &FrameLayout) -> Emitted {
+/// Encode an allocated, prologue-inserted machine function into bytes and
+/// relocations (`func_name`/`global_name` name the referenced symbols). A
+/// `R_RISCV_PCREL_LO12_*` refers to the local label `.Lpcrel_hi<offset>` on
+/// its `auipc` (the module driver renames these to unique labels and defines
+/// them).
+pub fn encode_function(
+    mf: &MachineFunction,
+    layout: &FrameLayout,
+    func_name: &dyn Fn(u32) -> String,
+    global_name: &dyn Fn(u32) -> String,
+) -> Emitted {
+    let (bytes, relocs) = encode_function_rv(mf, layout, func_name, global_name);
+    let relocations = relocs
+        .into_iter()
+        .map(|r| EmittedReloc {
+            offset: r.offset,
+            symbol: match r.target {
+                RelocTarget::Symbol(s) => s,
+                RelocTarget::HiLabel(at) => format!(".Lpcrel_hi{at}"),
+            },
+            kind: r.kind,
+            addend: 0,
+        })
+        .collect();
+    Emitted { bytes, relocations }
+}
+
+/// [`encode_function`] with the relocations in their structured form.
+fn encode_function_rv(
+    mf: &MachineFunction,
+    layout: &FrameLayout,
+    func_name: &dyn Fn(u32) -> String,
+    global_name: &dyn Fn(u32) -> String,
+) -> (Vec<u8>, Vec<RvReloc>) {
     let mut b = RvBuf::new();
-    let ctx = EncodeCtx { layout };
+    let ctx = EncodeCtx { layout, func_name, global_name };
 
     // Emit the entry block first (so the function symbol at offset 0 is the
     // entry), then the remaining blocks in arena order.
@@ -1154,54 +1520,118 @@ pub fn encode_function(mf: &MachineFunction, layout: &FrameLayout) -> Emitted {
         }
     }
     b.resolve(&block_off);
-    Emitted { bytes: b.bytes, relocations: Vec::new() }
+    (b.bytes, b.relocs)
 }
 
 /// Run isel → register allocation → frame layout → prologue/epilogue →
-/// encoding for one function under `opts`, returning the code and its stack
-/// usage (`func_name` names the callees).
+/// encoding for one function under `opts`, returning the code, its
+/// relocations and its stack usage (`func_name`/`global_name` name the
+/// referenced symbols).
 fn compile_function_full(
     module: &Module,
+    syms: &StrInterner,
     func: crate::ir::FuncId,
     opts: &CodegenOptions,
     func_name: &dyn Fn(u32) -> String,
-) -> (Emitted, StackUsage) {
-    let target = RiscvTarget::new();
+    global_name: &dyn Fn(u32) -> String,
+) -> (Vec<u8>, Vec<RvReloc>, StackUsage) {
+    let target = target_for(module, func, Some(syms), opts);
     let mut mf = target.select(module, func);
     regalloc::allocate(&mut mf, &target);
     let layout = layout_frame_with(&mf, &target, opts);
     insert_prologue_epilogue(&mut mf, &layout);
     let stack = layout.stack_usage(&mf, func_name);
-    (encode_function(&mf, &layout), stack)
+    let (bytes, relocs) = encode_function_rv(&mf, &layout, func_name, global_name);
+    (bytes, relocs, stack)
 }
 
-/// Compile one function of `module` to its encoded bytes. Runs isel → register
-/// allocation → frame layout → prologue/epilogue → encoding.
+/// The target for compiling function `func` of `module`: PIC addressing per
+/// `opts`, `fmod`/`fmodf` found through `syms`, and a frame pointer when the
+/// function uses `dyn_alloca`.
+pub(crate) fn target_for(
+    module: &Module,
+    func: crate::ir::FuncId,
+    syms: Option<&StrInterner>,
+    opts: &CodegenOptions,
+) -> RiscvTarget {
+    let f = module.function(func);
+    let dynamic = f
+        .blocks()
+        .flat_map(|(_, b)| b.insts().iter().copied())
+        .any(|i| matches!(f.inst(i).kind, crate::ir::InstKind::DynAlloca { .. }));
+    RiscvTarget::for_module(module, syms, opts).with_frame_pointer(dynamic)
+}
+
+/// Prepare a (vector-legalized) module for this backend: `frem` calls C's
+/// `fmod`/`fmodf`, so a module using it gets those declared (in a copy with a
+/// fresh interner, the module's own being shared). `None` when nothing needs
+/// changing.
+pub(crate) fn prepare(module: &Module, syms: &StrInterner) -> Option<(Module, StrInterner)> {
+    use crate::ir::{BinOp, InstKind, Type};
+    let mut widths = [false; 2];
+    for f in module.functions() {
+        for (_, b) in f.blocks() {
+            for &i in b.insts() {
+                let inst = f.inst(i);
+                if inst.kind == InstKind::Bin(BinOp::FRem)
+                    && let Type::Float(k) = module.types().get(inst.ty)
+                {
+                    widths[usize::from(k.bit_width() == 64)] = true;
+                }
+            }
+        }
+    }
+    let has = |name: &str| module.functions().any(|f| syms.resolve(f.name) == name);
+    let need: Vec<(&str, crate::ir::FloatKind)> = [("fmodf", crate::ir::FloatKind::F32), ("fmod", crate::ir::FloatKind::F64)]
+        .into_iter()
+        .zip(widths)
+        .filter(|&((name, _), used)| used && !has(name))
+        .map(|(n, _)| n)
+        .collect();
+    if need.is_empty() {
+        return None;
+    }
+    let bytes = crate::ir::binary::encode(module, syms);
+    let mut s = StrInterner::new();
+    let mut m = crate::ir::binary::decode(&bytes, &mut s).expect("a module round-trips through its binary form");
+    for (name, kind) in need {
+        let t = m.types_mut().float(kind);
+        let sig = m.types_mut().func(vec![t, t], t, false);
+        m.declare_function(s.intern(name), sig);
+    }
+    Some((m, s))
+}
+
+/// Compile one function of `module` to its encoded bytes and relocations
+/// (symbols named `f<index>` / `g<index>`). Runs isel → register allocation →
+/// frame layout → prologue/epilogue → encoding. A function using `frem`
+/// needs [`compile_module`] (which declares `fmod`).
 pub fn compile_function(module: &Module, func: crate::ir::FuncId) -> Emitted {
-    let name = |idx: u32| format!("f{idx}");
+    let fname = |idx: u32| format!("f{idx}");
+    let gname = |idx: u32| format!("g{idx}");
     let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
-    compile_function_full(&legal, func, &CodegenOptions::default(), &name).0
+    let opts = CodegenOptions::default();
+    let target = target_for(&legal, func, None, &opts);
+    let mut mf = target.select(&legal, func);
+    regalloc::allocate(&mut mf, &target);
+    let layout = layout_frame_with(&mf, &target, &opts);
+    insert_prologue_epilogue(&mut mf, &layout);
+    encode_function(&mf, &layout, &fname, &gname)
 }
 
 /// Compile every defined function of `module` into a relocatable
-/// [`ObjectModule`]: a single `.text` section with one global function symbol per
-/// definition. Call/global relocations are deferred (see the module docs), so a
-/// module whose functions are not self-contained links only after that follow-up.
-/// `syms` resolves the interned function names. Uses the default
-/// [`CodegenOptions`] (stack probes on); see [`compile_module_with`].
+/// [`ObjectModule`]: a `.text` section with one global function symbol per
+/// definition, the call/address relocations against (undefined-if-new)
+/// symbols, and every defined global's storage (`.rodata`/`.data`/`.bss`, see
+/// [`crate::codegen::data`]). `syms` resolves the interned names. Uses the
+/// default [`CodegenOptions`] (stack probes on); see [`compile_module_with`].
+/// Write it as an ELF object with [`super::write_elf`].
 pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
     compile_module_with(module, syms, &CodegenOptions::default()).object
 }
 
 /// Like [`compile_module`], under `opts`, and also returning every defined
 /// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
-///
-/// # Panics
-///
-/// If `opts` asks for position-independent code
-/// ([`RelocModel::is_pic`](crate::codegen::RelocModel::is_pic)): the RISC-V
-/// backend does not generate it yet. Use
-/// [`crate::target::compile_module_for`] to get that as an error instead.
 pub fn compile_module_with(
     module: &Module,
     syms: &StrInterner,
@@ -1210,23 +1640,32 @@ pub fn compile_module_with(
     if let Err(e) = crate::target::check_options(crate::target::TargetArch::Riscv64, opts) {
         panic!("{e}");
     }
-    // Vectors are scalarized for this target (no SIMD lowering yet; the
-    // generic legalizer keeps any vector code correct).
+    // Vectors are scalarized for this target (no V extension; the generic
+    // legalizer keeps any vector code correct).
     let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
-    let module: &Module = &legal;
+    let prepared = prepare(&legal, syms);
+    let (module, syms): (&Module, &StrInterner) = match &prepared {
+        Some((m, s)) => (m, s),
+        None => (&legal, syms),
+    };
     let mut obj = ObjectModule::new(module.name.clone());
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
     let mut stack = StackReport::new();
     let func_name = |idx: u32| -> String {
         syms.resolve(module.function(crate::ir::FuncId::from_index(idx as usize)).name).to_owned()
     };
+    let global_name = |idx: u32| -> String {
+        syms.resolve(module.global(crate::ir::GlobalId::from_index(idx as usize)).name).to_owned()
+    };
+    // `.Lpcrel_hiN` labels, numbered across the whole object.
+    let mut labels = 0usize;
 
     for (i, f) in module.functions().enumerate() {
         if f.is_declaration() {
             continue;
         }
         let fid = crate::ir::FuncId::from_index(i);
-        let (emitted, usage) = compile_function_full(module, fid, opts, &func_name);
+        let (bytes, relocs, usage) = compile_function_full(module, syms, fid, opts, &func_name, &global_name);
         stack.push(usage);
         // 4-align this function's start within .text (RV instructions are words).
         {
@@ -1236,8 +1675,8 @@ pub fn compile_module_with(
             }
         }
         let off = obj.section(text).bytes.len() as u64;
-        let len = emitted.bytes.len() as u64;
-        obj.section_mut(text).bytes.extend_from_slice(&emitted.bytes);
+        let len = bytes.len() as u64;
+        obj.section_mut(text).bytes.extend_from_slice(&bytes);
 
         let name = syms.resolve(f.name).to_owned();
         obj.add_symbol(Symbol::defined(
@@ -1248,7 +1687,35 @@ pub fn compile_module_with(
             off,
             len,
         ));
+        // Each `auipc` a low-part relocation points back to gets one label.
+        let mut label_of: std::collections::BTreeMap<u64, crate::mc::object::SymbolId> =
+            Default::default();
+        for r in &relocs {
+            let sym = match &r.target {
+                RelocTarget::Symbol(s) => obj.reference_symbol(s),
+                RelocTarget::HiLabel(at) => *label_of.entry(*at).or_insert_with(|| {
+                    labels += 1;
+                    obj.add_symbol(Symbol::defined(
+                        format!(".Lpcrel_hi{}", labels - 1),
+                        SymbolBinding::Local,
+                        SymbolType::NoType,
+                        text,
+                        off + at,
+                        0,
+                    ))
+                }),
+            };
+            obj.add_relocation(Relocation {
+                section: text,
+                offset: off + r.offset,
+                symbol: sym,
+                kind: r.kind,
+                addend: 0,
+            });
+        }
     }
+    // Every defined global's storage; pointer fields are `R_RISCV_64`.
+    crate::codegen::data::emit_globals(module, syms, &mut obj, RelocKind::Abs64);
     crate::codegen::linkage::apply_symbol_attrs(module, syms, &mut obj);
     CompiledModule { object: obj, stack }
 }

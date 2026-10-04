@@ -371,6 +371,25 @@ pub enum RelocKind {
     /// reference to a GOT pair (module id, offset) that `__tls_get_addr`
     /// takes, in the canonical `lea rdi, [rip + x@tlsgd]` sequence.
     TlsGd,
+    /// RISC-V `R_RISCV_CALL_PLT`: an `auipc ra` + `jalr ra` pair calling
+    /// `S + A` (through the PLT when `S` is preemptible): the PC-relative
+    /// displacement split across the `auipc`'s 20-bit and the `jalr`'s 12-bit
+    /// immediates (the field is both words, 8 bytes).
+    RiscvCallPlt,
+    /// RISC-V `R_RISCV_PCREL_HI20`: the high 20 bits of `S + A - P` (rounded
+    /// so the paired low 12 bits are signed) in an `auipc`'s U-type field.
+    RiscvPcrelHi20,
+    /// RISC-V `R_RISCV_PCREL_LO12_I`: the low 12 bits of the displacement
+    /// computed by the `R_RISCV_PCREL_HI20` or `R_RISCV_GOT_HI20` at the
+    /// address `S` (the *symbol is the label of the `auipc`*, not the target),
+    /// in an I-type immediate (`addi`, `ld`, ...).
+    RiscvPcrelLo12I,
+    /// RISC-V `R_RISCV_PCREL_LO12_S`: as [`RiscvPcrelLo12I`](RelocKind::RiscvPcrelLo12I)
+    /// for an S-type (store) immediate.
+    RiscvPcrelLo12S,
+    /// RISC-V `R_RISCV_GOT_HI20`: the high 20 bits of `G + GOT - P`, the
+    /// PC-relative address of `S`'s global-offset-table entry, in an `auipc`.
+    RiscvGotHi20,
 }
 
 impl RelocKind {
@@ -404,7 +423,13 @@ impl RelocKind {
             | RelocKind::Aarch64Ld64GotLo12Nc
             | RelocKind::ThumbCall
             | RelocKind::ThumbMovwAbsNc
-            | RelocKind::ThumbMovtAbs => 4,
+            | RelocKind::ThumbMovtAbs
+            | RelocKind::RiscvPcrelHi20
+            | RelocKind::RiscvPcrelLo12I
+            | RelocKind::RiscvPcrelLo12S
+            | RelocKind::RiscvGotHi20 => 4,
+            // An `auipc` + `jalr` pair.
+            RelocKind::RiscvCallPlt => 8,
         }
     }
 
@@ -437,6 +462,11 @@ impl RelocKind {
                 | RelocKind::Aarch64AdrGotPage
                 | RelocKind::ThumbCall
                 | RelocKind::Avr13Pcrel
+                | RelocKind::RiscvCallPlt
+                | RelocKind::RiscvPcrelHi20
+                | RelocKind::RiscvPcrelLo12I
+                | RelocKind::RiscvPcrelLo12S
+                | RelocKind::RiscvGotHi20
         )
     }
 
@@ -457,7 +487,8 @@ impl RelocKind {
     }
 
     /// Whether the relocation patches a bitfield inside an instruction rather
-    /// than a whole data field (the AArch64, Thumb and AVR instruction kinds).
+    /// than a whole data field (the AArch64, Thumb, AVR and RISC-V instruction
+    /// kinds).
     #[inline]
     pub fn is_instruction_field(self) -> bool {
         matches!(
@@ -476,6 +507,25 @@ impl RelocKind {
                 | RelocKind::AvrHi8Ldi
                 | RelocKind::AvrLo8LdiPm
                 | RelocKind::AvrHi8LdiPm
+                | RelocKind::RiscvCallPlt
+                | RelocKind::RiscvPcrelHi20
+                | RelocKind::RiscvPcrelLo12I
+                | RelocKind::RiscvPcrelLo12S
+                | RelocKind::RiscvGotHi20
+        )
+    }
+
+    /// Whether this is one of the RISC-V instruction kinds (which only the
+    /// RISC-V ELF writer understands).
+    #[inline]
+    pub fn is_riscv(self) -> bool {
+        matches!(
+            self,
+            RelocKind::RiscvCallPlt
+                | RelocKind::RiscvPcrelHi20
+                | RelocKind::RiscvPcrelLo12I
+                | RelocKind::RiscvPcrelLo12S
+                | RelocKind::RiscvGotHi20
         )
     }
 

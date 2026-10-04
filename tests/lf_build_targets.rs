@@ -63,6 +63,10 @@ fn objects_in_each_format() {
     assert_eq!(&macho[..8], &[0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1]);
     let macho = build_ok(&dir, &["-c", "--target", "arm64-apple-darwin"], "a.mo");
     assert_eq!(&macho[..8], &[0xcf, 0xfa, 0xed, 0xfe, 12, 0, 0, 1]);
+    // A RISC-V ELF64 object: EM_RISCV, the LP64D double-float ABI flag.
+    let rv = build_ok(&dir, &["-c", "--target", "riscv64-linux"], "r.o");
+    assert_eq!((rv[4], u16::from_le_bytes([rv[18], rv[19]])), (2, 243), "ELF64 EM_RISCV");
+    assert_eq!(u32::from_le_bytes(rv[48..52].try_into().unwrap()), 0x4, "EF_RISCV_FLOAT_ABI_DOUBLE");
     // --format overrides the triple's format (a Mach-O object of Linux code).
     let macho = build_ok(&dir, &["-c", "--format", "macho"], "f.mo");
     assert_eq!(&macho[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
@@ -126,8 +130,8 @@ fn unsupported_combinations_are_reported() {
     assert!(!ok && err.contains("oformat"), "{err}");
     let (ok, err) = lf(&dir, &["--target", "sparc-sun-solaris"]);
     assert!(!ok && err.contains("unknown target"), "{err}");
-    let (ok, err) = lf(&dir, &["-c", "--target", "riscv64-linux"]);
-    assert!(!ok && err.contains("ELF"), "{err}");
+    let (ok, err) = lf(&dir, &["-c", "--target", "riscv64-windows"]);
+    assert!(!ok && err.contains("COFF"), "{err}");
     let (ok, err) = lf(&dir, &["--format", "coff"]);
     assert!(!ok && err.contains("-c"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);

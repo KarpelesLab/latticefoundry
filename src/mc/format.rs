@@ -55,7 +55,7 @@ pub fn write_object(obj: &ObjectModule, triple: Triple) -> Result<Vec<u8>, Objec
 /// # Errors
 ///
 /// Returns an error when the format has no writer for `arch` (ELF is written
-/// for x86-64, AArch64, 32-bit Arm Thumb and AVR; COFF and Mach-O for x86-64 and
+/// for x86-64, AArch64, 32-bit Arm Thumb, AVR and RISC-V 64; COFF and Mach-O for x86-64 and
 /// AArch64; wasm for wasm32 only), or when the module holds a relocation the
 /// format cannot express.
 pub fn write_object_as(
@@ -74,6 +74,8 @@ pub fn write_object_as(
         }
         ObjectFormat::Elf if arch == TargetArch::Avr => crate::target::avr::write_elf(obj)
             .map_err(|e| ObjectWriteError::new(format!("cannot write an AVR ELF object: {e}"))),
+        ObjectFormat::Elf if arch == TargetArch::Riscv64 => crate::target::riscv::write_elf(obj)
+            .map_err(|e| ObjectWriteError::new(format!("cannot write a RISC-V ELF object: {e}"))),
         ObjectFormat::Elf => {
             if arch != TargetArch::X86_64 {
                 return Err(ObjectWriteError::new(format!(
@@ -82,7 +84,7 @@ pub fn write_object_as(
                 )));
             }
             if let Some(r) = obj.relocations().iter().find(|r| {
-                r.kind.is_instruction_field() || r.kind.is_avr()
+                r.kind.is_instruction_field() || r.kind.is_avr() || r.kind.is_riscv()
             }) {
                 return Err(ObjectWriteError::new(format!(
                     "relocation {:?} cannot appear in an x86-64 ELF object",

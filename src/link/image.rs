@@ -730,7 +730,12 @@ pub fn link_executable(
                     | RelocKind::AvrLo8Ldi
                     | RelocKind::AvrHi8Ldi
                     | RelocKind::AvrLo8LdiPm
-                    | RelocKind::AvrHi8LdiPm => {
+                    | RelocKind::AvrHi8LdiPm
+                    | RelocKind::RiscvCallPlt
+                    | RelocKind::RiscvPcrelHi20
+                    | RelocKind::RiscvPcrelLo12I
+                    | RelocKind::RiscvPcrelLo12S
+                    | RelocKind::RiscvGotHi20 => {
                     return Err(LinkError::UnsupportedReloc(r.kind));
                 }
             }

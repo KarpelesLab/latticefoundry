@@ -1,4 +1,4 @@
-//! The RISC-V RV64IM(A) machine opcode set ([`RvOp`]) and the integer
+//! The RISC-V RV64IMAFD machine opcode set ([`RvOp`]) and the
 //! instruction-selection rules.
 //!
 //! [`RvOp`] is this target's [`Opcode`] vocabulary: a *post-isel, pre-encoding*
@@ -16,12 +16,33 @@
 //! `x0` is hardwired zero: `mv rd, rs` is `addi rd, rs, 0`, a zero constant is a
 //! read of `x0`, `seqz`/`snez` compare against `x0`, and `ret` is `jalr x0, ra,
 //! 0`. Block arguments are realized by the framework's edge-move mechanism
-//! ([`Lower::edge_to`]). `call` moves arguments into the LP64 argument registers
-//! `a0`–`a7`, records `a0` and the caller-saved clobbers as fixed defs, and moves
-//! the result out of `a0`; `ret` moves its value into `a0`. The prologue moves
-//! incoming parameters out of the argument registers (framework prologue). RV64M
-//! has hardware divide/remainder, so `div`/`divu`/`rem`/`remu` lower directly —
+//! ([`Lower::edge_to`]). Calls, the entry prologue and returns follow the LP64D
+//! convention (the `abi` module): scalars in `a0`–`a7` / `fa0`–`fa7` (floats
+//! overflowing into integer registers, then 8-byte stack slots in the
+//! outgoing-argument area at the bottom of the caller's frame), by-value
+//! structs flattened into floating-point and integer registers or passed by
+//! reference, variadic arguments by the integer convention, and results in
+//! `a0`/`a1`/`fa0`/`fa1` or through a hidden `a0` pointer. A struct value is,
+//! at this level, a pointer to its storage (as on AArch64). RV64M has
+//! hardware divide/remainder, so `div`/`divu`/`rem`/`remu` lower directly —
 //! no fixed-register dance.
+//!
+//! ## Floating point (the F and D extensions)
+//!
+//! `f32`/`f64` values live in the `f` registers (`f32` NaN-boxed). Arithmetic
+//! is `fadd`/`fsub`/`fmul`/`fdiv` in the dynamic rounding mode
+//! (round-to-nearest-even under the default `fcsr`, as the IR requires); a
+//! multiply feeding an add or subtract becomes one fused `fmadd`/`fmsub`/
+//! `fnmsub` **only** when both carry `contract` (the IR's license to skip the
+//! intermediate rounding). `fneg` is sign injection (`fsgnjn`), exact for
+//! NaNs. `fcmp` is `feq`/`flt`/`fle` (which yield 0 for unordered operands)
+//! with an `xori` for the unordered predicates, and `and`/`or` for `ord`/`one`
+//! — no branch. Float-to-integer conversions truncate (`rtz`) with the
+//! saturating `fcvt.{w,wu,l,lu}` (an out-of-range input is poison in the IR,
+//! so saturation refines it), integer-to-float conversions use the 32-bit
+//! forms for `i32` and extend anything narrower to 64 bits first, and
+//! `frem` calls C's `fmod`/`fmodf`. A float `select` blends the bit patterns
+//! in GPRs. `f16` (the Zfh extension) is not supported.
 //!
 //! ## Narrow values
 //!
@@ -31,11 +52,12 @@
 //! leaves 300 there, and a `trunc` is a plain move. Ops that only feed the low
 //! bits (`add`, `mul`, `shl`, logic, stores) don't care; every op whose result
 //! depends on the upper bits (compares, right shifts, division, `zext`/`sext`,
-//! branch/select conditions, `switch`) first extends via
-//! `RiscvTarget::extend64` (`sext.w`, `andi`, or an `slli`+`srai`/`srli` pair).
-//! At call boundaries the LP64 psABI's signedness-independent rules are
-//! honored: an `i32` argument/return is sign-extended (`sext.w`) and an `i1`
-//! zero-extended, so foreign callees see ABI-conformant registers.
+//! branch/select conditions, `switch`, integer-to-float conversions) first
+//! extends via `RiscvTarget::extend64` (`sext.w`, `andi`, or an
+//! `slli`+`srai`/`srli` pair). At call boundaries the LP64 psABI's
+//! signedness-independent rules are honored: an `i32` argument/return is
+//! sign-extended (`sext.w`) and an `i1` zero-extended, so foreign callees see
+//! ABI-conformant registers.
 //!
 //! ## Atomics (the A extension)
 //!
@@ -44,22 +66,24 @@
 //! `RiscvTarget::lower_atomic` for the mapping.
 //!
 //! Deferred (noted for a follow-up): the RV64 word forms (`addw`/`divw`/
-//! `sraw`/...) as a cheaper `i32` lowering; scalar floating-point (F/D), the
-//! compressed (C) extension; and `> 8` integer arguments passed on the stack.
+//! `sraw`/...) as a cheaper `i32` lowering; `f16`; integers wider than 64
+//! bits; and the callee side of variadic functions (`va_start`).
 
 use crate::codegen::isel::{Lower, TargetIsel};
 use crate::codegen::mir::{
     MBlockId, MachineInst, MachineOperand, Opcode, PReg, Reg, RegClass, StackSlot, VReg,
 };
 use crate::codegen::target::{CallConv, MachineTarget};
-use crate::ir::inst::{BinOp, CastOp, InstKind, IntPred, UnaryOp};
+use crate::ir::inst::{BinOp, CastOp, FloatPred, InstKind, IntPred, UnaryOp};
 use crate::ir::types::Type;
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{InstData, Module, ValueId};
+use crate::support::StrInterner;
 
 use puremp::Int;
 
-use super::regs::RegFile;
+use super::abi::{self, Assigner, Loc, Part};
+use super::regs::{self, RegFile, fpr, gpr};
 
 /// The RV64IM MIR opcode vocabulary. Operand layouts are documented per variant;
 /// `Def`/`Use` are register operands, the rest are immediates, frame slots, branch
@@ -128,7 +152,9 @@ pub enum RvOp {
     Store = 26,
     /// `[Def d, Frame slot]` — `addi d, sp, #slot_off`.
     FrameAddr = 27,
-    /// `[Def d, Global g]` — `auipc d, %pcrel_hi(g); addi d, d, %pcrel_lo(g)`.
+    /// `[Def d, Global g, Imm got]` — the address of global `g`:
+    /// `auipc d, %pcrel_hi(g); addi d, d, %pcrel_lo(g)`, or with `got` set its
+    /// GOT entry's contents (`auipc d, %got_pcrel_hi(g); ld d, %pcrel_lo(d)`).
     GlobalAddr = 28,
     /// `[Func f | Use callee, Def a0, Def clobbers.., Use args..]` — call.
     Call = 29,
@@ -179,6 +205,78 @@ pub enum RvOp {
     /// the old value. `aqrl` as for [`RvOp::AtomicRmw`]. Clobbers `t0`, `t1`,
     /// `t2`, `t6`.
     CmpXchg = 44,
+    /// `[Def d, Func f, Imm got]` — the address of function `f` (a function
+    /// used as a value), as [`RvOp::GlobalAddr`].
+    FuncAddr = 45,
+
+    // --- the F and D extensions (scalar floating point) --------------------
+    /// `[Def d, Use a, Use b, Imm width]` — `fadd.{s,d} d, a, b` (`width` 32
+    /// or 64 picks the format; the rounding mode is the dynamic one, i.e.
+    /// round-to-nearest-even under the default `fcsr`).
+    FAdd = 46,
+    /// `[Def d, Use a, Use b, Imm width]` — `fsub.{s,d}`.
+    FSub = 47,
+    /// `[Def d, Use a, Use b, Imm width]` — `fmul.{s,d}`.
+    FMul = 48,
+    /// `[Def d, Use a, Use b, Imm width]` — `fdiv.{s,d}`.
+    FDiv = 49,
+    /// `[Def d, Use a, Use b, Use c, Imm width, Imm kind]` — a fused
+    /// multiply-add with one rounding: `kind` 0 `fmadd` (`a*b + c`), 1
+    /// `fmsub` (`a*b - c`), 2 `fnmsub` (`-(a*b) + c`), 3 `fnmadd`. Selected
+    /// only where the IR licenses contraction (`contract` on both the
+    /// multiply and the add).
+    FMadd = 50,
+    /// `[Def d, Use a, Use b, Imm width, Imm funct3]` — sign injection
+    /// `fsgnj{,n,x}.{s,d}` (`funct3` 0/1/2): `fneg` is `fsgnjn d, a, a` and a
+    /// float-to-float move `fsgnj d, a, a`.
+    FSgnj = 51,
+    /// `[Def d, Use a, Use b, Imm pred, Imm width]` — a floating-point compare
+    /// into a GPR (exactly 0 or 1), from `feq`/`flt`/`fle` plus `xori`/`and`/
+    /// `or` (see `fcmp_code`); branch-free. Clobbers `t0`.
+    FCmp = 52,
+    /// `[Def d, Imm bits, Imm width]` — a float constant: its IEEE bit
+    /// pattern materialized in `t0` and moved over (`fmv.{w,d}.x`).
+    FLi = 53,
+    /// `[Def d, Use s, Imm dst_width, Imm src_width]` — `fcvt.d.s` /
+    /// `fcvt.s.d`.
+    FCvtFF = 54,
+    /// `[Def d, Use s, Imm signed, Imm int_width, Imm float_width]` —
+    /// `fcvt.{w,wu,l,lu}.{s,d} d, s, rtz` (`int_width` 32 or 64): float to
+    /// integer, truncating. The 32-bit forms sign-extend their result.
+    FCvtFI = 55,
+    /// `[Def d, Use s, Imm signed, Imm int_width, Imm float_width]` —
+    /// `fcvt.{s,d}.{w,wu,l,lu}`: integer to float (the 32-bit forms read the
+    /// low word only).
+    FCvtIF = 56,
+    /// `[Def d, Use s, Imm width]` — `fmv.x.w` (sign-extending) / `fmv.x.d`:
+    /// a float's bits into a GPR.
+    FMvXF = 57,
+    /// `[Def d, Use s, Imm width]` — `fmv.w.x` (NaN-boxing) / `fmv.d.x`: a
+    /// GPR's low bits into a float register.
+    FMvFX = 58,
+
+    // --- stack arguments, dynamic allocation, the frame pointer ----------------
+    /// `[Def d, Imm off]` — `addi d, sp, off`: an address in the outgoing
+    /// stack-argument area at the bottom of the frame.
+    LeaSp = 59,
+    /// `[Def d, Imm off]` — the address of the incoming stack argument at
+    /// `off` (the caller's `sp + off`, i.e. this frame's base + frame size +
+    /// `off`).
+    LeaInArg = 60,
+    /// `[Def d, Use n, Imm align]` — `dyn_alloca`: move `sp` down by `n`
+    /// (rounded up to 16, probed when stack probes are on) and return an
+    /// `align`-aligned pointer to the new block; the outgoing-argument area is
+    /// kept at the bottom of the frame by relocating it below the block. Only
+    /// in a function with a frame pointer. Clobbers `t0`, `t1`.
+    DynAlloca = 61,
+    /// `[]` — `addi s0, sp, 0` (prologue of a frame-pointer function).
+    FpSetup = 62,
+    /// `[]` — `addi sp, s0, 0` (epilogue of a frame-pointer function).
+    FpRestore = 63,
+    /// `[]` — `sd zero, 0(sp)` (prologue): touch the bottom of a frame whose
+    /// saved registers sit above an outgoing-argument area, keeping the
+    /// stack-probe invariant for the frames it calls.
+    TouchSp = 64,
 }
 
 impl RvOp {
@@ -191,23 +289,31 @@ impl RvOp {
     /// Whether an instruction of this opcode may execute a conditional branch
     /// whose direction depends on a register operand — the constant-time
     /// audit of the lowering (`docs/ir-design.md` §6d): the terminators
-    /// `BrCond`/`Switch` and the LR/SC loops of `AtomicRmw` (narrow widths,
-    /// `nand`, and the min/max compares) and `CmpXchg`. Everything else — in
-    /// particular `Select` (a mask blend: `t & -c | f & ~-c`), `SetCmp`
-    /// (`slt`/`sltu`/`xor`), the variable shifts and `Mul` — is straight-line
+    /// `BrCond`/`Switch`, the LR/SC loops of `AtomicRmw` (narrow widths,
+    /// `nand`, and the min/max compares) and `CmpXchg`, and `DynAlloca`'s
+    /// probe loop over its size. Everything else — in particular `Select` (a
+    /// mask blend: `t & -c | f & ~-c`), `SetCmp` (`slt`/`sltu`/`xor`), the
+    /// variable shifts, `Mul`, and every floating-point op (`FCmp` is
+    /// `feq`/`flt`/`fle` with `xori`/`and`/`or`; the conversions are single
+    /// saturating instructions, with no fix-up branches) — is straight-line
     /// code. (The prologue's probe loop counts a constant frame size.)
     pub fn may_branch_on_data(self, _operands: &[MachineOperand]) -> bool {
-        matches!(self, RvOp::BrCond | RvOp::Switch | RvOp::AtomicRmw | RvOp::CmpXchg)
+        matches!(
+            self,
+            RvOp::BrCond | RvOp::Switch | RvOp::AtomicRmw | RvOp::CmpXchg | RvOp::DynAlloca
+        )
     }
 
     /// Decode a MIR [`Opcode`] back to an [`RvOp`].
     pub fn decode(op: Opcode) -> RvOp {
         use RvOp::*;
-        const TABLE: [RvOp; 45] = [
+        const TABLE: [RvOp; 65] = [
             Mv, Li, Add, Sub, And, Or, Xor, Mul, Mulh, Addi, Andi, Ori, Xori, Div, Divu, Rem, Remu,
             Slli, Srli, Srai, Sll, Srl, Sra, SetCmp, Select, Load, Store, FrameAddr, GlobalAddr,
             Call, Ret, J, BrCond, Switch, Unreachable, StoreFrame, LoadFrame, AddiSp, SaveReg,
-            RestoreReg, Ecall, SextW, Fence, AtomicRmw, CmpXchg,
+            RestoreReg, Ecall, SextW, Fence, AtomicRmw, CmpXchg, FuncAddr, FAdd, FSub, FMul, FDiv,
+            FMadd, FSgnj, FCmp, FLi, FCvtFF, FCvtFI, FCvtIF, FMvXF, FMvFX, LeaSp, LeaInArg,
+            DynAlloca, FpSetup, FpRestore, TouchSp,
         ];
         TABLE[op.0 as usize]
     }
@@ -241,6 +347,56 @@ pub(crate) fn pred_code(p: IntPred) -> u8 {
     }
 }
 
+/// A dense code for a non-constant [`FloatPred`], packed into the
+/// [`RvOp::FCmp`] immediate and decoded by the encoder and interpreter:
+///
+/// | code | predicate | sequence |
+/// |---|---|---|
+/// | 0 | `oeq` | `feq d, a, b` |
+/// | 1 | `olt` | `flt d, a, b` |
+/// | 2 | `ole` | `fle d, a, b` |
+/// | 3 | `ogt` | `flt d, b, a` |
+/// | 4 | `oge` | `fle d, b, a` |
+/// | 5 | `ord` | `feq t0, a, a; feq d, b, b; and d, d, t0` |
+/// | 6 | `one` | `flt t0, a, b; flt d, b, a; or d, d, t0` |
+///
+/// and `code + 8` is the negation (an `xori d, d, 1` after): `une` = !`oeq`,
+/// `uge` = !`olt`, `ugt` = !`ole`, `ule` = !`ogt`, `ult` = !`oge`, `uno` =
+/// !`ord`, `ueq` = !`one`. `feq`/`flt`/`fle` yield 0 when either operand is a
+/// NaN, which is exactly the ordered reading.
+pub(crate) fn fcmp_code(p: FloatPred) -> Option<u8> {
+    Some(match p {
+        FloatPred::Oeq => 0,
+        FloatPred::Olt => 1,
+        FloatPred::Ole => 2,
+        FloatPred::Ogt => 3,
+        FloatPred::Oge => 4,
+        FloatPred::Ord => 5,
+        FloatPred::One => 6,
+        FloatPred::Une => 8,
+        FloatPred::Uge => 9,
+        FloatPred::Ugt => 10,
+        FloatPred::Ule => 11,
+        FloatPred::Ult => 12,
+        FloatPred::Uno => 13,
+        FloatPred::Ueq => 14,
+        FloatPred::False | FloatPred::True => return None,
+    })
+}
+
+/// Round `v` up to a multiple of `align` (a power of two ≥ 1).
+fn align_up(v: u64, align: u64) -> u64 {
+    let a = align.max(1);
+    v.div_ceil(a) * a
+}
+
+/// The store width for an aggregate part of `size` bytes: the size itself
+/// when it is a machine width, else a whole doubleword (the destination is a
+/// home slot rounded up to 8 bytes, and a part starts at offset 0 or 8).
+fn part_store_size(size: u64) -> u64 {
+    if matches!(size, 1 | 2 | 4 | 8) { size } else { 8 }
+}
+
 fn def(r: PReg) -> MachineOperand {
     MachineOperand::Def(Reg::Physical(r))
 }
@@ -261,6 +417,18 @@ fn imm(v: u64) -> MachineOperand {
 #[derive(Debug)]
 pub struct RiscvTarget {
     rf: RegFile,
+    /// Per module global: whether its address is loaded from the GOT (a
+    /// preemptible symbol under PIC/PIE; see [`crate::codegen::linkage`]).
+    /// Empty (everything PC-relative) for [`RiscvTarget::new`].
+    global_got: Vec<bool>,
+    /// Per module function: likewise, for a function used as a value.
+    func_got: Vec<bool>,
+    /// The module's `fmodf` and `fmod` (function indices), which `frem`
+    /// calls.
+    fmod: [Option<u32>; 2],
+    /// Whether `s0` is the frame pointer (the function moves `sp` at run
+    /// time: `dyn_alloca`).
+    frame_pointer: bool,
 }
 
 impl Default for RiscvTarget {
@@ -272,7 +440,59 @@ impl Default for RiscvTarget {
 impl RiscvTarget {
     /// Construct the RV64 target with its fixed register file and LP64 ABI.
     pub fn new() -> RiscvTarget {
-        RiscvTarget { rf: RegFile::new() }
+        RiscvTarget {
+            rf: RegFile::new(false),
+            global_got: Vec::new(),
+            func_got: Vec::new(),
+            fmod: [None; 2],
+            frame_pointer: false,
+        }
+    }
+
+    /// This target with `s0` reserved as the frame pointer (for a function
+    /// that uses `dyn_alloca`).
+    pub fn with_frame_pointer(mut self, on: bool) -> RiscvTarget {
+        self.frame_pointer = on;
+        self.rf = RegFile::new(on);
+        self
+    }
+
+    /// Whether `s0` is reserved as the frame pointer.
+    pub fn frame_pointer(&self) -> bool {
+        self.frame_pointer
+    }
+
+    /// The target for compiling `module` under `opts`: under a
+    /// position-independent [`RelocModel`](crate::codegen::RelocModel), the
+    /// addresses of symbols that may bind outside the component come from the
+    /// GOT.
+    ///
+    /// With `syms`, the module's `fmod`/`fmodf` declarations (which `frem`
+    /// calls; see `encode::prepare`) are found by name.
+    pub fn for_module(
+        module: &Module,
+        syms: Option<&StrInterner>,
+        opts: &crate::codegen::CodegenOptions,
+    ) -> RiscvTarget {
+        use crate::codegen::linkage::{func_binds_locally, global_binds_locally};
+        let model = opts.reloc_model;
+        let global_got = (0..module.global_count())
+            .map(|g| !global_binds_locally(module, crate::ir::GlobalId::from_index(g), model))
+            .collect();
+        let func_got = (0..module.function_count())
+            .map(|f| !func_binds_locally(module, crate::ir::FuncId::from_index(f), model))
+            .collect();
+        let find = |name: &str| -> Option<u32> {
+            let syms = syms?;
+            module.functions().position(|f| syms.resolve(f.name) == name).map(|i| i as u32)
+        };
+        RiscvTarget {
+            rf: RegFile::new(false),
+            global_got,
+            func_got,
+            fmod: [find("fmodf"), find("fmod")],
+            frame_pointer: false,
+        }
     }
 
     /// Lower function `func` of `module` to MIR over this target.
@@ -512,10 +732,107 @@ impl RiscvTarget {
             BinOp::SDiv => self.lower_div(lo, RvOp::Div, true, d, inst, width),
             BinOp::URem => self.lower_div(lo, RvOp::Remu, false, d, inst, width),
             BinOp::SRem => self.lower_div(lo, RvOp::Rem, true, d, inst, width),
-            // Floating-point binops are out of the integer subset (deferred); a
-            // zero keeps the MIR well-formed (never reached by the integer tests).
-            _ => lo.emit(MachineInst::new(RvOp::Li.opcode(), vec![def_v(d), imm(0)])),
+            BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv => self.lower_fbin(lo, op, d, inst),
+            BinOp::FRem => self.lower_frem(lo, d, inst),
+            other => unreachable!("{other:?} reached the RISC-V isel (legalized away)"),
         }
+    }
+
+    /// The float width (32 or 64) of a value. `f16` needs the Zfh extension,
+    /// which this backend does not target.
+    fn float_width(lo: &Lower<'_, Self>, v: ValueId) -> u32 {
+        match lo.types().get(lo.func().value_type(v)) {
+            Type::Float(k) if matches!(k.bit_width(), 32 | 64) => k.bit_width(),
+            Type::Float(_) => panic!("riscv64 backend: f16 arithmetic needs the Zfh extension"),
+            other => panic!("riscv64 backend: a float operation on {other:?}"),
+        }
+    }
+
+    /// If `v` is a `contract` `fmul` with no other use, its operands: the
+    /// multiply a `contract` add or subtract may fuse into one `fmadd`-family
+    /// instruction (a single rounding, which `contract` licenses).
+    fn contractible_fmul(lo: &Lower<'_, Self>, v: ValueId) -> Option<(ValueId, ValueId)> {
+        let ValueDef::Inst(id) = lo.func().value(v).def else { return None };
+        let m = lo.func().inst(id);
+        (m.kind == InstKind::Bin(BinOp::FMul)
+            && m.flags.fast.contract
+            && lo.func().uses_of(v).len() == 1)
+            .then(|| (m.operands()[0], m.operands()[1]))
+    }
+
+    /// Which operand (0 or 1) of the `contract` `fadd`/`fsub` `user` is a
+    /// multiply it fuses with, if any (the first one that qualifies).
+    fn fusion_operand(lo: &Lower<'_, Self>, user: &InstData) -> Option<usize> {
+        if !matches!(user.kind, InstKind::Bin(BinOp::FAdd | BinOp::FSub)) || !user.flags.fast.contract {
+            return None;
+        }
+        (0..2).find(|&k| Self::contractible_fmul(lo, user.operands()[k]).is_some())
+    }
+
+    /// Whether `inst` is a multiply that its single user fuses: it then emits
+    /// nothing of its own.
+    fn fused_away(lo: &Lower<'_, Self>, inst: &InstData) -> bool {
+        let Some(r) = inst.result() else { return false };
+        if Self::contractible_fmul(lo, r).is_none() {
+            return false;
+        }
+        let u = lo.func().uses_of(r)[0];
+        Self::fusion_operand(lo, lo.func().inst(u.inst)) == Some(u.operand as usize)
+    }
+
+    /// `fadd`/`fsub`/`fmul`/`fdiv`, fusing a `contract` multiply-add.
+    fn lower_fbin(&self, lo: &mut Lower<'_, Self>, op: BinOp, d: VReg, inst: &InstData) {
+        let w = u64::from(Self::float_width(lo, inst.operands()[0]));
+        if let Some(k) = Self::fusion_operand(lo, inst) {
+            let (ma, mb) = Self::contractible_fmul(lo, inst.operands()[k]).expect("fusable");
+            let other = inst.operands()[1 - k];
+            // a*b + c: fmadd; a*b - c: fmsub; c - a*b: fnmsub.
+            let kind = match (op, k) {
+                (BinOp::FAdd, _) => 0,
+                (_, 0) => 1,
+                _ => 2,
+            };
+            let (a, b, c) = (lo.reg(ma), lo.reg(mb), lo.reg(other));
+            lo.emit(MachineInst::new(
+                RvOp::FMadd.opcode(),
+                vec![def_v(d), use_v(a), use_v(b), use_v(c), imm(w), imm(kind)],
+            ));
+            return;
+        }
+        let rop = match op {
+            BinOp::FAdd => RvOp::FAdd,
+            BinOp::FSub => RvOp::FSub,
+            BinOp::FMul => RvOp::FMul,
+            _ => RvOp::FDiv,
+        };
+        let a = lo.reg(inst.operands()[0]);
+        let b = lo.reg(inst.operands()[1]);
+        lo.emit(MachineInst::new(rop.opcode(), vec![def_v(d), use_v(a), use_v(b), imm(w)]));
+    }
+
+    /// `frem` is C's `fmod`/`fmodf` (the remainder of the truncated
+    /// quotient): a call to the C library function, which the module driver
+    /// declared (`encode::prepare`).
+    fn lower_frem(&self, lo: &mut Lower<'_, Self>, d: VReg, inst: &InstData) {
+        let w = Self::float_width(lo, inst.operands()[0]);
+        let f = self.fmod[usize::from(w == 64)].unwrap_or_else(|| {
+            panic!("riscv64 backend: `frem` needs `fmod`/`fmodf` declared (compile with compile_module)")
+        });
+        let a = lo.reg(inst.operands()[0]);
+        let b = lo.reg(inst.operands()[1]);
+        let (fa0, fa1) = (fpr(regs::FA0), fpr(regs::FA0 + 1));
+        lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(fa0), use_v(a)]));
+        lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(fa1), use_v(b)]));
+        let mut operands = vec![MachineOperand::Func(f), def(self.rf.cc.ret_reg)];
+        for &cs in &self.rf.caller_saved {
+            if cs != self.rf.cc.ret_reg {
+                operands.push(def(cs));
+            }
+        }
+        operands.push(use_p(fa0));
+        operands.push(use_p(fa1));
+        lo.emit(MachineInst::new(RvOp::Call.opcode(), operands));
+        lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_p(fa0)]));
     }
 
     /// Division / remainder. The 64-bit `div`/`rem` see every bit of both
@@ -576,53 +893,342 @@ impl RiscvTarget {
         }
     }
 
-    /// Conversions. `zext`/`sext` (and `inttoptr` from a narrower integer)
-    /// extend from the source's width, since its register's upper bits are not
-    /// clean; truncation, ptr→int and bitcasts are low-bits-preserving copies.
-    /// Float conversions are deferred (a plain copy keeps the MIR well-formed).
+    /// Conversions. Float↔float and int↔float go through `fcvt`; `zext`/`sext`
+    /// (and `inttoptr` from a narrower integer) extend from the source's width,
+    /// since its register's upper bits are not clean; a bitcast between a float
+    /// and an integer moves the bits across files (`fmv`); truncation, ptr→int
+    /// and same-file bitcasts are low-bits-preserving copies.
     fn lower_cast(&self, lo: &mut Lower<'_, Self>, op: CastOp, inst: &InstData) {
         let d = lo.result_reg(inst);
         let src = inst.operands()[0];
-        let s = match op {
-            CastOp::ZExt | CastOp::SExt | CastOp::IntToPtr => {
-                self.extend64(lo, src, op == CastOp::SExt)
-            }
-            _ => lo.reg(src),
+        let emit = |lo: &mut Lower<'_, Self>, o: RvOp, s: VReg, imms: &[u64]| {
+            let mut ops = vec![def_v(d), use_v(s)];
+            ops.extend(imms.iter().map(|&v| imm(v)));
+            lo.emit(MachineInst::new(o.opcode(), ops));
         };
-        lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(s)]));
+        let float_bits = |lo: &Lower<'_, Self>, ty| match lo.types().get(ty) {
+            Type::Float(k) => Some(k.bit_width()),
+            _ => None,
+        };
+        match op {
+            CastOp::FpTrunc | CastOp::FpExt => {
+                let (sw, dw) = (Self::float_width(lo, src), float_bits(lo, inst.ty).unwrap_or(64));
+                assert!(dw != 16, "riscv64 backend: f16 needs the Zfh extension");
+                let s = lo.reg(src);
+                emit(lo, RvOp::FCvtFF, s, &[u64::from(dw), u64::from(sw)]);
+            }
+            CastOp::FpToSi | CastOp::FpToUi => {
+                let fw = Self::float_width(lo, src);
+                let iw = lo.types().bit_width(inst.ty).unwrap_or(64);
+                assert!(iw <= 64, "riscv64 backend: a float conversion to i{iw}");
+                let s = lo.reg(src);
+                let signed = u64::from(op == CastOp::FpToSi);
+                emit(lo, RvOp::FCvtFI, s, &[signed, if iw > 32 { 64 } else { 32 }, u64::from(fw)]);
+            }
+            CastOp::SiToFp | CastOp::UiToFp => {
+                let fw = float_bits(lo, inst.ty).unwrap_or(64);
+                assert!(fw != 16, "riscv64 backend: f16 needs the Zfh extension");
+                let signed = op == CastOp::SiToFp;
+                let sw = lo.int_width(src);
+                assert!(sw <= 64, "riscv64 backend: a float conversion from i{sw}");
+                // The 32-bit forms read only the low word; anything else is
+                // converted from its 64-bit extension.
+                let (s, iw) = if sw == 32 { (lo.reg(src), 32) } else { (self.extend64(lo, src, signed), 64) };
+                emit(lo, RvOp::FCvtIF, s, &[u64::from(signed), iw, u64::from(fw)]);
+            }
+            // The source register's bits above its width are not clean.
+            CastOp::ZExt | CastOp::SExt | CastOp::IntToPtr => {
+                let s = self.extend64(lo, src, op == CastOp::SExt);
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(s)]));
+            }
+            CastOp::Bitcast => {
+                let s = lo.reg(src);
+                let w = u64::from(lo.int_width(src));
+                match (lo.mf().vreg_class(s), lo.mf().vreg_class(d)) {
+                    (RegClass::Gpr, RegClass::Fp) => emit(lo, RvOp::FMvFX, s, &[w]),
+                    (RegClass::Fp, RegClass::Gpr) => emit(lo, RvOp::FMvXF, s, &[w]),
+                    _ => lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(s)])),
+                }
+            }
+            // Truncation / ptr→int: preserve the low bits.
+            _ => {
+                let s = lo.reg(src);
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(s)]));
+            }
+        }
     }
 
-    /// Lower a `call` under the LP64 integer ABI: move scalar arguments into
-    /// `a0`–`a7`, record `a0` and the caller-saved clobbers, and move the result
-    /// out of `a0`.
+    /// The bits of the float register `v` (of `width` bits) in a fresh GPR.
+    fn to_gpr(&self, lo: &mut Lower<'_, Self>, v: VReg, width: u64) -> VReg {
+        let g = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(RvOp::FMvXF.opcode(), vec![def_v(g), use_v(v), imm(width)]));
+        g
+    }
+
+    /// The branchless blend `d = f ^ ((t ^ f) & -c)` of two GPRs with `c` in
+    /// {0, 1}. Every step names at most three registers,
+    /// so it stays allocatable when all of them spill (a four-register
+    /// `Select` needs one more spill scratch than the three the target
+    /// reserves).
+    fn blend(&self, lo: &mut Lower<'_, Self>, d: VReg, c: VReg, t: VReg, f: VReg) {
+        let zero = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(self.li(zero, Int::ZERO));
+        let mask = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(RvOp::Sub.opcode(), vec![def_v(mask), use_v(zero), use_v(c), imm(64)]));
+        let diff = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(RvOp::Xor.opcode(), vec![def_v(diff), use_v(t), use_v(f), imm(64)]));
+        let pick = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(RvOp::And.opcode(), vec![def_v(pick), use_v(diff), use_v(mask), imm(64)]));
+        lo.emit(MachineInst::new(RvOp::Xor.opcode(), vec![def_v(d), use_v(f), use_v(pick), imm(64)]));
+    }
+
+    // --- the LP64D calling convention ---------------------------------------
+
+    /// How many of a call's `n` arguments are named: all of them, except for
+    /// a direct call to a variadic function (its parameter count; the rest
+    /// follow the integer convention). An indirect call carries no signature
+    /// here and is treated as non-variadic.
+    fn named_count(lo: &Lower<'_, Self>, callee: ValueId, n: usize) -> usize {
+        let Some(fidx) = lo.callee_func(callee) else { return n };
+        let f = lo.module().function(crate::ir::FuncId::from_index(fidx as usize));
+        match lo.types().get(f.sig) {
+            Type::Func(ft) if ft.variadic => ft.params.len().min(n),
+            _ => n,
+        }
+    }
+
+    /// `base + off` in a fresh GPR (`base` itself when `off == 0`).
+    fn add_off(&self, lo: &mut Lower<'_, Self>, base: VReg, off: u64) -> VReg {
+        if off == 0 {
+            return base;
+        }
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        if off <= 2047 {
+            lo.emit(MachineInst::new(RvOp::Addi.opcode(), vec![def_v(d), use_v(base), imm(off), imm(64)]));
+        } else {
+            let k = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(self.li(k, Int::from_u64(off)));
+            lo.emit(MachineInst::new(RvOp::Add.opcode(), vec![def_v(d), use_v(base), use_v(k), imm(64)]));
+        }
+        d
+    }
+
+    /// Load `size` bytes at `[ptr + off]` into a fresh register of `class`.
+    fn load_at(&self, lo: &mut Lower<'_, Self>, class: RegClass, ptr: VReg, off: u64, size: u64) -> VReg {
+        let p = self.add_off(lo, ptr, off);
+        let d = lo.fresh_vreg(class);
+        lo.emit(MachineInst::new(RvOp::Load.opcode(), vec![def_v(d), use_v(p), imm(size)]));
+        d
+    }
+
+    /// Store the low `size` bytes of `v` at `[ptr + off]`.
+    fn store_at(&self, lo: &mut Lower<'_, Self>, ptr: VReg, off: u64, v: VReg, size: u64) {
+        let p = self.add_off(lo, ptr, off);
+        lo.emit(MachineInst::new(RvOp::Store.opcode(), vec![use_v(p), use_v(v), imm(size)]));
+    }
+
+    /// Exactly `size` (1..=8) bytes at `[ptr + off]`, zero-extended into a
+    /// fresh GPR: one load for a machine width, else little-endian pieces
+    /// combined with shifts (never reading past the object).
+    fn load_bytes(&self, lo: &mut Lower<'_, Self>, ptr: VReg, off: u64, size: u64) -> VReg {
+        if matches!(size, 1 | 2 | 4 | 8) {
+            return self.load_at(lo, RegClass::Gpr, ptr, off, size);
+        }
+        let mut acc: Option<VReg> = None;
+        let mut at = 0u64;
+        for piece in [4u64, 2, 1] {
+            if size - at >= piece {
+                let v = self.load_at(lo, RegClass::Gpr, ptr, off + at, piece);
+                let v = if at == 0 {
+                    v
+                } else {
+                    let s = lo.fresh_vreg(RegClass::Gpr);
+                    lo.emit(MachineInst::new(RvOp::Slli.opcode(), vec![def_v(s), use_v(v), imm(8 * at), imm(64)]));
+                    s
+                };
+                acc = Some(match acc {
+                    None => v,
+                    Some(a) => {
+                        let o = lo.fresh_vreg(RegClass::Gpr);
+                        lo.emit(MachineInst::new(RvOp::Or.opcode(), vec![def_v(o), use_v(a), use_v(v), imm(64)]));
+                        o
+                    }
+                });
+                at += piece;
+            }
+        }
+        acc.expect("a nonzero size")
+    }
+
+    /// Copy `size` bytes from `[src]` to `[dst]` in 8/4/2/1-byte pieces.
+    fn emit_memcpy(&self, lo: &mut Lower<'_, Self>, dst: VReg, src: VReg, size: u64) {
+        let mut o = 0u64;
+        while o < size {
+            let chunk = [8u64, 4, 2, 1].into_iter().find(|&c| size - o >= c).expect("bytes left");
+            let t = self.load_at(lo, RegClass::Gpr, src, o, chunk);
+            self.store_at(lo, dst, o, t, chunk);
+            o += chunk;
+        }
+    }
+
+    /// A fresh frame slot for an aggregate of type `ty` (rounded up to whole
+    /// doublewords, so a register part can be stored in full).
+    fn agg_slot(lo: &mut Lower<'_, Self>, ty: crate::ir::types::TypeId) -> StackSlot {
+        let size = align_up(lo.byte_size(ty).max(1), 8);
+        let align = lo.types().align_of(ty).max(8);
+        lo.new_slot(size, align)
+    }
+
+    /// `[Def d, Imm off]` of `op` (`LeaSp` / `LeaInArg`) into a fresh GPR.
+    fn lea(&self, lo: &mut Lower<'_, Self>, op: RvOp, off: u64) -> VReg {
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(op.opcode(), vec![def_v(d), imm(off)]));
+        d
+    }
+
+    /// The value one part of argument `arg` carries, in a fresh register: the
+    /// scalar itself (an `i32`/`i1` extended per the psABI), a float field or
+    /// an integer chunk read from the aggregate's storage, or the address of a
+    /// fresh copy of it (`ty` is the argument's ABI type).
+    fn arg_part(&self, lo: &mut Lower<'_, Self>, arg: ValueId, ty: crate::ir::types::TypeId, part: Part) -> VReg {
+        match part {
+            Part::Whole => {
+                let r = lo.reg(arg);
+                if lo.mf().vreg_class(r) == RegClass::Fp {
+                    r
+                } else {
+                    self.abi_value(lo, arg)
+                }
+            }
+            Part::Chunk { off, size, float: Some(_) } => {
+                let p = lo.reg(arg);
+                self.load_at(lo, RegClass::Fp, p, off, size)
+            }
+            Part::Chunk { off, size, float: None } => {
+                let p = lo.reg(arg);
+                let v = self.load_bytes(lo, p, off, size);
+                // A 32-bit integer field travels sign-extended, like an `i32`.
+                if size == 4 {
+                    let x = lo.fresh_vreg(RegClass::Gpr);
+                    lo.emit(MachineInst::new(RvOp::SextW.opcode(), vec![def_v(x), use_v(v)]));
+                    x
+                } else {
+                    v
+                }
+            }
+            Part::Ref => {
+                let size = lo.byte_size(ty);
+                let slot = Self::agg_slot(lo, ty);
+                let dst = lo.fresh_vreg(RegClass::Gpr);
+                lo.emit(self.frame_addr(dst, slot));
+                let src = lo.reg(arg);
+                self.emit_memcpy(lo, dst, src, size);
+                dst
+            }
+        }
+    }
+
+    /// The register a part travels in, from a value: a float in an integer
+    /// register goes over as its bits.
+    fn in_class(&self, lo: &mut Lower<'_, Self>, v: VReg, class: RegClass, width: u64) -> VReg {
+        match (lo.mf().vreg_class(v), class) {
+            (RegClass::Fp, RegClass::Gpr) => self.to_gpr(lo, v, width),
+            (RegClass::Gpr, RegClass::Fp) => {
+                let f = lo.fresh_vreg(RegClass::Fp);
+                lo.emit(MachineInst::new(RvOp::FMvFX.opcode(), vec![def_v(f), use_v(v), imm(width)]));
+                f
+            }
+            _ => v,
+        }
+    }
+
+    /// The float width of a part of an argument of type `ty` (64 for an
+    /// integer part).
+    fn part_width(lo: &Lower<'_, Self>, ty: crate::ir::types::TypeId, part: Part) -> u64 {
+        match (part, lo.types().get(ty)) {
+            (Part::Chunk { float: Some(w), .. }, _) => u64::from(w),
+            (Part::Whole, Type::Float(k)) => u64::from(k.bit_width()),
+            _ => 64,
+        }
+    }
+
+    /// Lower a `call` under the LP64D convention (see the `abi` module): every
+    /// part of every argument is materialized, stack parts are stored into
+    /// the outgoing area, and the register parts are moved into place as one
+    /// consecutive run right before the call (so no competing vreg definition
+    /// sits between an argument register's write and the call). The result
+    /// comes back in `a0`/`a1`/`fa0`/`fa1` (an aggregate is stored into a
+    /// fresh slot whose address is the result), or in caller memory whose
+    /// address is passed in `a0`.
     fn lower_call(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
-        let cc = &self.rf.cc;
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
-
-        // The final `arg-reg <- value-vreg` moves are emitted as one consecutive
-        // run right before the `call` so no competing vreg definition sits between
-        // an argument register's write and the call.
-        let mut reg_moves: Vec<(PReg, VReg)> = Vec::new();
-        let mut int_i = 0usize;
-        for &arg in args {
-            let v = self.abi_value(lo, arg);
-            if int_i < cc.arg_regs.len() {
-                let areg = cc.arg_regs[int_i];
-                int_i += 1;
-                reg_moves.push((areg, v));
+        let named = Self::named_count(lo, callee, args.len());
+        let ret_ty = inst.result().map(|r| lo.func().value_type(r));
+        let ret_plan = ret_ty.map(|t| abi::ret_locs(lo.types(), t));
+        let sret = matches!(ret_plan, Some(None));
+        // Classify by the callee's parameter types when the call is direct
+        // (an aggregate argument may be written as a plain pointer to its
+        // storage), else by the argument values' types.
+        let sig_params: Vec<crate::ir::types::TypeId> = match lo.callee_func(callee) {
+            Some(fidx) => {
+                let f = lo.module().function(crate::ir::FuncId::from_index(fidx as usize));
+                match lo.types().get(f.sig) {
+                    Type::Func(ft) => ft.params.clone(),
+                    _ => Vec::new(),
+                }
             }
-            // `> 8` integer arguments (stack-passed) are deferred; the fixtures
-            // stay within the eight argument registers.
+            None => Vec::new(),
+        };
+        let arg_ty = |lo: &Lower<'_, Self>, i: usize, a: ValueId| {
+            sig_params.get(i).copied().unwrap_or_else(|| lo.func().value_type(a))
+        };
+        let mut asg = Assigner::args(sret);
+        let plans: Vec<Vec<(Part, Loc)>> = args
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| asg.assign(lo.types(), arg_ty(lo, i, a), i < named))
+            .collect();
+        let arg_tys: Vec<crate::ir::types::TypeId> =
+            args.iter().enumerate().map(|(i, &a)| arg_ty(lo, i, a)).collect();
+
+        let mut reg_moves: Vec<(PReg, VReg)> = Vec::new();
+        let mut ret_slot = None;
+        if sret {
+            let slot = Self::agg_slot(lo, ret_ty.expect("a result"));
+            ret_slot = Some(slot);
+            let p = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(self.frame_addr(p, slot));
+            reg_moves.push((gpr(regs::A0), p));
+        }
+        for ((&arg, plan), &ty) in args.iter().zip(plans).zip(&arg_tys) {
+            for (part, loc) in plan {
+                let v = self.arg_part(lo, arg, ty, part);
+                let width = Self::part_width(lo, ty, part);
+                match loc {
+                    Loc::Gpr(n) => {
+                        let v = self.in_class(lo, v, RegClass::Gpr, width);
+                        reg_moves.push((gpr(n), v));
+                    }
+                    Loc::Fpr(n) => reg_moves.push((fpr(n), v)),
+                    Loc::Stack(off) => {
+                        let p = self.lea(lo, RvOp::LeaSp, off);
+                        let size = if lo.mf().vreg_class(v) == RegClass::Fp { width / 8 } else { 8 };
+                        lo.emit(MachineInst::new(RvOp::Store.opcode(), vec![use_v(p), use_v(v), imm(size)]));
+                    }
+                }
+            }
+        }
+        if asg.stack > 0 {
+            lo.reserve_outgoing(align_up(asg.stack, 16));
+        }
+        let used: Vec<PReg> = reg_moves.iter().map(|&(r, _)| r).collect();
+        for (r, v) in reg_moves {
+            lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(r), use_v(v)]));
         }
 
-        let used_arg_regs: Vec<PReg> = reg_moves.iter().map(|&(areg, _)| areg).collect();
-        for (areg, r) in reg_moves {
-            lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(areg), use_v(r)]));
-        }
-
-        let ret_reg = cc.ret_reg;
+        let ret_reg = self.rf.cc.ret_reg;
         let mut operands = Vec::new();
         match lo.callee_func(callee) {
             Some(fidx) => operands.push(MachineOperand::Func(fidx)),
@@ -637,15 +1243,195 @@ impl RiscvTarget {
                 operands.push(def(cs));
             }
         }
-        for &areg in &used_arg_regs {
-            operands.push(use_p(areg));
+        for &r in &used {
+            operands.push(use_p(r));
         }
         lo.emit(MachineInst::new(RvOp::Call.opcode(), operands));
 
-        if inst.result().is_some() {
-            let d = lo.result_reg(inst);
-            lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_p(ret_reg)]));
+        let Some(d) = inst.result().map(|_| lo.result_reg(inst)) else { return };
+        let ret_ty = ret_ty.expect("a result");
+        match ret_plan.expect("a result") {
+            None => lo.emit(self.frame_addr(d, ret_slot.expect("sret slot"))),
+            Some(parts) if !abi::is_aggregate(lo.types(), ret_ty) => {
+                let preg = match parts.first().map(|p| p.1) {
+                    Some(Loc::Fpr(n)) => fpr(n),
+                    Some(Loc::Gpr(n)) => gpr(n),
+                    _ => ret_reg,
+                };
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_p(preg)]));
+            }
+            Some(parts) => {
+                // Rescue the result registers first (one consecutive run right
+                // after the call), then store them into a fresh slot.
+                let saved: Vec<(Part, VReg)> = parts
+                    .iter()
+                    .map(|&(part, loc)| {
+                        let (preg, class) = match loc {
+                            Loc::Fpr(n) => (fpr(n), RegClass::Fp),
+                            Loc::Gpr(n) => (gpr(n), RegClass::Gpr),
+                            Loc::Stack(_) => unreachable!("a register return"),
+                        };
+                        let v = lo.fresh_vreg(class);
+                        lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(v), use_p(preg)]));
+                        (part, v)
+                    })
+                    .collect();
+                let slot = Self::agg_slot(lo, ret_ty);
+                lo.emit(self.frame_addr(d, slot));
+                for (part, v) in saved {
+                    if let Part::Chunk { off, size, .. } = part {
+                        self.store_at(lo, d, off, v, part_store_size(size));
+                    }
+                }
+            }
         }
+    }
+
+    /// The entry prologue under LP64D: every register part of every parameter
+    /// is first copied out of its argument register (one consecutive run, so
+    /// no allocation can clobber an incoming register first), then each
+    /// parameter is built: a scalar from its register or its stack slot (an
+    /// incoming stack argument is addressed above this frame, [`RvOp::LeaInArg`]);
+    /// an aggregate in registers is stored into a private home slot whose
+    /// address becomes the parameter; one passed by reference is its pointer.
+    /// A hidden return-memory pointer is stashed in the aux slot for `ret`.
+    fn lower_prologue_lp64d(&self, lo: &mut Lower<'_, Self>) {
+        let entry = lo.mf().entry().expect("a function being lowered has an entry block");
+        let pvs: Vec<VReg> = lo.mf().block(entry).params.clone();
+        let (sig, ret_ty) = match lo.types().get(lo.func().sig) {
+            Type::Func(ft) => (ft.params.clone(), ft.ret),
+            _ => (Vec::new(), lo.func().sig),
+        };
+        let sret = abi::is_aggregate(lo.types(), ret_ty) && abi::ret_locs(lo.types(), ret_ty).is_none();
+        let mut asg = Assigner::args(sret);
+        let plans: Vec<Vec<(Part, Loc)>> = sig.iter().map(|&t| asg.assign(lo.types(), t, true)).collect();
+
+        // 1. Copy every incoming register out.
+        let sret_ptr = sret.then(|| {
+            let v = lo.fresh_vreg(RegClass::Gpr);
+            lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(v), use_p(gpr(regs::A0))]));
+            v
+        });
+        let mut incoming: Vec<Vec<Option<VReg>>> = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            let mut row = Vec::with_capacity(plan.len());
+            for &(_, loc) in plan {
+                let (preg, class) = match loc {
+                    Loc::Gpr(n) => (gpr(n), RegClass::Gpr),
+                    Loc::Fpr(n) => (fpr(n), RegClass::Fp),
+                    Loc::Stack(_) => {
+                        row.push(None);
+                        continue;
+                    }
+                };
+                let v = lo.fresh_vreg(class);
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(v), use_p(preg)]));
+                row.push(Some(v));
+            }
+            incoming.push(row);
+        }
+        if let Some(v) = sret_ptr {
+            let slot = lo.new_slot(8, 8);
+            lo.set_aux_slot(slot);
+            lo.emit(MachineInst::new(RvOp::StoreFrame.opcode(), vec![use_v(v), MachineOperand::Frame(slot)]));
+        }
+
+        // 2. Build each parameter.
+        for (i, (&pv, plan)) in pvs.iter().zip(&plans).enumerate() {
+            let ty = sig[i];
+            // A part's value: its register, or a load from its stack slot.
+            let part_value = |this: &Self, lo: &mut Lower<'_, Self>, k: usize, class: RegClass, width: u64| -> VReg {
+                match (incoming[i][k], plan[k].1) {
+                    (Some(v), _) => this.in_class(lo, v, class, width),
+                    (None, Loc::Stack(off)) => {
+                        let p = this.lea(lo, RvOp::LeaInArg, off);
+                        let size = if class == RegClass::Fp { width / 8 } else { 8 };
+                        this.load_at(lo, class, p, 0, size)
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            if !abi::is_aggregate(lo.types(), ty) {
+                let class = lo.mf().vreg_class(pv);
+                let width = Self::part_width(lo, ty, Part::Whole);
+                let v = part_value(self, lo, 0, class, width);
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(pv), use_v(v)]));
+                continue;
+            }
+            match plan.first().map(|p| p.0) {
+                Some(Part::Ref) => {
+                    let v = part_value(self, lo, 0, RegClass::Gpr, 64);
+                    lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(pv), use_v(v)]));
+                }
+                _ => {
+                    let home = Self::agg_slot(lo, ty);
+                    lo.emit(self.frame_addr(pv, home));
+                    for (k, &(part, _)) in plan.iter().enumerate() {
+                        let Part::Chunk { off, size, float } = part else { unreachable!() };
+                        let (class, width) = match float {
+                            Some(w) => (RegClass::Fp, u64::from(w)),
+                            None => (RegClass::Gpr, 64),
+                        };
+                        let v = part_value(self, lo, k, class, width);
+                        let n = if float.is_some() { size } else { part_store_size(size) };
+                        self.store_at(lo, pv, off, v, n);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ret`: a scalar in `a0` (an `i32`/`i1` extended) or `fa0`; an
+    /// aggregate's parts read from its storage into `a0`/`a1`/`fa0`/`fa1`, or
+    /// copied through the hidden return-memory pointer. The `ret` itself uses
+    /// the result registers, so allocation keeps them intact up to it.
+    fn lower_ret(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        let ret_ty = match lo.types().get(lo.func().sig) {
+            Type::Func(ft) => ft.ret,
+            _ => lo.func().sig,
+        };
+        let mut uses = Vec::new();
+        if let Some(&v) = inst.operands().first() {
+            if abi::is_aggregate(lo.types(), ret_ty) {
+                let src = lo.reg(v);
+                match abi::ret_locs(lo.types(), ret_ty) {
+                    None => {
+                        let size = lo.byte_size(ret_ty);
+                        let slot = lo.aux_slot().expect("the return-memory pointer saved by the prologue");
+                        let dst = lo.fresh_vreg(RegClass::Gpr);
+                        lo.emit(MachineInst::new(
+                            RvOp::LoadFrame.opcode(),
+                            vec![def_v(dst), MachineOperand::Frame(slot)],
+                        ));
+                        self.emit_memcpy(lo, dst, src, size);
+                    }
+                    Some(parts) => {
+                        let vals: Vec<(Loc, VReg)> = parts
+                            .iter()
+                            .map(|&(part, loc)| (loc, self.arg_part(lo, v, ret_ty, part)))
+                            .collect();
+                        for (loc, val) in vals {
+                            let r = match loc {
+                                Loc::Gpr(n) => gpr(n),
+                                Loc::Fpr(n) => fpr(n),
+                                Loc::Stack(_) => unreachable!("a register return"),
+                            };
+                            lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(r), use_v(val)]));
+                            uses.push(use_p(r));
+                        }
+                    }
+                }
+            } else {
+                let r = self.arg_part(lo, v, ret_ty, Part::Whole);
+                let ret = match lo.mf().vreg_class(r) {
+                    RegClass::Fp => self.rf.cc.fp_ret_reg,
+                    RegClass::Gpr => self.rf.cc.ret_reg,
+                };
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(ret), use_v(r)]));
+                uses.push(use_p(ret));
+            }
+        }
+        lo.emit(MachineInst::new(RvOp::Ret.opcode(), uses));
     }
 }
 
@@ -722,10 +1508,33 @@ impl TargetIsel for RiscvTarget {
     }
 
     fn global_addr(&self, dst: VReg, g: u32) -> MachineInst {
-        MachineInst::new(RvOp::GlobalAddr.opcode(), vec![def_v(dst), MachineOperand::Global(g)])
+        let got = self.global_got.get(g as usize).copied().unwrap_or(false);
+        MachineInst::new(
+            RvOp::GlobalAddr.opcode(),
+            vec![def_v(dst), MachineOperand::Global(g), imm(u64::from(got))],
+        )
+    }
+
+    fn float_const(&self, dst: VReg, bits: u64, width: u32) -> MachineInst {
+        MachineInst::new(RvOp::FLi.opcode(), vec![def_v(dst), imm(bits), imm(u64::from(width))])
+    }
+
+    fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
+        self.lower_prologue_lp64d(lo);
+    }
+
+    fn func_addr(&self, dst: VReg, f: u32) -> MachineInst {
+        let got = self.func_got.get(f as usize).copied().unwrap_or(false);
+        MachineInst::new(
+            RvOp::FuncAddr.opcode(),
+            vec![def_v(dst), MachineOperand::Func(f), imm(u64::from(got))],
+        )
     }
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        if Self::fused_away(lo, inst) {
+            return;
+        }
         match &inst.kind {
             InstKind::Bin(op) => self.lower_bin(lo, *op, inst),
             InstKind::ICmp(pred) => {
@@ -760,11 +1569,16 @@ impl TargetIsel for RiscvTarget {
                 let slot = lo.new_slot(size, align);
                 lo.emit(self.frame_addr(d, slot));
             }
-            // Dynamic (runtime-sized) stack allocation is implemented and
-            // execution-tested only on x86-64 so far; the riscv sp-adjust
-            // lowering is deferred (like other target-specific gaps here).
-            InstKind::DynAlloca { .. } => {
-                panic!("riscv backend: dynamic `dyn_alloca` is not yet supported")
+            InstKind::DynAlloca { align } => {
+                // `sp` moves at run time: the function addresses its frame
+                // through `s0` (see `RvOp::DynAlloca` and the encoder).
+                assert!(self.frame_pointer, "dyn_alloca in a function compiled without a frame pointer");
+                let d = lo.result_reg(inst);
+                let n = self.extend64(lo, inst.operands()[0], false);
+                lo.emit(MachineInst::new(
+                    RvOp::DynAlloca.opcode(),
+                    vec![def_v(d), use_v(n), imm(u64::from(*align))],
+                ));
             }
             InstKind::Load { ty, .. } => {
                 let d = lo.result_reg(inst);
@@ -794,6 +1608,18 @@ impl TargetIsel for RiscvTarget {
                     vec![def_v(d), use_v(base), use_v(off), imm(64)],
                 ));
             }
+            InstKind::Select if lo.mf().vreg_class(lo.result_reg(inst)) == RegClass::Fp => {
+                // A float select blends the bit patterns in GPRs, branch-free
+                // like the integer one.
+                let d = lo.result_reg(inst);
+                let c = self.clean_cond(lo, inst.operands()[0]);
+                let t = lo.reg(inst.operands()[1]);
+                let f = lo.reg(inst.operands()[2]);
+                let (tx, fx) = (self.to_gpr(lo, t, 64), self.to_gpr(lo, f, 64));
+                let g = lo.fresh_vreg(RegClass::Gpr);
+                self.blend(lo, g, c, tx, fx);
+                lo.emit(MachineInst::new(RvOp::FMvFX.opcode(), vec![def_v(d), use_v(g), imm(64)]));
+            }
             InstKind::Select => {
                 // Branchless `d = f ^ ((t ^ f) & -c)` with `c` in {0, 1}, so a
                 // secret condition is constant-time (§6d); and every step names
@@ -804,15 +1630,7 @@ impl TargetIsel for RiscvTarget {
                 let c = self.clean_cond(lo, inst.operands()[0]);
                 let t = lo.reg(inst.operands()[1]);
                 let f = lo.reg(inst.operands()[2]);
-                let zero = lo.fresh_vreg(RegClass::Gpr);
-                lo.emit(self.li(zero, Int::ZERO));
-                let mask = lo.fresh_vreg(RegClass::Gpr);
-                lo.emit(MachineInst::new(RvOp::Sub.opcode(), vec![def_v(mask), use_v(zero), use_v(c), imm(64)]));
-                let diff = lo.fresh_vreg(RegClass::Gpr);
-                lo.emit(MachineInst::new(RvOp::Xor.opcode(), vec![def_v(diff), use_v(t), use_v(f), imm(64)]));
-                let pick = lo.fresh_vreg(RegClass::Gpr);
-                lo.emit(MachineInst::new(RvOp::And.opcode(), vec![def_v(pick), use_v(diff), use_v(mask), imm(64)]));
-                lo.emit(MachineInst::new(RvOp::Xor.opcode(), vec![def_v(d), use_v(f), use_v(pick), imm(64)]));
+                self.blend(lo, d, c, t, f);
             }
             InstKind::Freeze | InstKind::Declassify => {
                 let d = lo.result_reg(inst);
@@ -842,10 +1660,34 @@ impl TargetIsel for RiscvTarget {
                 let d = lo.result_reg(inst);
                 lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_p(a0)]));
             }
-            // Floating-point negation / compares are out of the integer subset.
-            InstKind::Unary(UnaryOp::FNeg) | InstKind::FCmp(_) => {
+            InstKind::Unary(UnaryOp::FNeg) => {
+                // A sign flip by sign injection (`fsgnjn d, s, s`), exact for
+                // every value including NaNs (`fneg` flips the sign bit).
                 let d = lo.result_reg(inst);
-                lo.emit(MachineInst::new(RvOp::Li.opcode(), vec![def_v(d), imm(0)]));
+                let w = u64::from(Self::float_width(lo, inst.operands()[0]));
+                let s = lo.reg(inst.operands()[0]);
+                lo.emit(MachineInst::new(
+                    RvOp::FSgnj.opcode(),
+                    vec![def_v(d), use_v(s), use_v(s), imm(w), imm(1)],
+                ));
+            }
+            InstKind::FCmp(pred) => {
+                let d = lo.result_reg(inst);
+                match fcmp_code(*pred) {
+                    None => {
+                        let v = u64::from(*pred == FloatPred::True);
+                        lo.emit(MachineInst::new(RvOp::Li.opcode(), vec![def_v(d), imm(v)]));
+                    }
+                    Some(code) => {
+                        let w = u64::from(Self::float_width(lo, inst.operands()[0]));
+                        let a = lo.reg(inst.operands()[0]);
+                        let b = lo.reg(inst.operands()[1]);
+                        lo.emit(MachineInst::new(
+                            RvOp::FCmp.opcode(),
+                            vec![def_v(d), use_v(a), use_v(b), imm(u64::from(code)), imm(w)],
+                        ));
+                    }
+                }
             }
             k if k.is_atomic() => self.lower_atomic(lo, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),
@@ -854,14 +1696,7 @@ impl TargetIsel for RiscvTarget {
 
     fn lower_term(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         match &inst.kind {
-            InstKind::Ret => {
-                if let Some(&v) = inst.operands().first() {
-                    let r = self.abi_value(lo, v);
-                    let ret = self.rf.cc.ret_reg;
-                    lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(ret), use_v(r)]));
-                }
-                lo.emit(MachineInst::new(RvOp::Ret.opcode(), Vec::new()));
-            }
+            InstKind::Ret => self.lower_ret(lo, inst),
             InstKind::Br(target) => {
                 let args: Vec<_> = inst.operands().to_vec();
                 let e = lo.edge_to(*target, &args);
