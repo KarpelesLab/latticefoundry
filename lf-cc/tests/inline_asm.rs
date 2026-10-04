@@ -387,6 +387,34 @@ int main(int argc, char **argv) {
 }
 
 #[test]
+fn fpu_control_h_macros() {
+    // glibc's `<fpu_control.h>` reads and writes the x87 control word
+    // through `"=m"`/`"m"` operands.
+    if !Path::new("/usr/include/fpu_control.h").is_file() {
+        eprintln!("skipping: no <fpu_control.h>");
+        return;
+    }
+    let src = r#"
+#include <fpu_control.h>
+#include <stdio.h>
+
+int main(void) {
+    fpu_control_t cw, cw2, rounded;
+    _FPU_GETCW(cw);
+    rounded = (cw & ~_FPU_RC_ZERO) | _FPU_RC_ZERO;
+    _FPU_SETCW(rounded);
+    _FPU_GETCW(cw2);
+    _FPU_SETCW(cw);
+    printf("%d %d\n", (cw2 & _FPU_RC_ZERO) == _FPU_RC_ZERO, (cw & 0x3f) == 0x3f);
+    return 0;
+}
+"#;
+    if let Some((code, out)) = differential("fpu_control", src) {
+        assert_eq!((code, out.as_str()), (0, "1 1\n"));
+    }
+}
+
+#[test]
 fn errors_are_clear() {
     let opts = PpOptions { std: CStd::parse("gnu17").unwrap(), ..PpOptions::default() };
     // `asm goto` is rejected by the front end.
