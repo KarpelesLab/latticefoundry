@@ -51,10 +51,12 @@ pub mod softfloat;
 pub(crate) mod simd128;
 pub mod stack;
 pub mod target;
+pub mod unwind;
 pub mod vtarget;
 
 pub use mir::MachineFunction;
 pub use options::{CodegenOptions, CompiledModule, RelocModel};
+pub use unwind::UnwindTables;
 pub use stack::{
     StackAnalysis, StackAssumptions, StackBlocker, StackBound, StackBoundError, StackReport, StackUsage,
 };

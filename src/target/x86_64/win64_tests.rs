@@ -9,7 +9,7 @@
 //! (including the full 128 bits of `xmm6..xmm15`) and checks them after the
 //! call. Skipped when no C compiler is present.
 
-use crate::codegen::CodegenOptions;
+use crate::codegen::{CodegenOptions, UnwindTables};
 use crate::ir::inst::Flags;
 use crate::ir::Module;
 use crate::support::StrInterner;
@@ -17,7 +17,9 @@ use crate::support::diagnostics::FileId;
 use crate::target::TargetOs;
 
 fn win64_object(module: &Module, syms: &StrInterner) -> Vec<u8> {
-    let opts = CodegenOptions::default().with_os(TargetOs::Windows);
+    // Packaged as ELF, which has no image-relative relocation for `.pdata`:
+    // the Windows frames (the code under test) without their tables.
+    let opts = CodegenOptions::default().with_os(TargetOs::Windows).with_unwind_tables(UnwindTables::None);
     let obj = super::compile_module_with(module, syms, &opts).object;
     crate::mc::elf::write(&obj)
 }

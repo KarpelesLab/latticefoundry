@@ -735,7 +735,8 @@ pub fn link_executable(
                     | RelocKind::RiscvPcrelHi20
                     | RelocKind::RiscvPcrelLo12I
                     | RelocKind::RiscvPcrelLo12S
-                    | RelocKind::RiscvGotHi20 => {
+                    | RelocKind::RiscvGotHi20
+                    | RelocKind::ImageRel32 => {
                     return Err(LinkError::UnsupportedReloc(r.kind));
                 }
             }

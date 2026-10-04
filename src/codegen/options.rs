@@ -8,6 +8,7 @@
 //! the prologues were built from.
 
 use crate::codegen::stack::StackReport;
+use crate::codegen::unwind::UnwindTables;
 use crate::mc::object::ObjectModule;
 use crate::target::TargetOs;
 
@@ -44,6 +45,13 @@ pub struct CodegenOptions {
     /// [`Triple`]: crate::target::Triple
     /// [`Triple::call_conv`]: crate::target::Triple::call_conv
     pub os: TargetOs,
+    /// The **unwind tables** to emit (default `None`: the OS's own, see
+    /// [`UnwindTables::default_for`] — `.pdata`/`.xdata` on Windows, compact
+    /// unwind on Darwin, none elsewhere). [`UnwindTables::EhFrame`] adds DWARF
+    /// `.eh_frame` call-frame information to an ELF object. See
+    /// [`crate::codegen::unwind`]; x86-64 emits every kind, AArch64 the
+    /// compact unwind of frames it can encode.
+    pub unwind: Option<UnwindTables>,
 }
 
 /// How position-dependent the generated code may be, and so how it addresses
@@ -79,7 +87,7 @@ impl RelocModel {
 
 impl Default for CodegenOptions {
     fn default() -> CodegenOptions {
-        CodegenOptions { stack_probes: true, reloc_model: RelocModel::Static, os: TargetOs::Linux }
+        CodegenOptions { stack_probes: true, reloc_model: RelocModel::Static, os: TargetOs::Linux, unwind: None }
     }
 }
 
@@ -106,6 +114,18 @@ impl CodegenOptions {
     pub fn with_os(mut self, os: TargetOs) -> CodegenOptions {
         self.os = os;
         self
+    }
+
+    /// Emit the unwind tables `tables` (see [`CodegenOptions::unwind`]).
+    pub fn with_unwind_tables(mut self, tables: UnwindTables) -> CodegenOptions {
+        self.unwind = Some(tables);
+        self
+    }
+
+    /// The unwind tables this compilation emits: the explicit choice, or the
+    /// OS's default.
+    pub fn unwind_tables(&self) -> UnwindTables {
+        self.unwind.unwrap_or(UnwindTables::default_for(self.os))
     }
 }
 

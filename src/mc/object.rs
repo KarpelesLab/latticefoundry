@@ -390,6 +390,11 @@ pub enum RelocKind {
     /// RISC-V `R_RISCV_GOT_HI20`: the high 20 bits of `G + GOT - P`, the
     /// PC-relative address of `S`'s global-offset-table entry, in an `auipc`.
     RiscvGotHi20,
+    /// A 32-bit **image-relative** address, `S + A - ImageBase` (PE/COFF
+    /// `IMAGE_REL_AMD64_ADDR32NB` / `IMAGE_REL_ARM64_ADDR32NB`, an "RVA"): the
+    /// address form of the Windows unwind tables (`.pdata`/`.xdata`, see
+    /// [`crate::codegen::unwind`]). Only the COFF writer expresses it.
+    ImageRel32,
 }
 
 impl RelocKind {
@@ -427,7 +432,8 @@ impl RelocKind {
             | RelocKind::RiscvPcrelHi20
             | RelocKind::RiscvPcrelLo12I
             | RelocKind::RiscvPcrelLo12S
-            | RelocKind::RiscvGotHi20 => 4,
+            | RelocKind::RiscvGotHi20
+            | RelocKind::ImageRel32 => 4,
             // An `auipc` + `jalr` pair.
             RelocKind::RiscvCallPlt => 8,
         }

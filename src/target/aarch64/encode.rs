@@ -1771,6 +1771,8 @@ struct FunctionOutput {
     emitted: Emitted,
     rows: Vec<(u64, u32)>,
     stack: StackUsage,
+    /// The frame saves no callee-saved register (only `x29`/`x30`).
+    cs_free: bool,
 }
 
 /// Run isel → register allocation → frame layout → prologue/epilogue →
@@ -1812,7 +1814,7 @@ fn compile_function_full(
         GotQuery { func: &got_func, global: &got_global },
         if lines { Some(&mut rows) } else { None },
     );
-    FunctionOutput { emitted, rows, stack }
+    FunctionOutput { emitted, rows, stack, cs_free: layout.cs_regs.is_empty() }
 }
 
 /// Compile one function of `module` to its encoded bytes and relocations. Runs
@@ -1882,6 +1884,8 @@ fn build_module(
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 4));
     let mut stack = StackReport::new();
     let mut funcs: Vec<FuncDebug> = Vec::new();
+    // Mach-O compact unwind records (function symbol, size, encoding).
+    let mut compact = Vec::new();
 
     for (i, f) in module.functions().enumerate() {
         if f.is_declaration() {
@@ -1903,7 +1907,7 @@ fn build_module(
         obj.section_mut(text).bytes.extend_from_slice(&emitted.bytes);
 
         let name = syms.resolve(f.name).to_owned();
-        obj.add_symbol(Symbol::defined(
+        let fsym = obj.add_symbol(Symbol::defined(
             name.clone(),
             SymbolBinding::Global,
             SymbolType::Func,
@@ -1911,6 +1915,13 @@ fn build_module(
             off,
             len,
         ));
+        // `UNWIND_ARM64_MODE_FRAME` is `stp x29, x30, [sp, #-16]!; mov x29,
+        // sp` with any callee-saved registers in pairs right below the
+        // fp/lr pair; this layout keeps them at the bottom of the frame
+        // instead, so only frames without them have a compact encoding.
+        if out.cs_free {
+            compact.push((fsym, len, crate::codegen::unwind::UNWIND_ARM64_MODE_FRAME));
+        }
         for r in &emitted.relocations {
             let sym = obj.reference_symbol(&r.symbol);
             obj.add_relocation(crate::mc::object::Relocation {
@@ -1943,6 +1954,9 @@ fn build_module(
     crate::codegen::linkage::apply_symbol_attrs(module, syms, &mut obj);
     if pic {
         obj.add_section(Section::new(".note.GNU-stack", SectionKind::Debug, 1));
+    }
+    if opts.unwind_tables() == crate::codegen::UnwindTables::CompactUnwind {
+        crate::codegen::unwind::emit_compact_unwind(&mut obj, &compact);
     }
 
     if let Some(source) = debug {

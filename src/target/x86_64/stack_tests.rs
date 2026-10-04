@@ -21,6 +21,7 @@ use crate::codegen::{CodegenOptions, CompiledModule};
 use crate::ir::Module;
 use crate::mc::object::{ObjectModule, SymbolValue};
 use crate::support::StrInterner;
+use crate::target::TargetOs;
 use crate::support::diagnostics::FileId;
 use crate::transform::pipeline::{OptLevel, optimize};
 
@@ -79,6 +80,23 @@ fn simulate_prologue(code: &[u8]) -> Prologue {
             pc += 2;
         } else if c.starts_with(&[0x48, 0x89, 0xE5]) {
             pc += 3; // mov rbp, rsp
+        } else if c.starts_with(&[0x48, 0x8D, 0x6C, 0x24]) {
+            pc += 5; // lea rbp, [rsp + disp8] (the Windows frame)
+        } else if c.starts_with(&[0x48, 0x8D, 0xAC, 0x24]) {
+            pc += 8; // lea rbp, [rsp + disp32]
+        } else if let Some(at) = [0usize, 1].into_iter().find(|&p| {
+            (p == 0 || c[0] == 0x44) && c[p..].starts_with(&[0x0F, 0x11]) && c[p + 2] & 0xC7 != 0x05 && c[p + 2] & 7 == 5
+        }) {
+            // movups [rbp + disp], xmm (the Windows xmm saves): rbp is the
+            // saved-rbp slot, at depth 16.
+            let modrm = c[at + 2];
+            let (disp, len) = if modrm >> 6 == 1 {
+                (i64::from(c[at + 3] as i8), 1)
+            } else {
+                (i64::from(i32::from_le_bytes(c[at + 3..at + 7].try_into().unwrap())), 4)
+            };
+            touches.push(16 - disp - 15);
+            pc += at + 3 + len;
         } else if c.starts_with(&[0x48, 0x81, 0xEC]) {
             depth += i64::from(imm32(pc + 3)); // sub rsp, imm32
             subs += 1;
@@ -166,13 +184,13 @@ entry ^0:
 #[test]
 fn reported_frame_equals_decoded_prologue() {
     let (m, syms) = prepare(FRAMES, OptLevel::O0);
-    for probes in [true, false] {
-        let opts = CodegenOptions::default().with_stack_probes(probes);
+    for (probes, os) in [true, false].into_iter().flat_map(|p| [(p, TargetOs::Linux), (p, TargetOs::Windows)]) {
+        let opts = CodegenOptions::default().with_stack_probes(probes).with_os(os);
         let out: CompiledModule = compile_module_with(&m, &syms, &opts);
         assert_eq!(out.stack.functions().len(), 5);
         for u in out.stack.functions() {
             let p = simulate_prologue(func_bytes(&out.object, &u.name));
-            let what = format!("{} (probes {probes})", u.name);
+            let what = format!("{} (probes {probes}, {os:?})", u.name);
             assert_eq!(p.depth as u64, u.frame_size, "{what}: frame size vs decoded prologue");
             assert_eq!(u.frame_size, u.return_address + u.saved_registers + u.sp_adjust, "{what}");
             assert_eq!(u.return_address, 8);
@@ -181,7 +199,9 @@ fn reported_frame_equals_decoded_prologue() {
             if probes {
                 assert_probed(&p, 4088, &what);
             } else {
-                assert!(p.subs <= 1, "{what}: one `sub rsp` without probes");
+                // Windows splits off the fixed part allocated before rbp is set.
+                let most = if os == TargetOs::Windows { 2 } else { 1 };
+                assert!(p.subs <= most, "{what}: {most} `sub rsp` at most without probes");
             }
             // Every static frame keeps rsp 16-aligned at calls.
             assert_eq!(u.frame_size % 16, 0, "{what}");

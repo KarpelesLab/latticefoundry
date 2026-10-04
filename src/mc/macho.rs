@@ -16,7 +16,9 @@
 //!   `.rodata` → `__TEXT,__const` (or `__DATA,__const` when it carries
 //!   relocations, which `__TEXT` must not), `.bss` → `__DATA,__bss`
 //!   (`S_ZEROFILL`, placed after every section with contents), `.debug_*` →
-//!   `__DWARF,__debug_*` (`S_ATTR_DEBUG`);
+//!   `__DWARF,__debug_*` (`S_ATTR_DEBUG`), and a `__compact_unwind` section
+//!   → `__LD,__compact_unwind` (`S_ATTR_DEBUG`; see
+//!   [`crate::codegen::unwind`]);
 //! - `LC_BUILD_VERSION` (macOS, minimum 11.0 by default — see
 //!   [`MachOOptions`]), so linkers know the platform;
 //! - `LC_SYMTAB` with `nlist_64` entries in the order `LC_DYSYMTAB` requires —
@@ -162,6 +164,11 @@ impl MachOOptions {
 
 /// The `(sectname, segname, flags)` of a module section.
 fn section_names(name: &str, kind: SectionKind, has_relocs: bool) -> (String, &'static str, u32) {
+    if name == "__compact_unwind" {
+        // The compact unwind records the linker folds into `__unwind_info`
+        // (see `codegen::unwind`); `S_ATTR_DEBUG` keeps them out of the image.
+        return (name.to_owned(), "__LD", S_REGULAR | S_ATTR_DEBUG);
+    }
     match kind {
         SectionKind::Text => (
             "__text".to_owned(),

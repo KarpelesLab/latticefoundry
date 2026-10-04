@@ -39,6 +39,7 @@
 //! | `Abs64` | `IMAGE_REL_AMD64_ADDR64` | `IMAGE_REL_ARM64_ADDR64` | `A` |
 //! | `Abs32`, `Abs32S` | `IMAGE_REL_AMD64_ADDR32` | `IMAGE_REL_ARM64_ADDR32` | `A` |
 //! | `Pc32`, `Plt32` | `IMAGE_REL_AMD64_REL32` | `IMAGE_REL_ARM64_REL32` (`Pc32`) | `A + 4` |
+//! | `ImageRel32` | `IMAGE_REL_AMD64_ADDR32NB` | `IMAGE_REL_ARM64_ADDR32NB` | `A` |
 //! | `Aarch64Call26` | — | `IMAGE_REL_ARM64_BRANCH26` | `imm26 = A / 4` |
 //! | `Aarch64AdrPrelPgHi21` | — | `IMAGE_REL_ARM64_PAGEBASE_REL21` | `immhi:immlo = A` |
 //! | `Aarch64AddAbsLo12Nc` | — | `IMAGE_REL_ARM64_PAGEOFFSET_12A` | `imm12 = A & 0xfff` |
@@ -93,9 +94,11 @@ const IMAGE_WEAK_EXTERN_SEARCH_ALIAS: u32 = 3;
 
 const IMAGE_REL_AMD64_ADDR64: u16 = 0x0001;
 const IMAGE_REL_AMD64_ADDR32: u16 = 0x0002;
+const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
 const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
 
 const IMAGE_REL_ARM64_ADDR32: u16 = 0x0001;
+const IMAGE_REL_ARM64_ADDR32NB: u16 = 0x0002;
 const IMAGE_REL_ARM64_BRANCH26: u16 = 0x0003;
 const IMAGE_REL_ARM64_PAGEBASE_REL21: u16 = 0x0004;
 const IMAGE_REL_ARM64_PAGEOFFSET_12A: u16 = 0x0006;
@@ -198,6 +201,9 @@ fn map_reloc(kind: RelocKind, addend: i64, machine: CoffMachine) -> Result<(u16,
             _ => Err(too_big()),
         }
     };
+    let rva32 = || -> Result<Patch, ObjectWriteError> {
+        u32::try_from(addend).map(Patch::Word32).map_err(|_| too_big())
+    };
     let rel32 = || -> Result<Patch, ObjectWriteError> {
         let stored = addend.checked_add(4).filter(|&v| fits_i32(v)).ok_or_else(too_big)?;
         Ok(Patch::Word32(stored as i32 as u32))
@@ -207,12 +213,14 @@ fn map_reloc(kind: RelocKind, addend: i64, machine: CoffMachine) -> Result<(u16,
             RelocKind::Abs64 => Ok((IMAGE_REL_AMD64_ADDR64, Patch::Word64(addend))),
             RelocKind::Abs32 | RelocKind::Abs32S => Ok((IMAGE_REL_AMD64_ADDR32, abs32()?)),
             RelocKind::Pc32 | RelocKind::Plt32 => Ok((IMAGE_REL_AMD64_REL32, rel32()?)),
+            RelocKind::ImageRel32 => Ok((IMAGE_REL_AMD64_ADDR32NB, rva32()?)),
             other => Err(unsupported(other, machine)),
         },
         CoffMachine::Arm64 => match kind {
             RelocKind::Abs64 => Ok((IMAGE_REL_ARM64_ADDR64, Patch::Word64(addend))),
             RelocKind::Abs32 | RelocKind::Abs32S => Ok((IMAGE_REL_ARM64_ADDR32, abs32()?)),
             RelocKind::Pc32 => Ok((IMAGE_REL_ARM64_REL32, rel32()?)),
+            RelocKind::ImageRel32 => Ok((IMAGE_REL_ARM64_ADDR32NB, rva32()?)),
             RelocKind::Aarch64Call26 => {
                 if addend % 4 != 0 || !(-(1 << 27)..(1 << 27)).contains(&addend) {
                     return Err(too_big());
@@ -978,6 +986,26 @@ mod tests {
         let x = m.reference_symbol("x");
         m.add_relocation(Relocation { section: t, offset: 0, symbol: x, kind: RelocKind::Pc32, addend: 1 << 40 });
         assert!(write(&m, CoffMachine::Amd64).is_err());
+    }
+
+    #[test]
+    fn image_relative_relocations() {
+        for (machine, ty) in [(CoffMachine::Amd64, IMAGE_REL_AMD64_ADDR32NB), (CoffMachine::Arm64, IMAGE_REL_ARM64_ADDR32NB)] {
+            let mut m = ObjectModule::new("p");
+            let t = m.add_section(Section::new(".text", SectionKind::Text, 16));
+            m.section_mut(t).bytes = vec![0xc3; 16];
+            let p = m.add_section(Section::new(".pdata", SectionKind::Rodata, 4));
+            m.section_mut(p).bytes = vec![0; 8];
+            let ts = m.add_symbol(Symbol::defined(".text", SymbolBinding::Local, SymbolType::Section, t, 0, 0));
+            m.add_relocation(Relocation { section: p, offset: 0, symbol: ts, kind: RelocKind::ImageRel32, addend: 0 });
+            m.add_relocation(Relocation { section: p, offset: 4, symbol: ts, kind: RelocKind::ImageRel32, addend: 12 });
+            let b = write(&m, machine).unwrap();
+            let sh = shdrs(&b);
+            assert_eq!(sh[1].name, ".pdata");
+            // Against the .text section symbol (index 0), the addend in place.
+            assert_eq!(relocs(&b, &sh[1]), [(0, 0, ty), (4, 0, ty)]);
+            assert_eq!(u32_at(&b, sh[1].data as usize + 4), 12);
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use crate::mc::object::ObjectModule;
+use crate::mc::object::{ObjectModule, RelocKind};
 use crate::target::{ObjectFormat, TargetArch, Triple};
 
 /// Why an [`ObjectModule`] could not be written in the requested format:
@@ -84,7 +84,10 @@ pub fn write_object_as(
                 )));
             }
             if let Some(r) = obj.relocations().iter().find(|r| {
-                r.kind.is_instruction_field() || r.kind.is_avr() || r.kind.is_riscv()
+                r.kind.is_instruction_field()
+                    || r.kind.is_avr()
+                    || r.kind.is_riscv()
+                    || r.kind == RelocKind::ImageRel32
             }) {
                 return Err(ObjectWriteError::new(format!(
                     "relocation {:?} cannot appear in an x86-64 ELF object",

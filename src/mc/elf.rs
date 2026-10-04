@@ -147,7 +147,8 @@ fn x86_64_reloc(kind: RelocKind) -> u32 {
         | RelocKind::RiscvPcrelHi20
         | RelocKind::RiscvPcrelLo12I
         | RelocKind::RiscvPcrelLo12S
-        | RelocKind::RiscvGotHi20 => {
+        | RelocKind::RiscvGotHi20
+        | RelocKind::ImageRel32 => {
             unreachable!("relocation kind {kind:?} in an x86-64 ELF object")
         }
     }

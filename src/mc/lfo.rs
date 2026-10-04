@@ -364,6 +364,7 @@ fn reloc_kind_code(k: RelocKind) -> u8 {
         RelocKind::RiscvPcrelLo12I => 25,
         RelocKind::RiscvPcrelLo12S => 26,
         RelocKind::RiscvGotHi20 => 27,
+        RelocKind::ImageRel32 => 28,
     }
 }
 
@@ -400,6 +401,7 @@ fn reloc_kind_from(c: u8) -> Result<RelocKind, DecodeError> {
         25 => RelocKind::RiscvPcrelLo12I,
         26 => RelocKind::RiscvPcrelLo12S,
         27 => RelocKind::RiscvGotHi20,
+        28 => RelocKind::ImageRel32,
         _ => return Err(DecodeError::InvalidTag { what: "reloc-kind", tag: u32::from(c) }),
     })
 }

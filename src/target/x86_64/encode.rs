@@ -45,6 +45,7 @@ use crate::codegen::options::{CodegenOptions, CompiledModule};
 use crate::codegen::stack::{STACK_PROBE_INTERVAL, StackReport, StackUsage, scan_calls};
 use crate::codegen::legalize::legalized;
 use crate::codegen::regalloc;
+use crate::codegen::unwind::{self, FrameOp, FrameStep, FunctionFrame, UnwindTables};
 use crate::ir::Module;
 use crate::mc::emit::{Emitted, Emitter, Ref};
 use crate::mc::object::{
@@ -592,6 +593,15 @@ pub struct FrameLayout {
     outgoing: i64,
     /// Whether the prologue's `sub rsp` and every `DynAlloca` emit stack probes.
     probes: bool,
+    /// Whether the frame takes the Windows x64 shape (see
+    /// [`FrameLayout::prologue_plan`]): `rbp` set after the pushes and a small
+    /// fixed allocation, so the `.pdata`/`.xdata` unwind codes can describe
+    /// it. Set for [`TargetOs::Windows`](crate::target::TargetOs::Windows).
+    windows: bool,
+    /// Windows: the fixed allocation made before `rbp` is set (the `xmm` save
+    /// area plus the 8-byte pad that makes `cs_bytes + fixed` a multiple of
+    /// 16); the rest of `sub_size` follows. Always 0 under System V.
+    fixed: i32,
 }
 
 impl FrameLayout {
@@ -626,6 +636,86 @@ impl FrameLayout {
             syscalls: scan.syscalls,
             probed: self.probes,
         }
+    }
+}
+
+impl FrameLayout {
+    /// The prologue built from this layout: each instruction, with what it
+    /// does to the frame (for the unwind tables, see
+    /// [`crate::codegen::unwind`]).
+    ///
+    /// System V:
+    ///
+    /// ```text
+    /// push rbp ; mov rbp, rsp ; push <callee-saved>... ; sub rsp, sub_size
+    /// ```
+    ///
+    /// Windows x64, ordered as its unwind codes require (pushes, then the
+    /// fixed allocation, then the frame register, then the `xmm` saves), with
+    /// `rbp` landing on the same saved-`rbp` slot so every `rbp`-relative
+    /// offset is the same as System V's:
+    ///
+    /// ```text
+    /// push rbp ; push <callee-saved>... ; sub rsp, fixed
+    /// lea rbp, [rsp + cs_bytes + fixed]        ; UWOP_SET_FPREG
+    /// movups [rbp - k], xmm6..15               ; UWOP_SAVE_XMM128
+    /// sub rsp, sub_size - fixed                ; probed; unwound through rbp
+    /// ```
+    pub fn prologue_plan(&self) -> Vec<(MachineInst, FrameOp)> {
+        let push = |r: u8| (MachineInst::new(X86Op::Push.opcode(), vec![phys_use(u16::from(r))]), FrameOp::Push(r));
+        let sub = |n: i32, probe: bool, touch: bool| {
+            MachineInst::new(
+                X86Op::SubRsp.opcode(),
+                vec![imm_op(n as u64), imm_op(u64::from(probe)), imm_op(u64::from(touch))],
+            )
+        };
+        let rbp = RBP as u8;
+        let mut plan = vec![push(rbp)];
+        let set_frame = |offset: i32| {
+            let inst = if offset == 0 {
+                MachineInst::new(X86Op::MovRbpRsp.opcode(), Vec::new())
+            } else {
+                MachineInst::new(
+                    X86Op::LeaRspOff.opcode(),
+                    vec![phys(RBP), MachineOperand::Imm(puremp::Int::from_i64(i64::from(offset)))],
+                )
+            };
+            (inst, FrameOp::SetFrame { reg: rbp, offset: offset as u32 })
+        };
+        if !self.windows {
+            plan.push(set_frame(0));
+            plan.extend(self.cs_regs.iter().map(|&r| push(r)));
+            if self.sub_size > 0 {
+                plan.push((sub(self.sub_size, self.probes, false), FrameOp::Alloc(self.sub_size as u32)));
+            }
+            return plan;
+        }
+        plan.extend(self.cs_regs.iter().map(|&r| push(r)));
+        if self.fixed > 0 {
+            plan.push((sub(self.fixed, false, false), FrameOp::Alloc(self.fixed as u32)));
+        }
+        plan.push(set_frame(self.cs_bytes + self.fixed));
+        for &(x, off) in &self.xmm_saves {
+            plan.push((
+                MachineInst::new(
+                    X86Op::SaveXmm.opcode(),
+                    vec![
+                        MachineOperand::Use(Reg::Physical(regs::xmm(u16::from(x)))),
+                        MachineOperand::Imm(puremp::Int::from_i64(i64::from(off))),
+                    ],
+                ),
+                FrameOp::SaveXmm { reg: x, fp_offset: off },
+            ));
+        }
+        let rest = self.sub_size - self.fixed;
+        if rest > 0 {
+            // The fixed part moved rsp below the last push without touching
+            // the stack: with probes, touch the new top before stepping down
+            // (the probing invariant of `codegen::stack`).
+            let touch = self.probes && self.fixed > 0 && self.sub_size as u64 >= STACK_PROBE_INTERVAL;
+            plan.push((sub(rest, self.probes, touch), FrameOp::Alloc(rest as u32)));
+        }
+        plan
     }
 }
 
@@ -680,18 +770,24 @@ pub fn layout_frame_with(
         .filter(|p| p.class == RegClass::Fp && used_xmm[p.num as usize])
         .map(|p| p.num as u8)
         .collect();
+    // Windows: an 8-byte pad below an odd number of pushes keeps the xmm save
+    // slots 16-byte aligned and makes `cs_bytes + fixed` (rbp's distance from
+    // rsp when the prologue sets it) a multiple of 16, as UWOP_SET_FPREG needs.
+    let windows = opts.os == crate::target::TargetOs::Windows;
+    let pad = if windows { cs_bytes % 16 } else { 0 };
     let xmm_saves: Vec<(u8, i32)> = xmm_cs
         .iter()
         .enumerate()
-        .map(|(k, &x)| (x, -(cs_bytes + 16 * (k as i32 + 1))))
+        .map(|(k, &x)| (x, -(cs_bytes + pad + 16 * (k as i32 + 1))))
         .collect();
+    let fixed = if windows { pad + 16 * xmm_saves.len() as i32 } else { 0 };
 
     // Slot offsets grow downward from just below the callee-saved region (the
     // pushed GPRs, then any xmm save slots). The alignment is taken relative
     // to `rbp`, which the prologue leaves 16-byte aligned (`push rbp` right
     // after the call's return address), so a slot of alignment up to 16 (a
     // vector) is really aligned whatever the number of callee-saved pushes.
-    let mut off = 16 * xmm_saves.len() as i64;
+    let mut off = i64::from(pad) + 16 * xmm_saves.len() as i64;
     let mut slot_off = vec![0i32; mf.frame().len()];
     for (i, off_slot) in slot_off.iter_mut().enumerate() {
         let info = mf.frame().slot(StackSlot::from_index(i));
@@ -708,7 +804,17 @@ pub fn layout_frame_with(
     let padded = align_up(total, 16);
     let sub_size = (padded - cs_bytes as i64) as i32;
 
-    FrameLayout { slot_off, cs_regs, xmm_saves, cs_bytes, sub_size, outgoing, probes: opts.stack_probes }
+    FrameLayout {
+        slot_off,
+        cs_regs,
+        xmm_saves,
+        cs_bytes,
+        sub_size,
+        outgoing,
+        probes: opts.stack_probes,
+        windows,
+        fixed,
+    }
 }
 
 /// The registers an instruction's encoder expansion writes without naming
@@ -750,27 +856,8 @@ fn imm_op(v: u64) -> MachineOperand {
 pub fn insert_prologue_epilogue(mf: &mut MachineFunction, layout: &FrameLayout) {
     let entry = mf.entry().expect("a function being compiled has an entry block");
 
-    // --- prologue: push rbp; mov rbp,rsp; push callee-saved; sub rsp,frame ---
-    // (`SubRsp`'s second operand requests the probed form.)
-    let mut prologue = vec![
-        MachineInst::new(X86Op::Push.opcode(), vec![phys_use(RBP)]),
-        MachineInst::new(X86Op::MovRbpRsp.opcode(), Vec::new()),
-    ];
-    for &cs in &layout.cs_regs {
-        prologue.push(MachineInst::new(X86Op::Push.opcode(), vec![phys_use(u16::from(cs))]));
-    }
-    if layout.sub_size > 0 {
-        prologue.push(MachineInst::new(
-            X86Op::SubRsp.opcode(),
-            vec![imm_op(layout.sub_size as u64), imm_op(u64::from(layout.probes))],
-        ));
-    }
-    for &(x, off) in &layout.xmm_saves {
-        prologue.push(MachineInst::new(
-            X86Op::SaveXmm.opcode(),
-            vec![MachineOperand::Use(Reg::Physical(regs::xmm(u16::from(x)))), MachineOperand::Imm(puremp::Int::from_i64(i64::from(off)))],
-        ));
-    }
+    // --- prologue: see `FrameLayout::prologue_plan` ---
+    let mut prologue: Vec<MachineInst> = layout.prologue_plan().into_iter().map(|(inst, _)| inst).collect();
     let old = std::mem::take(&mut mf.block_mut(entry).insts);
     prologue.extend(old);
     mf.block_mut(entry).insts = prologue;
@@ -1408,6 +1495,9 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         X86Op::MovRbpRsp => mov_rr(e, RBP as u8, RSP as u8, true),
         X86Op::SubRsp => {
             let probe = ops.get(1).is_some_and(|o| uimm(o) != 0);
+            if ops.get(2).is_some_and(|o| uimm(o) != 0) {
+                probe_rsp(e); // touch the current top first
+            }
             sub_rsp(e, uimm(&ops[0]), probe);
         }
         X86Op::LeaRspRbp => {
@@ -1712,7 +1802,7 @@ pub fn encode_function(
     func_name: &dyn Fn(u32) -> String,
     global_name: &dyn Fn(u32) -> String,
 ) -> Emitted {
-    encode_function_inner(mf, layout, func_name, global_name, GotQuery::NONE, None)
+    encode_function_inner(mf, layout, func_name, global_name, GotQuery::NONE, None, None)
 }
 
 /// Like [`encode_function`], but also collects the `(function-relative offset,
@@ -1728,8 +1818,19 @@ pub fn encode_function_lines(
 ) -> (Emitted, Vec<(u64, u32)>) {
     let mut rows = Vec::new();
     let emitted =
-        encode_function_inner(mf, layout, func_name, global_name, GotQuery::NONE, Some(&mut rows));
+        encode_function_inner(mf, layout, func_name, global_name, GotQuery::NONE, Some(&mut rows), None);
     (emitted, rows)
+}
+
+/// Where the frame-changing instructions of an encoded function ended up,
+/// for its unwind tables.
+#[derive(Debug, Default)]
+struct UnwindMarks {
+    /// The end offset of each of the entry block's first instructions — the
+    /// prologue, one per [`FrameLayout::prologue_plan`] step.
+    prologue_ends: Vec<u32>,
+    /// Each epilogue's `(end of pop rbp, end of ret)`.
+    epilogues: Vec<(u32, u32)>,
 }
 
 fn encode_function_inner(
@@ -1739,6 +1840,7 @@ fn encode_function_inner(
     global_name: &dyn Fn(u32) -> String,
     got: GotQuery<'_>,
     mut lines: Option<&mut Vec<(u64, u32)>>,
+    mut marks: Option<(usize, &mut UnwindMarks)>,
 ) -> Emitted {
     let mut e = Emitter::new();
     let labels: Vec<_> = (0..mf.num_blocks()).map(|_| e.create_label()).collect();
@@ -1753,9 +1855,10 @@ fn encode_function_inner(
             order.push(bid);
         }
     }
+    let mut pending_pop = None;
     for bid in order {
         e.bind_label(labels[bid.index()]);
-        for inst in &mf.block(bid).insts {
+        for (k, inst) in mf.block(bid).insts.iter().enumerate() {
             if let Some(rows) = lines.as_deref_mut()
                 && inst.line != 0
                 && rows.last().map(|&(_, l)| l) != Some(inst.line)
@@ -1763,6 +1866,21 @@ fn encode_function_inner(
                 rows.push((e.offset(), inst.line));
             }
             encode_inst(&mut e, inst, &ctx);
+            if let Some((prologue_len, m)) = marks.as_mut() {
+                let end = e.offset() as u32;
+                let op = X86Op::decode(inst.opcode);
+                if bid == entry && k < *prologue_len {
+                    m.prologue_ends.push(end);
+                } else if op == X86Op::Pop && rnum(&inst.operands[0]) == RBP as u8 {
+                    pending_pop = Some(end);
+                } else if op == X86Op::Ret {
+                    if let Some(pop) = pending_pop.take() {
+                        m.epilogues.push((pop, end));
+                    }
+                } else {
+                    pending_pop = None;
+                }
+            }
         }
     }
     e.finish().expect("intra-function branch resolution never overflows")
@@ -1774,6 +1892,9 @@ struct FunctionOutput {
     emitted: Emitted,
     rows: Vec<(u64, u32)>,
     stack: StackUsage,
+    /// The unwind description (its `offset` and `size` filled in by the
+    /// module driver).
+    frame: FunctionFrame,
 }
 
 /// Run isel → register allocation → frame layout → prologue/epilogue →
@@ -1805,6 +1926,8 @@ fn compile_function_full(
         !crate::codegen::linkage::global_binds_locally(module, crate::ir::GlobalId::from_index(idx as usize), model)
     };
     let mut rows = Vec::new();
+    let plan = layout.prologue_plan();
+    let mut marks = UnwindMarks::default();
     let emitted = encode_function_inner(
         &mf,
         &layout,
@@ -1812,8 +1935,18 @@ fn compile_function_full(
         &global_name,
         GotQuery { func: &got_func, global: &got_global },
         if lines { Some(&mut rows) } else { None },
+        Some((plan.len(), &mut marks)),
     );
-    FunctionOutput { emitted, rows, stack }
+    // The prologue's steps: the planned frame operations at the offsets their
+    // instructions were encoded to.
+    debug_assert_eq!(marks.prologue_ends.len(), plan.len(), "the prologue opens the entry block");
+    let steps = plan
+        .iter()
+        .zip(&marks.prologue_ends)
+        .map(|((_, op), &end)| FrameStep { end, op: *op })
+        .collect();
+    let frame = FunctionFrame { offset: 0, size: emitted.bytes.len() as u64, steps, epilogues: marks.epilogues };
+    FunctionOutput { emitted, rows, stack, frame }
 }
 
 /// Compile one function of `module` to its encoded bytes and relocations. Runs
@@ -1915,6 +2048,8 @@ fn build_module(
     let text = obj.add_section(Section::new(".text", SectionKind::Text, 16));
     let mut funcs: Vec<FuncDebug> = Vec::new();
     let mut stack = StackReport::new();
+    // Each function's unwind description and symbol.
+    let mut frames: Vec<(FunctionFrame, crate::mc::object::SymbolId)> = Vec::new();
 
     for (i, f) in module.functions().enumerate() {
         if f.is_declaration() {
@@ -1936,7 +2071,7 @@ fn build_module(
         obj.section_mut(text).bytes.extend_from_slice(&emitted.bytes);
 
         let name = syms.resolve(f.name).to_owned();
-        obj.add_symbol(Symbol::defined(
+        let fsym = obj.add_symbol(Symbol::defined(
             name.clone(),
             SymbolBinding::Global,
             SymbolType::Func,
@@ -1944,6 +2079,7 @@ fn build_module(
             off,
             len,
         ));
+        frames.push((FunctionFrame { offset: off, size: len, ..out.frame }, fsym));
         for r in &emitted.relocations {
             let sym = obj.reference_symbol(&r.symbol);
             obj.add_relocation(crate::mc::object::Relocation {
@@ -1977,6 +2113,7 @@ fn build_module(
     if pic {
         obj.add_section(Section::new(".note.GNU-stack", SectionKind::Debug, 1));
     }
+    emit_unwind_tables(&mut obj, text, &frames, opts.unwind_tables());
 
     if let Some(source) = debug {
         let text_size = obj.section(text).bytes.len() as u64;
@@ -1998,6 +2135,37 @@ fn build_module(
     }
 
     CompiledModule { object: obj, stack }
+}
+
+/// Add the unwind tables `tables` describing the module's functions (each
+/// frame with its function symbol) to `obj`. See [`crate::codegen::unwind`].
+fn emit_unwind_tables(
+    obj: &mut ObjectModule,
+    text: crate::mc::object::SectionId,
+    frames: &[(FunctionFrame, crate::mc::object::SymbolId)],
+    tables: UnwindTables,
+) {
+    let funcs: Vec<FunctionFrame> = frames.iter().map(|(f, _)| f.clone()).collect();
+    match tables {
+        UnwindTables::None => {}
+        // The Windows layout is built for these codes (see
+        // `FrameLayout::prologue_plan`); only System V frames (a non-Windows
+        // OS asking for `.pdata`) cannot be described, and then the object
+        // gets no table (`emit_win64` adds nothing on error).
+        UnwindTables::Win64 => {
+            let _ = unwind::emit_win64(obj, text, &funcs);
+        }
+        UnwindTables::EhFrame => unwind::emit_eh_frame(obj, text, &funcs),
+        UnwindTables::CompactUnwind => {
+            // A frame the compact encoding cannot express (Windows-only
+            // callee-saved registers, xmm saves) gets no record.
+            let records: Vec<_> = frames
+                .iter()
+                .filter_map(|(f, sym)| unwind::compact_unwind_x86_64(f).map(|enc| (*sym, f.size, enc)))
+                .collect();
+            unwind::emit_compact_unwind(obj, &records);
+        }
+    }
 }
 
 /// A non-allocated debug [`Section`] holding `bytes`.
