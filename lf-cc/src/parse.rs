@@ -49,6 +49,8 @@ pub fn parse(tokens: Vec<Token>, std: CStd) -> Result<TranslationUnit, Vec<Diagn
         va_list_record: None,
         cur_func: None,
         in_params: 0,
+        vla_ok: false,
+        vla_len: None,
         transparent_params: Vec::new(),
         extension: 0,
         named_fn_params: None,
@@ -128,6 +130,12 @@ struct Parser {
     /// Nesting depth of parameter lists being parsed (a parameter array bound
     /// need not be constant).
     in_params: u32,
+    /// Set while parsing the declarator of a block-scope object, whose
+    /// outermost array bound may be a run-time value (a variable-length
+    /// array); that bound is parked in [`vla_len`](Self::vla_len).
+    vla_ok: bool,
+    /// The run-time bound of the variable-length array declarator just parsed.
+    vla_len: Option<Expr>,
     /// The transparent-union parameters (index, union type) of the parameter
     /// list parsed last.
     transparent_params: Vec<(usize, CType)>,
@@ -477,6 +485,14 @@ impl Parser {
                 items.push(TopLevel::Asm(stmt.template));
                 continue;
             }
+            // `#pragma weak name`, as the preprocessor passes it on.
+            if matches!(self.peek_at(0), TokenKind::Ident(n) if n == "__pragma_weak") {
+                self.bump();
+                let (name, _) = self.expect_ident()?;
+                self.expect_punct(Punct::Semi, "';'")?;
+                items.push(TopLevel::PragmaWeak(name));
+                continue;
+            }
             // `__extension__ typedef long long ...;` / `__extension__ extern ...`.
             let ext = self.skip_extension();
             self.extension += u32::from(ext);
@@ -537,12 +553,16 @@ impl Parser {
         })?;
         let mut message: Option<String> = None;
         if self.eat_punct(Punct::Comma) {
-            match self.peek().clone() {
-                TokenKind::Str(s, _) => {
-                    self.bump();
-                    message = Some(String::from_utf8_lossy(&s).into_owned());
-                }
-                _ => return self.err("expected a string message in _Static_assert"),
+            // The message may be several adjacent literals (`"verify (" #R ")"`).
+            let mut text = Vec::new();
+            while let TokenKind::Str(s, _) = self.peek().clone() {
+                self.bump();
+                text.extend_from_slice(&s);
+                message = Some(String::new());
+            }
+            match message {
+                Some(_) => message = Some(String::from_utf8_lossy(&text).into_owned()),
+                None => return self.err("expected a string message in _Static_assert"),
             }
         }
         self.expect_punct(Punct::RParen, "')' to close _Static_assert")?;
@@ -841,6 +861,7 @@ impl Parser {
             asm_label,
             thread_local: self.spec_thread,
             attrs: attrs.sym(),
+            vla_len: None,
             span,
         }))
     }
@@ -917,6 +938,12 @@ impl Parser {
                     // expression (`regmatch_t m[__restrict n]`): the parameter is
                     // adjusted to a pointer, so the bound is irrelevant.
                     None if self.in_params > 0 && dims.is_empty() => dims.push(0u64),
+                    // A block-scope object's outermost bound may be a run-time
+                    // value: a variable-length array (C99 6.7.6.2).
+                    None if self.vla_ok && dims.is_empty() && self.vla_len.is_none() => {
+                        self.vla_len = Some(e);
+                        dims.push(0u64);
+                    }
                     None => {
                         return Err(Diagnostic::error(
                             "expected a constant integer expression (variable-length arrays are unsupported)",
@@ -1448,6 +1475,7 @@ impl Parser {
                     asm_label: None,
                     thread_local: false,
                     attrs: SymAttrs::default(),
+                    vla_len: None,
                     span,
                 }]),
                 span,
@@ -2844,7 +2872,19 @@ impl Parser {
         let thread_local = self.spec_thread;
         let mut decls = Vec::new();
         loop {
-            let (name, ty, name_span) = self.parse_named_declarator(base.clone())?;
+            self.vla_ok = true;
+            self.vla_len = None;
+            let declarator = self.parse_named_declarator(base.clone());
+            self.vla_ok = false;
+            let (name, ty, name_span) = declarator?;
+            let vla_len = self.vla_len.take().map(Box::new);
+            if vla_len.is_some() && !matches!(ty, CType::Array(_, 0)) {
+                return Err(Diagnostic::error(
+                    "a variable-length array is only supported as the type of an object itself \
+                     (not behind a pointer or function declarator)",
+                )
+                .with_span(name_span));
+            }
             let (asm_label, ty, attrs) = self.finish_declarator(ty, name_span, &sattrs)?;
             self.declare_ordinary(&name, Some(ty.clone()));
             let init =
@@ -2863,6 +2903,7 @@ impl Parser {
                 asm_label,
                 thread_local,
                 attrs: attrs.sym(),
+                vla_len,
                 span: name_span,
             });
             if !self.eat_punct(Punct::Comma) {

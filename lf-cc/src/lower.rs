@@ -614,9 +614,11 @@ impl FnLower<'_> {
     /// The IR type of a C type (aggregates via the precomputed map, vectors
     /// interned on demand).
     fn ir_of(&mut self, ty: &CType) -> TypeId {
-        if ty.is_aggregate() {
-            self.agg_types[ty]
-        } else if ty.is_vector() {
+        if let Some(&id) = self.agg_types.get(ty) {
+            id
+        } else if ty.is_aggregate() || ty.is_vector() {
+            // An aggregate no local or signature names (the discarded value
+            // of `*f();`, say) is interned on demand, as vectors are.
             let records = self.records;
             layout::ir_type(self.b.types_mut(), records, ty)
         } else {
@@ -743,19 +745,7 @@ impl FnLower<'_> {
                 let base = self.slots[*obj];
                 self.zero_fill(base, *size);
                 for st in stores {
-                    self.set_line(st.value.span);
-                    let val = self.lower_rvalue(&st.value);
-                    let addr = self.offset_ptr(base, st.offset);
-                    match &st.bits {
-                        Some(bp) => {
-                            self.bitfield_write_at(addr, bp, val, false);
-                        }
-                        None => {
-                            let ty = self.tys.of(&st.value.ty);
-                            let align = align_of(&st.value.ty);
-                            self.b.store(ty, addr, val, align);
-                        }
-                    }
+                    self.agg_store(base, st);
                 }
             }
             TStmt::If(cond, then, els) => self.lower_if(cond, then, els.as_deref()),
@@ -1169,8 +1159,10 @@ impl FnLower<'_> {
             TExprKind::Obj(id) => self.slots[*id],
             TExprKind::Global(idx) => self.b.global_ref(self.global_ids[*idx]),
             TExprKind::Deref(inner) => self.lower_rvalue(inner),
+            // The record may be an rvalue (`f().m`): its storage then is
+            // the call's result slot (see `lower_struct_addr`).
             TExprKind::Field { base, offset } => {
-                let a = self.lower_lvalue(base);
+                let a = self.lower_struct_addr(base);
                 self.offset_ptr(a, *offset)
             }
             TExprKind::CompoundLiteral { obj, zero_size, stores } => {
@@ -1193,18 +1185,31 @@ impl FnLower<'_> {
             self.zero_fill(base, zero_size);
         }
         for st in stores {
-            self.set_line(st.value.span);
-            let val = self.lower_rvalue(&st.value);
+            self.agg_store(base, st);
+        }
+    }
+
+    /// Perform one store of an aggregate initializer into the object at
+    /// `base`: a scalar, a bit-field, or a whole `struct`/`union` member.
+    fn agg_store(&mut self, base: ValueId, st: &AggStore) {
+        self.set_line(st.value.span);
+        if st.value.ty.is_record() {
+            let src = self.lower_struct_addr(&st.value);
             let addr = self.offset_ptr(base, st.offset);
-            match &st.bits {
-                Some(bp) => {
-                    self.bitfield_write_at(addr, bp, val, false);
-                }
-                None => {
-                    let ty = self.tys.of(&st.value.ty);
-                    let align = align_of(&st.value.ty);
-                    self.b.store(ty, addr, val, align);
-                }
+            let size = layout::size_of(self.records, &st.value.ty);
+            self.copy_bytes(addr, src, size);
+            return;
+        }
+        let val = self.lower_rvalue(&st.value);
+        let addr = self.offset_ptr(base, st.offset);
+        match &st.bits {
+            Some(bp) => {
+                self.bitfield_write_at(addr, bp, val, false);
+            }
+            None => {
+                let ty = self.tys.of(&st.value.ty);
+                let align = align_of(&st.value.ty);
+                self.b.store(ty, addr, val, align);
             }
         }
     }
@@ -1222,6 +1227,17 @@ impl FnLower<'_> {
     }
 
     /// Displace a pointer by a constant byte offset (in-bounds).
+    /// A struct address as a plain `ptr` value. A struct-returning call's
+    /// result is an aggregate-typed value that denotes its storage address
+    /// (ir-design §6); a block argument must match the `ptr` parameter type.
+    fn as_ptr(&mut self, v: ValueId) -> ValueId {
+        if self.b.value_type(v) == self.tys.ptr {
+            return v;
+        }
+        let zero = self.b.const_i64(self.tys.i64, 0);
+        self.b.ptr_add(v, zero, true)
+    }
+
     fn offset_ptr(&mut self, base: ValueId, offset: u64) -> ValueId {
         if offset == 0 {
             return base;
@@ -2085,7 +2101,7 @@ impl FnLower<'_> {
     /// The address of a bit-field's storage unit: the base aggregate lvalue's
     /// address displaced by the storage unit's byte offset.
     fn bitfield_unit_addr(&mut self, base: &TExpr, offset: u64) -> ValueId {
-        let a = self.lower_lvalue(base);
+        let a = self.lower_struct_addr(base);
         self.offset_ptr(a, offset)
     }
 
@@ -2238,9 +2254,11 @@ impl FnLower<'_> {
                 self.b.cond_br(cond, then_bb, &[], else_bb, &[]);
                 self.switch(then_bb);
                 let tv = self.lower_struct_addr(t);
+                let tv = self.as_ptr(tv);
                 self.b.br(join_bb, &[tv]);
                 self.switch(else_bb);
                 let fv = self.lower_struct_addr(f);
+                let fv = self.as_ptr(fv);
                 self.b.br(join_bb, &[fv]);
                 self.switch(join_bb);
                 self.b.param(join_bb, 0)

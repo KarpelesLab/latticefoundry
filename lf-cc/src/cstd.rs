@@ -180,9 +180,10 @@ impl CStd {
         self.is_c23() || self.is_gnu()
     }
 
-    /// Attribute specifier sequences `[[...]]` (C23).
+    /// Attribute specifier sequences `[[...]]`: C23, and an extension in
+    /// every GNU dialect (as GCC accepts them).
     pub fn attributes(self) -> bool {
-        self.is_c23()
+        self.is_c23() || self.is_gnu()
     }
 
     /// The `bool` / `true` / `false` keywords (C23; earlier they are ordinary

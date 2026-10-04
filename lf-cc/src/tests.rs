@@ -175,7 +175,11 @@ fn modulo_on_double_is_rejected() {
 
 #[test]
 fn double_array_size_is_rejected() {
+    // At block scope a non-constant bound makes a variable-length array,
+    // whose length must still have integer type.
     let err = check_source("int f(){ double a[1.5]; return (int)a[0]; }").unwrap_err();
+    assert!(err.iter().any(|d| d.message.contains("non-integer type")));
+    let err = check_source("double a[1.5]; int f(){ return (int)a[0]; }").unwrap_err();
     assert!(err.iter().any(|d| d.message.contains("constant integer expression")));
 }
 

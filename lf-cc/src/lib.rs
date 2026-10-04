@@ -22,7 +22,9 @@ pub mod preprocess;
 pub mod sema;
 
 pub use cstd::CStd;
-pub use preprocess::{MacroOp, PpOptions, SourceLocation, SourceMap, default_system_include_dirs};
+pub use preprocess::{
+    MacroOp, PpOptions, SourceLocation, SourceMap, default_system_include_dirs, preprocess_text,
+};
 
 use latticefoundry::codegen::{CodegenOptions, RelocModel};
 use latticefoundry::ir::{Module, Visibility};
@@ -105,11 +107,23 @@ pub fn check_source_mapped(
     source: &str,
     opts: &PpOptions,
 ) -> Result<sema::Program, (Vec<Diagnostic>, SourceMap)> {
+    check_source_full(source, opts).map(|(program, _)| program)
+}
+
+/// Like [`check_source_mapped`], but the [`SourceMap`] is returned on success
+/// too (it lists the files the unit read; see [`SourceMap::dependencies`]).
+pub fn check_source_full(
+    source: &str,
+    opts: &PpOptions,
+) -> Result<(sema::Program, SourceMap), (Vec<Diagnostic>, SourceMap)> {
     let (tokens, map) = preprocess::preprocess_mapped(source, opts);
     let checked = tokens
         .and_then(|tokens| parse::parse(tokens, opts.std))
         .and_then(|unit| sema::check(&unit, opts.std));
-    checked.map_err(|diags| (diags, map))
+    match checked {
+        Ok(program) => Ok((program, map)),
+        Err(diags) => Err((diags, map)),
+    }
 }
 
 /// Why a full source-to-executable build failed.
@@ -169,6 +183,9 @@ pub struct CompiledModule {
     pub module: ObjectModule,
     /// The file-scope asm templates, in source order (see [`CompiledObject`]).
     pub toplevel_asm: Vec<String>,
+    /// The files the translation unit read, main source first (the `-MD`
+    /// dependency list; see [`SourceMap::dependencies`]).
+    pub deps: Vec<String>,
 }
 
 /// Compile one translation unit to an in-memory [`ObjectModule`] (plus its
@@ -195,9 +212,10 @@ pub fn compile_module_cfg(
     debug: bool,
     cfg: &CodegenConfig,
 ) -> Result<CompiledModule, BuildError> {
-    let program = check_source_mapped(source, opts).map_err(|(d, m)| BuildError::Frontend(d, m))?;
+    let (program, map) =
+        check_source_full(source, opts).map_err(|(d, m)| BuildError::Frontend(d, m))?;
     let module = compile_program(&program, source, input_name, opt, debug, cfg)?;
-    Ok(CompiledModule { module, toplevel_asm: program.toplevel_asm })
+    Ok(CompiledModule { module, toplevel_asm: program.toplevel_asm, deps: map.dependencies() })
 }
 
 /// Link in-memory objects (from [`compile_module_with`]) into a static,

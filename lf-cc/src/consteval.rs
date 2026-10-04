@@ -201,6 +201,20 @@ pub fn eval(e: &Expr, env: &impl ConstEnv) -> Option<CInt> {
                 None => v,
             })
         }
+        // A floating constant may be the immediate operand of a cast to an
+        // integer type (C11 6.6p6): gnulib's `TYPE_IS_INTEGER (t)` is
+        // `((t) 1.5 == 1)`. The conversion truncates toward zero.
+        ExprKind::Cast(ty, inner) if ty.unqual().is_integer() || matches!(ty.unqual(), CType::Bool) => {
+            match &inner.kind {
+                ExprKind::FloatLit(v, _) if matches!(ty.unqual(), CType::Bool) => {
+                    Some(CInt::new(i128::from(*v != 0.0), ty))
+                }
+                ExprKind::FloatLit(v, _) if v.is_finite() && v.trunc().abs() < 1.7e38 => {
+                    Some(CInt::new(v.trunc() as i128, ty))
+                }
+                _ => Some(cast(eval(inner, env)?, ty)),
+            }
+        }
         ExprKind::Cast(ty, inner) => Some(cast(eval(inner, env)?, ty)),
         ExprKind::SizeofType(ty) => Some(CInt::size(env.size_of_type(ty))),
         ExprKind::SizeofExpr(inner) => Some(CInt::size(env.size_of_expr(inner)?)),

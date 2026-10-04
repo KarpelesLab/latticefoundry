@@ -890,6 +890,10 @@ pub struct VarDecl {
     pub thread_local: bool,
     /// The GNU symbol attributes (visibility, weak).
     pub attrs: SymAttrs,
+    /// For a variable-length array (a block-scope `T a[n];`, whose `ty` is
+    /// then `T[0]`), the length expression `n`, evaluated when the
+    /// declaration is reached.
+    pub vla_len: Option<Box<Expr>>,
     /// The source span of the declarator.
     pub span: Span,
 }
@@ -973,6 +977,9 @@ pub enum TopLevel {
     /// A file-scope `asm("...");` declaration: its template text, emitted
     /// verbatim into the assembly the translation unit contributes.
     Asm(String),
+    /// `#pragma weak name`: give `name` a weak binding (wherever it is
+    /// declared in the unit).
+    PragmaWeak(String),
 }
 
 /// A whole translation unit: the ordered top-level declarations of one file,

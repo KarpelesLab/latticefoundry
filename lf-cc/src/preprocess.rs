@@ -165,6 +165,152 @@ pub fn preprocess_mapped(
     (result, pp.map)
 }
 
+/// Preprocess `main_source` to text, as `cc -E` prints it: the expanded
+/// tokens with their original line structure, `# <line> "<file>"` line markers
+/// wherever the output moves to another file or jumps ahead in one, and a
+/// space wherever the source had whitespace or two tokens would otherwise lex
+/// as one. The [`SourceMap`] is returned as for [`preprocess_mapped`] (it also
+/// lists the files read, see [`SourceMap::dependencies`]).
+pub fn preprocess_text(
+    main_source: &str,
+    opts: &PpOptions,
+) -> (Result<String, Vec<Diagnostic>>, SourceMap) {
+    let mut pp = Pp::new(opts, main_source);
+    pp.define_predefined(opts);
+    pp.apply_cmdline(&opts.cmdline);
+    if opts.hosted {
+        pp.preinclude("stdc-predef.h");
+    }
+    let toks = pp.lex_file(main_source, 0);
+    pp.process_file(0, toks);
+    if pp.diags.iter().any(Diagnostic::is_error) {
+        return (Err(std::mem::take(&mut pp.diags)), pp.map);
+    }
+    let out = std::mem::take(&mut pp.out);
+    let text = TextEmitter::new(&pp.map).emit(&out);
+    (Ok(text), pp.map)
+}
+
+/// Prints a preprocessed token stream as text (see [`preprocess_text`]).
+struct TextEmitter<'a> {
+    map: &'a SourceMap,
+    /// Line-start offsets of the file currently being printed (index into
+    /// `map.files`).
+    file: Option<usize>,
+    line_starts: Vec<u32>,
+    /// The output line the next token lands on (in `file`).
+    line: u32,
+    out: String,
+    /// The last token printed on the current line (to avoid accidental pastes).
+    last: Option<PpKind>,
+}
+
+impl<'a> TextEmitter<'a> {
+    fn new(map: &'a SourceMap) -> TextEmitter<'a> {
+        TextEmitter { map, file: None, line_starts: Vec::new(), line: 1, out: String::new(), last: None }
+    }
+
+    fn marker(&mut self, line: u32, flag: &str) {
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
+            self.out.push('\n');
+        }
+        let name = self.file.map(|f| self.map.files[f].name.as_str()).unwrap_or("");
+        self.out.push_str(&format!("# {line} \"{}\"{flag}\n", escape_string(name)));
+        self.line = line;
+        self.last = None;
+    }
+
+    fn emit(mut self, toks: &[PpTok]) -> String {
+        let main = self.map.files.first().map(|f| f.name.clone()).unwrap_or_default();
+        self.out.push_str(&format!("# 1 \"{}\"\n", escape_string(&main)));
+        self.file = Some(0);
+        self.line_starts = line_starts(&self.map.files[0].text);
+        for t in toks {
+            if matches!(t.kind, PpKind::Placemarker) {
+                continue;
+            }
+            let off = t.span.start;
+            let Some(fidx) = self.map.files.partition_point(|f| f.base <= off).checked_sub(1) else {
+                continue;
+            };
+            if self.file != Some(fidx) {
+                self.file = Some(fidx);
+                self.line_starts = line_starts(&self.map.files[fidx].text);
+                let line = self.line_of(off - self.map.files[fidx].base);
+                self.marker(line, "");
+            }
+            let line = self.line_of(off - self.map.files[fidx].base);
+            if line > self.line {
+                if line - self.line > 8 {
+                    self.marker(line, "");
+                } else {
+                    while self.line < line {
+                        self.out.push('\n');
+                        self.line += 1;
+                    }
+                    self.last = None;
+                }
+            }
+            if let PpKind::Pragma(text) = &t.kind {
+                if !self.out.ends_with('\n') {
+                    self.out.push('\n');
+                    self.line += 1;
+                }
+                self.out.push_str(&format!("#pragma {text}\n"));
+                self.line += 1;
+                self.last = None;
+                continue;
+            }
+            let spelling = t.kind.spelling();
+            match &self.last {
+                None if t.space_before && !self.out.ends_with('\n') => self.out.push(' '),
+                Some(prev) if t.space_before || would_paste(prev, &t.kind) => self.out.push(' '),
+                _ => {}
+            }
+            self.out.push_str(&spelling);
+            self.last = Some(t.kind.clone());
+        }
+        if !self.out.ends_with('\n') {
+            self.out.push('\n');
+        }
+        self.out
+    }
+
+    /// The 1-based line of local offset `off` in the current file.
+    fn line_of(&self, off: u32) -> u32 {
+        self.line_starts.partition_point(|&s| s <= off) as u32
+    }
+}
+
+/// The offsets at which each line of `text` starts (the first is 0).
+fn line_starts(text: &str) -> Vec<u32> {
+    let mut v = vec![0u32];
+    v.extend(text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(i, _)| i as u32 + 1));
+    v
+}
+
+/// Whether printing `next` right after `prev` with no space between them
+/// could lex as different tokens (`a` `b` → `ab`, `+` `+` → `++`, `1` `.` …).
+fn would_paste(prev: &PpKind, next: &PpKind) -> bool {
+    let word = |k: &PpKind| matches!(k, PpKind::Ident(_) | PpKind::Number(_));
+    match (prev, next) {
+        (a, b) if word(a) && (word(b) || matches!(b, PpKind::Str(_) | PpKind::Char(_))) => true,
+        (PpKind::Number(_), PpKind::Punct(Punct::Dot)) => true,
+        // `1e` `+` would lex as the one pp-number `1e+`.
+        (PpKind::Number(n), PpKind::Punct(Punct::Plus | Punct::Minus)) => {
+            n.ends_with(['e', 'E', 'p', 'P'])
+        }
+        (PpKind::Punct(Punct::Dot), PpKind::Number(_)) => true,
+        (PpKind::Punct(_) | PpKind::Hash | PpKind::HashHash, PpKind::Punct(_) | PpKind::Hash | PpKind::HashHash) => {
+            let joined = format!("{}{}", prev.spelling(), next.spelling());
+            match_punct(joined.as_bytes()).is_some_and(|(_, len)| len > prev.spelling().len())
+                || joined.starts_with("//")
+                || joined.starts_with("/*")
+        }
+        _ => false,
+    }
+}
+
 /// The maximum `#include` nesting depth (cycle guard).
 const INCLUDE_DEPTH_LIMIT: usize = 200;
 
@@ -234,6 +380,20 @@ impl SourceMap {
         base.checked_add(u32::try_from(text.len()).ok()?)?;
         self.files.push(SourceFile { name, text, base, included_at });
         Some(base)
+    }
+
+    /// The files read from disk for this translation unit, each once, in the
+    /// order first read (the main source first): what `-MD` writes as the
+    /// object's dependencies. The builtin compiler headers are not files and
+    /// are left out.
+    pub fn dependencies(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.files
+            .iter()
+            .filter(|f| !(f.name.starts_with('<') && f.name.ends_with('>')))
+            .filter(|f| seen.insert(f.name.as_str()))
+            .map(|f| f.name.clone())
+            .collect()
     }
 
     /// The number of files (inclusions) recorded.
@@ -351,6 +511,13 @@ enum PpKind {
     HashHash,
     /// A placemarker: the empty operand of `##`.
     Placemarker,
+    /// A `#pragma` directive (its text after `pragma`), kept in place in the
+    /// output: `-E` prints it, and `#pragma weak` reaches the parser.
+    Pragma(String),
+    /// A character that begins no other token (`@`, a lone `'`): a valid
+    /// preprocessing token, and an error only if it reaches the parser (so
+    /// it may sit in a skipped group or an `#error` message).
+    Other(String),
 }
 
 impl PpKind {
@@ -362,6 +529,8 @@ impl PpKind {
             PpKind::Hash => "#".to_owned(),
             PpKind::HashHash => "##".to_owned(),
             PpKind::Placemarker => String::new(),
+            PpKind::Pragma(text) => format!("#pragma {text}"),
+            PpKind::Other(s) => s.clone(),
         }
     }
 }
@@ -932,37 +1101,31 @@ impl Pp {
                     id
                 }
             } else if c == b'"' {
+                // An unterminated quote is a lone `"`/`'` token (C11 6.4p3):
+                // harmless in a skipped group or an `#error` message.
                 match self.lex_quoted(bytes, &mut pos, b'"') {
                     Some(raw) => PpKind::Str(raw),
                     None => {
-                        self.diags.push(
-                            Diagnostic::error("unterminated string literal")
-                                .with_span(self.fspan(file_idx, start, pos)),
-                        );
-                        continue;
+                        pos = start + 1;
+                        PpKind::Other("\"".to_owned())
                     }
                 }
             } else if c == b'\'' {
                 match self.lex_quoted(bytes, &mut pos, b'\'') {
                     Some(raw) => PpKind::Char(raw),
                     None => {
-                        self.diags.push(
-                            Diagnostic::error("unterminated character constant")
-                                .with_span(self.fspan(file_idx, start, pos)),
-                        );
-                        continue;
+                        pos = start + 1;
+                        PpKind::Other("'".to_owned())
                     }
                 }
             } else if let Some((k, len)) = match_punct(&bytes[pos..]) {
                 pos += len;
                 k
             } else {
-                self.diags.push(
-                    Diagnostic::error(format!("unexpected character '{}'", c as char))
-                        .with_span(self.fspan(file_idx, start, start + 1)),
-                );
-                pos += 1;
-                continue;
+                // Any other character (a whole UTF-8 sequence).
+                let len = text.get(pos..).and_then(|t| t.chars().next()).map_or(1, char::len_utf8);
+                pos += len;
+                PpKind::Other(String::from_utf8_lossy(&bytes[start..pos]).into_owned())
             };
 
             out.push(PpTok {
@@ -1042,9 +1205,10 @@ impl Pp {
                             closed = true;
                             break;
                         }
+                        // A comment is one space (translation phase 3): the
+                        // newlines inside it do not end a directive's line.
                         if bytes[*pos] == b'\n' {
                             *line += 1;
-                            *bol = true;
                         }
                         *pos += 1;
                     }
@@ -1155,7 +1319,12 @@ impl Pp {
 
             let active = cond.last().map(|c| c.active).unwrap_or(true);
             if line[0].bol && matches!(line[0].kind, PpKind::Hash) {
-                if !run.is_empty() {
+                // Conditional directives change no macro, so the pending text
+                // can wait for the rest of its group: that lets a macro's
+                // arguments span `#ifdef`… `#endif` (as GCC allows).
+                let conditional = matches!(line.get(1).map(|t| &t.kind), Some(PpKind::Ident(n))
+                    if matches!(n.as_str(), "if" | "ifdef" | "ifndef" | "elif" | "elifdef" | "elifndef" | "else" | "endif"));
+                if !run.is_empty() && !conditional {
                     let r = std::mem::take(&mut run);
                     let e = self.expand(r);
                     self.out.extend(e);
@@ -1279,9 +1448,13 @@ impl Pp {
             "pragma" => {
                 if let Some(PpKind::Ident(n)) = line.get(2).map(|t| &t.kind)
                     && n == "once"
-                    && let Some(Some(canon)) = self.file_canon.get(file_idx as usize).cloned()
                 {
-                    self.pragma_once.insert(canon);
+                    if let Some(Some(canon)) = self.file_canon.get(file_idx as usize).cloned() {
+                        self.pragma_once.insert(canon);
+                    }
+                } else {
+                    let text = spell_line(&line[2..]);
+                    self.out.push(PpTok { kind: PpKind::Pragma(text), bol: true, ..line[0].clone() });
                 }
             }
             // `#ident "…"` / `#sccs "…"`: version strings for the object file's
@@ -1829,7 +2002,8 @@ impl Pp {
                 None => {
                     let mut hs = t.hideset.clone();
                     hs.insert(name.clone());
-                    let repl = self.subst(&mac.body, &[], &[], false, &hs, &t);
+                    let mut repl = self.subst(&mac.body, &[], &[], false, &hs, &t);
+                    inherit_spacing(&mut repl, &t, &mut input);
                     for tok in repl.into_iter().rev() {
                         input.push_front(tok);
                     }
@@ -1848,7 +2022,8 @@ impl Pp {
                     let mut hs: BTreeSet<String> =
                         t.hideset.intersection(&close_hs).cloned().collect();
                     hs.insert(name.clone());
-                    let repl = self.subst(&mac.body, params, &args, mac.variadic, &hs, &t);
+                    let mut repl = self.subst(&mac.body, params, &args, mac.variadic, &hs, &t);
+                    inherit_spacing(&mut repl, &t, &mut input);
                     for tok in repl.into_iter().rev() {
                         input.push_front(tok);
                     }
@@ -2207,7 +2382,8 @@ impl Pp {
                     match op.as_str() {
                         "__has_builtin" => i128::from(has_builtin(&name)),
                         "__has_attribute" => i128::from(has_gnu_attribute(&name)),
-                        "__has_c_attribute" => has_c_attribute(&name),
+                        "__has_c_attribute" if self.std.attributes() => has_c_attribute(&name),
+                        "__has_c_attribute" => 0,
                         _ => i128::from(has_feature(&name, self.std)),
                     }
                 }
@@ -2246,7 +2422,7 @@ impl Pp {
                     return Err(Diagnostic::error("string literal in `#if` expression")
                         .with_span(t.span));
                 }
-                PpKind::Hash | PpKind::HashHash | PpKind::Placemarker => {
+                PpKind::Hash | PpKind::HashHash | PpKind::Placemarker | PpKind::Pragma(_) | PpKind::Other(_) => {
                     return Err(Diagnostic::error("invalid token in `#if` expression")
                         .with_span(t.span));
                 }
@@ -2290,7 +2466,35 @@ impl Pp {
                     self.diags.push(Diagnostic::error("stray '#' in program").with_span(span));
                     continue;
                 }
+                PpKind::Other(s) => {
+                    let msg = match s.as_str() {
+                        "'" | "\"" => format!("missing terminating {s} character"),
+                        _ => format!("stray '{s}' in program"),
+                    };
+                    self.diags.push(Diagnostic::error(msg).with_span(span));
+                    continue;
+                }
                 PpKind::Placemarker => continue,
+                // `#pragma weak name` becomes `__pragma_weak name ;` for the
+                // parser; every other pragma is a diagnostic or optimization
+                // control without meaning to lf-cc, and is dropped.
+                PpKind::Pragma(text) => {
+                    let mut words = text.split_whitespace();
+                    if words.next() == Some("weak") {
+                        let rest: String = words.collect::<Vec<_>>().join(" ");
+                        if rest.contains('=') {
+                            self.diags.push(
+                                Diagnostic::error("`#pragma weak name = target` (a weak alias) is not supported")
+                                    .with_span(span),
+                            );
+                        } else if !rest.is_empty() {
+                            out.push(Token { kind: TokenKind::Ident("__pragma_weak".to_owned()), span });
+                            out.push(Token { kind: TokenKind::Ident(rest), span });
+                            out.push(Token { kind: TokenKind::Punct(Punct::Semi), span });
+                        }
+                    }
+                    continue;
+                }
             };
             out.push(Token { kind, span });
         }
@@ -2653,6 +2857,25 @@ fn base_keyword(word: &str) -> Option<Keyword> {
 }
 
 /// Strip leading whitespace flags from a macro body (does not alter tokens).
+/// A macro's replacement takes the invocation's place, including the
+/// whitespace before it (so `-E` output keeps `f() __THROW` apart); an empty
+/// replacement passes that whitespace on to the token after it.
+fn inherit_spacing(repl: &mut [PpTok], inv: &PpTok, rest: &mut VecDeque<PpTok>) {
+    if !inv.space_before {
+        return;
+    }
+    match repl.iter_mut().find(|t| !matches!(t.kind, PpKind::Placemarker)) {
+        Some(first) => first.space_before = true,
+        None => {
+            if let Some(next) = rest.front_mut()
+                && !next.bol
+            {
+                next.space_before = true;
+            }
+        }
+    }
+}
+
 fn clean_body(rest: &[PpTok]) -> Vec<PpTok> {
     let mut body = rest.to_vec();
     if let Some(first) = body.first_mut() {

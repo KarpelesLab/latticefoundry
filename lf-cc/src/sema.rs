@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use latticefoundry::support::diagnostics::{Diagnostic, Span};
 
 use crate::ast::{
-    AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, FuncType, Init, IntTy, Quals, RecordId,
+    AsmStmt, BinaryOp, CType, Designator, Expr, ExprKind, FloatTy, FuncType, Init, IntTy, Quals, RecordId,
     Records, Stmt, StmtKind, Storage, StrKind, SymAttrs, TopLevel, TranslationUnit, UnaryOp, VarDecl,
 };
 use latticefoundry::ir::Visibility;
@@ -74,7 +74,8 @@ enum InitBuilt {
 pub struct AggStore {
     /// Byte offset within the object (the storage-unit offset for a bit-field).
     pub offset: u64,
-    /// The value to store (already converted to the field/element type).
+    /// The value to store (already converted to the field/element type). A
+    /// `struct`/`union`-typed value is copied in whole.
     pub value: TExpr,
     /// The bit placement, `Some` only when the target member is a bit-field.
     pub bits: Option<crate::layout::BitPlacement>,
@@ -669,6 +670,11 @@ struct Checker {
     /// also appear in the constant initializer of a `static` local (a dispatch
     /// table).
     cur_labels: HashMap<String, u32>,
+    /// While a block-scope `static` object's initializer is evaluated: the
+    /// block-scope names it can see, as the types `sizeof` measures, and
+    /// the `static` objects among them (whose addresses are constants).
+    scope_types: HashMap<String, CType>,
+    scope_statics: HashMap<String, usize>,
 }
 
 /// The value `&&label` takes for label `id`: a small nonzero dispatch number
@@ -770,6 +776,19 @@ impl Checker {
                 }
                 TopLevel::Global(g) => self.register_global(g),
                 TopLevel::Asm(text) => self.toplevel_asm.push(text.clone()),
+                TopLevel::PragmaWeak(_) => {}
+            }
+        }
+        // `#pragma weak` applies to the entity however its declarations are
+        // placed around the pragma.
+        for item in &unit.items {
+            if let TopLevel::PragmaWeak(name) = item {
+                if let Some(&idx) = self.sig_index.get(name) {
+                    self.sigs[idx].weak = true;
+                }
+                if let Some(&idx) = self.global_index.get(name) {
+                    self.globals[idx].weak = true;
+                }
             }
         }
         // Pass 2: check each function body.
@@ -833,6 +852,10 @@ impl Checker {
                 self.sig_by_symbol.remove(name);
                 self.sigs[idx].name = label.to_owned();
                 self.sig_by_symbol.insert(label.to_owned(), idx);
+            }
+            if !sig_compatible(&self.sigs[idx], &ret, &params, variadic) {
+                self.error(span, format!("conflicting types for '{name}'"));
+                return;
             }
             let existing = &mut self.sigs[idx];
             // Any `static` declaration of the name gives the whole entity internal
@@ -909,6 +932,10 @@ impl Checker {
         if let Some(idx) = prior {
             self.global_index.insert(g.name.clone(), idx);
             if !self.relabel_global(idx, g) || !self.same_thread_storage(idx, g) {
+                return;
+            }
+            if !types_compatible(&self.globals[idx].ty, &ty) {
+                self.error(g.span, format!("conflicting types for '{}'", g.name));
                 return;
             }
             // A second full definition (both with initializers) is an error.
@@ -1021,8 +1048,12 @@ impl Checker {
     fn const_eval(&self, e: &Expr) -> Option<i128> {
         // Keyed by C name (a global's `name` is its symbol, which an asm label
         // may have changed).
-        let gtypes: HashMap<&str, &CType> =
-            self.global_index.iter().map(|(n, &i)| (n.as_str(), &self.globals[i].ty)).collect();
+        let gtypes: HashMap<&str, &CType> = self
+            .global_index
+            .iter()
+            .map(|(n, &i)| (n.as_str(), &self.globals[i].ty))
+            .chain(self.scope_types.iter().map(|(n, t)| (n.as_str(), t)))
+            .collect();
         let env = SemaConsts {
             enums: &self.enum_consts,
             constexprs: &self.constexprs,
@@ -1056,9 +1087,11 @@ impl Checker {
                 let stride = self.size_of(elem);
                 let mut idx = 0u64;
                 for item in items {
-                    idx = apply_index_designators(&item.designators, idx);
+                    let rest;
+                    (idx, rest) = apply_index_designators(&item.designators, idx);
                     if idx < u64::from(*n) {
-                        self.build_global_bytes(elem, &item.init, off + idx * stride, bytes, relocs, span);
+                        let sub = sub_init(rest, &item.init);
+                        self.build_global_bytes(elem, &sub, off + idx * stride, bytes, relocs, span);
                     }
                     idx += 1;
                 }
@@ -1086,11 +1119,13 @@ impl Checker {
                 };
                 let mut idx = 0u64;
                 for item in items {
-                    idx = apply_index_designators(&item.designators, idx);
+                    let rest;
+                    (idx, rest) = apply_index_designators(&item.designators, idx);
                     if idx < *n {
+                        let sub = sub_init(rest, &item.init);
                         self.build_global_bytes(
                             elem,
-                            &item.init,
+                            &sub,
                             off + idx * stride,
                             bytes,
                             relocs,
@@ -1111,7 +1146,8 @@ impl Checker {
                 };
                 let mut field_idx = 0usize;
                 for item in items {
-                    field_idx = self.apply_field_designators(id, &item.designators, field_idx);
+                    let rest;
+                    (field_idx, rest) = self.apply_field_designators(id, &item.designators, field_idx);
                     let nfields = self.records.get(id).fields.len();
                     // Unnamed bit-fields (padding, and `:0`) take no initializer.
                     while field_idx < nfields && is_unnamed_bitfield(&self.records, id, field_idx) {
@@ -1120,11 +1156,12 @@ impl Checker {
                     if field_idx < nfields {
                         let fty = self.records.get(id).fields[field_idx].ty.clone();
                         let (foff, bits) = layout::field_placement(&self.records, id, field_idx);
+                        let sub = sub_init(rest, &item.init);
                         match bits {
                             // A bit-field initializer OR's its masked, shifted value
                             // into the storage unit's bytes (the image is zeroed).
                             Some(bp) => {
-                                match init_scalar_expr(&item.init).and_then(|e| self.const_eval(e)) {
+                                match init_scalar_expr(&sub).and_then(|e| self.const_eval(e)) {
                                     Some(v) => write_bitfield_bytes(bytes, off + foff, v, bp),
                                     None => self.error(
                                         span,
@@ -1134,7 +1171,7 @@ impl Checker {
                             }
                             None => self.build_global_bytes(
                                 &fty,
-                                &item.init,
+                                &sub,
                                 off + foff,
                                 bytes,
                                 relocs,
@@ -1198,33 +1235,85 @@ impl Checker {
     /// (into a member or a constant array element), and casts. Returns `None` if
     /// `e` is not an address constant.
     fn const_addr(&mut self, e: &Expr) -> Option<(Option<String>, i64)> {
+        self.const_addr_typed(e).map(|(sym, off, _)| (sym, off))
+    }
+
+    /// [`const_addr`](Self::const_addr), also returning the type the address
+    /// points to when known (the stride of `addr + n`; `None` steps bytes, as
+    /// GNU C does for `void *`).
+    fn const_addr_typed(&mut self, e: &Expr) -> Option<(Option<String>, i64, Option<CType>)> {
         match &e.kind {
             // An integer that is not otherwise a constant-expression (rare here):
             // treat as a pure numeric address with no symbol.
-            ExprKind::IntLit(v, _) => Some((None, *v as i64)),
+            ExprKind::IntLit(v, _) => Some((None, *v as i64, None)),
             ExprKind::StrLit(bytes, kind) => {
                 let idx = self.intern_string(bytes.clone(), *kind);
-                Some((Some(self.globals[idx].name.clone()), 0))
+                Some((Some(self.globals[idx].name.clone()), 0, Some(kind.elem_type())))
             }
             // A cast does not change the represented address.
-            ExprKind::Cast(_, inner) => self.const_addr(inner),
+            ExprKind::Cast(ty, inner) => {
+                let (sym, off, _) = self.const_addr_typed(inner)?;
+                Some((sym, off, ty.unqual().pointee().cloned()))
+            }
             // An identifier of array or function type decays to its address.
             ExprKind::Ident(name) => {
+                if let Some(&idx) = self.scope_statics.get(name)
+                    && let CType::Array(elem, _) = &self.globals[idx].ty
+                {
+                    let elem = (**elem).clone();
+                    return self.static_address_of(idx, e.span).map(|sym| (Some(sym), 0, Some(elem)));
+                }
+                if self.scope_types.contains_key(name) {
+                    return None;
+                }
                 if let Some(&idx) = self.sig_index.get(name) {
-                    return Some((Some(self.sigs[idx].name.clone()), 0));
+                    return Some((Some(self.sigs[idx].name.clone()), 0, None));
                 }
                 if let Some(&idx) = self.global_index.get(name)
-                    && matches!(self.globals[idx].ty, CType::Array(..))
+                    && let CType::Array(elem, _) = &self.globals[idx].ty
                 {
-                    return self.static_address_of(idx, e.span).map(|sym| (Some(sym), 0));
+                    let elem = (**elem).clone();
+                    return self.static_address_of(idx, e.span).map(|sym| (Some(sym), 0, Some(elem)));
                 }
                 None
             }
             // `&lvalue`: the address of a named object (optionally into a member or
             // a constant array element).
             ExprKind::Unary(UnaryOp::AddrOf, inner) => {
-                let (sym, off, _ty) = self.const_lvalue(inner)?;
-                Some((Some(sym), off))
+                // `&f` is the function's address, like `f`.
+                if let ExprKind::Ident(name) = &inner.kind
+                    && !self.scope_types.contains_key(name)
+                    && !self.global_index.contains_key(name)
+                    && let Some(&idx) = self.sig_index.get(name)
+                {
+                    return Some((Some(self.sigs[idx].name.clone()), 0, None));
+                }
+                let (sym, off, ty) = self.const_lvalue(inner)?;
+                Some((Some(sym), off, Some(ty)))
+            }
+            // `addr + n`, `n + addr`, `addr - n`: an address constant displaced
+            // by an integer constant expression (C11 6.6p9).
+            ExprKind::Binary(op @ (BinaryOp::Add | BinaryOp::Sub), a, b) => {
+                let (addr, n, sign) = if !matches!(a.kind, ExprKind::IntLit(..))
+                    && let Some(n) = self.const_eval(b)
+                {
+                    (a, n, if *op == BinaryOp::Sub { -1 } else { 1 })
+                } else if *op == BinaryOp::Add
+                    && let Some(n) = self.const_eval(a)
+                {
+                    (b, n, 1)
+                } else {
+                    return None;
+                };
+                let (sym, off, pointee) = self.const_addr_typed(addr)?;
+                sym.as_ref()?;
+                let stride = match &pointee {
+                    Some(t) if !matches!(t.unqual(), CType::Void | CType::Func(_)) => {
+                        layout::stride_of(&self.records, t) as i64
+                    }
+                    _ => 1,
+                };
+                Some((sym, off + sign * (n as i64) * stride, pointee))
             }
             _ => None,
         }
@@ -1252,7 +1341,11 @@ impl Checker {
     fn const_lvalue(&mut self, e: &Expr) -> Option<(String, i64, CType)> {
         match &e.kind {
             ExprKind::Ident(name) => {
-                let &idx = self.global_index.get(name)?;
+                let idx = match self.scope_statics.get(name) {
+                    Some(&idx) => idx,
+                    None if self.scope_types.contains_key(name) => return None,
+                    None => *self.global_index.get(name)?,
+                };
                 let sym = self.static_address_of(idx, e.span)?;
                 Some((sym, 0, self.globals[idx].ty.clone()))
             }
@@ -1292,7 +1385,7 @@ impl Checker {
                     let mut idx = 0u64;
                     let mut max = 0u64;
                     for item in items {
-                        idx = apply_index_designators(&item.designators, idx);
+                        idx = apply_index_designators(&item.designators, idx).0;
                         max = max.max(idx + 1);
                         idx += 1;
                     }
@@ -1304,12 +1397,27 @@ impl Checker {
         ty.clone()
     }
 
-    fn apply_field_designators(&self, id: RecordId, desigs: &[Designator], cur: usize) -> usize {
-        match desigs.first() {
-            Some(Designator::Field(name)) => {
-                self.records.field(id, name).map(|(i, _)| i).unwrap_or(cur)
-            }
-            _ => cur,
+    /// The member of record `id` an initializer item's designation selects
+    /// (`cur`, the next member in order, when it has none), and the rest of
+    /// the chain, which designates within that member. A name inside an
+    /// anonymous struct/union member selects that member, which the whole
+    /// chain then designates within.
+    fn apply_field_designators<'d>(
+        &self,
+        id: RecordId,
+        desigs: &'d [Designator],
+        cur: usize,
+    ) -> (usize, &'d [Designator]) {
+        let Some(Designator::Field(name)) = desigs.first() else { return (cur, &[]) };
+        if let Some((i, _)) = self.records.field(id, name) {
+            return (i, &desigs[1..]);
+        }
+        let anon = self.records.get(id).fields.iter().position(|f| {
+            f.anonymous && matches!(f.ty.unqual(), CType::Record(inner) if member_type(&self.records, *inner, name).is_some())
+        });
+        match anon {
+            Some(i) => (i, desigs),
+            None => (cur, &[]),
         }
     }
 
@@ -1344,6 +1452,7 @@ impl Checker {
             switches: Vec::new(),
             labels,
             reg_vars: HashMap::new(),
+            prologue: Vec::new(),
         };
         // Parameters become objects with storage in the outermost scope.
         for p in &f.params {
@@ -1362,6 +1471,11 @@ impl Checker {
             if let Some(s) = self.check_stmt(&mut ctx, stmt) {
                 body.push(s);
             }
+        }
+        if !ctx.prologue.is_empty() {
+            let mut prologue = std::mem::take(&mut ctx.prologue);
+            prologue.append(&mut body);
+            body = prologue;
         }
         let decl_line = f.span.start; // placeholder; refined to a real line by lower via source map
         self.funcs.push(TFunc {
@@ -1804,6 +1918,12 @@ impl Checker {
                 self.error(d.span, ATOMIC_SCALARS_ONLY);
                 continue;
             }
+            if let Some(len) = &d.vla_len {
+                if let Some(stmts) = self.declare_vla(ctx, d, &ty, len) {
+                    out.extend(stmts);
+                }
+                continue;
+            }
             if let Some(init) = &d.init {
                 ty = self.deduce_array_len(&ty, init);
             }
@@ -1887,7 +2007,26 @@ impl Checker {
                 if ctx.scopes.last().unwrap().contains_key(&d.name) {
                     self.error(d.span, format!("redeclaration of '{}'", d.name));
                 }
+                // Its initializer sees the enclosing block-scope names.
+                for scope in &ctx.scopes {
+                    for (name, b) in scope {
+                        let ty = match *b {
+                            Binding::Local(id) => ctx.locals[id].ty.clone(),
+                            Binding::Static(idx) => {
+                                self.scope_statics.insert(name.clone(), idx);
+                                self.globals[idx].ty.clone()
+                            }
+                            Binding::Vla { .. } => continue,
+                        };
+                        if !matches!(b, Binding::Static(_)) {
+                            self.scope_statics.remove(name);
+                        }
+                        self.scope_types.insert(name.clone(), ty);
+                    }
+                }
                 let idx = self.make_static_local(&d.name, &ty, quals, d);
+                self.scope_types.clear();
+                self.scope_statics.clear();
                 ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Static(idx));
                 continue;
             }
@@ -1932,6 +2071,89 @@ impl Checker {
             1 => Some(out.pop().unwrap()),
             _ => Some(TStmt::Block(out)),
         }
+    }
+
+    /// Declare the block-scope variable-length array `d` (of type `T[0]`, with
+    /// run-time length `len`): evaluate the length once into a hidden local,
+    /// find `len * sizeof(T)` bytes of stack for it, and bind the name to that
+    /// storage. The name then reads as a pointer to the first element (what
+    /// the array decays to), and `sizeof` the name multiplies the saved length
+    /// out.
+    ///
+    /// The storage comes from `dyn_alloca`, which is released only when the
+    /// function returns, so each declaration keeps one block and reuses it
+    /// whenever the declaration is reached again: the previous instance's
+    /// lifetime has ended by then (C11 6.2.4p7). A block too small is
+    /// replaced by one at least twice as large, so a VLA in a loop takes
+    /// O(largest size) stack, not O(iterations).
+    fn declare_vla(&mut self, ctx: &mut FnCtx, d: &VarDecl, ty: &CType, len: &Expr) -> Option<Vec<TStmt>> {
+        let CType::Array(elem, _) = ty else { return None };
+        let elem = (**elem).clone();
+        if d.storage != Storage::None {
+            self.error(d.span, format!("variable-length array '{}' must have automatic storage", d.name));
+            return None;
+        }
+        if d.init.is_some() {
+            self.error(d.span, format!("variable-length array '{}' may not be initialized", d.name));
+            return None;
+        }
+        let incomplete = match &elem {
+            CType::Record(id) => !self.records.get(*id).complete,
+            other => matches!(other, CType::Void | CType::Func(_) | CType::Array(_, 0)),
+        };
+        if incomplete {
+            self.error(d.span, "array has incomplete element type");
+            return None;
+        }
+        if ctx.scopes.last().unwrap().contains_key(&d.name) {
+            self.error(d.span, format!("redeclaration of '{}'", d.name));
+        }
+        let n = self.check_rvalue(ctx, len)?;
+        if !n.ty.is_integer() {
+            self.error(len.span, "size of array has non-integer type");
+            return None;
+        }
+        let n = self.convert(n, &size_t());
+        let sp = d.span;
+        let sz = size_t();
+        let len_id = ctx.add_object("", sz.clone());
+        let cap_id = ctx.add_object("", sz.clone());
+        let ptr_ty = CType::ptr_to(elem.clone());
+        let ptr_id = ctx.add_object(&d.name, ptr_ty.clone());
+        // On entry: no block yet (`cap = 0`, `ptr = 0`).
+        let zero = |ty: &CType| TExpr::new(TExprKind::Const(0), ty.clone(), sp);
+        ctx.prologue.push(TStmt::InitLocal(cap_id, zero(&sz)));
+        let null = self.convert(zero(&sz), &ptr_ty);
+        ctx.prologue.push(TStmt::InitLocal(ptr_id, null));
+        // At the declaration: `len = n; if (bytes > cap) { cap = bytes > 2*cap
+        // ? bytes : 2*cap; ptr = dyn_alloca(cap); }`.
+        let obj = |id: ObjId, ty: &CType| TExpr::new(TExprKind::Obj(id), ty.clone(), sp);
+        let bytes = self.vla_size(len_id, &elem, sp);
+        let two = TExpr::new(TExprKind::Const(2), sz.clone(), sp);
+        let twice = TExpr::new(TExprKind::Arith(BinaryOp::Mul, Box::new(obj(cap_id, &sz)), Box::new(two)), sz.clone(), sp);
+        let int = CType::int();
+        let gt = |a: TExpr, b: TExpr| TExpr::new(TExprKind::Cmp(BinaryOp::Gt, Box::new(a), Box::new(b)), int.clone(), sp);
+        let new_cap = TExpr::new(
+            TExprKind::Cond(Box::new(gt(bytes.clone(), twice.clone())), Box::new(bytes.clone()), Box::new(twice)),
+            sz.clone(),
+            sp,
+        );
+        let set_cap = TExpr::new(TExprKind::Assign(Box::new(obj(cap_id, &sz)), Box::new(new_cap)), sz.clone(), sp);
+        let alloc = TExpr::new(TExprKind::DynAlloca(Box::new(obj(cap_id, &sz))), CType::ptr_to(CType::Void), sp);
+        let alloc = self.convert(alloc, &ptr_ty);
+        let set_ptr = TExpr::new(TExprKind::Assign(Box::new(obj(ptr_id, &ptr_ty)), Box::new(alloc)), ptr_ty.clone(), sp);
+        let grow = TStmt::Block(vec![TStmt::Expr(Some(set_cap)), TStmt::Expr(Some(set_ptr))]);
+        let check = TStmt::If(gt(bytes, obj(cap_id, &sz)), Box::new(grow), None);
+        ctx.scopes.last_mut().unwrap().insert(d.name.clone(), Binding::Vla { ptr: ptr_id, len: len_id });
+        Some(vec![TStmt::InitLocal(len_id, n), check])
+    }
+
+    /// The size in bytes of a variable-length array of `elem`s whose length
+    /// is held in local `len`: `len * sizeof(elem)`, a `size_t`.
+    fn vla_size(&mut self, len: ObjId, elem: &CType, span: Span) -> TExpr {
+        let n = TExpr::new(TExprKind::Obj(len), size_t(), span);
+        let elem_size = TExpr::new(TExprKind::Const(self.size_of(elem) as i128), size_t(), span);
+        TExpr::new(TExprKind::Arith(BinaryOp::Mul, Box::new(n), Box::new(elem_size)), size_t(), span)
     }
 
     /// Create the backing global for a `static` block-scope object of type `ty`,
@@ -2078,12 +2300,14 @@ impl Checker {
                 let stride = layout::stride_of(&self.records, elem);
                 let mut idx = 0u64;
                 for item in items {
-                    idx = apply_index_designators(&item.designators, idx);
+                    let rest;
+                    (idx, rest) = apply_index_designators(&item.designators, idx);
                     if idx < *n {
+                        let sub = sub_init(rest, &item.init);
                         self.build_member_init(
                             ctx,
                             elem,
-                            &item.init,
+                            &sub,
                             base + idx * stride,
                             out,
                             span,
@@ -2103,9 +2327,11 @@ impl Checker {
                 let stride = self.size_of(&elem);
                 let mut idx = 0u64;
                 for item in items {
-                    idx = apply_index_designators(&item.designators, idx);
+                    let rest;
+                    (idx, rest) = apply_index_designators(&item.designators, idx);
                     if idx < u64::from(*n) {
-                        self.build_member_init(ctx, &elem, &item.init, base + idx * stride, out, span)?;
+                        let sub = sub_init(rest, &item.init);
+                        self.build_member_init(ctx, &elem, &sub, base + idx * stride, out, span)?;
                     } else {
                         self.error(span, "excess elements in a vector initializer");
                         return None;
@@ -2125,7 +2351,8 @@ impl Checker {
                 };
                 let mut field_idx = 0usize;
                 for item in items {
-                    field_idx = self.apply_field_designators(id, &item.designators, field_idx);
+                    let rest;
+                    (field_idx, rest) = self.apply_field_designators(id, &item.designators, field_idx);
                     let nfields = self.records.get(id).fields.len();
                     // Unnamed bit-fields (padding, and `:0`) take no initializer.
                     while field_idx < nfields && is_unnamed_bitfield(&self.records, id, field_idx) {
@@ -2135,19 +2362,19 @@ impl Checker {
                         let fty = self.records.get(id).fields[field_idx].ty.clone();
                         let (foff, bits) =
                             layout::field_placement(&self.records, id, field_idx);
+                        let sub = sub_init(rest, &item.init);
                         match bits {
                             // A bit-field member is always scalar: emit a masked
                             // read-modify-write store directly.
                             Some(bp) => {
-                                let v = self.build_scalar_init(ctx, &fty, &item.init, span)?;
+                                let v = self.build_scalar_init(ctx, &fty, &sub, span)?;
                                 out.push(AggStore {
                                     offset: base + foff,
                                     value: v,
                                     bits: Some(bp),
                                 });
                             }
-                            None => self
-                                .build_member_init(ctx, &fty, &item.init, base + foff, out, span)?,
+                            None => self.build_member_init(ctx, &fty, &sub, base + foff, out, span)?,
                         }
                     }
                     field_idx += 1;
@@ -2170,6 +2397,19 @@ impl Checker {
         span: Span,
     ) -> Option<()> {
         let ty = ty.unqual();
+        // A `struct`/`union` member initialized from an expression of its
+        // record type (`{ .it_value = ts }`): a whole-member copy.
+        if ty.is_record()
+            && let Init::Expr(e) = init
+        {
+            let te = self.check_rvalue(ctx, e)?;
+            if &te.ty != ty {
+                self.error(span, "invalid initializer for a struct/union member");
+                return None;
+            }
+            out.push(AggStore { offset: base, value: te, bits: None });
+            return Some(());
+        }
         if braced_aggregate(ty, init) {
             self.build_agg_stores(ctx, ty, init, base, out, span)
         } else {
@@ -2242,6 +2482,13 @@ impl Checker {
             ExprKind::PostInc(inner) => self.check_incdec(ctx, inner, true, true, span),
             ExprKind::PostDec(inner) => self.check_incdec(ctx, inner, false, true, span),
             ExprKind::SizeofExpr(inner) => {
+                // `sizeof vla` is computed at run time from the saved length.
+                if let ExprKind::Ident(name) = &inner.kind
+                    && let Some(Binding::Vla { ptr, len }) = ctx.lookup(name)
+                {
+                    let elem = ctx.locals[ptr].ty.pointee().cloned().unwrap_or(CType::Void);
+                    return Some(self.vla_size(len, &elem, span));
+                }
                 self.unevaluated += 1;
                 let te = self.check_expr(ctx, inner);
                 self.unevaluated -= 1;
@@ -2573,10 +2820,8 @@ impl Checker {
                 self.error(span, "'.' requires a struct/union operand");
                 return None;
             }
-            if !bt.is_lvalue() {
-                self.error(span, "'.' requires an lvalue struct/union");
-                return None;
-            }
+            // A record rvalue (a call's result, `c ? s1 : s2`, ...) has its
+            // members read from its temporary storage.
             bt
         };
         let CType::Record(id) = &record_lvalue.ty else { unreachable!() };
@@ -2603,6 +2848,11 @@ impl Checker {
                 let ty = ctx.locals[id].ty.clone();
                 let quals = ctx.locals[id].quals;
                 return Some(TExpr::new(TExprKind::Obj(id), ty, span).with_quals(quals));
+            }
+            // A variable-length array reads as the pointer to its storage.
+            Some(Binding::Vla { ptr, .. }) => {
+                let ty = ctx.locals[ptr].ty.clone();
+                return Some(TExpr::new(TExprKind::Obj(ptr), ty, span));
             }
             // A `static` block-scope object resolves to its backing global.
             Some(Binding::Static(idx)) => {
@@ -3728,6 +3978,62 @@ fn size_t() -> CType {
 /// of merging redundant file-scope declarations: it replaces an incomplete
 /// array (`T[]`, modelled as length 0) with a sized one (`extern int a[];` then
 /// `int a[10];`).
+/// Whether a redeclaration `ret f(params, ...)` agrees with the earlier
+/// signature `sig` (C11 6.7p4: all declarations of an entity have compatible
+/// types). A declaration without a prototype (`f()`) is compatible with any.
+fn sig_compatible(sig: &FuncSig, ret: &CType, params: &[CType], variadic: bool) -> bool {
+    let old = FuncType { ret: sig.ret.clone(), params: sig.params.clone(), variadic: sig.variadic };
+    let new = FuncType { ret: ret.clone(), params: params.to_vec(), variadic };
+    func_types_compatible(&old, &new)
+}
+
+/// Whether two function types are compatible (C11 6.7.6.3p15): compatible
+/// return types and, when both have prototypes, the same number of
+/// compatible parameters and the same variadic-ness. A type without a
+/// prototype (`()`, modelled as an empty variadic list) matches any.
+fn func_types_compatible(a: &FuncType, b: &FuncType) -> bool {
+    let unprototyped = |f: &FuncType| f.params.is_empty() && f.variadic;
+    types_compatible(&a.ret, &b.ret)
+        && (unprototyped(a)
+            || unprototyped(b)
+            || (a.variadic == b.variadic
+                && a.params.len() == b.params.len()
+                && a.params.iter().zip(&b.params).all(|(x, y)| param_compatible(x, y))))
+}
+
+/// Parameter compatibility. An old-style definition `f(c) char c; {...}`
+/// matches a prototype naming the *promoted* type (`int f(int)`), and lf-cc
+/// does not record which definitions were old-style, so a parameter also
+/// matches its default argument promotion.
+fn param_compatible(a: &CType, b: &CType) -> bool {
+    let promote = |t: &CType| match t.unqual() {
+        CType::Bool => CType::int(),
+        CType::Int(i) if i.width < 32 && i.bitint.is_none() => CType::int(),
+        CType::Float(FloatTy::F32) => CType::Float(FloatTy::F64),
+        other => other.clone(),
+    };
+    types_compatible(a, b) || types_compatible(&promote(a), &promote(b))
+}
+
+/// Whether two declared types are compatible (C11 6.2.7), as far as lf-cc's
+/// type model can tell them apart: it does not track `const`, `long` versus
+/// `long long`, `long double` versus `double` or every struct tag scope, so
+/// it answers "compatible" whenever it cannot be sure. The point is to reject
+/// the redeclarations gcc rejects (`int strerror_r(...)` against glibc's
+/// `char *strerror_r(...)`), which configure scripts probe for.
+fn types_compatible(a: &CType, b: &CType) -> bool {
+    match (a.unqual(), b.unqual()) {
+        (CType::Int(x), CType::Int(y)) => x.width == y.width && x.signed == y.signed && x.bitint == y.bitint,
+        (CType::Float(x), CType::Float(y)) => x == y,
+        (CType::Pointer(x), CType::Pointer(y)) => types_compatible(x, y),
+        (CType::Array(x, n), CType::Array(y, m)) => (*n == 0 || *m == 0 || n == m) && types_compatible(x, y),
+        (CType::Func(x), CType::Func(y)) => func_types_compatible(x, y),
+        (CType::Vector(x, n), CType::Vector(y, m)) => n == m && types_compatible(x, y),
+        (CType::Record(_), CType::Record(_)) => true,
+        (x, y) => std::mem::discriminant(x) == std::mem::discriminant(y),
+    }
+}
+
 fn ty_is_more_complete(new_ty: &CType, old_ty: &CType) -> bool {
     matches!((old_ty, new_ty), (CType::Array(_, 0), CType::Array(_, n)) if *n != 0)
 }
@@ -3815,6 +4121,9 @@ enum Binding {
     Local(ObjId),
     /// A `static` block-scope object: an index into [`Program::globals`].
     Static(usize),
+    /// A variable-length array: the local holding the pointer to its stack
+    /// storage, and the local holding its length (in elements).
+    Vla { ptr: ObjId, len: ObjId },
 }
 
 struct FnCtx {
@@ -3832,6 +4141,9 @@ struct FnCtx {
     /// The register a GNU register-asm variable (`register long r10
     /// asm("r10")`) names, by object: honored when it is an asm operand.
     reg_vars: HashMap<ObjId, String>,
+    /// Statements run on function entry, before the body (the
+    /// variable-length arrays' storage bookkeeping).
+    prologue: Vec<TStmt>,
 }
 
 impl FnCtx {
@@ -3899,7 +4211,7 @@ impl ConstEnv for SemaConsts<'_> {
     /// is one whose type the AST fixes on its own (a string literal, a cast, a
     /// nested `sizeof`, …) — see `ast_static_type`.
     fn size_of_expr(&self, e: &Expr) -> Option<u64> {
-        ast_static_type(e, &self.gtypes).map(|ty| layout::size_of(self.recs, &ty))
+        ast_static_type(e, &self.gtypes, self.recs).map(|ty| layout::size_of(self.recs, &ty))
     }
 
     fn other(&self, e: &Expr) -> Option<CInt> {
@@ -3918,7 +4230,13 @@ impl ConstEnv for SemaConsts<'_> {
 /// constant initializer — string literals, casts, compound literals, and the
 /// literals/`sizeof` results whose type the node itself carries. Returns `None`
 /// when the type would require variable/typedef context the caller lacks.
-fn ast_static_type(e: &Expr, gtypes: &HashMap<&str, &CType>) -> Option<CType> {
+fn ast_static_type(e: &Expr, gtypes: &HashMap<&str, &CType>, recs: &Records) -> Option<CType> {
+    let rec = |x: &Expr| ast_static_type(x, gtypes, recs);
+    // The element type a pointer or array operand designates.
+    let pointee = |t: CType| match t.unqual() {
+        CType::Pointer(inner) | CType::Array(inner, _) => Some((**inner).clone()),
+        _ => None,
+    };
     match &e.kind {
         ExprKind::IntLit(_, ty) | ExprKind::FloatLit(_, ty) => Some(ty.clone()),
         ExprKind::StrLit(bytes, kind) => {
@@ -3934,12 +4252,34 @@ fn ast_static_type(e: &Expr, gtypes: &HashMap<&str, &CType>) -> Option<CType> {
         // A file-scope object (typically `sizeof array` for a length-deduced
         // global array), resolved via the global-type map.
         ExprKind::Ident(name) => gtypes.get(name.as_str()).map(|t| (*t).clone()),
-        ExprKind::Cond(_, t, f) => {
-            ast_static_type(t, gtypes).or_else(|| ast_static_type(f, gtypes))
+        ExprKind::Cond(_, t, f) => rec(t).or_else(|| rec(f)),
+        ExprKind::Comma(_, b) => rec(b),
+        // `((struct s *) 0)->member`, `x.member`: the member's declared type.
+        ExprKind::Member(base, name, arrow) => {
+            let base = rec(base)?;
+            let base = if *arrow { pointee(base)? } else { base };
+            match base.unqual() {
+                CType::Record(id) => member_type(recs, *id, name),
+                _ => None,
+            }
         }
-        ExprKind::Comma(_, b) => ast_static_type(b, gtypes),
+        ExprKind::Unary(UnaryOp::Deref, x) => pointee(rec(x)?),
+        ExprKind::Unary(UnaryOp::AddrOf, x) => Some(CType::Pointer(Box::new(rec(x)?))),
+        ExprKind::Index(a, i) => pointee(rec(a)?).or_else(|| pointee(rec(i)?)),
         _ => None,
     }
+}
+
+/// The type of member `name` of record `id`, looking through anonymous
+/// struct/union members.
+fn member_type(recs: &Records, id: RecordId, name: &str) -> Option<CType> {
+    if let Some((_, f)) = recs.field(id, name) {
+        return Some(f.ty.clone());
+    }
+    recs.get(id).fields.iter().filter(|f| f.anonymous).find_map(|f| match f.ty.unqual() {
+        CType::Record(inner) => member_type(recs, *inner, name),
+        _ => None,
+    })
 }
 
 /// Evaluate a constant expression to an `f64` for a floating-point global
@@ -4077,10 +4417,24 @@ fn write_float_bytes(bytes: &mut [u8], off: u64, v: f64, fty: crate::ast::FloatT
 
 /// The array index selected by an initializer item's designator chain (its first
 /// `[index]` designator), or the running `cur` for a positional item.
-fn apply_index_designators(desigs: &[Designator], cur: u64) -> u64 {
+fn apply_index_designators(desigs: &[Designator], cur: u64) -> (u64, &[Designator]) {
     match desigs.first() {
-        Some(Designator::Index(i)) => *i as u64,
-        _ => cur,
+        Some(Designator::Index(i)) => (*i as u64, &desigs[1..]),
+        _ => (cur, &[]),
+    }
+}
+
+/// The initializer of the subobject a designator selected: the item's own
+/// initializer, or — when the chain goes on (`[0].tv_sec = v`) — the braced
+/// list `{ .tv_sec = v }` the rest of the chain designates within it.
+fn sub_init<'a>(rest: &[Designator], init: &'a Init) -> std::borrow::Cow<'a, Init> {
+    if rest.is_empty() {
+        std::borrow::Cow::Borrowed(init)
+    } else {
+        std::borrow::Cow::Owned(Init::List(vec![crate::ast::InitItem {
+            designators: rest.to_vec(),
+            init: init.clone(),
+        }]))
     }
 }
 

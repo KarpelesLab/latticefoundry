@@ -9,6 +9,10 @@
 //!   A source's file-scope `asm(...)` is assembled by `rsasm` and merged into
 //!   that one object by a relocatable (`-r`) `qld` link.
 //! * `-S` / `--emit-lf` dumps the lowered `.lf` IR instead.
+//! * `-E` prints the preprocessed source; `-M`/`-MM` print make rules naming
+//!   the files a source includes, and `-MD`/`-MMD` (with `-MF`, `-MT`, `-MQ`,
+//!   `-MP`) write them while compiling, as automake's dependency tracking
+//!   expects.
 //! * Otherwise the inputs are linked. By default that is a **hosted** link:
 //!   the host C runtime is located with [`HostCrt::discover`] and our own
 //!   GNU-ld-compatible linker `qld` produces a dynamically linked executable
@@ -113,6 +117,28 @@ struct Options {
     sanitize_trap: SanitizeKinds,
     /// `-f[no-]sanitize-recover`: whether to continue after a report.
     sanitize_recover: bool,
+    /// `-E`: preprocess only, printing the result.
+    preprocess_only: bool,
+    /// Make-style dependency output (`-M`, `-MD`, ...).
+    deps: DepOptions,
+}
+
+/// The `-M` family: make rules naming the headers a source includes.
+#[derive(Debug, Default)]
+struct DepOptions {
+    /// `-M`/`-MM`: the rule *is* the output (implies `-E`, prints no code).
+    only: bool,
+    /// `-MD`/`-MMD`: write the rule as a side effect of compiling.
+    side: bool,
+    /// `-MM`/`-MMD`: leave out system headers.
+    user_only: bool,
+    /// `-MF <file>`: where the rule goes.
+    file: Option<String>,
+    /// `-MT`/`-MQ <target>`: the rule's targets (default: the object name).
+    targets: Vec<String>,
+    /// `-MP`: a phony target for each header, so a deleted header does not
+    /// break `make`.
+    phony: bool,
 }
 
 impl Options {
@@ -175,6 +201,11 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let n_sources = opts.sources().count();
 
+    // `-E` (or `-M`/`-MM`): preprocess only.
+    if opts.preprocess_only || opts.deps.only {
+        return preprocess_only(&opts);
+    }
+
     // `-S` / `--emit-lf`: lower each C source and dump its IR, then stop.
     if opts.emit_lf {
         if opts.output.is_some() && n_sources > 1 {
@@ -219,8 +250,11 @@ fn run(args: &[String]) -> Result<(), String> {
             match item {
                 Item::Source(input) | Item::Asm(input) => {
                     let output = opts.output.clone().unwrap_or_else(|| format!("{}.o", stem(input)));
-                    let unit = compile_item(&opts, item)?;
+                    let (unit, deps) = compile_item(&opts, item)?;
                     write_unit_object(unit, Path::new(&output))?;
+                    if opts.deps.side {
+                        write_deps(&opts, &output, &deps)?;
+                    }
                 }
                 Item::File(path) => {
                     eprintln!("lf-cc: warning: {path}: linker input file unused because linking not done");
@@ -245,7 +279,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut units: Vec<Option<Unit>> = Vec::with_capacity(opts.items.len());
     for item in &opts.items {
         units.push(match item {
-            Item::Source(_) | Item::Asm(_) => Some(compile_item(&opts, item)?),
+            Item::Source(_) | Item::Asm(_) => Some(compile_item(&opts, item)?.0),
             Item::File(_) | Item::LinkerArg(_) => None,
         });
     }
@@ -376,8 +410,110 @@ impl Unit {
     }
 }
 
-/// Compile (or assemble) one source item.
-fn compile_item(opts: &Options, item: &Item) -> Result<Unit, String> {
+/// `-E`, `-M`, `-MM`: preprocess each C source and print the result (or its
+/// make rule) to the `-o` file or standard output.
+fn preprocess_only(opts: &Options) -> Result<(), String> {
+    let mut out = String::new();
+    for item in &opts.items {
+        let input = match item {
+            Item::Source(p) | Item::Asm(p) => p,
+            Item::File(p) => return Err(format!("{p}: unsupported input file type for -E")),
+            Item::LinkerArg(_) => continue,
+        };
+        let source = read_source(input)?;
+        let (text, map) = lf_cc::preprocess_text(&source, &opts.pp_options(input));
+        let text = text.map_err(|diags| render_diags(&map, &diags))?;
+        if opts.deps.only {
+            out.push_str(&dep_rule(opts, &format!("{}.o", stem(input)), &map.dependencies()));
+        } else {
+            out.push_str(&text);
+            if opts.deps.side {
+                let target = opts.output.clone().unwrap_or_else(|| format!("{}.o", stem(input)));
+                write_deps(opts, &target, &map.dependencies())?;
+            }
+        }
+    }
+    match &opts.output {
+        Some(path) if path != "-" => write_file(Path::new(path), out.as_bytes()),
+        _ => {
+            use std::io::Write;
+            std::io::stdout().write_all(out.as_bytes()).map_err(|e| format!("cannot write output: {e}"))
+        }
+    }
+}
+
+/// The make rule for an object built from the files `deps` (the source
+/// first), as `-M` prints it.
+fn dep_rule(opts: &Options, object: &str, deps: &[String]) -> String {
+    let system: Vec<PathBuf> = if opts.deps.user_only {
+        let mut dirs = opts.system_dirs.clone();
+        if !opts.nostdinc {
+            dirs.extend(lf_cc::default_system_include_dirs());
+        }
+        dirs
+    } else {
+        Vec::new()
+    };
+    let deps: Vec<&String> =
+        deps.iter().filter(|d| !system.iter().any(|dir| Path::new(d).starts_with(dir))).collect();
+    let targets = if opts.deps.targets.is_empty() {
+        make_escape(object)
+    } else {
+        opts.deps.targets.join(" ")
+    };
+    let mut rule = format!("{targets}:");
+    let mut width = rule.len();
+    for d in &deps {
+        let d = make_escape(d);
+        if width + d.len() + 1 > 78 {
+            rule.push_str(" \\\n");
+            width = 0;
+        }
+        rule.push(' ');
+        rule.push_str(&d);
+        width += d.len() + 1;
+    }
+    rule.push('\n');
+    if opts.deps.phony {
+        for d in deps.iter().skip(1) {
+            rule.push_str(&format!("\n{}:\n", make_escape(d)));
+        }
+    }
+    rule
+}
+
+/// Quote a file name for a make rule (spaces, `$` and `#`).
+fn make_escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            ' ' | '\t' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '$' => out.push_str("$$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `-MD`/`-MMD`: write the make rule for `object` to the `-MF` file, or next
+/// to the object with a `.d` suffix.
+fn write_deps(opts: &Options, object: &str, deps: &[String]) -> Result<(), String> {
+    let path = match &opts.deps.file {
+        Some(f) => f.clone(),
+        None => {
+            let p = Path::new(object);
+            p.with_extension("d").to_string_lossy().into_owned()
+        }
+    };
+    write_file(Path::new(&path), dep_rule(opts, object, deps).as_bytes())
+}
+
+/// Compile (or assemble) one source item, also returning the files it read
+/// (for `-MD`).
+fn compile_item(opts: &Options, item: &Item) -> Result<(Unit, Vec<String>), String> {
     match item {
         Item::Source(input) => {
             let source = read_source(input)?;
@@ -392,10 +528,10 @@ fn compile_item(opts: &Options, item: &Item) -> Result<Unit, String> {
             .map_err(|e| build_error(input, e))?;
             let asm = lf_cc::assemble_toplevel_asm(&compiled.toplevel_asm, input)
                 .map_err(|e| build_error(input, e))?;
-            Ok(Unit::C { module: compiled.module, asm })
+            Ok((Unit::C { module: compiled.module, asm }, compiled.deps))
         }
         Item::Asm(input) => assemble_file(Path::new(input), &AsmOptions::new(TargetArch::X86_64))
-            .map(Unit::Asm)
+            .map(|u| (Unit::Asm(u), vec![input.clone()]))
             .map_err(|e| format!("{input}: {e}")),
         Item::File(_) | Item::LinkerArg(_) => unreachable!("not a translation unit"),
     }
@@ -435,6 +571,12 @@ fn freestanding_crt0() -> Result<Vec<u8>, String> {
 /// Read a C source. Invalid UTF-8 (a Latin-1 comment, say) is replaced rather
 /// than rejected, as the preprocessor does for headers.
 fn read_source(input: &str) -> Result<String, String> {
+    if input == "-" {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes).map_err(|e| format!("cannot read standard input: {e}"))?;
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
     std::fs::read(input)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|e| format!("cannot read {input}: {e}"))
@@ -538,7 +680,11 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         sanitize: SanitizeKinds::NONE,
         sanitize_trap: SanitizeKinds::NONE,
         sanitize_recover: true,
+        preprocess_only: false,
+        deps: DepOptions::default(),
     };
+    // `-x <language>`: how the following inputs are treated (`None`: by suffix).
+    let mut lang: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -552,6 +698,25 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-g0" => opts.debug = false,
             "-S" | "--emit-lf" => opts.emit_lf = true,
             "-c" => opts.emit_obj = true,
+            "-E" => opts.preprocess_only = true,
+            "-M" => opts.deps.only = true,
+            "-MM" => {
+                opts.deps.only = true;
+                opts.deps.user_only = true;
+            }
+            "-MD" => opts.deps.side = true,
+            "-MMD" => {
+                opts.deps.side = true;
+                opts.deps.user_only = true;
+            }
+            "-MP" => opts.deps.phony = true,
+            "-MF" => opts.deps.file = Some(value(arg)?),
+            "-MT" => opts.deps.targets.push(value(arg)?),
+            "-MQ" => opts.deps.targets.push(make_escape(&value(arg)?)),
+            "-x" => {
+                let l = value(arg)?;
+                lang = (l != "none").then_some(l);
+            }
             "-nostdinc" => opts.nostdinc = true,
             "-nostdlib" => opts.nostdlib = true,
             "-ansi" => opts.std = CStd::C89,
@@ -634,10 +799,24 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             tok if OptLevel::parse_flag(tok).is_some() => {
                 opts.opt = OptLevel::parse_flag(tok).expect("checked");
             }
+            _ if arg.starts_with("-MF") => opts.deps.file = Some(arg[3..].to_owned()),
+            _ if arg.starts_with("-MT") => opts.deps.targets.push(arg[3..].to_owned()),
+            _ if arg.starts_with("-MQ") => opts.deps.targets.push(make_escape(&arg[3..])),
+            _ if arg.starts_with("-x") => {
+                let l = &arg[2..];
+                lang = (l != "none").then(|| l.to_owned());
+            }
             flag if flag.starts_with('-') && flag != "-" => {
                 return Err(format!("unrecognized option '{flag}'"));
             }
-            positional if positional.ends_with(".c") => {
+            "-" if lang.is_none() => opts.items.push(Item::Source("-".to_owned())),
+            positional if lang.is_some() => match lang.as_deref() {
+                Some("c" | "c-header" | "cpp-output") => opts.items.push(Item::Source(positional.to_owned())),
+                Some("assembler") => opts.items.push(Item::Asm(positional.to_owned())),
+                Some(l) => return Err(format!("language {l} not recognized")),
+                None => unreachable!("checked"),
+            },
+            positional if positional.ends_with(".c") || positional.ends_with(".i") => {
                 opts.items.push(Item::Source(positional.to_owned()))
             }
             positional if positional.ends_with(".s") => {
@@ -657,6 +836,13 @@ fn print_usage() {
     println!("usage:");
     println!("  lf-cc [options] <file.c|file.s|file.o|lib.a|-l<lib>>...\n");
     println!("  -c             compile each source to an object (foo.c -> foo.o)");
+    println!("  -E             preprocess only, printing the result (to -o, or stdout)");
+    println!("  -M / -MM       print the make rule of each source's included files (-MM:");
+    println!("                 without system headers); -MD / -MMD write it while compiling,");
+    println!("                 to -MF <file> (default: the object with a .d suffix);");
+    println!("                 -MT/-MQ <target> name the rule's target, -MP adds phony rules");
+    println!("  -x <language>  treat the following inputs as c, assembler, or by suffix (none);");
+    println!("                 '-' reads the source from standard input");
     println!("  -S / --emit-lf dump the lowered .lf IR instead of an executable");
     println!("  -o <out>       output path (default: the input stem for one .c, else a.out)");
     println!("  -O0..-O3       optimization level (default: -O0; -Os/-Oz = -O2, -Og = -O1)");
