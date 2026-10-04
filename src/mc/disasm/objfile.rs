@@ -239,7 +239,11 @@ pub fn from_object_module(obj: &ObjectModule, arch: Option<TargetArch>) -> Binar
         obj.relocations().iter().find_map(|r| match r.kind {
             k if k.is_avr() => Some(TargetArch::Avr),
             k if k.is_thumb() => Some(TargetArch::Thumb),
-            RelocKind::Aarch64Call26 | RelocKind::Aarch64AdrPrelPgHi21 | RelocKind::Aarch64AddAbsLo12Nc => {
+            RelocKind::Aarch64Call26
+            | RelocKind::Aarch64AdrPrelPgHi21
+            | RelocKind::Aarch64AddAbsLo12Nc
+            | RelocKind::Aarch64AdrGotPage
+            | RelocKind::Aarch64Ld64GotLo12Nc => {
                 Some(TargetArch::AArch64)
             }
             _ => None,

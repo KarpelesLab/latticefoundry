@@ -158,6 +158,27 @@ fn linked_executable_has_addresses() {
 }
 
 #[test]
+fn aarch64_pic_got_relocations() {
+    let (m, syms) = super::parse_for(TargetArch::AArch64, INTS);
+    let opts = crate::codegen::CodegenOptions::default().with_pic(true);
+    let obj = crate::target::compile_module_for(TargetArch::AArch64, &m, &syms, &opts).expect("PIC compile").object;
+    let file = object_file(TargetArch::AArch64, &obj, ObjectFormat::Elf);
+    let bin = objfile::read(&file).unwrap();
+    let t = text(&bin, ".text");
+    assert!(t.relocs.iter().any(|r| r.kind == "R_AARCH64_ADR_GOT_PAGE"), "{:?}", t.relocs);
+    assert!(t.relocs.iter().any(|r| r.kind == "R_AARCH64_LD64_GOT_LO12_NC"), "{:?}", t.relocs);
+    let out = list(&bin, TargetArch::AArch64, "pic.o", &ListingOptions::new());
+    assert!(out.contains("// R_AARCH64_ADR_GOT_PAGE"), "{out}");
+    let lfo = objfile::read(&crate::mc::lfo::encode(&obj)).unwrap();
+    assert_eq!(lfo.arch, Some(TargetArch::AArch64));
+    // The GOT sequences decode as llvm-objdump does.
+    let opts = crate::mc::disasm::Options::default();
+    if let Some(r) = super::differential(TargetArch::AArch64, &file, &[], &opts, &|s| s) {
+        super::assert_clean("aarch64 PIC ELF", &r);
+    }
+}
+
+#[test]
 fn unrecognized_and_corrupt_files() {
     assert!(objfile::read(b"hello world").is_err());
     assert!(objfile::read(b"").is_err());
