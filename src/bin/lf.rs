@@ -19,7 +19,7 @@
 //! For RISC-V (`--target riscv64-linux`), the LP64D code links through qld
 //! into a static Linux executable whose `_start` calls the entry function and
 //! exits with its result; `-c` writes an ELF64 `EM_RISCV` object (`-c --pic`
-//! a position-independent one).
+//! a position-independent one), and `--shared` a shared library.
 //!
 //! For AVR (`--target avr-atmega328p`), `--oformat ihex|binary` links a
 //! flashable firmware image (vector table, startup code, program, runtime)
@@ -109,7 +109,7 @@ fn print_usage() {
     println!("  --base ADDR    image load address (default 0x400000); for binary/ihex, where");
     println!("                 the first byte of code goes; for Cortex-M, the flash origin (default 0)");
     println!("  --shared       build a shared library (position-independent; default lib<input>.so;");
-    println!("                 x86-64 or AArch64 Linux)");
+    println!("                 x86-64, AArch64 or RISC-V Linux)");
     println!("  -soname <name> set the shared library's DT_SONAME");
     println!("  --pie          build a position-independent executable against the host C library");
     println!("  --pic          with -c: position-independent code for a shared library");
@@ -378,6 +378,10 @@ fn link_with_qld(opts: &BuildOptions, obj: &latticefoundry::mc::object::ObjectMo
         OutputKind::Shared => format!("lib{stem}.so"),
         _ => stem.clone(),
     });
+    if opts.target.arch == TargetArch::Riscv64 {
+        // Likewise for RISC-V (LP64D).
+        return target::riscv::link_shared(obj, opts.soname.as_deref(), &opts.link_extra, Path::new(&output));
+    }
     if opts.target.arch == TargetArch::AArch64 {
         // A shared library (`--pie` is x86-64 only): no AArch64 C runtime on
         // the host, so undefined symbols are left for the loader.
@@ -613,8 +617,9 @@ fn parse_build(args: &[String]) -> Result<BuildOptions, String> {
         return Err("--entry only applies to executables linked by lf (not --shared or --pie)".to_owned());
     }
     let x86_64_elf = target.arch == TargetArch::X86_64 && target.object_format() == ObjectFormat::Elf;
-    if output_kind == OutputKind::Shared && !x86_64_elf && !aarch64_elf {
-        return Err(format!("--shared needs an x86-64 ELF or AArch64 ELF target, not {target}"));
+    let riscv64_elf = target.arch == TargetArch::Riscv64 && target.object_format() == ObjectFormat::Elf;
+    if output_kind == OutputKind::Shared && !x86_64_elf && !aarch64_elf && !riscv64_elf {
+        return Err(format!("--shared needs an x86-64 ELF, AArch64 ELF or RISC-V ELF target, not {target}"));
     }
     if output_kind == OutputKind::Pie && !x86_64_elf {
         return Err(format!("--pie needs an x86-64 ELF target, not {target}"));

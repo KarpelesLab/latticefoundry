@@ -164,6 +164,31 @@ pub fn link_static_executable(
     result
 }
 
+/// Link `obj` (compiled position-independent) into a RISC-V shared library
+/// at `output` with qld ([`crate::link::gnu::shared_library_args`]: `-shared
+/// -z text`, an optional `soname`, `extra` arguments such as `-L`/`-l`).
+/// There is no RISC-V C runtime on the host, so undefined symbols are left
+/// for the dynamic loader.
+///
+/// # Errors
+///
+/// When the object cannot be written or the link fails.
+pub fn link_shared(
+    obj: &crate::mc::object::ObjectModule,
+    soname: Option<&str>,
+    extra: &[String],
+    output: &std::path::Path,
+) -> Result<(), String> {
+    let tmp = std::path::PathBuf::from(format!("{}.lf-tmp.o", output.display()));
+    let bytes = write_elf(obj).map_err(|e| format!("cannot write a RISC-V ELF object: {e}"))?;
+    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    let mut args: Vec<std::ffi::OsString> = vec!["-m".into(), "elf64lriscv".into()];
+    args.extend(crate::link::gnu::shared_library_args(None, &[&tmp], soname, extra, output));
+    let result = crate::link::gnu::link_gnu("lf", &args).map_err(|e| format!("link error: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 /// Serialize a RISC-V object (from [`compile_module`]) as an ELF64
 /// relocatable file for the LP64D ABI.
 ///

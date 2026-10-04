@@ -83,6 +83,10 @@ fn riscv64_executables_link_through_qld() {
     assert_ne!(u64::from_le_bytes(exe[24..32].try_into().unwrap()), 0, "an entry point");
     let pic = build_ok(&dir, &["--target", "riscv64-linux", "-c", "--pic"], "p.o");
     assert_eq!(u16::from_le_bytes([pic[18], pic[19]]), 243);
+    let so = build_ok(&dir, &["--target", "riscv64-linux", "--shared", "-soname", "libtg.so.1"], "libtg.so");
+    assert_eq!(u16::from_le_bytes([so[16], so[17]]), 3, "ET_DYN");
+    assert_eq!(u16::from_le_bytes([so[18], so[19]]), 243, "EM_RISCV");
+    assert!(so.windows(10).any(|w| w == b"libtg.so.1"), "the DT_SONAME string");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
