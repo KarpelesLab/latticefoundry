@@ -190,17 +190,19 @@ fn other_targets_reject_pic_with_a_clear_error() {
     let m = parse_module("module \"m\"\nfunc @f() -> void {\nentry ^0:\n  ret\n}\n", FileId::new(0), &mut syms)
         .unwrap();
     let pic = CodegenOptions::default().with_pic(true);
-    let arch = TargetArch::Riscv64;
+    // Thumb (Cortex-M firmware) has no PIC.
+    let arch = TargetArch::Thumb;
     let err = compile_module_for(arch, &m, &syms, &pic).unwrap_err();
     assert_eq!(err, CodegenError::UnsupportedRelocModel { arch, model: RelocModel::Pic });
     assert!(err.to_string().contains("position-independent"), "{err}");
     // Position-dependent code still compiles.
     assert!(compile_module_for(arch, &m, &syms, &CodegenOptions::default()).is_ok());
-    // x86-64 and AArch64 generate it.
-    assert!(compile_module_for(TargetArch::X86_64, &m, &syms, &pic).is_ok());
-    assert!(compile_module_for(TargetArch::AArch64, &m, &syms, &pic).is_ok());
+    // x86-64, AArch64 and RISC-V generate it.
+    for arch in [TargetArch::X86_64, TargetArch::AArch64, TargetArch::Riscv64] {
+        assert!(compile_module_for(arch, &m, &syms, &pic).is_ok(), "{arch}");
+    }
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::target::riscv::compile_module_with(&m, &syms, &pic)
+        crate::target::thumb::compile_module_with(&m, &syms, &pic)
     }));
     assert!(r.is_err(), "the infallible entry point refuses PIC too");
 }

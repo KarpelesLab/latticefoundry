@@ -56,6 +56,8 @@ mod link_tests;
 #[cfg(test)]
 mod dyn_tests;
 #[cfg(test)]
+mod pic_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod stack_tests;

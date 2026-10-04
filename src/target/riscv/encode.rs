@@ -1634,6 +1634,14 @@ pub fn compile_module(module: &Module, syms: &StrInterner) -> ObjectModule {
 
 /// Like [`compile_module`], under `opts`, and also returning every defined
 /// function's [`StackUsage`] (in definition order) in the [`CompiledModule`].
+///
+/// Under a position-independent [`RelocModel`](crate::codegen::RelocModel)
+/// the code addresses every symbol that may bind outside the component
+/// through its GOT entry (`auipc`+`ld`, `R_RISCV_GOT_HI20`), the others
+/// PC-relatively; calls stay `R_RISCV_CALL_PLT` (the linker routes a call to
+/// a preemptible function through the PLT); and constant globals holding
+/// addresses move to `.data.rel.ro`. No relocation needs a fixed load
+/// address, so the object links into a shared library or a PIE.
 pub fn compile_module_with(
     module: &Module,
     syms: &StrInterner,
@@ -1716,8 +1724,10 @@ pub fn compile_module_with(
             });
         }
     }
-    // Every defined global's storage; pointer fields are `R_RISCV_64`.
-    crate::codegen::data::emit_globals(module, syms, &mut obj, RelocKind::Abs64);
+    // Every defined global's storage; pointer fields are `R_RISCV_64`. Under
+    // PIC, constants holding addresses go to `.data.rel.ro`.
+    let pic = opts.reloc_model.is_pic();
+    crate::codegen::data::emit_globals_with(module, syms, &mut obj, RelocKind::Abs64, pic);
     crate::codegen::linkage::apply_symbol_attrs(module, syms, &mut obj);
     CompiledModule { object: obj, stack }
 }

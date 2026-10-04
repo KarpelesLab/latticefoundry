@@ -242,6 +242,50 @@ pub(super) fn load_elf(bytes: &[u8]) -> Result<Image, String> {
             text.push((vaddr, vaddr + memsz));
         }
     }
+    // A shared library or PIE, loaded at its link addresses: apply its
+    // dynamic relocations (`R_RISCV_RELATIVE`, `R_RISCV_64`,
+    // `R_RISCV_JUMP_SLOT`) as a dynamic loader would, against the image's
+    // own definitions.
+    for k in 0..phnum {
+        let p = phoff + k * phsz;
+        if u32_at(p) != 2 {
+            continue; // PT_DYNAMIC
+        }
+        let (dyn_off, dyn_size) = (u64_at(p + 8) as usize, u64_at(p + 32) as usize);
+        let mut tags: HashMap<u64, u64> = HashMap::new();
+        let mut rels: Vec<(u64, u64)> = Vec::new();
+        for e in (dyn_off..dyn_off + dyn_size).step_by(16) {
+            let (tag, val) = (u64_at(e), u64_at(e + 8));
+            if tag == 0 {
+                break;
+            }
+            tags.insert(tag, val);
+        }
+        // DT_RELA/DT_RELASZ, DT_JMPREL/DT_PLTRELSZ.
+        for (at, size) in [(7u64, 8u64), (23, 2)] {
+            if let (Some(&a), Some(&n)) = (tags.get(&at), tags.get(&size)) {
+                rels.push((a, n));
+            }
+        }
+        let symtab = tags.get(&6).copied().unwrap_or(0);
+        for (addr, size) in rels {
+            for r in (addr..addr + size).step_by(24) {
+                let (off, info, addend) = (mem.read(r, 8), mem.read(r + 8, 8), mem.read(r + 16, 8));
+                let sym_value = mem.read(symtab + 24 * (info >> 32) + 8, 8);
+                let v = match info & 0xffff_ffff {
+                    3 => addend,                          // R_RISCV_RELATIVE
+                    2 => sym_value.wrapping_add(addend),  // R_RISCV_64
+                    5 => sym_value,                       // R_RISCV_JUMP_SLOT
+                    0 => continue,
+                    t => return Err(format!("dynamic relocation type {t}")),
+                };
+                if info >> 32 != 0 && sym_value == 0 && info & 0xffff_ffff != 3 {
+                    return Err(format!("dynamic relocation against an undefined symbol at {off:#x}"));
+                }
+                mem.write(off, 8, v);
+            }
+        }
+    }
     let mut symbols = HashMap::new();
     let (shoff, shnum, shsz) = (u64_at(40) as usize, u16_at(60) as usize, u16_at(58) as usize);
     for k in 0..shnum {
