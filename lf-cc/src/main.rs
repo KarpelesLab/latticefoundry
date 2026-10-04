@@ -26,6 +26,10 @@
 //! * `-fPIC`/`-fpic` and `-fPIE`/`-fpie` select position-independent code
 //!   (`CodegenOptions::with_reloc_model`); `-fvisibility=` sets the default
 //!   ELF visibility of definitions.
+//! * `-fsanitize=undefined` (or a list of checks) inserts run-time checks for
+//!   undefined behavior (`transform::sanitize`); `-fsanitize-trap` traps
+//!   instead of reporting, and `-fno-sanitize-recover` exits after the first
+//!   report.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -41,6 +45,8 @@ use latticefoundry::mc::object::ObjectModule;
 use latticefoundry::support::diagnostics::Diagnostic;
 use latticefoundry::target::TargetArch;
 use latticefoundry::transform::pipeline::OptLevel;
+use latticefoundry::transform::sanitize::{SanitizeKinds, SanitizeOptions, SanitizeRuntime, UbKind};
+use latticefoundry::target::TargetOs;
 
 use lf_cc::{BuildError, CStd, CodegenConfig, MacroOp, PpOptions, SourceMap};
 
@@ -101,6 +107,12 @@ struct Options {
     pie: bool,
     /// `-fvisibility=`: the default visibility of definitions.
     visibility: Visibility,
+    /// `-fsanitize=`: the undefined-behavior checks.
+    sanitize: SanitizeKinds,
+    /// `-fsanitize-trap[=]`: the checks that trap instead of reporting.
+    sanitize_trap: SanitizeKinds,
+    /// `-f[no-]sanitize-recover`: whether to continue after a report.
+    sanitize_recover: bool,
 }
 
 impl Options {
@@ -134,7 +146,13 @@ impl Options {
             None if self.pie => RelocModel::Pie,
             None => RelocModel::Static,
         };
-        CodegenConfig { reloc_model, default_visibility: self.visibility }
+        let sanitize = (!self.sanitize.is_empty()).then(|| SanitizeOptions {
+            kinds: self.sanitize,
+            trap: self.sanitize_trap.intersect(self.sanitize),
+            recover: self.sanitize_recover,
+            runtime: SanitizeRuntime::for_target(TargetArch::X86_64, TargetOs::Linux),
+        });
+        CodegenConfig { reloc_model, default_visibility: self.visibility, sanitize }
     }
 
     /// The translation units to compile (C and assembly sources), in order.
@@ -517,6 +535,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         shared: false,
         pie: false,
         visibility: Visibility::Default,
+        sanitize: SanitizeKinds::NONE,
+        sanitize_trap: SanitizeKinds::NONE,
+        sanitize_recover: true,
     };
 
     let mut it = args.iter();
@@ -556,6 +577,24 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-shared" => opts.shared = true,
             "-pie" => opts.pie = true,
             "-no-pie" | "-nopie" => opts.pie = false,
+            _ if arg.starts_with("-fsanitize=") => {
+                opts.sanitize = opts.sanitize.union(sanitizer_list(&arg["-fsanitize=".len()..])?);
+            }
+            _ if arg.starts_with("-fno-sanitize=") => {
+                opts.sanitize = opts.sanitize.minus(sanitizer_list(&arg["-fno-sanitize=".len()..])?);
+            }
+            "-fsanitize-trap" | "-fsanitize-undefined-trap-on-error" => opts.sanitize_trap = SanitizeKinds::ALL,
+            "-fno-sanitize-trap" => opts.sanitize_trap = SanitizeKinds::NONE,
+            _ if arg.starts_with("-fsanitize-trap=") => {
+                opts.sanitize_trap = opts.sanitize_trap.union(sanitizer_list(&arg["-fsanitize-trap=".len()..])?);
+            }
+            _ if arg.starts_with("-fno-sanitize-trap=") => {
+                opts.sanitize_trap = opts.sanitize_trap.minus(sanitizer_list(&arg["-fno-sanitize-trap=".len()..])?);
+            }
+            _ if arg == "-fsanitize-recover" || arg.starts_with("-fsanitize-recover=") => opts.sanitize_recover = true,
+            _ if arg == "-fno-sanitize-recover" || arg.starts_with("-fno-sanitize-recover=") => {
+                opts.sanitize_recover = false
+            }
             _ if arg.starts_with("-fvisibility=") => {
                 opts.visibility = match &arg["-fvisibility=".len()..] {
                     "default" => Visibility::Default,
@@ -642,12 +681,40 @@ fn print_usage() {
     println!("  -pie           link a position-independent executable (sources default to -fPIE)");
     println!("  -fPIC/-fpic    position-independent code for a shared library");
     println!("  -fPIE/-fpie    position-independent code for an executable");
+    println!("  -fsanitize=undefined|<check>,...");
+    println!("                 run-time checks for undefined behavior (signed-integer-overflow,");
+    println!("                 shift, integer-divide-by-zero, float-cast-overflow, bounds,");
+    println!("                 object-size, pointer-overflow, null, alignment, unreachable);");
+    println!("                 reports go to stderr (-fno-sanitize-recover: exit after one)");
+    println!("  -fsanitize-trap[=<checks>]  trap (ud2, SIGILL) instead of reporting");
     println!("  -fvisibility=<default|hidden|protected>");
     println!("                 the ELF visibility of definitions without a visibility attribute\n");
     println!("Linking is hosted by default: the host C runtime (crt1.o, libc) is linked in");
     println!("with qld, LatticeFoundry's own linker. Without a host C runtime lf-cc falls");
     println!("back to the -nostdlib link. Warning flags (-W...), -pipe, -m64, -march=,");
     println!("and code-generation flags that do not change lf-cc's output are ignored.");
+}
+
+/// The undefined-behavior checks a `-fsanitize=` list names. `undefined` is
+/// GCC's group: every check but `float-cast-overflow`. Checks lf-cc does not
+/// implement (`vla-bound`, `return`, `bool`, `enum`, ...) are ignored with a
+/// warning; other sanitizers (`address`, `thread`, ...) are an error.
+fn sanitizer_list(list: &str) -> Result<SanitizeKinds, String> {
+    let mut set = SanitizeKinds::NONE;
+    for name in list.split(',').filter(|n| !n.is_empty()) {
+        let kinds = match name {
+            "undefined" => SanitizeKinds::ALL.minus(SanitizeKinds::of(&[UbKind::FloatCast])),
+            "vla-bound" | "return" | "bool" | "enum" | "nonnull-attribute" | "returns-nonnull-attribute"
+            | "builtin" | "vptr" | "float-divide-by-zero" | "bounds-strict" => {
+                eprintln!("lf-cc: warning: -fsanitize={name} is not implemented; ignored");
+                SanitizeKinds::NONE
+            }
+            other => SanitizeKinds::from_name(other)
+                .ok_or_else(|| format!("unsupported sanitizer '{other}' (lf-cc implements the undefined-behavior checks)"))?,
+        };
+        set = set.union(kinds);
+    }
+    Ok(set)
 }
 
 /// The file stem of `input` (`dir/foo.c` → `foo`).

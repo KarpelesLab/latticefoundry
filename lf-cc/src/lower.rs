@@ -28,6 +28,7 @@ use crate::sema::{
     AggStore, AtomicOp, FuncSig, LocalInfo, MemOrder, Program, TExpr, TExprKind, TFunc, TGlobal, TStmt,
 };
 use crate::CodegenConfig;
+use latticefoundry::transform::sanitize::UbKind;
 
 /// The size in bytes of a System V `__va_list_tag` (`va_copy` copies this many).
 const VA_LIST_SIZE: u64 = 24;
@@ -365,8 +366,10 @@ pub fn lower_with(
             va_fp: 0,
             va_reg_save,
             va_overflow,
-            debug,
+            debug: debug || cfg.sanitize.is_some(),
             linemap: &linemap,
+            signed_nsw: cfg.sanitize.is_some_and(|o| o.kinds.contains(UbKind::SignedOverflow)),
+            shift_nsw: cfg.sanitize.is_some_and(|o| o.kinds.contains(UbKind::ShiftBase)),
         };
         fl.lower_function(f, decl_line);
     }
@@ -488,6 +491,11 @@ struct FnLower<'a> {
     va_overflow: FuncId,
     debug: bool,
     linemap: &'a LineMap,
+    /// Mark signed `int`-or-wider `+ - *` (and unary `-`, `++`, `--`) `nsw`,
+    /// so the sanitizer checks C's signed overflow (`-fsanitize=`).
+    signed_nsw: bool,
+    /// Mark signed `<<` `nsw` (`-fsanitize=shift-base`).
+    shift_nsw: bool,
 }
 
 impl FnLower<'_> {
@@ -634,6 +642,20 @@ impl FnLower<'_> {
             Some(p) => layout::size_of(self.records, p),
             None => 1,
         }
+    }
+
+    /// The flags of integer `op` on C type `ty`: `nsw` on a signed `+ - *`
+    /// of at least `int`'s rank when signed overflow is checked (narrower
+    /// types are promoted first, so their arithmetic cannot overflow), and on
+    /// such a `<<` when shifts are; none otherwise (lf-cc's arithmetic wraps).
+    fn int_flags(&self, op: BinOp, ty: &CType) -> Flags {
+        let wanted = match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => self.signed_nsw,
+            BinOp::Shl => self.shift_nsw,
+            _ => false,
+        };
+        let int_rank = matches!(ty.unqual(), CType::Int(i) if i.signed && i.bitint.is_none() && i.width >= 32);
+        if wanted && int_rank { Flags::nsw() } else { Flags::NONE }
     }
 
     fn set_line(&mut self, span: latticefoundry::support::diagnostics::Span) {
@@ -1187,7 +1209,9 @@ impl FnLower<'_> {
             TExprKind::Arith(op, l, r) => {
                 let lv = self.lower_rvalue(l);
                 let rv = self.lower_rvalue(r);
-                let res = self.b.bin(lane_binop(*op, &e.ty), lv, rv, Flags::NONE);
+                let bop = lane_binop(*op, &e.ty);
+                let flags = self.int_flags(bop, &e.ty);
+                let res = self.b.bin(bop, lv, rv, flags);
                 self.normalize_bitint(res, &e.ty)
             }
             TExprKind::Shift(op, l, r) => {
@@ -1205,7 +1229,8 @@ impl FnLower<'_> {
                     _ if lane_of(&l.ty).is_signed() => BinOp::AShr,
                     _ => BinOp::LShr,
                 };
-                let res = self.b.bin(binop, lv, rv, Flags::NONE);
+                let flags = self.int_flags(binop, &e.ty);
+                let res = self.b.bin(binop, lv, rv, flags);
                 self.normalize_bitint(res, &e.ty)
             }
             TExprKind::Cmp(op, l, r) => {
@@ -1261,7 +1286,8 @@ impl FnLower<'_> {
                 } else {
                     let ty = self.tys.of(&e.ty);
                     let zero = self.b.const_i64(ty, 0);
-                    let res = self.b.sub(zero, v, Flags::NONE);
+                    let flags = self.int_flags(BinOp::Sub, &e.ty);
+                    let res = self.b.sub(zero, v, flags);
                     self.normalize_bitint(res, &e.ty)
                 }
             }
@@ -1690,10 +1716,13 @@ impl FnLower<'_> {
                     _ if lane_of(compute_ty).is_signed() => BinOp::AShr,
                     _ => BinOp::LShr,
                 };
-                self.b.bin(binop, oldc, amt, Flags::NONE)
+                let flags = self.int_flags(binop, compute_ty);
+                self.b.bin(binop, oldc, amt, flags)
             } else {
                 let rc = self.convert(rv0, rty, compute_ty);
-                self.b.bin(lane_binop(op, compute_ty), oldc, rc, Flags::NONE)
+                let bop = lane_binop(op, compute_ty);
+                let flags = self.int_flags(bop, compute_ty);
+                self.b.bin(bop, oldc, rc, flags)
             };
             self.convert(res, compute_ty, lty)
         };
@@ -1890,10 +1919,11 @@ impl FnLower<'_> {
             self.b.bin(op, old, one, Flags::NONE)
         } else {
             let one = self.b.const_i64(ity, 1);
+            let flags = self.int_flags(BinOp::Add, ty);
             let stepped = if inc {
-                self.b.add(old, one, Flags::NONE)
+                self.b.add(old, one, flags)
             } else {
-                self.b.sub(old, one, Flags::NONE)
+                self.b.sub(old, one, flags)
             };
             self.normalize_bitint(stepped, ty)
         }

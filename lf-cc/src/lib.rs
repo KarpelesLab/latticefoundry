@@ -36,13 +36,15 @@ use latticefoundry::support::StrInterner;
 use latticefoundry::support::diagnostics::Diagnostic;
 use latticefoundry::target::{TargetArch, x86_64};
 use latticefoundry::transform::pipeline::{self, OptLevel};
+use latticefoundry::transform::sanitize::{self, SanitizeOptions};
 use latticefoundry::verify;
 
 use sema::{FuncSig, TGlobal};
 
-/// Code-generation choices that do not change a program's meaning but shape
-/// its object: the relocation model (`-fPIC`/`-fPIE`) and the default symbol
-/// visibility of definitions (`-fvisibility=`).
+/// Code-generation choices that shape the object: the relocation model
+/// (`-fPIC`/`-fPIE`), the default symbol visibility of definitions
+/// (`-fvisibility=`), and the run-time undefined-behavior checks
+/// (`-fsanitize=`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodegenConfig {
     /// How position-independent the code must be (default: static).
@@ -50,6 +52,10 @@ pub struct CodegenConfig {
     /// The visibility of every definition without a `visibility` attribute
     /// (default: `default`).
     pub default_visibility: Visibility,
+    /// The undefined-behavior sanitizer, when enabled: signed `int`
+    /// arithmetic is lowered with `nsw` (C's overflow rule) and
+    /// `transform::sanitize` instruments the module before optimization.
+    pub sanitize: Option<SanitizeOptions>,
 }
 
 /// Compile C source text all the way to a lowered IR [`Module`] plus the symbol
@@ -304,9 +310,13 @@ fn compile_program(
     debug: bool,
     cfg: &CodegenConfig,
 ) -> Result<ObjectModule, BuildError> {
-    let (mut module, syms) = lower::lower_with(program, source, input_name, debug, cfg);
+    let (mut module, mut syms) = lower::lower_with(program, source, input_name, debug, cfg);
 
     verify_or(&module, "lowered")?;
+    if let Some(opts) = &cfg.sanitize {
+        sanitize::sanitize_module(&mut module, &mut syms, input_name, opts).map_err(BuildError::Backend)?;
+        verify_or(&module, "sanitized")?;
+    }
     pipeline::optimize(&mut module, opt);
     if opt != OptLevel::O0 {
         verify_or(&module, "optimized")?;
