@@ -132,3 +132,32 @@ fn errors_and_help() {
     assert!(!ok && err.contains("cannot read"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn section_less_executable_starts_at_code_not_headers() {
+    // `lf build` writes a static executable without section headers (unless
+    // `-g`); `lf-dis` then falls back to the executable segment, which also
+    // maps the ELF and program headers. Those must not be decoded as code, and
+    // the entry point gets a label.
+    let dir = scratch("exe");
+    let exe = dir.join("dis.exe");
+    let o = Command::new(env!("CARGO_BIN_EXE_lf"))
+        .arg("build")
+        .arg(dir.join("dis.lf"))
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("run lf");
+    // `ext` is undefined, so the static link may legitimately fail; only an
+    // image that linked is checked.
+    if !o.status.success() {
+        std::fs::write(dir.join("dis.lf"), SRC.replace("func @ext(i64) -> i64\n", "func @ext(i64) -> i64 {\nentry ^0(%x: i64):\n  ret %x\n}\n")).unwrap();
+        let o = Command::new(env!("CARGO_BIN_EXE_lf")).arg("build").arg(dir.join("dis.lf")).arg("-o").arg(&exe).output().unwrap();
+        assert!(o.status.success(), "lf build: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    let out = dis_ok(&["-d", exe.to_str().unwrap()]);
+    assert!(out.contains("<entry>:"), "entry label missing:\n{out}");
+    // The ELF magic (7f 45 4c 46) is header data, never a listed instruction.
+    assert!(!out.contains("7f 45 4c 46") && !out.contains("7f 45 "), "headers decoded as code:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

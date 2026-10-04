@@ -395,6 +395,7 @@ fn read_elf(file: &[u8]) -> Result<Binary, String> {
     let e_type = b.u16(16)?;
     let machine = b.u16(18)?;
     let (phoff, shoff, ehsize_at) = if wide { (b.u64(32)?, b.u64(40)?, 52) } else { (u64::from(b.u32(28)?), u64::from(b.u32(32)?), 40) };
+    let entry = if wide { b.u64(24)? } else { u64::from(b.u32(24)?) };
     let phentsize = u64::from(b.u16(ehsize_at + 2)?);
     let phnum = u64::from(b.u16(ehsize_at + 4)?);
     let shentsize = u64::from(b.u16(ehsize_at + 6)?);
@@ -561,11 +562,20 @@ fn read_elf(file: &[u8]) -> Result<Binary, String> {
             } else {
                 (b.u32(at + 24)?, u64::from(b.u32(at + 4)?), u64::from(b.u32(at + 8)?), u64::from(b.u32(at + 16)?))
             };
+            // The first segment usually maps the file headers too: start after
+            // the ELF header and the program header table, not at their bytes.
+            let headers_end = (if wide { 64 } else { 52 }).max(phoff + phnum * phentsize);
+            let skip = if offset < headers_end { (headers_end - offset).min(filesz) } else { 0 };
             if ty == 1
                 && flags & 1 != 0
-                && let Ok(data) = b.slice(offset, filesz)
+                && skip < filesz
+                && let Ok(data) = b.slice(offset + skip, filesz - skip)
             {
-                out.push(CodeSection::new(format!("LOAD{k}"), vaddr, data.to_vec(), true));
+                let mut sec = CodeSection::new(format!("LOAD{k}"), vaddr + skip, data.to_vec(), true);
+                if (sec.addr..sec.addr + sec.bytes.len() as u64).contains(&entry) {
+                    sec.labels.push(Label { addr: entry, name: "entry".to_owned(), kind: LabelKind::Function });
+                }
+                out.push(sec);
             }
         }
     }
