@@ -16,7 +16,7 @@
 use std::fmt::Write as _;
 
 use super::objfile::{Binary, CodeSection, LabelKind, MappingKind};
-use super::{Inst, Options, comment_marker, decode, min_unit};
+use super::{Inst, Options, State, comment_marker, decode_in, min_unit};
 use crate::target::TargetArch;
 
 /// What to list.
@@ -74,17 +74,22 @@ fn walk(sec: &CodeSection, arch: TargetArch, opts: &ListingOptions, start: u64, 
     let lo = opts.start.map_or(start, |s| s.max(start));
     let hi = opts.stop.map_or(end, |s| s.min(end));
     let mut addr = start;
+    let mut state = State::default();
     // Skip to `lo` by decoding (to stay in step) without reporting.
     while addr < hi {
         let boundary = next_boundary(sec, addr, end);
+        if sec.labels.iter().any(|l| l.addr == addr) {
+            state = State::default(); // no IT block spans a label
+        }
         let from = (addr - sec.addr) as usize;
         let to = (boundary - sec.addr) as usize;
         let Some(bytes) = sec.bytes.get(from..to) else { break };
         let inst = if in_data(sec, addr) {
             let unit = if arch == TargetArch::Thumb || arch == TargetArch::AArch64 { 4 } else { min_unit(arch) };
+            state = State::default();
             Inst::data(bytes, unit.min(bytes.len()), true)
         } else {
-            decode(arch, bytes, addr, &opts.disasm)
+            decode_in(arch, bytes, addr, &opts.disasm, &mut state)
         };
         let len = inst.len.max(1) as u64;
         if addr >= lo {

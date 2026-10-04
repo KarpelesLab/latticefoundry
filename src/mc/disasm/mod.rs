@@ -212,11 +212,29 @@ pub fn comment_marker(arch: TargetArch) -> &'static str {
     }
 }
 
+/// Decoding state carried from one instruction to the next: the Thumb
+/// `ITSTATE`, which makes the instructions of an `IT` block conditional
+/// (`addeq`) and changes how a 16-bit data-processing instruction prints
+/// (`add` inside the block, `adds` outside). Other architectures carry none.
+/// A fresh [`State::default`] is "outside any IT block".
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct State {
+    /// The Thumb `ITSTATE` bits (`firstcond[3:1]` in bits 7:5, then the
+    /// condition's low bit and mask in bits 4:0); 0 outside an IT block.
+    pub it: u8,
+}
+
 /// Decode one instruction of `arch` from the start of `bytes`, which sit at
 /// address `addr` (branch targets are absolute). Never panics; for non-empty
 /// `bytes` the result's `len` is between 1 and `bytes.len()`. Empty `bytes`
-/// give a zero-length `.byte` with no operands.
+/// give a zero-length `.byte` with no operands. Decodes outside any Thumb
+/// IT block; [`decode_in`] carries that state through a sequence.
 pub fn decode(arch: TargetArch, bytes: &[u8], addr: u64, opts: &Options) -> Inst {
+    decode_in(arch, bytes, addr, opts, &mut State::default())
+}
+
+/// [`decode`], reading and advancing the inter-instruction `state`.
+pub fn decode_in(arch: TargetArch, bytes: &[u8], addr: u64, opts: &Options, state: &mut State) -> Inst {
     if bytes.is_empty() {
         return Inst { len: 0, mnemonic: ".byte".to_owned(), operands: Vec::new(), target: None, target_operand: None, known: false };
     }
@@ -224,12 +242,13 @@ pub fn decode(arch: TargetArch, bytes: &[u8], addr: u64, opts: &Options) -> Inst
         TargetArch::X86_64 => x86::decode(bytes, addr, opts),
         TargetArch::AArch64 => aarch64::decode(bytes, addr),
         TargetArch::Riscv64 => riscv::decode(bytes, addr),
-        TargetArch::Thumb => thumb::decode(bytes, addr),
+        TargetArch::Thumb => thumb::decode_in(bytes, addr, state),
         TargetArch::Avr => avr::decode(bytes, addr),
         TargetArch::Wasm32 => wasm::decode(bytes, addr),
     };
     if inst.len == 0 || inst.len > bytes.len() {
         // A decoder bug must not stall or overrun a listing.
+        *state = State::default();
         return Inst::data(bytes, min_unit(arch), true);
     }
     inst
@@ -240,8 +259,9 @@ pub fn decode(arch: TargetArch, bytes: &[u8], addr: u64, opts: &Options) -> Inst
 pub fn disassemble(arch: TargetArch, bytes: &[u8], addr: u64, opts: &Options) -> Vec<(u64, Inst)> {
     let mut out = Vec::new();
     let mut at = 0;
+    let mut state = State::default();
     while at < bytes.len() {
-        let inst = decode(arch, &bytes[at..], addr.wrapping_add(at as u64), opts);
+        let inst = decode_in(arch, &bytes[at..], addr.wrapping_add(at as u64), opts, &mut state);
         let len = inst.len.max(1);
         out.push((addr.wrapping_add(at as u64), inst));
         at += len;
