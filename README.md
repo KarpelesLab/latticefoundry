@@ -176,8 +176,9 @@ Its test suite is differential: each program's exit status is compared with
 `.s`, `.o`, `.a` and `-l` inputs, and `-c` writes one object per source. By
 default it links a dynamic executable against the host libc using qld;
 `-nostdlib` gives a static, libc-free executable instead. It never runs gcc or
-the system `ld`. GNU `asm` labels, compiler barriers and file-scope `asm`
-blocks are supported; file-scope asm is assembled with rsasm. The real glibc
+the system `ld`. GNU `asm` labels, file-scope `asm` blocks and inline `asm`
+statements with operands (x86-64) are supported; both kinds of asm are
+assembled with rsasm, inline asm spliced into the function. The real glibc
 `<string.h>` already compiles.
 
 Real packages built from source with `lf-cc`:

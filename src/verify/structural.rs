@@ -1492,7 +1492,7 @@ impl Ctx<'_> {
         }
     }
 
-    /// Check an `inline_asm` (`docs/ir-design.md` §6i): the constraint
+    /// Check an `inline_asm` (`docs/ir-design.md` §6j): the constraint
     /// prefixes, a type on exactly the register outputs, one value operand
     /// per [`InlineAsm::operand_slots`] entry (a pointer for an indirect
     /// operand, the output's type for a `+` register output, a constant or

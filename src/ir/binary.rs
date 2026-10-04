@@ -107,7 +107,7 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 /// bump: a reader that predates them rejects such a stream with
 /// [`DecodeError::InvalidTag`] rather than misreading it.
 ///
-/// Inline assembly (`docs/ir-design.md` §6i) is the same: `inline_asm` is
+/// Inline assembly (`docs/ir-design.md` §6j) is the same: `inline_asm` is
 /// opcode tag 45 (the template, a flag byte with bit 0 = `volatile`, then
 /// counted outputs — constraint, optional name, optional type — inputs and
 /// clobbers) and `asm_output` tag 46, with no bump.
@@ -1197,7 +1197,7 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
             w.u8(44);
             w.u8(op.code());
         }
-        // Inline asm uses tags 45/46 (`docs/ir-design.md` §6i); streams
+        // Inline asm uses tags 45/46 (`docs/ir-design.md` §6j); streams
         // without it keep their bytes, so no version bump was needed.
         InstKind::InlineAsm(asm) => {
             w.u8(45);

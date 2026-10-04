@@ -559,7 +559,9 @@ dedicated opcode:
   what it may touch, and what it returns. So it stays analyzable (precise
   effects rather than "anything"), portable (one IR spelling, three backend
   lowerings), and verifiable (typed operands, a checked arity, and an honest
-  "unknown" in the refinement checker).
+  "unknown" in the refinement checker). (Existing C code written with GCC's
+  extended `asm` is still compiled: §6j's `inline_asm` carries it, as a
+  compatibility op the compiler never emits on its own.)
 
 ## 6b. Volatile accesses, atomics and fences  *(decided)*
 
@@ -902,6 +904,7 @@ reaches any of the following:
 | any float arithmetic, `fcmp`, or float conversion | subnormal slow paths; x86-64's `u64`↔float conversions branch |
 | the size of a `dyn_alloca` | its stack-probe loop runs over the size |
 | an operand of a `syscall` | it leaves the program |
+| an operand of an `inline_asm` with a non-empty template (§6j) | the template is opaque: it may branch on it or use it as an address |
 | the value of an atomic store, rmw or cmpxchg; an rmw or cmpxchg on memory that may hold a secret | retry loops compare memory contents |
 | a public parameter of a direct call; an indirect or variadic argument | secrecy is part of the callee's interface |
 | the `ret` of a function whose return is not `secret` | the same |
@@ -963,7 +966,7 @@ Each target's MIR opcode set has `may_branch_on_data()`, the instructions
 that may take a conditional branch depending on a register value:
 
 - x86-64: the terminators, the `u64`↔float fix-ups, the `lock cmpxchg` loop,
-  and `dyn_alloca`'s probe loop;
+  `dyn_alloca`'s probe loop, and an inline asm with a non-empty template;
 - AArch64: the terminators, the atomic retry loops and `dyn_alloca`'s probe
   loop;
 - RISC-V: the terminators, the atomic retry loops and `dyn_alloca`'s probe
@@ -1516,6 +1519,158 @@ redzones), and precede each load and store with a shadow load and compare
 `__lf_ub_report` with a new kind) and, for heap coverage, `malloc`/`free`
 interposition with quarantine. Use-after-return and the dynamic stack need
 the frame-layout cooperation that `dyn_alloca` already has.
+## 6j. Inline assembly: `inline_asm` and `asm_output`  *(decided)*
+
+§6a rejected inline assembly as the way *our* front ends reach the kernel,
+and that still holds: `syscall`, the atomics and `fence` say precisely what
+they do. But C code in the wild — glibc and Linux headers, musl's syscall
+wrappers, `cpuid`/`rdtsc` helpers, `sys/io.h` — is written with GCC's
+extended `asm`, and compiling it as is needs an op that carries such a
+statement through the pipeline. It is a compatibility feature, as opaque to
+the optimizer and the verifiers as the semantics below say, and nothing in
+the compiler emits one on its own.
+
+```text
+%lo  = inline_asm volatile "rdtsc" outs("=a" i32, "=d" i32) : i32
+%hi  = asm_output %lo, 1 : i32
+%sum = inline_asm "addq %2, %0" outs("=r" [s] i64) ins("0" (%a), "r" [b] (%b)) clobbers("cc") : i64
+       inline_asm volatile "movq %1, %0" outs("=m" (%p)) ins("r" (%v)) : void
+```
+
+- **Payload.** The template (still unsubstituted: `%0`, `%[name]`, `%k1`,
+  `%=`, `%%` are the target's business), the outputs (each a constraint
+  starting with `=` or `+`, an optional `[name]`, and the type of the value
+  a register output produces), the inputs (constraint and optional name),
+  the clobber list (register names, `"memory"`, `"cc"`) and `volatile`.
+  Operands are numbered as in GCC: outputs first, then inputs.
+- **Operands.** An *indirect* operand — one whose constraint allows only
+  memory (`m`, `o`, `V`) — is the pointer to that memory. So the value
+  operands are, in order: the pointer of each indirect output and the
+  incoming value of each `+` register output, then one per input
+  (`InlineAsm::operand_slots`). A matching constraint (`"0"`, `"[name]"`)
+  ties an input to a register output; an immediate-only one (`i`, `n`, the
+  range letters) takes a constant or, for `i`, a symbol.
+- **Results.** Instructions have one result (§6b's `cmpxchg` made the same
+  choice), and an aggregate would be an address (§6). So the result is the
+  *first register output*, and `asm_output %asm, n` projects register output
+  `n` of the asm whose result is `%asm` (the result names the whole asm). A
+  pass that merges two identical pure asms replaces one result with the
+  other, and the projections follow; a dead asm whose outputs are all
+  unread goes away with them. An asm without register outputs is `void`.
+- **Rejected: a struct result with `extractvalue`.** Aggregate-typed values
+  are addresses in this IR; a tuple type would be a new kind of value for
+  one opcode.
+- **Rejected: outputs through memory.** Lowering every output but one to a
+  store through a pointer operand would turn `"=a"`/`"=d"` pairs into stack
+  traffic and make every such slot escape (mem2reg could not promote it).
+
+**Semantics.** The template is opaque. A `volatile` asm, or one that clobbers
+memory or has an indirect operand, is an effect exactly as strong as a call
+to an unknown function: a full memory clobber that escapes its pointer
+operands, never removed, duplicated, reordered with other memory operations,
+calls or syscalls, hoisted or speculated. Any other asm is a **pure**
+function of its inputs: removable when no output is read, but still never
+hoisted or speculated, since its template may trap. `asm_output` is pure. A
+poison operand is undefined behavior: the asm would observe an arbitrary
+register. Front ends make an asm without outputs `volatile`, as GCC does.
+
+**What sees it.**
+
+- *Passes.* `has_side_effect` is true for the effectful kind, so DCE and
+  SCCP keep it; LICM's hoistable set excludes both opcodes; the e-graph
+  treats them as opaque and re-emits them verbatim; mem2reg never promotes
+  a slot whose address reaches an asm; inlining copies it like any other
+  instruction (each copy is assembled separately, so its labels cannot
+  clash); module merging remaps the output types.
+- *Analyses.* Every abstract domain gives both results ⊤, and constant
+  folding never evaluates them. The reference evaluator has no denotation;
+  the IR interpreter reports them as unsupported.
+- *Refinement.* A function containing one, even a pure, output-less asm, is
+  `Unknown`, never a proof.
+- *Constant time* (§6d). An operand of an asm with a non-empty template must
+  be public (`CtRole::AsmOperand`): the template may branch on it or use it
+  as an address. An empty template (`asm("" : "+r"(x))`, the optimization
+  barrier constant-time code uses) runs no instruction, so it may take
+  secrets. Outputs carry the join of the operands' taint and, for an asm
+  that may read memory, the taint of escaped memory; a secret operand of a
+  memory-touching asm taints escaped memory. The codegen audit counts the
+  x86-64 asm instruction as `may_branch_on_data` unless its template is
+  empty.
+- *Binary form.* Opcode tag 45 (the template, a flag byte, then counted
+  outputs, inputs and clobbers) and tag 46 (the output index), with no
+  version bump: a stream without inline asm keeps its bytes.
+
+**Lowering (x86-64).** `x86_64::check_inline_asm` plans every statement
+before code generation (and `target::check_module` and `lf-cc` call it), so a
+bad constraint, clobber or template is an error naming the function, not a
+backend panic. Then:
+
+| constraint | placement |
+|---|---|
+| `r` `q` `l` `p` `U` `g` `X` | any allocatable general register (`g`/`X` with a constant: immediate) |
+| `a` `b` `c` `d` `S` `D` | that register (`rax`, `rbx`, `rcx`, `rdx`, `rsi`, `rdi`) |
+| `{r10}`, `{xmm3}`, ... | that register (not GCC syntax: how a front end passes a register-asm variable's register) |
+| `Q`, `R` | a free register of `rax`/`rbx`/`rcx`/`rdx` (and `rsi`/`rdi` for `R`), picked statically |
+| `x` `v` | any allocatable xmm register |
+| `m` `o` `V` | memory: `(%reg)`, the register holding the pointer |
+| `i` `n` `e` `Z` `I`..`N` | an immediate (range-checked); `i`/`s` on a global or function: its symbol |
+| `0`..`9`, `[name]` | the register of that output |
+| `+` | an output whose register also carries the incoming value |
+| `&` | early clobber (always honored: see below) |
+| `A`, `f` `t` `u`, `y`, `Y*` | rejected with a clear error |
+
+Each register input is copied into a fresh virtual register right before
+the asm, each fixed-register input is moved into its register in one
+consecutive run (the range-based fixed-register intervals that `syscall` and
+`div` use), and the asm is a single MIR instruction whose operands are the
+output registers (defs; tied and `+` ones also uses), the input registers,
+the pointer registers of memory operands, the immediates and symbols, and a
+def of every clobbered register. Each output is copied out right after.
+Since every asm operand is live at the asm, inputs, outputs and clobbers
+always get distinct registers, which is GCC's early-clobber guarantee and
+more. A clobbered callee-saved register is saved by the prologue like any
+other written one; `rbp` cannot be clobbered.
+
+After allocation the encoder instantiates the template with the chosen
+registers — `%N` prints the register at the operand's own width (`%al`,
+`%ax`, `%eax`, `%rax`; `%r9d`), and the modifiers `b`/`h`/`w`/`k`/`q`
+(sizes), `c`/`P` (bare constant or symbol), `n` (negated), `a` (address),
+`z` (size suffix), `H` (the next eightbyte of a memory operand),
+`x`/`t`/`g` (xmm/ymm/zmm) and `V` (no `%`) apply; `%=` is a number unique to
+the statement, `%%`, `%{`, `%|`, `%}` are literal, and `{att|intel}` keeps
+the AT&T alternative. The text is assembled on its own by rsasm, and its
+`.text` bytes are spliced into the function: a reference to an external
+symbol becomes a relocation of the function's object, a PC-relative
+reference to the template's own code becomes an internal label, and an
+absolute one becomes a relocation against the function's own symbol. Labels
+the template defines (`1:`/`1b`/`1f`, `.L%=`) are therefore local to the
+statement, and a template that emits into another section or defines a
+global symbol is rejected.
+
+Other targets (AArch64, RISC-V, Thumb, AVR, wasm32) report
+"inline asm is not supported on this target" from `target::check_module`
+and from their instruction selection.
+
+**Front end.** `lf-cc` lowers every `asm` statement inside a function to
+`inline_asm`: output lvalues have their address taken before the asm and the
+result stored after it (a `+` output's value read first), memory operands
+pass their object's address (a memory input that is not an lvalue goes
+through a temporary), immediate-only operands must be constants or address
+constants, and a matching input is converted to its output's type. A GNU
+register-asm variable (`register long r10 asm("r10")`) used as a register
+operand gets the `{r10}` constraint, which is what musl's syscall wrappers
+rely on. A basic asm (no colon) is a volatile, memory-clobbering asm with no
+operands whose `%` signs are escaped; an asm without outputs is volatile.
+File-scope asm is unchanged (assembled as its own object).
+
+**Limitations.** No `asm goto` (it would need branch targets on the op; a
+clear error), no x87/MMX/AVX-512 mask operands, no flag-output (`=@cc`)
+constraints, integer operands wider than 64 bits, no constraint
+alternatives beyond taking the union of their letters, and alignment
+directives inside a template align relative to the statement, not the
+function. An asm reading secret memory through a memory clobber is not
+itself a constant-time violation (its outputs are tainted, so a branch on
+them is).
 
 ## 7. Instruction flags: one unified model  *(decided)*
 

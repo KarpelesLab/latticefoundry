@@ -1078,7 +1078,7 @@ impl FnLower<'_> {
 
     /// Lower an expression to a pointer to its storage (it must be an lvalue).
     /// Lower a GNU `asm` statement to an `inline_asm` (`docs/ir-design.md`
-    /// §6i): each output's address is taken before the asm (a `+` output's
+    /// §6j): each output's address is taken before the asm (a `+` output's
     /// value read there too) and the result stored back after it; a memory
     /// operand passes its object's address (a memory input that is not an
     /// lvalue goes through a temporary).

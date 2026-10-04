@@ -122,7 +122,7 @@ pub fn check_options(arch: TargetArch, opts: &CodegenOptions) -> Result<(), Code
 }
 
 /// Check that `arch`'s backend can compile what `module` contains, beyond
-/// what [`check_options`] covers: inline asm (`docs/ir-design.md` §6i) is
+/// what [`check_options`] covers: inline asm (`docs/ir-design.md` §6j) is
 /// assembled only by the x86-64 backend, which also checks each statement's
 /// constraints, clobbers and template here so a bad one is a clean error
 /// rather than a backend panic.

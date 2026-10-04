@@ -55,7 +55,7 @@ pub mod unwind;
 pub mod vtarget;
 
 /// The diagnostic every backend without an inline-asm lowering gives for an
-/// `inline_asm` (`docs/ir-design.md` §6i): only x86-64 assembles templates.
+/// `inline_asm` (`docs/ir-design.md` §6j): only x86-64 assembles templates.
 pub const INLINE_ASM_UNSUPPORTED: &str = "inline asm is not supported on this target";
 
 /// The first function of `module` that contains an `inline_asm`, with its

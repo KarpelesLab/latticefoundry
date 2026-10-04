@@ -676,7 +676,7 @@ pub struct AsmInput {
 }
 
 /// The payload of an [`inline_asm`](InstKind::InlineAsm) instruction: a GCC
-/// extended-asm statement (`docs/ir-design.md` §6i).
+/// extended-asm statement (`docs/ir-design.md` §6j).
 ///
 /// Operands are numbered as in GCC: the outputs `0..outputs.len()`, then the
 /// inputs. The **value operands** of the instruction are, in order: one per
@@ -1013,7 +1013,7 @@ pub enum InstKind {
     /// speculated. Its result is unknown to every analysis. A poison operand is
     /// undefined behavior (the kernel would observe an arbitrary register).
     Syscall,
-    /// GCC-style inline assembly (`docs/ir-design.md` §6i); the payload holds
+    /// GCC-style inline assembly (`docs/ir-design.md` §6j); the payload holds
     /// the template, constraints, clobbers and `volatile` flag, and the value
     /// operands are laid out per [`InlineAsm::operand_slots`]. The result is
     /// the first register output (type = that output's type), or none (`void`)

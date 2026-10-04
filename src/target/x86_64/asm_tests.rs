@@ -1,4 +1,4 @@
-//! Execution tests for `inline_asm` on x86-64 (`docs/ir-design.md` §6i).
+//! Execution tests for `inline_asm` on x86-64 (`docs/ir-design.md` §6j).
 //!
 //! Each program is `.lf` text with GCC-style inline asm, verified, run
 //! through the `-O0`/`-O2` pipelines, compiled by our backend (the template
@@ -315,4 +315,40 @@ fn empty_template_value_barrier() {
   ret %r"#,
     );
     check(&src, 40, 1, 42);
+}
+
+#[test]
+fn explicit_register_constraints() {
+    // `{reg}` (how lf-cc passes a register-asm variable) pins any register,
+    // the spill-reload scratch `r10` included.
+    let src = func(
+        r#"  %r = inline_asm "movq %%r10, %0; addq %%r8, %0" outs("=r" i64) ins("{r10}" (%a), "{r8}" (%b)) : i64
+  %s = inline_asm "leaq 1(%1), %%r9" outs("={r9}" i64) ins("r" (%r)) : i64
+  ret %s"#,
+    );
+    check(&src, 40, 1, 42);
+}
+
+#[test]
+fn the_constant_time_audit_sees_asm_as_branching() {
+    // The selected asm instruction may branch on its operands unless its
+    // template is empty (`docs/ir-design.md` §6d, §6j).
+    let src = func(
+        r#"  %x = inline_asm "" outs("+r" i64 (%a)) : i64
+  %y = inline_asm "addq %1, %0" outs("+r" i64 (%x)) ins("r" (%b)) : i64
+  ret %y"#,
+    );
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(&src, FileId::new(0), &mut syms).unwrap();
+    let mf = super::X86_64Target::new().select(&m, crate::ir::FuncId::from_index(0));
+    let mut seen = Vec::new();
+    for b in mf.block_ids() {
+        for inst in &mf.block(b).insts {
+            let op = super::X86Op::decode(inst.opcode);
+            if op == super::X86Op::InlineAsm {
+                seen.push(op.may_branch_on_data(&inst.operands));
+            }
+        }
+    }
+    assert_eq!(seen, [false, true]);
 }

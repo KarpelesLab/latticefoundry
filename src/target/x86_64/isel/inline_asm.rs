@@ -1,4 +1,4 @@
-//! GCC-style inline assembly on x86-64 (`docs/ir-design.md` §6i).
+//! GCC-style inline assembly on x86-64 (`docs/ir-design.md` §6j).
 //!
 //! An `inline_asm` goes through three steps, each written from GCC's
 //! documented constraint semantics (the i386 machine constraints and operand
@@ -6,7 +6,7 @@
 //!
 //! 1. **Planning** ([`plan`]): each operand's constraint picks a place — a
 //!    register of a class (`r`, `q`, `x`, ...), a fixed register (`a`, `b`,
-//!    `c`, `d`, `S`, `D`, and a free one of `Q`/`R`), memory (`m`), an
+//!    `c`, `d`, `S`, `D`, `{reg}`, and a free one of `Q`/`R`), memory (`m`), an
 //!    immediate (`i`, `n` and the range letters), a symbol (`i` on an
 //!    address), or the register of the output it is tied to (`"0"`, `+`).
 //!    The plan also resolves the clobber list and checks what GCC rejects
@@ -239,6 +239,8 @@ struct OpInfo {
     bits: u32,
     /// The value is a float or a vector (it lives in an xmm by default).
     fp: bool,
+    /// The value is a vector.
+    vector: bool,
     value: OpValue,
     /// For a `+` output: the incoming value.
     incoming: Option<ValueId>,
@@ -276,13 +278,13 @@ struct Plan {
     clobbers: Vec<PReg>,
 }
 
-/// The value's bit width and whether it is float/vector.
-fn type_info(types: &TypeContext, ty: TypeId) -> (u32, bool) {
+/// The value's bit width, whether it is float or vector, and whether vector.
+fn type_info(types: &TypeContext, ty: TypeId) -> (u32, bool, bool) {
     match types.get(ty) {
-        Type::Int(b) => (*b, false),
-        Type::Float(_) => (types.bit_width(ty).unwrap_or(64), true),
-        Type::Vector(..) => ((types.size_of(ty) * 8) as u32, true),
-        _ => (64, false),
+        Type::Int(b) => (*b, false, false),
+        Type::Float(_) => (types.bit_width(ty).unwrap_or(64), true, false),
+        Type::Vector(..) => ((types.size_of(ty) * 8) as u32, true, true),
+        _ => (64, false, false),
     }
 }
 
@@ -305,13 +307,14 @@ fn operand_infos(module: &Module, f: &Function, inst: &InstData, asm: &InlineAsm
     for (j, o) in asm.outputs.iter().enumerate() {
         let indirect = InlineAsm::is_indirect(&o.constraint);
         let v = operand(AsmSlot::Output(j));
-        let (bits, fp) = o.ty.map_or((64, false), |t| type_info(types, t));
+        let (bits, fp, vector) = o.ty.map_or((64, false, false), |t| type_info(types, t));
         out.push(OpInfo {
             constraint: o.constraint.clone(),
             is_output: true,
             indirect,
             bits,
             fp,
+            vector,
             value: if indirect { v.map_or(OpValue::None, OpValue::Value) } else { OpValue::None },
             incoming: if indirect { None } else { v },
         });
@@ -319,13 +322,14 @@ fn operand_infos(module: &Module, f: &Function, inst: &InstData, asm: &InlineAsm
     for (k, a) in asm.inputs.iter().enumerate() {
         let v = operand(AsmSlot::Input(k)).expect("every input has an operand");
         let indirect = InlineAsm::is_indirect(&a.constraint);
-        let (bits, fp) = type_info(types, f.value_type(v));
+        let (bits, fp, vector) = type_info(types, f.value_type(v));
         out.push(OpInfo {
             constraint: a.constraint.clone(),
             is_output: false,
             indirect,
             bits,
             fp,
+            vector,
             value: if indirect { OpValue::Value(v) } else { classify(v) },
             incoming: None,
         });
@@ -403,6 +407,19 @@ fn plan(asm: &InlineAsm, infos: &[OpInfo]) -> Result<Plan, String> {
                 return Err(format!("constraint `{c}` needs this operand in memory; pass its address instead"));
             }
             _ => {}
+        }
+        // What legalization keeps whole: integers up to 64 bits, `f32`/`f64`
+        // and 128-bit vectors.
+        if !matches!(place, Place::Mem | Place::Imm | Place::Sym) {
+            if !info.fp && info.bits > 64 {
+                return Err(format!("a {}-bit integer operand is not supported (`{c}`)", info.bits));
+            }
+            if info.vector && info.bits != 128 {
+                return Err(format!("a {}-bit vector operand is not supported, only 128-bit ones (`{c}`)", info.bits));
+            }
+            if info.fp && !info.vector && !matches!(info.bits, 32 | 64) {
+                return Err(format!("a {}-bit float operand is not supported (`{c}`)", info.bits));
+            }
         }
         places.push(place);
     }
@@ -665,7 +682,7 @@ fn operand_text(placed: &Placed, bits: u32, modifier: Option<char>) -> Result<St
 // ===========================================================================
 
 /// Check every `inline_asm` of `module` for x86-64 code generation: its
-/// constraints and clobbers are planned (see [`plan`]) and its template is
+/// constraints and clobbers are planned (`docs/ir-design.md` §6j) and its template is
 /// instantiated with stand-in registers and assembled, so that a bad
 /// statement is reported here, naming its function, rather than as a backend
 /// panic.

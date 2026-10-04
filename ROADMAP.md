@@ -793,13 +793,18 @@ GNU/glibc constructs `lf-cc` does not yet accept. Making `lf-cc` a drop-in that
 consumes the actual `/usr/include` (rather than minimal hosted-header stubs)
 requires, roughly:
 
-- *Done so far:* asm labels (including glibc's `__REDIRECT`), GNU
-  extended-asm syntax (compiler barriers compile to nothing), file-scope `asm`
-  (assembled with rsasm), `__extension__`, `__USER_LABEL_PREFIX__`,
+- *Done so far:* asm labels (including glibc's `__REDIRECT`), file-scope
+  `asm` (assembled with rsasm), `__extension__`, `__USER_LABEL_PREFIX__`,
   `__inline__`/`__restrict__`, and trailing `__attribute__`. The real
   `<string.h>` compiles and runs; `<stdio.h>` stops at `__builtin_va_list`.
-  Still open: inline asm with instructions or operands, which needs an
-  inline-asm IR op.
+  Inline asm with instructions and operands is done on x86-64 through the
+  `inline_asm` IR op ([ir-design §6j](docs/ir-design.md)): GCC's constraints
+  (registers, fixed registers, memory, immediates, matching, `+`, `&`),
+  clobbers, named operands and operand modifiers, labels in templates, and
+  register-asm variables as operands, with the template assembled by rsasm
+  and spliced into the function. glibc's `<sys/io.h>`, musl-style syscall
+  wrappers, `rdtsc`/`cpuid` helpers and asm atomics match gcc. Still open:
+  `asm goto`, and inline asm on the other targets (a clear error today).
 - **GNU C extensions** the headers use pervasively: `__attribute__((...))` (parse
   in every position, mostly ignore), `__extension__`, `__inline`/`__inline__`,
   `__restrict`, `__asm__`/`asm` (incl. asm *labels* on declarations and

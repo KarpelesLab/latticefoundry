@@ -602,7 +602,7 @@ impl<'a> FunctionBuilder<'a> {
             .expect("syscall has a result")
     }
 
-    /// GCC-style inline assembly (`docs/ir-design.md` §6i). `operands` are the
+    /// GCC-style inline assembly (`docs/ir-design.md` §6j). `operands` are the
     /// value operands in [`InlineAsm::operand_slots`] order. Returns the
     /// instruction's result — the first register output — or `None` when the
     /// asm has no register output; read the other register outputs with

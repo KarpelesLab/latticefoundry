@@ -1,5 +1,5 @@
 //! Tests for the `inline_asm` / `asm_output` instructions (`docs/ir-design.md`
-//! §6i): text and binary round trips, the builder, the verifier, the
+//! §6j): text and binary round trips, the builder, the verifier, the
 //! analyses' and passes' conservative treatment, the refinement and
 //! constant-time checkers, and the targets without an inline-asm lowering.
 
@@ -468,6 +468,9 @@ fn other_targets_reject_inline_asm_cleanly() {
         (r#"outs("=&a" i64) ins("a" (%x))"#, "early-clobber output 0 and an input"),
         (r#"outs("=r" i64) ins("N" (i64 300))"#, "out of range"),
         (r#"outs("=r" i64) ins("I" (%x))"#, "needs a constant operand"),
+        (r#"outs("=r" i64) ins("x" (i128 5))"#, "128-bit integer operand"),
+        (r#"outs("=r" i64) ins("r" (i128 5))"#, "does not fit a general register"),
+        (r#"outs("=r" i64) ins("{r10}" (%x), "{r10}" (i64 3))"#, "two inputs need register %r10"),
     ] {
         let src = format!("module \"o\"\nfunc @h(i64) -> i64 {{\nentry ^0(%x: i64):\n  %y = inline_asm \"nop\" {body} : i64\n  ret %y\n}}\n");
         let mut s = StrInterner::new();

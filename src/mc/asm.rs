@@ -122,7 +122,7 @@ pub struct FragmentReloc {
 }
 
 /// A piece of assembly assembled on its own, to be spliced into a function
-/// being encoded (inline asm, `docs/ir-design.md` §6i): its `.text` bytes and
+/// being encoded (inline asm, `docs/ir-design.md` §6j): its `.text` bytes and
 /// the relocations they need.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct AsmFragment {
