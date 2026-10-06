@@ -46,6 +46,8 @@
 //! - initially, every secret global;
 //! - every root a secret-derived value is stored to (by `store`, or the value
 //!   operand of an atomic), and every root a `store secret` writes;
+//! - every root a `memset` fills with a secret-derived byte, and every root a
+//!   `memcpy`/`memmove` copies into from a root that may hold a secret;
 //! - `Unknown` memory as soon as a call or syscall receives a secret argument
 //!   (the callee may stash it through any pointer it can reach).
 //!
@@ -513,6 +515,10 @@ fn summarize_memory(
                     mem.taint(root(ops[0]));
                 }
                 InstKind::CmpXchg { .. } if secret(ops[2]) => mem.taint(root(ops[0])),
+                // Bulk memory moves bytes, not values: a fill writes its byte,
+                // a copy whatever its source memory may hold.
+                InstKind::MemSet { .. } if secret(ops[1]) => mem.taint(root(ops[0])),
+                InstKind::MemCopy { .. } if mem.root_secret(root(ops[1])) => mem.taint(root(ops[0])),
                 InstKind::Call if ops[1..].iter().any(|&a| secret(a)) => {
                     mem.taint(MemRoot::Unknown);
                 }
@@ -578,6 +584,10 @@ fn slot_escapes(f: &Function, v: ValueId) -> bool {
             let data = f.inst(u.inst);
             let derived = match &data.kind {
                 InstKind::Load { .. } | InstKind::AtomicLoad { .. } => u.operand == 0,
+                // The two addresses of a bulk-memory op (a memset's operand 1
+                // is its byte, never an address).
+                InstKind::MemCopy { .. } if u.operand < 2 => continue,
+                InstKind::MemSet { .. } if u.operand == 0 => continue,
                 InstKind::Store { .. }
                 | InstKind::AtomicStore { .. }
                 | InstKind::AtomicRmw { .. }

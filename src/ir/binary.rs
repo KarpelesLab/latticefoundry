@@ -117,6 +117,11 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 /// version-5 extension varint like `thread_local`: no bump, a module without
 /// hints encodes exactly as before, and a reader that predates the bits
 /// rejects them as unknown extension flags. Both bits set is rejected.
+///
+/// Bulk memory (`docs/ir-design.md` §6k) is likewise tag values only:
+/// `memcpy`/`memmove` are opcode tag 47 and `memset` tag 48, each followed by
+/// a flag byte (bit 0 = `volatile`, bit 1 = overlapping, i.e. `memmove`; any
+/// other bit, and bit 1 on `memset`, is rejected) and the varint alignment.
 pub const VERSION: u32 = 5;
 
 /// Bit 7 of a (version ≥ 5) global or function attribute byte: an extension
@@ -1168,6 +1173,16 @@ fn write_inst_kind(w: &mut Writer, kind: &InstKind, t: &Tables) {
             w.u8(25);
             w.u8(ordering_code(*ordering));
         }
+        InstKind::MemCopy { align, volatile, overlapping } => {
+            w.u8(47);
+            w.u8(u8::from(*volatile) | (u8::from(*overlapping) << 1));
+            w.uvarint(u64::from(*align));
+        }
+        InstKind::MemSet { align, volatile } => {
+            w.u8(48);
+            w.u8(u8::from(*volatile));
+            w.uvarint(u64::from(*align));
+        }
         InstKind::PtrAdd { inbounds } => {
             w.u8(8);
             w.u8(u8::from(*inbounds));
@@ -1776,6 +1791,20 @@ fn read_inst_kind(r: &mut Reader<'_>, types: &[TypeId]) -> Result<InstKind, Deco
             InstKind::InlineAsm(Box::new(crate::ir::inst::InlineAsm { template, outputs, inputs, clobbers, volatile }))
         }
         46 => InstKind::AsmOutput(r.u32()?),
+        tag @ (47 | 48) => {
+            let flags = r.u8()?;
+            let allowed = if tag == 47 { 3 } else { 1 };
+            if flags & !allowed != 0 {
+                return Err(DecodeError::InvalidTag { what: "bulk-memory flags", tag: u32::from(flags) });
+            }
+            let align = r.u32()?;
+            let volatile = flags & 1 != 0;
+            if tag == 47 {
+                InstKind::MemCopy { align, volatile, overlapping: flags & 2 != 0 }
+            } else {
+                InstKind::MemSet { align, volatile }
+            }
+        }
         t => return Err(DecodeError::InvalidTag { what: "opcode", tag: u32::from(t) }),
     })
 }

@@ -465,6 +465,37 @@ impl<'a> FunctionBuilder<'a> {
         self.emit(InstKind::Store { ty, align, volatile: false, secret: true }, vec![ptr, val], Flags::NONE, None);
     }
 
+    /// Copy `n` bytes (an unsigned integer of any width) from `src` to `dst`;
+    /// the ranges must not overlap unless `dst == src` (see
+    /// [`InstKind::MemCopy`]). `align` is the alignment both pointers have (1
+    /// when nothing is known).
+    pub fn memcpy(&mut self, dst: ValueId, src: ValueId, n: ValueId, align: u32) {
+        let kind = InstKind::MemCopy { align, volatile: false, overlapping: false };
+        self.emit(kind, vec![dst, src, n], Flags::NONE, None);
+    }
+
+    /// Like [`memcpy`](FunctionBuilder::memcpy), but the ranges may overlap.
+    pub fn memmove(&mut self, dst: ValueId, src: ValueId, n: ValueId, align: u32) {
+        let kind = InstKind::MemCopy { align, volatile: false, overlapping: true };
+        self.emit(kind, vec![dst, src, n], Flags::NONE, None);
+    }
+
+    /// Fill `n` bytes at `dst` with `byte` (an `i8`; see [`InstKind::MemSet`]).
+    pub fn memset(&mut self, dst: ValueId, byte: ValueId, n: ValueId, align: u32) {
+        self.emit(InstKind::MemSet { align, volatile: false }, vec![dst, byte, n], Flags::NONE, None);
+    }
+
+    /// A bulk-memory op of any flavor (`kind` is a [`InstKind::MemCopy`] or
+    /// [`InstKind::MemSet`], e.g. a volatile one) on `[dst, src_or_byte, n]`.
+    ///
+    /// # Panics
+    ///
+    /// When `kind` is not a bulk-memory op.
+    pub fn bulk_memory(&mut self, kind: InstKind, dst: ValueId, src_or_byte: ValueId, n: ValueId) {
+        assert!(kind.is_bulk_memory(), "bulk_memory: {kind:?} is not a bulk-memory op");
+        self.emit(kind, vec![dst, src_or_byte, n], Flags::NONE, None);
+    }
+
     /// The natural alignment of an atomic access of `ty`: its size in bytes.
     fn atomic_align(&self, ty: TypeId) -> u32 {
         self.types.size_of(ty).max(1) as u32

@@ -75,6 +75,12 @@
 //! interpreter / verifier layer built in a later phase, and [`eval`] panics if
 //! asked to evaluate one. `PtrAdd` *is* handled: it is pure address arithmetic.
 //!
+//! The bulk-memory ops `MemCopy` (`memcpy`/`memmove`) and `MemSet`
+//! (`docs/ir-design.md` §6k) produce no value either, but their meaning is a
+//! pure function of the operands and a byte memory, so it is defined here once,
+//! by [`exec_bulk_memory`] over any [`ByteMemory`]: every executor that runs
+//! them (the test executor, the refinement tests) shares this one definition.
+//!
 //! ## Overflow / exactness detection
 //!
 //! All integer values are carried as their **unsigned bit pattern** — a
@@ -374,10 +380,105 @@ pub fn eval(
         | InstKind::Br(_)
         | InstKind::CondBr { .. }
         | InstKind::Switch(_)
-        | InstKind::Unreachable => {
+        | InstKind::Unreachable
+        | InstKind::MemCopy { .. }
+        | InstKind::MemSet { .. } => {
             panic!("semantics::eval called on a non-value-producing opcode: {kind:?}")
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk memory (`docs/ir-design.md` §6k).
+// ---------------------------------------------------------------------------
+
+/// A byte-addressed memory with per-byte poison, as the bulk-memory semantics
+/// see it.
+pub trait ByteMemory {
+    /// The byte at `addr`: `None` when `addr` is not inside a live
+    /// allocation, `Some(None)` for a poison (e.g. uninitialized) byte.
+    fn read_byte(&self, addr: u64) -> Option<Option<u8>>;
+    /// Overwrite the byte at `addr` (only called for a live byte).
+    fn write_byte(&mut self, addr: u64, byte: Option<u8>);
+}
+
+/// Perform the bulk-memory op `kind` (`memcpy`, `memmove` or `memset`) with
+/// `operands` (`[dst, src, n]` or `[dst, byte, n]`) on `mem`: the reference
+/// meaning of [`InstKind::MemCopy`] and [`InstKind::MemSet`].
+///
+/// # Errors
+///
+/// The reason the op is undefined behavior: a poison `n`; for `n > 0`, a
+/// poison, misaligned or out-of-allocation `dst`/`src`, or (for `memcpy`)
+/// partially overlapping ranges. Memory is unchanged on error.
+///
+/// # Panics
+///
+/// When `kind` is not a bulk-memory op or the operands are ill-typed.
+pub fn exec_bulk_memory(kind: &InstKind, operands: &[SemValue], mem: &mut dyn ByteMemory) -> Result<(), String> {
+    let (align, overlapping, fill) = match kind {
+        InstKind::MemCopy { align, overlapping, .. } => (*align, *overlapping, false),
+        InstKind::MemSet { align, .. } => (*align, false, true),
+        k => panic!("exec_bulk_memory on {k:?}"),
+    };
+    let n = match &operands[2] {
+        SemValue::Poison => return Err("bulk-memory length is poison".into()),
+        SemValue::Int { bits, .. } => bits.clone(),
+        v => panic!("bulk-memory length {v:?} is not an integer"),
+    };
+    if n.is_zero() {
+        return Ok(());
+    }
+    let Some(n) = n.to_u64() else {
+        return Err("bulk-memory length exceeds the address space".into());
+    };
+    let addr = |v: &SemValue, what: &str| -> Result<u64, String> {
+        match v {
+            SemValue::Poison => Err(format!("bulk-memory {what} pointer is poison")),
+            SemValue::Ptr(a) => {
+                let a = a.to_u64().expect("pointers are at most 64 bits");
+                if a % u64::from(align.max(1)) != 0 {
+                    return Err(format!("bulk-memory {what} 0x{a:x} is not aligned to {align}"));
+                }
+                if a.checked_add(n).is_none() {
+                    return Err(format!("bulk-memory {what} range wraps the address space"));
+                }
+                Ok(a)
+            }
+            v => panic!("bulk-memory {what} {v:?} is not a pointer"),
+        }
+    };
+    let dst = addr(&operands[0], "destination")?;
+    let live = |mem: &dyn ByteMemory, base: u64, what: &str| -> Result<(), String> {
+        match (0..n).find(|&i| mem.read_byte(base + i).is_none()) {
+            Some(i) => Err(format!("bulk-memory {what} byte 0x{:x} is not in a live allocation", base + i)),
+            None => Ok(()),
+        }
+    };
+    live(mem, dst, "destination")?;
+    if fill {
+        let byte = match &operands[1] {
+            SemValue::Poison => None,
+            SemValue::Int { width: 8, bits } => Some(bits.to_u64().expect("an i8") as u8),
+            v => panic!("memset byte {v:?} is not an i8"),
+        };
+        for i in 0..n {
+            mem.write_byte(dst + i, byte);
+        }
+        return Ok(());
+    }
+    let src = addr(&operands[1], "source")?;
+    live(mem, src, "source")?;
+    if !overlapping && dst != src && dst < src + n && src < dst + n {
+        return Err(format!("memcpy ranges overlap (dst 0x{dst:x}, src 0x{src:x}, {n} bytes)"));
+    }
+    // Through a temporary: the memmove meaning, and the same as a forward
+    // copy for disjoint (or identical) ranges.
+    let bytes: Vec<Option<u8>> = (0..n).map(|i| mem.read_byte(src + i).expect("checked live")).collect();
+    for (i, b) in bytes.into_iter().enumerate() {
+        mem.write_byte(dst + i as u64, b);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

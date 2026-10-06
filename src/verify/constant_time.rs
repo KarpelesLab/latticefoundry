@@ -109,6 +109,12 @@ pub enum CtRole {
     /// An unflagged store to memory that is neither a non-escaping stack slot
     /// nor a secret global.
     PublicStore,
+    /// The length of a `memcpy`/`memmove`/`memset` (like an address, it
+    /// decides which memory is touched and how long the copy runs).
+    BulkLength,
+    /// The source of a `memcpy`/`memmove` that may hold a secret, copied to
+    /// memory that is neither a non-escaping stack slot nor a secret global.
+    SecretCopyToPublic,
 }
 
 impl CtRole {
@@ -144,6 +150,10 @@ impl CtRole {
             }
             CtRole::PublicStore => {
                 "is stored to memory that is not declared secret (use `store secret`)".into()
+            }
+            CtRole::BulkLength => "is the length of a `memcpy`/`memmove`/`memset`".into(),
+            CtRole::SecretCopyToPublic => {
+                "is copied from secret memory to memory that is not declared secret".into()
             }
         }
     }
@@ -282,6 +292,35 @@ pub fn ct_violations_with(
                     }
                 }
                 InstKind::DynAlloca { .. } => flag(ops[0], CtRole::AllocaSize),
+                // Bulk memory (§6k): the addresses and the length decide which
+                // memory is touched and for how long, so they must be public;
+                // the bytes moved may be secret, but only into memory that may
+                // hold secrets (as for `store`).
+                InstKind::MemCopy { .. } | InstKind::MemSet { .. } => {
+                    flag(ops[0], CtRole::Address);
+                    flag(ops[2], CtRole::BulkLength);
+                    let local = match taint.root_of(ops[0]) {
+                        MemRoot::Stack(_) => true,
+                        MemRoot::Global(g) => module.global_attrs(g).secret,
+                        MemRoot::Unknown => false,
+                    };
+                    if matches!(data.kind, InstKind::MemSet { .. }) {
+                        if !local {
+                            flag(ops[1], CtRole::PublicStore);
+                        }
+                    } else {
+                        flag(ops[1], CtRole::Address);
+                        if !local && taint.memory_secret(taint.root_of(ops[1])) {
+                            out.push(CtViolation {
+                                func,
+                                inst: i,
+                                block: bid,
+                                value: ops[1],
+                                role: CtRole::SecretCopyToPublic,
+                            });
+                        }
+                    }
+                }
                 InstKind::Syscall => {
                     for &v in ops {
                         flag(v, CtRole::SyscallOperand);
@@ -455,6 +494,9 @@ fn opcode_name(kind: &InstKind) -> &'static str {
         InstKind::AtomicRmw { .. } => "atomic_rmw",
         InstKind::CmpXchg { .. } => "cmpxchg",
         InstKind::Fence(_) => "fence",
+        InstKind::MemCopy { overlapping: false, .. } => "memcpy",
+        InstKind::MemCopy { overlapping: true, .. } => "memmove",
+        InstKind::MemSet { .. } => "memset",
         InstKind::PtrAdd { .. } => "ptr_add",
         InstKind::Select => "select",
         InstKind::Freeze => "freeze",

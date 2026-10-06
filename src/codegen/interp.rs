@@ -225,6 +225,25 @@ impl Interp<'_> {
                 fr.regs.insert(d, old);
             }
             VOp::Fence => {}
+            // Bulk memory: through a temporary, which is both the memmove
+            // meaning and (for disjoint or identical ranges) the memcpy one.
+            VOp::MemCopy | VOp::MemSet => {
+                let dst = addr(&self.rd(fr, use_reg(ops, 0)?))?;
+                let mid = self.rd(fr, use_reg(ops, 1)?);
+                let n = addr(&self.rd(fr, use_reg(ops, 2)?))?;
+                if n > 0 {
+                    let bytes: Vec<u8> = if VOp::decode(inst.opcode) == VOp::MemSet {
+                        vec![mid.mod_2k(8).to_u64().unwrap_or(0) as u8; n]
+                    } else {
+                        let src = addr(&mid)?;
+                        (0..n).map(|i| fr.mem.get(src + i).copied().unwrap_or(0)).collect()
+                    };
+                    if dst + n > fr.mem.len() {
+                        fr.mem.resize(dst + n + 16, 0);
+                    }
+                    fr.mem[dst..dst + n].copy_from_slice(&bytes);
+                }
+            }
             VOp::FrameAddr => {
                 let d = def(ops, 0)?;
                 let slot = frame_slot(ops, 1)?;

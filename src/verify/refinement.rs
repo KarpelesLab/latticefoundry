@@ -754,6 +754,8 @@ impl Enc<'_> {
             | InstKind::DynAlloca { .. }
             | InstKind::Load { .. }
             | InstKind::Store { .. }
+            | InstKind::MemCopy { .. }
+            | InstKind::MemSet { .. }
             | InstKind::Call => return Err(unsupported("memory / call op")),
             // Atomics and fences: memory state plus inter-thread ordering, which
             // the checker does not model; skipped (Unknown), never proved.

@@ -963,6 +963,50 @@ pub enum InstKind {
     /// never removed, and no memory operation may cross it in a direction its
     /// ordering forbids (`seq_cst` and `acq_rel` forbid both).
     Fence(AtomicOrdering),
+    /// Bulk copy (`memcpy`, or `memmove` when `overlapping`); operands
+    /// `[dst, src, n]`, no result (`docs/ir-design.md` §6k). `dst` and `src`
+    /// are pointers (any address space; an aggregate value denotes its
+    /// address), `n` is an integer of any width read **unsigned**. Copies the
+    /// `n` bytes at `src` to the `n` bytes at `dst`, byte by byte, poison bytes
+    /// included (a poison byte of the source makes the same byte of the
+    /// destination poison).
+    ///
+    /// - `n == 0` is a no-op whatever the pointers are (null, dangling, even
+    ///   poison): nothing is read or written.
+    /// - Otherwise both ranges must lie inside live allocations and both
+    ///   addresses must be multiples of `align`; a poison `dst`/`src`, a
+    ///   dangling or misaligned one, or a poison `n` is undefined behavior.
+    /// - `memcpy` (`overlapping == false`): the ranges must not overlap,
+    ///   except that `dst == src` exactly is allowed (and leaves memory as it
+    ///   was); a partial overlap is undefined behavior. `memmove`
+    ///   (`overlapping == true`): any overlap is fine — it copies as if
+    ///   through a temporary buffer.
+    ///
+    /// A **volatile** copy touches every byte of both ranges exactly once (the
+    /// access widths and order are unspecified) and is never removed, merged,
+    /// split into a forwarded value, or moved across another volatile access,
+    /// atomic, fence, call or syscall.
+    MemCopy {
+        /// The alignment both `dst` and `src` are known to have, in bytes (a
+        /// power of two; 1 = none).
+        align: u32,
+        /// Whether the copy is volatile (see above).
+        volatile: bool,
+        /// `memmove` semantics: the ranges may overlap.
+        overlapping: bool,
+    },
+    /// Bulk fill (`memset`); operands `[dst, byte, n]`, no result. `byte` is
+    /// an `i8`, `n` an integer of any width read unsigned. Writes `byte` to
+    /// each of the `n` bytes at `dst` (a poison `byte` makes them all poison).
+    /// `n == 0` is a no-op whatever `dst` is; otherwise `dst` must address
+    /// `n` live bytes and be a multiple of `align`, and a poison `dst` or `n`
+    /// is undefined behavior. `volatile` as for [`MemCopy`](InstKind::MemCopy).
+    MemSet {
+        /// The alignment `dst` is known to have, in bytes (a power of two).
+        align: u32,
+        /// Whether the fill is volatile.
+        volatile: bool,
+    },
     /// Pointer displacement; operands `[base, byte_offset]`, result is a pointer.
     /// Computes `base + byte_offset` as a byte address — this replaces
     /// `getelementptr`; structured addressing is a builder convenience that
@@ -1139,7 +1183,19 @@ impl InstKind {
 
     /// Whether this opcode is a volatile `load` or `store`.
     pub fn is_volatile(&self) -> bool {
-        matches!(self, InstKind::Load { volatile: true, .. } | InstKind::Store { volatile: true, .. })
+        matches!(
+            self,
+            InstKind::Load { volatile: true, .. }
+                | InstKind::Store { volatile: true, .. }
+                | InstKind::MemCopy { volatile: true, .. }
+                | InstKind::MemSet { volatile: true, .. }
+        )
+    }
+
+    /// Whether this is a bulk-memory op (`memcpy`, `memmove` or `memset`;
+    /// `docs/ir-design.md` §6k).
+    pub fn is_bulk_memory(&self) -> bool {
+        matches!(self, InstKind::MemCopy { .. } | InstKind::MemSet { .. })
     }
 
     /// Whether this instruction must be kept even when its result is unused,
@@ -1157,6 +1213,8 @@ impl InstKind {
             InstKind::Alloca { .. }
             | InstKind::DynAlloca { .. }
             | InstKind::Store { .. }
+            | InstKind::MemCopy { .. }
+            | InstKind::MemSet { .. }
             | InstKind::Call
             | InstKind::Syscall => true,
             InstKind::InlineAsm(asm) => asm.has_side_effect(),

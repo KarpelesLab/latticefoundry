@@ -182,7 +182,7 @@ pub(crate) fn concrete_eval(
         | crate::ir::InstKind::Syscall
         | crate::ir::InstKind::InlineAsm(_)
         | crate::ir::InstKind::AsmOutput(_) => None,
-        kind if kind.is_atomic() => None,
+        kind if kind.is_atomic() || kind.is_bulk_memory() => None,
         kind => match eval(types, inst.ty, kind, &inst.flags, operands) {
             EvalOutcome::Value(v) => Some(v),
             EvalOutcome::UndefinedBehavior => None,

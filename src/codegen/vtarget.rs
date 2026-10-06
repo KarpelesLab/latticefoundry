@@ -119,6 +119,13 @@ pub enum VOp {
     /// `[Imm ordering]` — a memory fence. No sequential effect; kept so the
     /// barrier stays visible in the MIR.
     Fence = 35,
+    /// `[Use dst, Use src, Use n, Imm overlapping]` — copy `n` bytes from
+    /// `src` to `dst` (`memcpy`, or `memmove` when `overlapping` is 1;
+    /// `docs/ir-design.md` §6k). `n == 0` touches nothing.
+    MemCopy = 36,
+    /// `[Use dst, Use byte, Use n]` — fill `n` bytes at `dst` with the low
+    /// byte of `byte` (`memset`).
+    MemSet = 37,
 }
 
 impl VOp {
@@ -131,11 +138,11 @@ impl VOp {
     /// Decode a target [`Opcode`] back to a [`VOp`].
     pub fn decode(op: Opcode) -> VOp {
         use VOp::*;
-        const TABLE: [VOp; 36] = [
+        const TABLE: [VOp; 38] = [
             Li, Move, Add, Sub, Mul, UDiv, SDiv, URem, SRem, And, Or, Xor, Shl, LShr, AShr, ICmp,
             Select, Cast, Load, Store, FrameAddr, GlobalAddr, Call, Ret, Jmp, BrCond, Switch,
             Unreachable, StackStore, StackLoad, Unsupported, DynAlloca, Syscall, AtomicRmw,
-            CmpXchg, Fence,
+            CmpXchg, Fence, MemCopy, MemSet,
         ];
         TABLE[op.0 as usize]
     }
@@ -555,6 +562,31 @@ impl TargetIsel for VirtualTarget {
                 lo.emit(MachineInst::new(
                     VOp::Fence.opcode(),
                     vec![MachineOperand::Imm(Int::from_u64(u64::from(ordering.code())))],
+                ));
+            }
+            InstKind::MemCopy { overlapping, .. } => {
+                let ops = inst.operands();
+                let (d, s, n) = (lo.reg(ops[0]), lo.reg(ops[1]), lo.reg(ops[2]));
+                lo.emit(MachineInst::new(
+                    VOp::MemCopy.opcode(),
+                    vec![
+                        MachineOperand::Use(Reg::Virtual(d)),
+                        MachineOperand::Use(Reg::Virtual(s)),
+                        MachineOperand::Use(Reg::Virtual(n)),
+                        MachineOperand::Imm(Int::from_u64(u64::from(*overlapping))),
+                    ],
+                ));
+            }
+            InstKind::MemSet { .. } => {
+                let ops = inst.operands();
+                let (d, b, n) = (lo.reg(ops[0]), lo.reg(ops[1]), lo.reg(ops[2]));
+                lo.emit(MachineInst::new(
+                    VOp::MemSet.opcode(),
+                    vec![
+                        MachineOperand::Use(Reg::Virtual(d)),
+                        MachineOperand::Use(Reg::Virtual(b)),
+                        MachineOperand::Use(Reg::Virtual(n)),
+                    ],
                 ));
             }
             InstKind::Call => self.lower_call(lo, inst),

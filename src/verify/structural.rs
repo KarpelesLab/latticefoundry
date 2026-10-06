@@ -657,6 +657,50 @@ impl<'a> Ctx<'a> {
                 }
                 self.arity(inst, ops, 0);
             }
+            InstKind::MemCopy { align, .. } | InstKind::MemSet { align, .. } => {
+                let copy = matches!(data.kind, InstKind::MemCopy { .. });
+                let name = match data.kind {
+                    InstKind::MemCopy { overlapping: true, .. } => "memmove",
+                    InstKind::MemCopy { .. } => "memcpy",
+                    _ => "memset",
+                };
+                self.check_align(inst, name, *align);
+                if !self.arity(inst, ops, 3) {
+                    return;
+                }
+                let addr_ok = |t: TypeId| is_ptr(module, t) || is_aggregate(module, t);
+                let d = func.value_type(ops[0]);
+                if !addr_ok(d) {
+                    self.err(format!(
+                        "instruction #{}: {name} destination must be a pointer or an aggregate value, found {}",
+                        inst.index(),
+                        render_type(module, d),
+                    ));
+                }
+                let m = func.value_type(ops[1]);
+                if copy && !addr_ok(m) {
+                    self.err(format!(
+                        "instruction #{}: {name} source must be a pointer or an aggregate value, found {}",
+                        inst.index(),
+                        render_type(module, m),
+                    ));
+                }
+                if !copy && !matches!(module.types().get(m), Type::Int(8)) {
+                    self.err(format!(
+                        "instruction #{}: memset byte must be an i8, found {}",
+                        inst.index(),
+                        render_type(module, m),
+                    ));
+                }
+                let n = func.value_type(ops[2]);
+                if !matches!(module.types().get(n), Type::Int(1..=64)) {
+                    self.err(format!(
+                        "instruction #{}: {name} length must be an integer of at most 64 bits, found {}",
+                        inst.index(),
+                        render_type(module, n),
+                    ));
+                }
+            }
             InstKind::PtrAdd { .. } => {
                 if !self.arity(inst, ops, 2) {
                     return;

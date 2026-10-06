@@ -40,7 +40,7 @@ pub use inst::{
 };
 pub use datalayout::{DataLayout, DataLayoutError, Endian, PointerSpec};
 pub use merge::{MergeError, merge_modules};
-pub use semantics::{EvalOutcome, FoldResult, SemValue, eval, fold};
+pub use semantics::{ByteMemory, EvalOutcome, FoldResult, SemValue, eval, exec_bulk_memory, fold};
 pub use types::{FloatKind, FuncType, Layout, Type, TypeContext, TypeId};
 pub use value::{AddrTarget, Const, ConstId, ConstPool, FloatBits, Value, ValueDef, ValueId};
 
@@ -1019,5 +1019,7 @@ pub(crate) mod tests;
 mod vector_tests;
 #[cfg(test)]
 mod asm_tests;
+#[cfg(test)]
+mod bulk_tests;
 #[cfg(test)]
 pub(crate) mod refexec;

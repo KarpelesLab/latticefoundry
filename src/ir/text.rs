@@ -63,6 +63,9 @@
 //!               | "cmpxchg" ordering ordering operand "," operand "," operand
 //!                 "align" INT ":" type
 //!               | "fence" ordering
+//!               | ( "memcpy" | "memmove" ) [ "volatile" ] operand "," operand ","
+//!                 operand "align" INT
+//!               | "memset" [ "volatile" ] operand "," operand "," operand "align" INT
 //!               | "ptr_add" [ "inbounds" ] operand "," operand ":" type
 //!               | "select" operand "," operand "," operand ":" type
 //!               | "freeze" operand ":" type
@@ -497,6 +500,25 @@ fn write_inst<W: fmt::Write>(
             write_type(f, module, *ty)
         }
         InstKind::Fence(ordering) => write!(f, "fence {}", ordering.name()),
+        InstKind::MemCopy { .. } | InstKind::MemSet { .. } => {
+            let (name, align, volatile) = match &data.kind {
+                InstKind::MemCopy { align, volatile, overlapping } => {
+                    (if *overlapping { "memmove" } else { "memcpy" }, *align, *volatile)
+                }
+                InstKind::MemSet { align, volatile } => ("memset", *align, *volatile),
+                _ => unreachable!(),
+            };
+            write!(f, "{name} ")?;
+            if volatile {
+                write!(f, "volatile ")?;
+            }
+            op(f, ops[0])?;
+            write!(f, ", ")?;
+            op(f, ops[1])?;
+            write!(f, ", ")?;
+            op(f, ops[2])?;
+            write!(f, " align {align}")
+        }
         InstKind::PtrAdd { inbounds } => {
             write!(f, "ptr_add")?;
             if *inbounds {
@@ -1355,6 +1377,8 @@ enum OpAst {
     AtomicRmw(RmwOp, TypeId, u32, AtomicOrdering, Operand, Operand),
     CmpXchg(TypeId, u32, AtomicOrdering, AtomicOrdering, Operand, Operand, Operand),
     Fence(AtomicOrdering),
+    /// `(kind, dst, src-or-byte, n)` of a `memcpy`/`memmove`/`memset`.
+    Bulk(InstKind, Operand, Operand, Operand),
     PtrAdd(bool, Operand, Operand),
     Select(Operand, Operand, Operand),
     Freeze(Operand),
@@ -2086,6 +2110,22 @@ impl Parser {
                 Ok(OpAst::CmpXchg(ty, align, success, failure, ptr, expected, new))
             }
             "fence" => Ok(OpAst::Fence(self.parse_ordering()?)),
+            "memcpy" | "memmove" | "memset" => {
+                let volatile = self.eat_ident("volatile");
+                let dst = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let mid = self.parse_operand(module)?;
+                self.expect(&TokKind::Comma, "`,`")?;
+                let n = self.parse_operand(module)?;
+                self.expect_ident("align")?;
+                let align = self.parse_u32()?;
+                let kind = if opname == "memset" {
+                    InstKind::MemSet { align, volatile }
+                } else {
+                    InstKind::MemCopy { align, volatile, overlapping: opname == "memmove" }
+                };
+                Ok(OpAst::Bulk(kind, dst, mid, n))
+            }
             "ptr_add" => {
                 let inbounds = self.eat_ident("inbounds");
                 let base = self.parse_operand(module)?;
@@ -2754,6 +2794,12 @@ fn emit_inst(
         OpAst::Fence(ordering) => {
             b.fence(*ordering);
             None
+        }
+        OpAst::Bulk(kind, dst, mid, n) => {
+            let d = resolve_operand(b, dst, names, func_names, global_names)?;
+            let m = resolve_operand(b, mid, names, func_names, global_names)?;
+            let nv = resolve_operand(b, n, names, func_names, global_names)?;
+            b.append_inst(kind.clone(), vec![d, m, nv], Flags::NONE, None)
         }
         OpAst::PtrAdd(inbounds, base, off) => {
             let ba = resolve_operand(b, base, names, func_names, global_names)?;

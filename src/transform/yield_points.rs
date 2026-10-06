@@ -132,6 +132,7 @@ pub fn inst_cost(kind: &InstKind) -> u64 {
         | InstKind::Fence(_) => 20,
         InstKind::Call => CALL_COST,
         InstKind::Syscall => 100,
+        InstKind::MemCopy { .. } | InstKind::MemSet { .. } => 20,
         InstKind::DynAlloca { .. } => 10,
         _ => 1,
     }

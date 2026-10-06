@@ -5,9 +5,10 @@
 //! byte-addressed memory (each byte defined or poison), so a whole program —
 //! block arguments, `alloca`/`load`/`store`, globals, direct calls — can be
 //! evaluated by the *same* per-opcode semantics the optimizer and backends are
-//! checked against. Every value-producing opcode goes through `eval`; only the
-//! stateful ones (`alloca`, `load`, `store`, `call`) and control flow are
-//! interpreted here. Undefined behavior (as `eval` defines it, plus a branch on
+//! checked against. Every value-producing opcode goes through `eval` and the
+//! bulk-memory ops through `exec_bulk_memory`; only the other stateful ones
+//! (`alloca`, `load`, `store`, `call`) and control flow are interpreted here.
+//! Undefined behavior (as `eval` defines it, plus a branch on
 //! poison, `unreachable`, an access through a poison or unallocated address)
 //! stops execution with an error, as does anything unsupported (atomics,
 //! `syscall`, a call to a declaration).
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 use puremp::Int;
 
 use crate::ir::inst::InstKind;
-use crate::ir::semantics::{EvalOutcome, SemValue, eval};
+use crate::ir::semantics::{ByteMemory, EvalOutcome, SemValue, eval, exec_bulk_memory};
 use crate::ir::types::{FloatKind, Type, TypeId};
 use crate::ir::value::{Const, ConstId, FloatBits, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Module};
@@ -229,6 +230,11 @@ impl<'m> Exec<'m> {
                         self.store(a, *ty, &ops[1]);
                         None
                     }
+                    InstKind::MemCopy { .. } | InstKind::MemSet { .. } => {
+                        let mut mem = MapMemory(&mut self.mem);
+                        exec_bulk_memory(&inst.kind, &ops, &mut mem).map_err(ExecError::Ub)?;
+                        None
+                    }
                     InstKind::Call => {
                         let callee = match &func.value(inst.operands()[0]).def {
                             ValueDef::Func(fid) => *fid,
@@ -292,6 +298,19 @@ impl<'m> Exec<'m> {
             block = next;
             incoming = args;
         }
+    }
+}
+
+/// The executor's memory seen as a [`ByteMemory`] for the bulk-memory ops.
+struct MapMemory<'a>(&'a mut HashMap<u64, Option<u8>>);
+
+impl ByteMemory for MapMemory<'_> {
+    fn read_byte(&self, addr: u64) -> Option<Option<u8>> {
+        self.0.get(&addr).copied()
+    }
+
+    fn write_byte(&mut self, addr: u64, byte: Option<u8>) {
+        self.0.insert(addr, byte);
     }
 }
 
