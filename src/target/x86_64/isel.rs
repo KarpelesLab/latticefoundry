@@ -458,6 +458,7 @@ impl X86Op {
             | X86Op::Switch
             | X86Op::Switch128
             | X86Op::RmwLoop
+            | X86Op::MemmoveRep
             | X86Op::DynAlloca => true,
             // An opaque template may branch on anything, unless it is empty.
             X86Op::InlineAsm => flags(1) & 1 != 0,
