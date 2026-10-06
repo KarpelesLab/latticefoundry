@@ -49,7 +49,7 @@ use crate::ir::{BlockId, Function};
 use puremp::Int;
 
 /// The computed fixpoint of an analysis over one function: an abstract value per
-/// [`ValueId`] and executability per [`BlockId`].
+/// [`ValueId`] and executability per [`BlockId`] and per CFG edge.
 ///
 /// A value defined in an unreachable block, or not yet constrained, is
 /// [`AbstractDomain::bottom`]; a block that the solver never proved executable
@@ -58,6 +58,9 @@ use puremp::Int;
 pub struct FixpointResult<D: AbstractDomain> {
     values: Vec<D>,
     block_reachable: Vec<bool>,
+    /// `edge_exec[b][k]`: whether the `k`-th outgoing edge of block `b` was
+    /// proven executable.
+    edge_exec: Vec<Vec<bool>>,
 }
 
 impl<D: AbstractDomain> FixpointResult<D> {
@@ -69,6 +72,13 @@ impl<D: AbstractDomain> FixpointResult<D> {
     /// Whether block `b` was proven executable.
     pub fn is_reachable(&self, b: BlockId) -> bool {
         self.block_reachable.get(b.index()).copied().unwrap_or(false)
+    }
+
+    /// Whether the `k`-th successor edge of block `b` (in terminator edge
+    /// order) was proven executable. A reachable block whose terminator has
+    /// no executable edge (a branch on poison, say) never transfers control.
+    pub fn is_edge_executable(&self, b: BlockId, k: usize) -> bool {
+        self.edge_exec.get(b.index()).and_then(|e| e.get(k)).copied().unwrap_or(false)
     }
 
     /// The number of SSA values covered.
@@ -133,12 +143,13 @@ pub fn solve_with<D: AbstractDomain>(
         return FixpointResult {
             values: vec![D::bottom(); n_vals],
             block_reachable: vec![false; n_blocks],
+            edge_exec: vec![Vec::new(); n_blocks],
         };
     };
 
     let mut engine = Engine::new(func, types, consts, entry, hooks);
     engine.run(entry);
-    FixpointResult { values: engine.vals, block_reachable: engine.block_exec }
+    FixpointResult { values: engine.vals, block_reachable: engine.block_exec, edge_exec: engine.edge_exec }
 }
 
 /// The mutable working state of one solver run.

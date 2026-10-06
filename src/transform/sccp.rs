@@ -154,6 +154,9 @@ enum TermChoice {
     /// The condition is a known constant: replace the terminator with an
     /// unconditional `br` along successor edge index `.0`.
     Single(usize),
+    /// No edge is executable (the condition is poison, so the branch is
+    /// undefined behavior): the terminator becomes `unreachable`.
+    Unreachable,
 }
 
 /// Everything [`Sccp::run`] needs, extracted from the fixpoint so it survives the
@@ -235,7 +238,7 @@ impl Plan {
         // Excluding use-less parameter folds is what makes the pass idempotent: a
         // parameter proven constant persists across the rebuild, but after its
         // uses are rewired there is nothing left to change on a second run.
-        let pruned = term_choice.iter().any(|c| matches!(c, TermChoice::Single(_)));
+        let pruned = term_choice.iter().any(|c| matches!(c, TermChoice::Single(_) | TermChoice::Unreachable));
         let dropped = reachable.iter().any(|&r| !r);
         let folded = value_const.iter().enumerate().any(|(i, vc)| {
             if vc.is_none() {
@@ -304,6 +307,7 @@ fn symbol_params(
             let feasible = match term_choice[b.index()] {
                 TermChoice::KeepAll => true,
                 TermChoice::Single(e) => e == si,
+                TermChoice::Unreachable => false,
             };
             if feasible && reachable[succ.index()] {
                 incoming[succ.index()].push(edge_args(term, si));
@@ -376,6 +380,15 @@ fn terminator_choice(
         return TermChoice::KeepAll;
     };
     let term = func.inst(t);
+    // The solver proves edges executable from the condition's abstract value:
+    // when it proves none (a branch or switch on poison), the block can only
+    // reach its terminator through undefined behavior. Keeping the terminator
+    // is not an option, since its successors may be unreachable, hence never
+    // rebuilt.
+    let n_succ = term.successors().len();
+    if n_succ > 0 && (0..n_succ).all(|k| !res.is_edge_executable(bb, k)) {
+        return TermChoice::Unreachable;
+    }
     match &term.kind {
         InstKind::CondBr { .. } => {
             let cond = term.operands()[0];
@@ -502,6 +515,7 @@ fn rebuild(old: &Function, plan: &Plan, builder: &mut FunctionBuilder<'_>, entry
             TermChoice::Single(edge) => {
                 emit_single_edge(&mut vmap, old, builder, &new_block, bb, edge);
             }
+            TermChoice::Unreachable => builder.unreachable(),
             TermChoice::KeepAll => {
                 rebuild_terminator(&mut vmap, old, builder, &succ_map, bb, |_, _, _| {});
             }
