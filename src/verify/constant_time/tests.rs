@@ -332,3 +332,32 @@ fn vector_code_is_checked_lane_wise() {
     let r = roles_default(&bad);
     assert!(r.contains(&CtRole::Division) && r.contains(&CtRole::BranchCondition), "{r:?}");
 }
+
+/// Bulk memory (`docs/ir-design.md` §6k): a secret length or address is
+/// rejected; secret bytes may be moved, but only into memory that may hold
+/// secrets (a non-escaping slot or a secret global), like `store`.
+#[test]
+fn bulk_memory_rules() {
+    // A secret length, and a secret-derived address.
+    let src = body(
+        "  %t = alloca [64 x i8] : ptr\n  memset %t, i8 0, %s align 1\n  %a = ptr_add %t, %s : ptr\n  memcpy %a, %q, i64 4 align 1\n  ret i64 0\n",
+    );
+    assert_eq!(roles_default(&src), [CtRole::BulkLength, CtRole::Address, CtRole::Address]);
+    // A secret fill byte: fine into a local slot, rejected into a parameter.
+    let src = body(
+        "  %b = trunc %s : i8\n  %t = alloca [8 x i8] : ptr\n  memset %t, %b, i64 8 align 1\n  memset %q, %b, i64 8 align 1\n  ret i64 0\n",
+    );
+    assert_eq!(roles_default(&src), [CtRole::PublicStore]);
+    // Secret contents copied: local to local is fine; the taint follows the
+    // copy, so reading the copy and branching on it is rejected; copying the
+    // secret slot out through a parameter is rejected.
+    let src = body(
+        "  %t = alloca i64 : ptr\n  store %s, %t align 8 : i64\n  %u = alloca i64 : ptr\n  memcpy %u, %t, i64 8 align 8\n  %v = load %u align 8 : i64\n  %c = icmp eq %v, i64 0 : i1\n  memcpy %q, %t, i64 8 align 8\n  cond_br %c, ^1, ^1\n^1:\n  ret i64 0\n",
+    );
+    assert_eq!(roles_default(&src), [CtRole::SecretCopyToPublic, CtRole::BranchCondition]);
+    // Public copies and fills with public operands are fine.
+    let src = body(
+        "  %t = alloca [16 x i8] : ptr\n  memcpy %t, %q, %p align 1\n  memmove %q, %t, i64 16 align 1\n  memset %q, i8 7, %p align 1\n  ret i64 0\n",
+    );
+    assert_eq!(roles_default(&src), []);
+}

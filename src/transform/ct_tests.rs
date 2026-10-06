@@ -13,8 +13,8 @@ use crate::transform::pipeline::{OptLevel, pass_by_name, pipeline_for};
 use crate::verify::{CtPolicy, ct_violations, verify_module};
 
 /// Every individual pass `pass_by_name` knows.
-pub(crate) const PASSES: [&str; 8] =
-    ["mem2reg", "sccp", "simplify_cfg", "dce", "egraph", "licm", "inline", "dfe"];
+pub(crate) const PASSES: [&str; 9] =
+    ["mem2reg", "sccp", "simplify_cfg", "dce", "egraph", "licm", "inline", "dfe", "memopt"];
 
 /// A conditional swap of two `n`-limb numbers by a secret bit (the core of a
 /// Montgomery ladder), a ladder driving it bit by bit over a secret scalar,

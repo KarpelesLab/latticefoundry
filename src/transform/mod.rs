@@ -31,6 +31,7 @@ pub mod egraph;
 pub mod inline;
 pub mod licm;
 pub mod mem2reg;
+pub mod memopt;
 pub mod pipeline;
 pub mod sanitize;
 pub mod sccp;
