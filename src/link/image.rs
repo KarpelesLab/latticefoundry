@@ -101,6 +101,7 @@ const STT_FUNC: u8 = 2;
 const STT_OBJECT: u8 = 1;
 const STT_NOTYPE: u8 = 0;
 const SHN_UNDEF: u16 = 0;
+const SHN_ABS: u16 = 0xfff1;
 
 /// The largest `.rodata` (in bytes, alignment padding included) that
 /// [`MergeRodata::Auto`] places in the code segment.
@@ -707,6 +708,21 @@ pub fn link_executable(
         });
     }
 
+    // An empty section whose whole group was skipped above (a zero-byte
+    // `.rodata`, or `.data`/`.bss` when the program has no writable data)
+    // still needs an address for the symbols it defines: give it one past the
+    // end of the image. It holds no bytes, so nothing is ever read there; only
+    // its address is taken.
+    let image_end = segments.last().map_or(base, |s| s.vaddr + s.memsz);
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, s) in obj.sections().iter().enumerate() {
+            if s.kind != SectionKind::Debug && !placement.contains_key(&(oi, si)) {
+                debug_assert_eq!(s.size(), 0, "a non-empty section was left unplaced");
+                placement.insert((oi, si), align_up(image_end, s.align.max(1)));
+            }
+        }
+    }
+
     // 4. Apply relocations now that every section has an address. Relocations
     //    inside non-loadable debug sections are handled later (their sections
     //    have no virtual address / placement).
@@ -1122,7 +1138,12 @@ fn emit_debug_and_sections(
             let rec = SymRec {
                 name_off: add_str(&sym.name, &mut strtab),
                 info: (bind << 4) | st_type,
-                shndx: shndx_of(kind),
+                // A symbol in an empty section that got no section header
+                // (see `link_executable`) is given as an absolute address.
+                shndx: match shndx_of(kind) {
+                    SHN_UNDEF => SHN_ABS,
+                    i => i,
+                },
                 value,
                 size: sym.size,
             };
@@ -1713,6 +1734,86 @@ mod tests {
         assert_eq!(disp as i64, target_addr as i64 - 4 - p as i64);
         // e_entry points at _start (text offset 0).
         assert_eq!(rd_u64(&img, 24), BASE_DEFAULT + text_foff);
+    }
+
+    /// Issue #22: a symbol defined in a zero-byte `.rodata`, `.data` or
+    /// `.bss` (whose segment is then never emitted) must still resolve, under
+    /// every `.rodata` merge mode and with or without the symbol table.
+    #[test]
+    fn symbol_in_an_empty_section_links() {
+        for kind in [SectionKind::Rodata, SectionKind::Data, SectionKind::Bss] {
+            for merge in [MergeRodata::Never, MergeRodata::Auto, MergeRodata::Always] {
+                for debug in [false, true] {
+                    // `_start` holds an `Abs64` field naming `e`, in an empty
+                    // section of `kind`, then a second (global) one in another.
+                    let mut m = ObjectModule::new("t");
+                    let mut text = Section::new(".text", SectionKind::Text, 16);
+                    text.bytes = vec![0; 17];
+                    text.bytes[16] = 0xc3;
+                    let tid = m.add_section(text);
+                    m.add_symbol(Symbol::defined("_start", SymbolBinding::Global, SymbolType::Func, tid, 0, 17));
+                    for (i, (name, binding)) in [("e", SymbolBinding::Local), ("g", SymbolBinding::Global)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let sid = m.add_section(Section::new(".x", kind, 8));
+                        let sym = m.add_symbol(Symbol::defined(name, binding, SymbolType::Object, sid, 0, 0));
+                        m.add_relocation(Relocation {
+                            section: tid,
+                            offset: 8 * i as u64,
+                            symbol: sym,
+                            kind: RelocKind::Abs64,
+                            addend: 0,
+                        });
+                    }
+                    let opts = ImageOptions { merge_rodata: merge, debug, ..ImageOptions::default() };
+                    let ctx = format!("{kind:?}, {merge:?}, debug {debug}");
+                    let img = link_executable(vec![m], &opts).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                    // Only the text segment is emitted; both symbols sit past
+                    // its end, 8-aligned.
+                    let ph = phdrs(&img);
+                    assert_eq!(ph.len(), 1, "{ctx}");
+                    let end = align_up(ph[0].3 + ph[0].4, 8);
+                    let text_foff = (rd_u64(&img, 24) - BASE_DEFAULT) as usize;
+                    assert_eq!(rd_u64(&img, text_foff), end, "{ctx}");
+                    assert_eq!(rd_u64(&img, text_foff + 8), end, "{ctx}");
+                }
+            }
+        }
+    }
+
+    /// Issue #22, as Lode hit it: a compiled module referencing a global
+    /// placed in an empty `.rodata`.
+    #[test]
+    fn compiled_reference_to_an_empty_rodata_links() {
+        use crate::ir::{CastOp, Const, Flags, Global};
+        use crate::support::StrInterner;
+        let mut syms = StrInterner::new();
+        let mut m = crate::Module::new("k");
+        let i8t = m.types_mut().int(8);
+        let i64t = m.types_mut().int(64);
+        let arr = m.types_mut().array(i8t, 1);
+        let init = m.intern_const(Const::Poison(arr));
+        let g = m.add_global(Global { name: syms.intern("empty"), ty: arr, init: Some(init) });
+        let sig = m.types_mut().func(vec![], i64t, false);
+        let f = m.declare_function(syms.intern("main"), sig);
+        {
+            let mut b = m.build(f);
+            b.create_entry_block();
+            let p = b.global_ref(g);
+            let v = b.load(i8t, p, 1);
+            let w = b.cast(CastOp::ZExt, v, i64t);
+            let z = b.const_i64(i64t, 0);
+            let r = b.mul(w, z, Flags::NONE);
+            b.ret(Some(r));
+        }
+        let mut obj = crate::target::x86_64::compile_module(&m, &syms);
+        let sec = obj.add_section(Section::new(".rodata", SectionKind::Rodata, 1));
+        obj.add_symbol(Symbol::defined("empty", SymbolBinding::Local, SymbolType::Object, sec, 0, 0));
+        for merge in [MergeRodata::Never, MergeRodata::Always] {
+            let opts = ImageOptions { merge_rodata: merge, ..ImageOptions::default() };
+            assert!(link_executable(vec![obj.clone()], &opts).is_ok(), "{merge:?}");
+        }
     }
 
     #[test]
