@@ -18,8 +18,8 @@
 //!   removed here;
 //! - every function that shares its **symbol name** with a global. A frontend
 //!   may reach a function through a symbol-name alias instead of a `func_ref`
-//!   (lf-cc takes a function's address through a body-less global of the same
-//!   name), and such a reference is invisible to the IR graph.
+//!   (a body-less global of the same name), and such a reference is invisible
+//!   to the IR graph.
 //!
 //! From a live function, every function its body references
 //! ([`Module::referenced_functions`]: used `func_ref` values, i.e. call targets

@@ -93,9 +93,8 @@ pub trait TargetIsel: MachineTarget + Sized {
 
     /// Build "materialize the address of function `f` into `dst`", for a
     /// function used as a value (its address stored, passed, or called
-    /// through). The default is a zero placeholder, for targets that resolve
-    /// function values themselves (x86-64) or not yet at all; a direct call
-    /// never comes here (see [`Lower::callee_func`]).
+    /// through). The default is a zero placeholder, for targets that cannot
+    /// yet; a direct call never comes here (see [`Lower::callee_func`]).
     fn func_addr(&self, dst: VReg, _f: u32) -> MachineInst {
         self.li(dst, Int::ZERO)
     }

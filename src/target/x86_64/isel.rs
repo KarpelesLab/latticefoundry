@@ -2157,6 +2157,13 @@ impl TargetIsel for X86_64Target {
         MachineInst::new(X86Op::GlobalAddr.opcode(), vec![def_v(dst), MachineOperand::Global(g)])
     }
 
+    /// A function used as a value wherever the framework materializes it (a
+    /// block argument on an edge, say) gets its real address, as
+    /// `oper` gives an instruction operand.
+    fn func_addr(&self, dst: VReg, f: u32) -> MachineInst {
+        MachineInst::new(X86Op::FuncAddr.opcode(), vec![def_v(dst), MachineOperand::Func(f)])
+    }
+
     fn float_const(&self, dst: VReg, bits: u64, width: u32) -> MachineInst {
         MachineInst::new(
             X86Op::LoadFConst.opcode(),

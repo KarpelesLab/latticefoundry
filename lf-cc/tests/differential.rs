@@ -364,6 +364,27 @@ fn programs() -> Vec<(&'static str, &'static str)> {
              int apply(IntFn g,int v){ return g(v); } \
              int main(){ IntFn f=inc; return apply(f,41)+apply(neg,-1)+(apply(inc,0)); }",
         ),
+        // `static` functions reached only through static data (a table, a
+        // struct of callbacks, a union, a `void *`) must survive dead-function
+        // elimination; a pointer chosen by a branch (a block argument at -O2)
+        // and address comparisons must see the real addresses.
+        (
+            "fnptr_static_data",
+            "static int add1(int x){return x+1;} static int dbl(int x){return x*2;} \
+             static int only_tab(int x){return x-5;} static int only_ops(int x){return x^3;} \
+             static int only_vp(int x){return x*3;} static int only_un(int x){return x+9;} \
+             static int unused(int x){return x*7;} \
+             static int (*tab[])(int)={add1,dbl,only_tab}; \
+             struct ops{int k; int (*fn)(int);}; static struct ops ops[]={{1,only_ops},{2,add1}}; \
+             static void *vp=(void *)only_vp; union U{long l; int (*f)(int);}; static union U u={.f=only_un}; \
+             int (*gfp)(int)=dbl; \
+             static int pick(int c,int x){ int (*f)(int)=c?add1:dbl; return f(x); } \
+             int main(int argc,char **argv){ (void)argv; \
+               int r=tab[0](1)+tab[1](2)+tab[2](10)+ops[0].fn(4)+ops[1].fn(1); \
+               r+=((int(*)(int))vp)(2)+u.f(1)+gfp(3)+pick(argc,5)+pick(argc-1,5); \
+               r+=(gfp==dbl)+(tab[0]==add1)+((void *)tab[0]==(void *)tab[1])+(gfp!=0); \
+               return r; }",
+        ),
         // --- floating point (float / double) --------------------------------
         // The IEEE operations below are exact, so lf-cc and gcc must agree
         // bit-for-bit; each `main` returns an integral value in 0..256. Function

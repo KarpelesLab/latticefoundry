@@ -346,6 +346,72 @@ fn static_functions_and_objects_have_internal_linkage_in_the_ir() {
     assert_eq!(symbol_binding(src, "api"), Some((SymbolBinding::Global, false)));
 }
 
+/// The object symbols of `src` compiled at `opt`.
+fn defined_symbols(src: &str, opt: OptLevel) -> Vec<String> {
+    let opts = PpOptions { std: lf_cc::CStd::parse("gnu17").unwrap(), ..PpOptions::default() };
+    let unit = lf_cc::compile_module_with(src, "t.c", &opts, opt, false).expect("compiles");
+    let obj = unit.module;
+    obj.symbols().iter().filter(|s| !s.is_undefined()).map(|s| s.name.clone()).collect()
+}
+
+#[test]
+fn function_addresses_are_ir_function_references_not_alias_globals() {
+    // Taking a function's address is a `func_ref`: no body-less `global @f :
+    // ptr` shadows the function, and a `static` function named only by data
+    // is kept referenced through an address constant.
+    let src = "static int f(int x) { return x; }\n\
+               static int g(int x) { return -x; }\n\
+               static int (*tab[])(int) = { g };\n\
+               int (*get(void))(int) { return f; }\n\
+               int use(int i) { return tab[0](i); }\n";
+    let (module, syms) = lf_cc::compile_to_ir(src, "t.c", false).expect("compiles");
+    let text = latticefoundry::ir::text::print_module(&module, &syms);
+    assert!(!text.contains("@f : ptr") && !text.contains("@g : ptr"), "{text}");
+    assert!(text.contains("func internal @f"), "{text}");
+    assert!(text.contains("ptr @g"), "the table's function is referenced by an address constant:\n{text}");
+}
+
+#[test]
+fn unused_static_functions_are_removed_at_o2() {
+    let src = "static int unused(int x) { return x * 3 + 1; }\n\
+               static int unused_cycle_a(int x);\n\
+               static int unused_cycle_b(int x) { return x ? unused_cycle_a(x - 1) : 0; }\n\
+               static int unused_cycle_a(int x) { return x ? unused_cycle_b(x - 1) : 1; }\n\
+               static int via_data(int x) { return x - 1; }\n\
+               static int via_value(int x) { return x + 2; }\n\
+               static int (*const tab[])(int) = { via_data };\n\
+               int (*get(void))(int) { return via_value; }\n\
+               int api(int i) { return tab[0](i); }\n";
+    let o0 = defined_symbols(src, OptLevel::O0);
+    assert!(o0.iter().any(|s| s == "unused"), "-O0 keeps every function: {o0:?}");
+    let o2 = defined_symbols(src, OptLevel::O2);
+    for gone in ["unused", "unused_cycle_a", "unused_cycle_b"] {
+        assert!(!o2.iter().any(|s| s == gone), "{gone} should be removed at -O2: {o2:?}");
+    }
+    for kept in ["via_data", "via_value", "get", "api"] {
+        assert!(o2.iter().any(|s| s == kept), "{kept} must stay: {o2:?}");
+    }
+}
+
+#[test]
+fn single_call_static_helper_is_inlined_at_o2() {
+    // Too big for the "small callee" rule: only the single-call-site rule
+    // inlines it, so its definition disappears. Called twice, it stays.
+    let helper = "static int helper(int *a, int n) {\n\
+                    int s = 0;\n\
+                    for (int i = 0; i < n; i++) { s += a[i] * (i + 1); if (s > 1000) s -= a[i] ^ i; }\n\
+                    for (int i = n - 1; i >= 0; i--) { s ^= a[i] << (i & 7); s += s / 3; }\n\
+                    for (int i = 0; i < n; i += 2) { s -= a[i] * a[i]; s = s % 100003; }\n\
+                    return s;\n\
+                  }\n";
+    let once = format!("{helper}int api(int *a, int n) {{ return helper(a, n) + 1; }}\n");
+    let syms = defined_symbols(&once, OptLevel::O2);
+    assert!(!syms.iter().any(|s| s == "helper"), "single-call helper should be inlined: {syms:?}");
+    let twice = format!("{helper}int api(int *a, int n) {{ return helper(a, n) + helper(a, n - 1); }}\n");
+    let syms = defined_symbols(&twice, OptLevel::O2);
+    assert!(syms.iter().any(|s| s == "helper"), "a helper called twice is not duplicated: {syms:?}");
+}
+
 /// The header both translation units include: a C99 plain `inline` definition.
 const INLINE_H: &str = "inline int sq(int x) { return x * x; }\ninline int cube(int x) { return x * sq(x); }\n";
 

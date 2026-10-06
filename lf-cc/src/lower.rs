@@ -16,7 +16,7 @@ use latticefoundry::ir::types::{Type, TypeContext, TypeId};
 use latticefoundry::ir::value::{FloatBits, ValueId};
 use latticefoundry::codegen::RelocModel;
 use latticefoundry::ir::{
-    BlockId, Const, DataLayout, FuncAttrs, FuncId, GlobalAttrs, GlobalId, Global, Linkage, Module, Visibility,
+    AddrTarget, BlockId, Const, DataLayout, FuncAttrs, FuncId, GlobalAttrs, GlobalId, Global, Linkage, Module, Visibility,
 };
 use latticefoundry::support::StrInterner;
 use latticefoundry::support::puremp;
@@ -265,33 +265,46 @@ pub fn lower_with(
         global_ids.push(module.define_global(Global { name, ty, init: Some(init) }, attrs));
     }
 
-    // For each function, an externally-defined ("init: None") global aliasing its
-    // symbol name. Taking a function's address (`FuncPtr`) materializes through
-    // this global's `global_ref` (a RIP-relative `lea` relocated to the function
-    // symbol), because the backend materializes a bare `func_ref` *value* as zero
-    // — it only honours `func_ref` as a direct call target. The synthetic global
-    // is never emitted as data (it is not in `program.globals`), so at link time
-    // the reference resolves to the function definition of the same name.
-    //
-    // A C99 inline definition's address is that of the *external* function
-    // (defined in some other translation unit), so its alias names the external
-    // symbol, not the private copy direct calls use.
-    let ptr_ty = tys.ptr;
-    let mut func_addr_globals: Vec<GlobalId> = Vec::with_capacity(program.sigs.len());
-    for sig in &program.sigs {
-        let name = syms.intern(&sig.name);
-        let local = sig.is_static || (pie && sig.defined && !sig.inline_def);
-        let visibility = if sig.inline_def {
-            sig.visibility.unwrap_or_default()
-        } else {
-            func_visibility(sig, cfg)
-        };
-        let attrs = GlobalAttrs {
-            linkage: if local { Linkage::Internal } else { Linkage::External },
-            visibility,
-            ..GlobalAttrs::DETACHED
-        };
-        func_addr_globals.push(module.define_global(Global { name, ty: ptr_ty, init: None }, attrs));
+    // The function each signature's address names: the function itself, so
+    // taking it is a `func_ref` the optimizer sees (a `static` function nobody
+    // references can be dropped, one called once can be inlined freely). A C99
+    // inline definition's address is that of the *external* function (defined
+    // in some other translation unit), so it names a declaration of the
+    // external symbol, not the private copy direct calls use.
+    let mut addr_funcs: Vec<FuncId> = func_ids.clone();
+    for (i, sig) in program.sigs.iter().enumerate() {
+        if sig.inline_def {
+            let ty = module.function(func_ids[i]).sig;
+            let ext = module.declare_function(syms.intern(&sig.name), ty);
+            module.set_func_attrs(ext, FuncAttrs::new(Linkage::External, sig.visibility.unwrap_or_default()));
+            addr_funcs[i] = ext;
+        }
+    }
+
+    // The global data the driver emits (`emit_globals`) addresses functions by
+    // symbol name, which the IR does not see. List every function so addressed
+    // in one detached (never emitted) table of address constants, so they stay
+    // referenced for dead-function elimination and the inliner.
+    let by_name: HashMap<&str, FuncId> =
+        program.sigs.iter().zip(&addr_funcs).map(|(s, &f)| (s.name.as_str(), f)).collect();
+    let mut data_funcs: Vec<FuncId> = program
+        .globals
+        .iter()
+        .flat_map(|g| &g.relocs)
+        .filter_map(|r| by_name.get(r.symbol.as_str()).copied())
+        .collect();
+    data_funcs.sort_unstable();
+    data_funcs.dedup();
+    if !data_funcs.is_empty() {
+        let ptr = tys.ptr;
+        let elems: Vec<_> = data_funcs
+            .iter()
+            .map(|&f| module.intern_const(Const::Addr { ty: ptr, target: AddrTarget::Func(f), offset: 0 }))
+            .collect();
+        let ty = module.types_mut().array(ptr, elems.len() as u64);
+        let init = module.intern_const(Const::Aggregate { ty, elems });
+        let attrs = GlobalAttrs { linkage: Linkage::Internal, ..GlobalAttrs::DETACHED };
+        module.define_global(Global { name: syms.intern("lf.data_func_refs"), ty, init: Some(init) }, attrs);
     }
 
     // Precompute the interned IR type of every local/parameter aggregate, so the
@@ -354,7 +367,7 @@ pub fn lower_with(
             terminated: false,
             func_ids: &func_ids,
             global_ids: &global_ids,
-            func_addr_globals: &func_addr_globals,
+            addr_funcs: &addr_funcs,
             locals: &f.locals,
             tys,
             agg_types: &agg_types,
@@ -468,8 +481,8 @@ struct FnLower<'a> {
     terminated: bool,
     func_ids: &'a [FuncId],
     global_ids: &'a [GlobalId],
-    /// External aliases (one per function) for materializing function addresses.
-    func_addr_globals: &'a [GlobalId],
+    /// The function whose address each signature's designator names.
+    addr_funcs: &'a [FuncId],
     locals: &'a [LocalInfo],
     tys: Tys,
     /// Interned IR types of aggregate local/parameter types (for `alloca`).
@@ -1491,7 +1504,7 @@ impl FnLower<'_> {
             TExprKind::IncDec { target, inc, post, scale } => {
                 self.lower_incdec(target, *inc, *post, *scale)
             }
-            TExprKind::FuncPtr(idx) => self.b.global_ref(self.func_addr_globals[*idx]),
+            TExprKind::FuncPtr(idx) => self.b.func_ref(self.addr_funcs[*idx]),
             TExprKind::FuncRef(_) => {
                 unreachable!("function designator not decayed to a function pointer")
             }

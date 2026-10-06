@@ -1065,6 +1065,77 @@ fn run_func_pointer() {
     }
 }
 
+/// `long long fp_pick(long long c, long long x)` calls `fp_seven(x)` when `c`
+/// is nonzero and `fp_neg(x)` otherwise, through a pointer chosen by a
+/// **block argument**: each edge passes a `func_ref` as a value, which the
+/// edge copy (not an instruction operand) materializes.
+fn build_func_pointer_phi() -> (Module, StrInterner) {
+    let mut syms = StrInterner::new();
+    let mut m = Module::new("t");
+    let i64t = m.types_mut().int(64);
+    let ptrt = m.types_mut().ptr();
+    let sig1 = m.types_mut().func(vec![i64t], i64t, false);
+    let sig2 = m.types_mut().func(vec![i64t, i64t], i64t, false);
+    let seven = m.declare_function(syms.intern("fp_seven"), sig1);
+    let neg = m.declare_function(syms.intern("fp_neg"), sig1);
+    let pick = m.declare_function(syms.intern("fp_pick"), sig2);
+    {
+        let mut b = m.build(seven);
+        let entry = b.create_entry_block();
+        let y = b.param(entry, 0);
+        let k = b.const_i64(i64t, 7);
+        let r = b.mul(y, k, Flags::NONE);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(neg);
+        let entry = b.create_entry_block();
+        let y = b.param(entry, 0);
+        let z = b.const_i64(i64t, 0);
+        let r = b.sub(z, y, Flags::NONE);
+        b.ret(Some(r));
+    }
+    {
+        let mut b = m.build(pick);
+        let entry = b.create_entry_block();
+        let c = b.param(entry, 0);
+        let x = b.param(entry, 1);
+        let join = b.create_block(&[ptrt]);
+        let z = b.const_i64(i64t, 0);
+        let cond = b.icmp(IntPred::Ne, c, z);
+        let fs = b.func_ref(seven);
+        let fn_ = b.func_ref(neg);
+        b.cond_br(cond, join, &[fs], join, &[fn_]);
+        b.switch_to(join);
+        let fp = b.param(join, 0);
+        let r = b.call(fp, &[x], i64t).expect("call has a result");
+        b.ret(Some(r));
+    }
+    (m, syms)
+}
+
+#[test]
+fn run_func_pointer_through_block_argument() {
+    // A function address passed along an edge must be the real address, not
+    // the zero placeholder: calling through it would otherwise crash.
+    let (m, syms) = build_func_pointer_phi();
+    let obj = compile_module(&m, &syms);
+    let relocs = obj.relocations().iter().filter(|r| obj.symbol(r.symbol).name == "fp_neg").count();
+    assert!(relocs >= 1, "expected a relocation to fp_neg (its taken address)");
+    let c = r#"
+        long long fp_pick(long long, long long);
+        int main(void) {
+            if (fp_pick(1, 6) != 42) return 1;
+            if (fp_pick(0, 6) != -6) return 2;
+            return 0;
+        }
+    "#;
+    match compile_link_run(&m, &syms, "funcptr_phi", c) {
+        Some(code) => assert_eq!(code, 0, "indirect call via an edge-passed address failed (exit {code})"),
+        None => eprintln!("skipping run_func_pointer_through_block_argument: no C compiler"),
+    }
+}
+
 /// `f64 u2d(u64)` = `(double)(unsigned long)x` — `uitofp` from a 64-bit source.
 fn build_u64_to_f64() -> (Module, StrInterner, FuncId) {
     let mut syms = StrInterner::new();
