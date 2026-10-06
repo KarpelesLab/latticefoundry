@@ -65,6 +65,17 @@
 //! [`DetHashMap`]/[`DetHashSet`] (fixed-seed hashing, tenet T5); classes and
 //! nodes are visited in id/insertion order and ties in extraction break on that
 //! order, so the output is byte-for-byte reproducible across runs.
+//!
+//! ## Placement
+//!
+//! The rebuild walks the blocks in dominator preorder. A modeled value whose
+//! extracted term is needed in a block its definition dominates is emitted at
+//! its original definition (the original computed it there, so this adds no
+//! work and no undefined behavior on any path, and never sinks a value into a
+//! loop); other terms are emitted at their first use. Emitted terms are cached
+//! in a **dominator-scoped** table: a term computed in block `d` is reused by
+//! every block `d` dominates, and a sibling block, where it is not available,
+//! computes its own (issue #14).
 
 use crate::analysis::cfg::{ControlFlowGraph, Dominators};
 use crate::ir::builder::FunctionBuilder;
@@ -845,8 +856,11 @@ impl<'a> EGraph<'a> {
 
     /// Whether the extraction differs from the original: any simplification (a
     /// class whose cheapest node is not the value's own node), any CSE merge (two
-    /// distinct live modeled values sharing a class), or any dead modeled op (its
-    /// value unused, so the rebuild drops it). Precise enough to be idempotent.
+    /// distinct live modeled values sharing a class, one defined in a block that
+    /// dominates the other's, so the rebuild reuses it), or any dead modeled op
+    /// (its value unused, so the rebuild drops it). Precise enough to be
+    /// idempotent: a class shared only by sibling blocks is recomputed in each,
+    /// exactly as before, so it is no change.
     fn decide_changed(
         &mut self,
         func: &Function,
@@ -855,7 +869,18 @@ impl<'a> EGraph<'a> {
         best_node: &[Option<ENode>],
     ) -> bool {
         let used = compute_used(func, types);
-        let mut class_first: DetHashMap<usize, usize> = DetHashMap::default();
+        let cfg = ControlFlowGraph::new(func);
+        let doms = Dominators::new(func, &cfg);
+        let mut def_block = vec![usize::MAX; func.value_count()];
+        for (bid, blk) in func.blocks() {
+            for &i in blk.insts() {
+                if let Some(r) = func.inst(i).result() {
+                    def_block[r.index()] = bid.index();
+                }
+            }
+        }
+        // The definition blocks of the live modeled values seen so far, per class.
+        let mut class_blocks: DetHashMap<usize, Vec<usize>> = DetHashMap::default();
         for i in 0..func.value_count() {
             let v = ValueId::from_index(i);
             if !modeled_value(func, types, v) {
@@ -865,13 +890,12 @@ impl<'a> EGraph<'a> {
             if !used.contains(&v) {
                 return true; // a dead pure op the rebuild will drop
             }
-            match class_first.get(&cr) {
-                Some(&first) if first != i => return true, // CSE-merged with another value
-                Some(_) => {}
-                None => {
-                    class_first.insert(cr, i);
-                }
+            let b = def_block[i];
+            let seen = class_blocks.entry(cr).or_default();
+            if seen.iter().any(|&o| doms.dominates(o, b) || doms.dominates(b, o)) {
+                return true; // CSE-merged with a value the rebuild reuses
             }
+            seen.push(b);
             let orig = original_enode(func, v, root, &self.value_class);
             if best_node[cr].as_ref() != Some(&orig) {
                 return true; // simplified/reassociated/folded away
@@ -951,24 +975,32 @@ fn rebuild_function(old: &Function, plan: &Plan, builder: &mut FunctionBuilder<'
     }
 
     // Emit in dominator preorder so every surviving definition precedes its uses.
+    // Extracted subterms are cached in a dominator-scoped table: a term emitted
+    // in block `d` is reused by every block `d` dominates (it is available
+    // there) and forgotten when the walk leaves `d`'s subtree, so a sibling
+    // never reuses it and recomputes it instead (issue #14).
+    let anchor = anchored_values(old, plan, &doms);
+    let mut cache = ScopedCache::default();
     for b in dom_preorder(old, &doms) {
         let bb = BlockId::from_index(b);
         builder.switch_to(new_block[b]);
-        // Extracted modeled subterms are cached per block, so a shared subterm is
-        // emitted once and its definition (earlier in the block) dominates every
-        // reuse; the cache is *not* shared across blocks (that would break
-        // dominance), so a value used in several blocks is recomputed locally.
-        let mut cache: DetHashMap<usize, ValueId> = DetHashMap::default();
+        cache.enter(b, &doms);
         for &i in old.block(bb).insts() {
             builder.set_line_from(old, i);
             let inst = old.inst(i);
-            // Pure modeled results are emitted lazily at their use sites via the
-            // extraction DAG, so skip them here (unused ones simply vanish — a
-            // DCE bonus). Everything else (memory, calls, float, ...) is opaque
-            // and reproduced verbatim, with its operands optimized.
+            // A pure modeled result whose extracted term is needed below its
+            // definition is emitted right there, as the original computed it,
+            // so every dominated use shares that one computation and nothing
+            // is sunk into a loop; any other modeled term is emitted lazily at
+            // its first use (an unused one simply vanishes — a DCE bonus).
+            // Everything else (memory, calls, float, ...) is opaque and
+            // reproduced verbatim, with its operands optimized.
             if let Some(r) = inst.result()
-                && plan.value_node[r.index()].is_some()
+                && let Some(idx) = plan.value_node[r.index()]
             {
+                if anchor[r.index()] {
+                    emit_ext(plan, old, builder, &mut vmap, &mut cache, idx);
+                }
                 continue;
             }
             let mut ops = Vec::with_capacity(inst.operands().len());
@@ -985,6 +1017,58 @@ fn rebuild_function(old: &Function, plan: &Plan, builder: &mut FunctionBuilder<'
     }
 }
 
+/// Which modeled values the rebuild emits at their own definition: those whose
+/// extracted term is needed (by an opaque instruction or terminator, through
+/// the extraction DAG) in a block their definition dominates. The original
+/// computed the value there, so emitting its (refining) term there adds no
+/// work and no undefined behavior on any path.
+fn anchored_values(old: &Function, plan: &Plan, doms: &Dominators) -> Vec<bool> {
+    let nv = old.value_count();
+    let mut def_block = vec![usize::MAX; nv];
+    // `anchors_of[idx]`: the modeled values whose extraction is node `idx`.
+    let mut anchors_of: Vec<Vec<usize>> = vec![Vec::new(); plan.nodes.len()];
+    for (bid, blk) in old.blocks() {
+        for &i in blk.insts() {
+            if let Some(r) = old.inst(i).result() {
+                def_block[r.index()] = bid.index();
+                if let Some(idx) = plan.value_node[r.index()] {
+                    anchors_of[idx].push(r.index());
+                }
+            }
+        }
+    }
+    let mut anchor = vec![false; nv];
+    let mut seen_in = vec![usize::MAX; plan.nodes.len()];
+    let mut stack = Vec::new();
+    for (bid, blk) in old.blocks() {
+        let u = bid.index();
+        // The roots: operands of the opaque instructions and the terminator.
+        for &i in blk.insts().iter().chain(blk.terminator().iter()) {
+            let inst = old.inst(i);
+            if inst.result().is_some_and(|r| plan.value_node[r.index()].is_some()) {
+                continue; // modeled: emitted on demand, not a root
+            }
+            stack.extend(inst.operands().iter().filter_map(|o| plan.value_node[o.index()]));
+        }
+        // Everything they need (once per block), marking the anchors above `u`.
+        while let Some(idx) = stack.pop() {
+            if seen_in[idx] == u {
+                continue;
+            }
+            seen_in[idx] = u;
+            for &v in &anchors_of[idx] {
+                if !anchor[v] && doms.dominates(def_block[v], u) {
+                    anchor[v] = true;
+                }
+            }
+            if let ExtNode::Op { children, .. } = &plan.nodes[idx] {
+                stack.extend(children.iter().copied());
+            }
+        }
+    }
+    anchor
+}
+
 /// The new value for an operand: the extracted term for a pure modeled value, or
 /// the passed-through mapping for an opaque one.
 fn operand_val(
@@ -992,7 +1076,7 @@ fn operand_val(
     old: &Function,
     builder: &mut FunctionBuilder<'_>,
     vmap: &mut [Option<ValueId>],
-    cache: &mut DetHashMap<usize, ValueId>,
+    cache: &mut ScopedCache,
     o: ValueId,
 ) -> ValueId {
     match plan.value_node[o.index()] {
@@ -1001,16 +1085,59 @@ fn operand_val(
     }
 }
 
-/// Materialize extraction node `idx` into the current block, caching per block.
+/// Extraction nodes already materialized at the current point of the rebuild,
+/// scoped along the dominator tree: an entry made while emitting block `d`
+/// stays visible in every block `d` dominates and is dropped once the
+/// dominator-preorder walk leaves `d`'s subtree.
+#[derive(Debug, Default)]
+struct ScopedCache {
+    /// Extraction node → the new value computing it.
+    map: DetHashMap<usize, ValueId>,
+    /// Keys in insertion order, so a scope can be unwound.
+    log: Vec<usize>,
+    /// The open scopes: `(block, log length when it was entered)`, each block
+    /// dominated by the one below it.
+    scopes: Vec<(usize, usize)>,
+}
+
+impl ScopedCache {
+    /// Enter block `b`: close every open scope whose block does not dominate
+    /// `b` (an unreachable `b` closes them all), then open `b`'s.
+    fn enter(&mut self, b: usize, doms: &Dominators) {
+        while let Some(&(top, mark)) = self.scopes.last() {
+            if doms.dominates(top, b) {
+                break;
+            }
+            for k in self.log.drain(mark..) {
+                self.map.remove(&k);
+            }
+            self.scopes.pop();
+        }
+        self.scopes.push((b, self.log.len()));
+    }
+
+    fn get(&self, idx: usize) -> Option<ValueId> {
+        self.map.get(&idx).copied()
+    }
+
+    fn insert(&mut self, idx: usize, v: ValueId) {
+        if self.map.insert(idx, v).is_none() {
+            self.log.push(idx);
+        }
+    }
+}
+
+/// Materialize extraction node `idx` at the current point, reusing a value
+/// already computed in a dominating position.
 fn emit_ext(
     plan: &Plan,
     old: &Function,
     builder: &mut FunctionBuilder<'_>,
     vmap: &mut [Option<ValueId>],
-    cache: &mut DetHashMap<usize, ValueId>,
+    cache: &mut ScopedCache,
     idx: usize,
 ) -> ValueId {
-    if let Some(&v) = cache.get(&idx) {
+    if let Some(v) = cache.get(idx) {
         return v;
     }
     let v = match &plan.nodes[idx] {
@@ -1045,7 +1172,7 @@ fn emit_terminator(
     old: &Function,
     builder: &mut FunctionBuilder<'_>,
     vmap: &mut [Option<ValueId>],
-    cache: &mut DetHashMap<usize, ValueId>,
+    cache: &mut ScopedCache,
     new_block: &[BlockId],
     bb: BlockId,
 ) {
@@ -1781,5 +1908,165 @@ mod tests {
         };
         assert_eq!(pick(None), InstKind::Bin(BinOp::Add), "cost alone picks the cheaper add");
         assert_eq!(pick(Some(&secret)), InstKind::Bin(BinOp::Mul), "the public mul wins with secrets");
+    }
+
+    // --- issue #14: reuse a value computed in a dominating block ------------
+
+    use crate::ir::refexec::run_named;
+    use crate::ir::semantics::SemValue;
+    use crate::ir::text::{parse_module, print_module};
+    use crate::support::diagnostics::FileId;
+    use crate::transform::pipeline::pass_by_name;
+
+    fn parse(src: &str) -> (Module, StrInterner) {
+        let mut syms = StrInterner::new();
+        let m = parse_module(src, FileId::new(0), &mut syms).unwrap_or_else(|e| panic!("parse: {e:?}"));
+        (m, syms)
+    }
+
+    /// Run the `egraph` pass (as `lf-opt -p egraph` does); the output must verify.
+    fn egraph_pass(m: &mut Module, syms: &StrInterner) -> Changed {
+        let c = pass_by_name("egraph").expect("known pass").run(m);
+        if let Err(e) = verify_module(m) {
+            panic!("egraph output must verify: {e:#?}\n{}", print_module(m, syms));
+        }
+        c
+    }
+
+    fn named(m: &Module, syms: &StrInterner, name: &str) -> FuncId {
+        let i = m.functions().position(|f| syms.resolve(f.name) == name).expect("function exists");
+        FuncId::from_index(i)
+    }
+
+    /// The number of `kind` instructions in each block of `f`, by block index.
+    fn per_block(f: &Function, pred: impl Fn(&InstKind) -> bool) -> Vec<usize> {
+        f.blocks().map(|(_, b)| b.insts().iter().filter(|&&i| pred(&f.inst(i).kind)).count()).collect()
+    }
+
+    fn is_udiv(k: &InstKind) -> bool {
+        matches!(k, InstKind::Bin(BinOp::UDiv))
+    }
+
+    /// `@name(args)` on the original and the optimized module: the optimized
+    /// result must refine the original's (equal, for these poison-free inputs).
+    fn agree(orig: &(Module, StrInterner), opt: &(Module, StrInterner), name: &str, args: &[SemValue]) {
+        let want = run_named(&orig.0, &orig.1, name, args).expect("source runs");
+        let got = run_named(&opt.0, &opt.1, name, args).expect("optimized runs");
+        assert_eq!(got, want, "@{name}{args:?}");
+    }
+
+    fn int(width: u32, v: i64) -> SemValue {
+        SemValue::int(width, Int::from_i64(v))
+    }
+
+    /// The issue #14 repro: `%2` is computed in the entry, which dominates `^2`.
+    const ISSUE14_LF: &str = r#"
+module "i14"
+func @f(i64, i64) -> i64 {
+entry ^0(%0: i64, %1: i64):
+  %2 = udiv %0, i64 10 : i64
+  %3 = icmp eq %2, i64 0 : i1
+  cond_br %3, ^1, ^2
+^1:
+  %4 = sub nuw %1, i64 1 : i64
+  ret %4
+^2:
+  %5 = sub nuw %1, i64 1 : i64
+  %6 = add %2, %5 : i64
+  ret %6
+}
+"#;
+
+    #[test]
+    fn issue14_dominating_value_is_reused() {
+        // The repro as filed, plus a variant whose `* 1` forces a rebuild.
+        let forced = ISSUE14_LF.replace("  ret %6\n", "  %7 = mul %6, i64 1 : i64\n  ret %7\n");
+        for (src, rebuilt) in [(ISSUE14_LF.to_string(), false), (forced, true)] {
+            let before = parse(&src);
+            let mut opt = parse(&src);
+            let c = egraph_pass(&mut opt.0, &opt.1);
+            // The sibling `sub`s share a class but neither dominates the other,
+            // so there is nothing to reuse: the repro alone is a fixpoint.
+            assert_eq!(c == Changed::Yes, rebuilt, "{}", print_module(&opt.0, &opt.1));
+            let f = opt.0.function(named(&opt.0, &opt.1, "f"));
+            assert_eq!(per_block(f, is_udiv), vec![1, 0, 0], "one udiv, in the entry:\n{}", print_module(&opt.0, &opt.1));
+            assert_eq!(per_block(f, |k| matches!(k, InstKind::Bin(BinOp::Sub))), vec![0, 1, 1], "each sibling keeps its sub");
+            for (a, b) in [(0, 5), (9, 1), (10, 1), (12345, 7), (-1, 3)] {
+                agree(&before, &opt, "f", &[int(64, a), int(64, b)]);
+            }
+            assert_eq!(egraph_pass(&mut opt.0, &opt.1), Changed::No, "idempotent");
+        }
+    }
+
+    /// A loop: the header's `udiv` is reused by the body (which it dominates),
+    /// a body-only recomputation of it collapses into it, and a preheader
+    /// value used only inside the loop stays in the preheader (it is not sunk
+    /// into the loop and recomputed every iteration).
+    const LOOP_LF: &str = r#"
+module "loop"
+func @g(i64, i64) -> i64 {
+entry ^0(%n: i64, %k: i64):
+  %q = udiv %k, i64 10 : i64
+  br ^1(%n, i64 0)
+^1(%i: i64, %acc: i64):
+  %d = udiv %i, i64 10 : i64
+  %z = icmp eq %i, i64 0 : i1
+  cond_br %z, ^2, ^3
+^2:
+  %e = mul %acc, i64 1 : i64
+  ret %e
+^3:
+  %s = add %acc, %q : i64
+  %t = add %s, %d : i64
+  %d2 = udiv %i, i64 10 : i64
+  %u = add %t, %d2 : i64
+  br ^1(%d, %u)
+}
+"#;
+
+    #[test]
+    fn issue14_loop_reuses_dominating_values() {
+        let before = parse(LOOP_LF);
+        let mut opt = parse(LOOP_LF);
+        assert_eq!(egraph_pass(&mut opt.0, &opt.1), Changed::Yes);
+        let f = opt.0.function(named(&opt.0, &opt.1, "g"));
+        assert_eq!(per_block(f, is_udiv), vec![1, 1, 0, 0], "preheader + header only:\n{}", print_module(&opt.0, &opt.1));
+        for (n, k) in [(0, 0), (7, 3), (12345, 99), (1 << 40, 1000)] {
+            agree(&before, &opt, "g", &[int(64, n), int(64, k)]);
+        }
+        assert_eq!(egraph_pass(&mut opt.0, &opt.1), Changed::No, "idempotent");
+    }
+
+    /// The same expression in two sibling blocks: neither dominates the other,
+    /// so reusing one in the other would be invalid; each recomputes it.
+    const SIBLINGS_LF: &str = r#"
+module "sib"
+func @h(i64, i1) -> i64 {
+entry ^0(%x: i64, %c: i1):
+  cond_br %c, ^1, ^2
+^1:
+  %a = udiv %x, i64 10 : i64
+  %a1 = mul %a, i64 1 : i64
+  ret %a1
+^2:
+  %b = udiv %x, i64 10 : i64
+  %b1 = add %b, i64 3 : i64
+  ret %b1
+}
+"#;
+
+    #[test]
+    fn issue14_non_dominating_value_is_recomputed() {
+        let before = parse(SIBLINGS_LF);
+        let mut opt = parse(SIBLINGS_LF);
+        assert_eq!(egraph_pass(&mut opt.0, &opt.1), Changed::Yes, "the `* 1` folds");
+        let f = opt.0.function(named(&opt.0, &opt.1, "h"));
+        assert_eq!(per_block(f, is_udiv), vec![0, 1, 1], "one udiv per sibling:\n{}", print_module(&opt.0, &opt.1));
+        for x in [0, 9, 10, 12345, -1] {
+            for c in [0, 1] {
+                agree(&before, &opt, "h", &[int(64, x), int(1, c)]);
+            }
+        }
+        assert_eq!(egraph_pass(&mut opt.0, &opt.1), Changed::No, "idempotent");
     }
 }
