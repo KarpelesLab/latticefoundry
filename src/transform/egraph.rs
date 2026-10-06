@@ -21,7 +21,10 @@
 //! arithmetic, block parameters, and terminators — is an **opaque leaf**: its
 //! result is an input to the e-graph, reproduced verbatim by the rebuild. This
 //! is exactly the subset the [`refinement`](crate::verify::refinement) checker
-//! reasons about, which is what lets every rule be machine-verified.
+//! reasons about, which is what lets every rule be machine-verified. The one
+//! exception among block parameters is a parameter of a block entered by a
+//! single edge (an inlined callee's return block): it always equals that
+//! edge's argument, so it shares the argument's e-class.
 //!
 //! ## The e-graph (union-find + hash-consing + congruence)
 //!
@@ -44,10 +47,16 @@
 //! tiny functions and asking [`check_refinement`](crate::verify::check_refinement)
 //! — the in-file tests assert every rule returns `Refines`. Most rules are full
 //! *equalities* (mutual refinement): `x+0=x`, commutativity, associativity of
-//! flag-free `+`/`*`, `x*2^k = x<<k`, and constant folding. A few are
+//! flag-free `+`/`*`, `x*2^k = x<<k`, constant folding, and the shift/cast
+//! identities that unpack a packed tag/payload word (`trunc(zext x) = x`,
+//! `(x << k) >> k = x & (2^(w-k) - 1)`, `(p | c) >> k = p >> k` for
+//! `c < 2^k`, cast chains, shift chains; issue #17). Those with a side
+//! condition are proved under it, with symbolic constants. A few are
 //! *one-directional* refinements where the rhs is strictly more defined —
-//! `x*0 → 0` and `x&0 → 0` (a poison `x` makes the lhs poison but the rhs is the
-//! defined constant `0`). Unioning those is still sound for extraction because
+//! `x*0 → 0`, `x&0 → 0`, and the masks of a packed word (`(y<<k | c) & m →
+//! c & m` for `m < 2^k`, `trunc(y<<k | c) → trunc c`, a shift chain past the
+//! width `→ 0`): a poison `y` makes the lhs poison but the rhs is a defined
+//! constant. Unioning those is still sound for extraction because
 //! the rhs is a **constant**, which the cost model makes the unique cheapest
 //! member of its class, so min-cost extraction always selects the refining
 //! direction and never regresses a genuine `0` into a poison-capable product.
@@ -86,7 +95,7 @@ use crate::ir::value::{Const, ConstPool, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, Module};
 use crate::pass::{Changed, ModulePass};
 use crate::support::{DetHashMap, DetHashSet};
-use crate::transform::{FunctionTransform, dom_preorder, remap_value};
+use crate::transform::{FunctionTransform, dom_preorder, edge_args, remap_value};
 
 use puremp::Int;
 
@@ -264,6 +273,7 @@ impl Plan {
         // Build one e-class for every SSA value (pure ops become e-nodes over
         // their operands' classes; everything else is an opaque leaf).
         let mut eg = EGraph::new(types, consts, nv);
+        eg.forward = single_edge_args(func);
         for i in 0..nv {
             eg.class_of(func, ValueId::from_index(i));
         }
@@ -329,6 +339,9 @@ struct EGraph<'a> {
     memo: DetHashMap<ENode, usize>,
     /// Memo of `value → e-class id` while building.
     value_class: Vec<Option<usize>>,
+    /// `forward[p]`: the argument a block parameter `p` always equals, when
+    /// its block is entered by a single edge (see [`single_edge_args`]).
+    forward: Vec<Option<ValueId>>,
 }
 
 impl<'a> EGraph<'a> {
@@ -340,6 +353,7 @@ impl<'a> EGraph<'a> {
             classes: Vec::new(),
             memo: DetHashMap::default(),
             value_class: vec![None; value_count],
+            forward: vec![None; value_count],
         }
     }
 
@@ -403,6 +417,12 @@ impl<'a> EGraph<'a> {
     /// instructions recurse into their operands; every other value is a leaf.
     fn class_of(&mut self, func: &Function, v: ValueId) -> usize {
         if let Some(id) = self.value_class[v.index()] {
+            return id;
+        }
+        if let Some(a) = self.forward.get(v.index()).copied().flatten() {
+            // A copy of its block's only incoming argument: the same class.
+            let id = self.class_of(func, a);
+            self.value_class[v.index()] = Some(id);
             return id;
         }
         let ty = func.value_type(v);
@@ -613,8 +633,11 @@ impl<'a> EGraph<'a> {
     /// Apply the algebraic rewrite rules to one `(class, node)`. Every rule below
     /// is proved a refinement by the in-file `verified_rules_refine` test.
     fn apply_algebraic(&mut self, ci: usize, node: &ENode, ty: TypeId) -> bool {
-        let NodeOp::Bin(op, flags) = &node.op else {
-            return false;
+        let (op, flags) = match &node.op {
+            NodeOp::Bin(op, flags) => (op, flags),
+            NodeOp::Cast(op, rty) => return self.apply_cast(ci, *op, *rty, node),
+            NodeOp::Select => return self.apply_select(ci, node),
+            _ => return false,
         };
         // Restrict the algebraic rules to flag-free integer ops so no `nsw`/`nuw`/
         // `exact` assumption is ever silently dropped (that would be unsound).
@@ -686,6 +709,8 @@ impl<'a> EGraph<'a> {
                 if self.is_zero_class(a) || self.is_zero_class(b) {
                     changed |= self.add_zero(ci, ty);
                 }
+                // masks of packed values (the commuted node covers `m & x`)
+                changed |= self.apply_and_mask(ci, a, b, ty);
             }
             BinOp::Or => {
                 changed |= self.union_new(ci, NodeOp::Bin(BinOp::Or, none), vec![b, a], ty);
@@ -703,6 +728,9 @@ impl<'a> EGraph<'a> {
                     let r = self.find(b);
                     changed |= self.union(ci, r);
                 }
+            }
+            BinOp::Shl | BinOp::LShr | BinOp::AShr => {
+                changed |= self.apply_shift(ci, *op, a, b, ty);
             }
             BinOp::Xor => {
                 changed |= self.union_new(ci, NodeOp::Bin(BinOp::Xor, none), vec![b, a], ty);
@@ -723,6 +751,231 @@ impl<'a> EGraph<'a> {
             _ => {}
         }
         changed
+    }
+
+    // --- shift / cast rules (issue #17) ------------------------------------
+    //
+    // These let a value packed as `or(shl(zext x, k), c)` (a payload above a
+    // small tag, e.g. after inlining a constructor) be unpacked again. Each
+    // is proved by `shift_cast_rules_refine`, side conditions included. A
+    // rule whose rhs is strictly *more defined* than its lhs (it drops an
+    // operand that could be poison) is only applied when the rhs is a
+    // **constant**, which extraction always prefers (module docs); every
+    // other rule is an equality, proved in both directions.
+
+    /// The integer constant class `id` equals, reduced to its type's width.
+    fn const_int(&mut self, id: usize) -> Option<Int> {
+        let r = self.find(id);
+        let w = int_width(self.types, self.classes[r].ty)?;
+        match self.class_const(r)? {
+            Const::Int { value, .. } => Some(value.mod_2k(w)),
+            _ => None,
+        }
+    }
+
+    /// The shift amount in class `id`: a constant `k` with `k < w`.
+    fn shift_amount(&mut self, id: usize, w: u32) -> Option<u32> {
+        let k = self.const_int(id)?.to_u64()?;
+        if k < u64::from(w) { u32::try_from(k).ok() } else { None }
+    }
+
+    /// The width of class `id`'s (integer) type.
+    fn class_width(&mut self, id: usize) -> Option<u32> {
+        let r = self.find(id);
+        int_width(self.types, self.classes[r].ty)
+    }
+
+    /// The e-class of the integer constant `value mod 2^w` of type `ty`.
+    fn int_const(&mut self, ty: TypeId, w: u32, value: &Int) -> usize {
+        self.add_op(NodeOp::Const(Const::Int { ty, value: value.mod_2k(w) }), Vec::new(), ty)
+    }
+
+    /// Union `ci` with the integer constant `value` of type `ty`.
+    fn union_const(&mut self, ci: usize, ty: TypeId, w: u32, value: &Int) -> bool {
+        if self.classes.len() >= MAX_NODES {
+            return false;
+        }
+        let nid = self.int_const(ty, w, value);
+        self.union(ci, nid)
+    }
+
+    /// The `(op, operand)` of every cast e-node in class `id`.
+    fn cast_children(&mut self, id: usize) -> Vec<(CastOp, usize)> {
+        let r = self.find(id);
+        let mut out = Vec::new();
+        for n in &self.classes[r].nodes {
+            if let NodeOp::Cast(op, _) = &n.op
+                && n.children.len() == 1
+            {
+                out.push((*op, n.children[0]));
+            }
+        }
+        out
+    }
+
+    /// The `(y, k, c)` of every flag-free `or(shl(y, k), c)` in class `id`
+    /// whose `k` is a shift amount and `c` a constant (either `or` order: the
+    /// commuted node is in the class too).
+    fn packed_parts(&mut self, id: usize, w: u32) -> Vec<(usize, u32, Int)> {
+        let mut out = Vec::new();
+        for (p, q) in self.bin_children(id, BinOp::Or) {
+            let Some(c) = self.const_int(q) else { continue };
+            for (y, kc) in self.bin_children(p, BinOp::Shl) {
+                if let Some(k) = self.shift_amount(kc, w) {
+                    out.push((y, k, c.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Rules on a flag-free shift `op(a, b)` of type `ty`.
+    fn apply_shift(&mut self, ci: usize, op: BinOp, a: usize, b: usize, ty: TypeId) -> bool {
+        let Some(w) = int_width(self.types, ty) else {
+            return false;
+        };
+        let Some(k) = self.shift_amount(b, w) else {
+            return false;
+        };
+        let none = Flags::NONE;
+        let mut changed = false;
+        // x shift 0 = x
+        if k == 0 {
+            let r = self.find(a);
+            return self.union(ci, r);
+        }
+        // Same-direction shifts combine: (x << j) << k = x << (j+k), and all
+        // bits are shifted out once j+k ≥ w (a constant rhs).
+        if matches!(op, BinOp::Shl | BinOp::LShr) {
+            for (x, jc) in self.bin_children(a, op) {
+                let Some(j) = self.shift_amount(jc, w) else { continue };
+                if j + k < w {
+                    let amt = self.int_const(ty, w, &Int::from_u64(u64::from(j + k)));
+                    changed |= self.union_new(ci, NodeOp::Bin(op, none), vec![x, amt], ty);
+                } else {
+                    changed |= self.add_zero(ci, ty);
+                }
+            }
+        }
+        if op == BinOp::LShr {
+            // (x << k) >> k = x & (2^(w-k) - 1)
+            for (x, kc) in self.bin_children(a, BinOp::Shl) {
+                if self.shift_amount(kc, w) == Some(k) {
+                    let mask = Int::from_u64(1).mul_2k(w - k).sub(&Int::from_u64(1));
+                    let m = self.int_const(ty, w, &mask);
+                    changed |= self.union_new(ci, NodeOp::Bin(BinOp::And, none), vec![x, m], ty);
+                }
+            }
+            // (p | c) >> k = p >> k when c < 2^k: c's bits are all shifted out.
+            for (p, q) in self.bin_children(a, BinOp::Or) {
+                if self.const_int(q).is_some_and(|c| c.bit_len() <= k) {
+                    let kc = self.find(b);
+                    changed |= self.union_new(ci, NodeOp::Bin(BinOp::LShr, none), vec![p, kc], ty);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Mask rules on a flag-free `and(a, b)` with a constant mask `b`.
+    fn apply_and_mask(&mut self, ci: usize, a: usize, b: usize, ty: TypeId) -> bool {
+        let Some(w) = int_width(self.types, ty) else {
+            return false;
+        };
+        let Some(m) = self.const_int(b) else {
+            return false;
+        };
+        let ones = |n: u32| Int::from_u64(1).mul_2k(n).sub(&Int::from_u64(1));
+        let mut changed = false;
+        // x & -1 = x
+        if m == ones(w) {
+            let r = self.find(a);
+            changed |= self.union(ci, r);
+        }
+        // zext(x : iN) & m = zext x when m keeps the low N bits
+        for (op, x) in self.cast_children(a) {
+            if op == CastOp::ZExt
+                && let Some(n) = self.class_width(x)
+                && m.mod_2k(n) == ones(n)
+            {
+                let r = self.find(a);
+                changed |= self.union(ci, r);
+            }
+        }
+        // (shl(y, k) | c) & m → c & m when m < 2^k (the payload is masked off;
+        // a strict refinement whose rhs is a constant)
+        for (_, k, c) in self.packed_parts(a, w) {
+            if m.bit_len() <= k {
+                changed |= self.union_const(ci, ty, w, &c.bitand(&m));
+            }
+        }
+        changed
+    }
+
+    /// Rules on a cast `op x : rty` (casts carry no flags).
+    fn apply_cast(&mut self, ci: usize, op: CastOp, rty: TypeId, node: &ENode) -> bool {
+        let (Some(rw), [x]) = (int_width(self.types, rty), node.children.as_slice()) else {
+            return false;
+        };
+        let x = *x;
+        let Some(xw) = self.class_width(x) else {
+            return false;
+        };
+        let mut changed = false;
+        for (inner, y) in self.cast_children(x) {
+            let Some(yw) = self.class_width(y) else { continue };
+            // `op(inner(y : iY) : iX) : iR` as a single cast of `y`, or `None`
+            // when the pair does not simplify (or simplifies to `y` itself).
+            let merged = match (op, inner) {
+                // trunc(ext y): drop the extension, or keep a narrower one
+                (CastOp::Trunc, CastOp::ZExt | CastOp::SExt) => match rw.cmp(&yw) {
+                    std::cmp::Ordering::Equal => {
+                        let r = self.find(y);
+                        changed |= self.union(ci, r);
+                        None
+                    }
+                    std::cmp::Ordering::Less => Some(CastOp::Trunc),
+                    std::cmp::Ordering::Greater => Some(inner),
+                },
+                (CastOp::Trunc, CastOp::Trunc) => Some(CastOp::Trunc),
+                (CastOp::ZExt, CastOp::ZExt) | (CastOp::SExt, CastOp::SExt) => Some(op),
+                // sext(zext y) = zext y: a widening zext leaves the sign bit clear
+                (CastOp::SExt, CastOp::ZExt) if yw < xw => Some(CastOp::ZExt),
+                _ => None,
+            };
+            if let Some(m) = merged {
+                changed |= self.union_new(ci, NodeOp::Cast(m, rty), vec![y], rty);
+            }
+        }
+        // trunc(shl(y, k) | c) → trunc c when the result fits below bit k (a
+        // strict refinement whose rhs is a constant)
+        if op == CastOp::Trunc {
+            for (_, k, c) in self.packed_parts(x, xw) {
+                if rw <= k {
+                    changed |= self.union_const(ci, rty, rw, &c);
+                }
+            }
+        }
+        changed
+    }
+
+    /// `select` with a constant condition is its chosen arm.
+    fn apply_select(&mut self, ci: usize, node: &ENode) -> bool {
+        let [c, t, f] = node.children.as_slice() else {
+            return false;
+        };
+        let (t, f) = (*t, *f);
+        match self.const_int(*c) {
+            Some(v) if v.is_one() => {
+                let r = self.find(t);
+                self.union(ci, r)
+            }
+            Some(v) if v.is_zero() => {
+                let r = self.find(f);
+                self.union(ci, r)
+            }
+            _ => false,
+        }
     }
 
     /// Union `ci` with the constant `0` of type `ty`.
@@ -903,6 +1156,46 @@ impl<'a> EGraph<'a> {
         }
         false
     }
+}
+
+/// For every parameter of a reachable, non-entry block entered by exactly one
+/// CFG edge (as the inliner leaves a callee's return block), the argument
+/// that edge passes: the parameter always equals it. Modeling the parameter
+/// as its argument's e-class lets rules see through the copy. The argument
+/// is available wherever the parameter is: it is used by the terminator of
+/// the edge's source block, which dominates the target (the only way in).
+/// Uses of the parameter by opaque instructions are left as they are.
+fn single_edge_args(func: &Function) -> Vec<Option<ValueId>> {
+    let mut out = vec![None; func.value_count()];
+    let cfg = ControlFlowGraph::new(func);
+    let doms = Dominators::new(func, &cfg);
+    // Per block: the number of incoming edges and the first edge's arguments.
+    let mut edges: Vec<(usize, Option<&[ValueId]>)> = vec![(0, None); func.block_count()];
+    for (bid, blk) in func.blocks() {
+        if !doms.is_reachable(bid.index()) {
+            continue;
+        }
+        let Some(t) = blk.terminator() else { continue };
+        let term = func.inst(t);
+        for (si, succ) in term.successors().into_iter().enumerate() {
+            let e = &mut edges[succ.index()];
+            e.0 += 1;
+            e.1.get_or_insert(edge_args(term, si));
+        }
+    }
+    for (bid, blk) in func.blocks() {
+        if Some(bid) == func.entry() || !doms.is_reachable(bid.index()) {
+            continue;
+        }
+        if let (1, Some(args)) = edges[bid.index()]
+            && args.len() == blk.params().len()
+        {
+            for (&p, &a) in blk.params().iter().zip(args) {
+                out[p.index()] = Some(a);
+            }
+        }
+    }
+    out
 }
 
 /// Recursively lower the chosen e-node of class `cr` into the extraction DAG,
@@ -1916,7 +2209,7 @@ mod tests {
     use crate::ir::semantics::SemValue;
     use crate::ir::text::{parse_module, print_module};
     use crate::support::diagnostics::FileId;
-    use crate::transform::pipeline::pass_by_name;
+    use crate::transform::pipeline::{OptLevel, optimize, pass_by_name};
 
     fn parse(src: &str) -> (Module, StrInterner) {
         let mut syms = StrInterner::new();
@@ -2068,5 +2361,367 @@ entry ^0(%x: i64, %c: i1):
             }
         }
         assert_eq!(egraph_pass(&mut opt.0, &opt.1), Changed::No, "idempotent");
+    }
+
+    // --- issue #17: shift and cast rules -------------------------------------
+
+    /// The issue #17 repro: a tag in the low byte, a payload above it.
+    const ISSUE17_LF: &str = r#"
+module "i17"
+func @pack(i8, i32) -> i64 {
+entry ^0(%t: i8, %v: i32):
+  %a = zext %t : i64
+  %b = zext %v : i64
+  %c = shl %b, i64 8 : i64
+  %d = or %c, %a : i64
+  ret %d
+}
+func @main(i32) -> i64 {
+entry ^0(%v: i32):
+  %p = call @pack(i8 1, %v) : i64
+  %t = trunc %p : i8
+  %ok = icmp eq %t, i8 1 : i1
+  %s = lshr %p, i64 8 : i64
+  %w = trunc %s : i32
+  %r = zext %w : i64
+  %z = select %ok, %r, i64 0 : i64
+  ret %z
+}
+"#;
+
+    #[test]
+    fn issue17_packed_value_unpacks_after_inlining() {
+        let before = parse(ISSUE17_LF);
+        let mut opt = parse(ISSUE17_LF);
+        optimize(&mut opt.0, OptLevel::O2);
+        if let Err(e) = verify_module(&opt.0) {
+            panic!("-O2 output must verify: {e:#?}");
+        }
+        let f = opt.0.function(named(&opt.0, &opt.1, "main"));
+        // `%ok` folded to true, the select to `%r`, and `%r` to `zext %v`.
+        let kinds: Vec<InstKind> =
+            f.blocks().flat_map(|(_, b)| b.insts().iter().map(|&i| f.inst(i).kind.clone())).collect();
+        assert_eq!(kinds, vec![InstKind::Cast(crate::ir::inst::CastOp::ZExt)], "{}", print_module(&opt.0, &opt.1));
+        let r = ret_operand(f);
+        let ValueDef::Inst(i) = f.value(r).def else { panic!("returns the zext") };
+        let entry = f.entry().expect("has a body");
+        assert_eq!(f.inst(i).operands(), &[f.block(entry).params()[0]], "zext %v");
+        for v in [0, 1, 0x7fff_ffff, -1, 0x1234_5678] {
+            agree(&before, &opt, "main", &[int(32, v)]);
+        }
+    }
+
+    /// Run `egraph` alone on `src` and execute `@f` on every argument tuple,
+    /// returning the optimized module.
+    fn egraph_agrees(src: &str, argsets: &[Vec<SemValue>]) -> (Module, StrInterner) {
+        let before = parse(src);
+        let mut opt = parse(src);
+        egraph_pass(&mut opt.0, &opt.1);
+        for args in argsets {
+            agree(&before, &opt, "f", args);
+        }
+        opt
+    }
+
+    /// Whether `@f` still contains an instruction matching `pred`.
+    fn has(m: &(Module, StrInterner), pred: impl Fn(&InstKind) -> bool) -> bool {
+        count_kind(m.0.function(named(&m.0, &m.1, "f")), pred) > 0
+    }
+
+    #[test]
+    fn issue17_rules_fire_on_their_shapes() {
+        let args: Vec<Vec<SemValue>> = [0, 1, 0x7f, -1, 0x1234_5678].iter().map(|&v| vec![int(32, v)]).collect();
+        // trunc(lshr(or(shl(zext x, 8), 0xff), 8)) = x: the whole chain goes.
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i32 {
+entry ^0(%x: i32):
+  %a = zext %x : i64
+  %b = shl %a, i64 8 : i64
+  %c = or %b, i64 255 : i64
+  %d = lshr %c, i64 8 : i64
+  %e = trunc %d : i32
+  ret %e
+}
+"#, &args);
+        assert_eq!(count_kind(m.0.function(named(&m.0, &m.1, "f")), |_| true), 0, "{}", print_module(&m.0, &m.1));
+        // and(or(shl(_, 8), 0x5a), 0xff) = 0x5a; trunc(or(shl(_, 8), 0x15a)) : i8 = 0x5a.
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i64 {
+entry ^0(%x: i32):
+  %a = zext %x : i64
+  %b = shl %a, i64 8 : i64
+  %c = or %b, i64 346 : i64
+  %d = and %c, i64 255 : i64
+  %t = trunc %c : i8
+  %u = zext %t : i64
+  %s = add %d, %u : i64
+  ret %s
+}
+"#, &args);
+        assert_int_ret(&m.0, named(&m.0, &m.1, "f"), 64, 0xb4);
+        // lshr(shl(zext x, 16), 16) = zext x; zext/sext chains collapse.
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i64 {
+entry ^0(%x: i32):
+  %a = zext %x : i64
+  %b = shl %a, i64 16 : i64
+  %c = lshr %b, i64 16 : i64
+  %n = trunc %x : i16
+  %w = zext %n : i32
+  %z = zext %w : i64
+  %s = sext %w : i64
+  %t = add %z, %s : i64
+  %r = xor %c, %t : i64
+  ret %r
+}
+"#, &args);
+        let f = m.0.function(named(&m.0, &m.1, "f"));
+        assert!(!has(&m, |k| matches!(k, InstKind::Bin(BinOp::Shl | BinOp::LShr))), "{}", print_module(&m.0, &m.1));
+        assert_eq!(count_kind(f, |k| matches!(k, InstKind::Cast(_))), 3, "zext x, trunc x, one zext:\n{}", print_module(&m.0, &m.1));
+        // shifts of shifts by constants
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i32 {
+entry ^0(%x: i32):
+  %a = shl %x, i32 3 : i32
+  %b = shl %a, i32 4 : i32
+  %c = lshr %x, i32 20 : i32
+  %d = lshr %c, i32 12 : i32
+  %e = lshr %b, i32 0 : i32
+  %r = or %e, %d : i32
+  ret %r
+}
+"#, &args);
+        let f = m.0.function(named(&m.0, &m.1, "f"));
+        assert_eq!(count_kind(f, |_| true), 1, "a single `shl x, 7`:\n{}", print_module(&m.0, &m.1));
+    }
+
+    /// Where a side condition fails, the rule must not fire (execution then
+    /// checks the result is still right).
+    #[test]
+    fn issue17_rules_respect_side_conditions() {
+        let args: Vec<Vec<SemValue>> = [0, 1, 0x7f, -1, 0x1234_5678].iter().map(|&v| vec![int(32, v)]).collect();
+        let shifts = |k: &InstKind| matches!(k, InstKind::Bin(BinOp::LShr | BinOp::Shl));
+        // c = 0x1ff ≥ 2^8: a tag bit lands in the payload, so no unpacking.
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i32 {
+entry ^0(%x: i32):
+  %a = zext %x : i64
+  %b = shl %a, i64 8 : i64
+  %c = or %b, i64 511 : i64
+  %d = lshr %c, i64 8 : i64
+  %e = trunc %d : i32
+  ret %e
+}
+"#, &args);
+        assert!(has(&m, |k| matches!(k, InstKind::Bin(BinOp::Or))), "{}", print_module(&m.0, &m.1));
+        // trunc to i16 > k = 8 and a mask 0x1ff ≥ 2^8 keep payload bits.
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i64 {
+entry ^0(%x: i32):
+  %a = zext %x : i64
+  %b = shl %a, i64 8 : i64
+  %c = or %b, i64 1 : i64
+  %d = and %c, i64 511 : i64
+  %t = trunc %c : i16
+  %u = zext %t : i64
+  %s = add %d, %u : i64
+  ret %s
+}
+"#, &args);
+        assert!(has(&m, shifts), "{}", print_module(&m.0, &m.1));
+        // k = 40 > 64 - 32: the round trip loses payload bits, so it is a mask,
+        // not `zext x`.
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i64 {
+entry ^0(%x: i32):
+  %a = zext %x : i64
+  %b = shl %a, i64 40 : i64
+  %c = lshr %b, i64 40 : i64
+  ret %c
+}
+"#, &args);
+        assert!(has(&m, |k| matches!(k, InstKind::Bin(BinOp::And))), "{}", print_module(&m.0, &m.1));
+        // A flagged shift (`shl nuw`, `lshr exact`) is left alone: the rules
+        // fire on flag-free ops only, so no poison assumption is dropped.
+        let m = egraph_agrees(r#"
+module "m"
+func @f(i32) -> i64 {
+entry ^0(%x: i32):
+  %a = zext %x : i64
+  %b = shl nuw %a, i64 8 : i64
+  %c = lshr %b, i64 8 : i64
+  %d = lshr exact %a, i64 0 : i64
+  %r = add %c, %d : i64
+  ret %r
+}
+"#, &args);
+        assert!(has(&m, shifts), "{}", print_module(&m.0, &m.1));
+    }
+
+    /// **B2 verification of the shift/cast rules (issue #17).** Each rule is
+    /// a refinement `lhs ⇒ rhs` under its side condition `pre`, encoded in the
+    /// source as `select pre, lhs, poison` (where the side condition fails any
+    /// target refines it). Symbolic shift amounts and constants stand for the
+    /// constants the e-graph matches. An *equality* is also proved in reverse
+    /// (`select pre, rhs, poison ⇒ lhs`); a one-directional rule (its rhs drops
+    /// an operand that may be poison) is only applied by the e-graph when its
+    /// rhs is a constant. Wide values are `i8`, narrow ones `i3`/`i4`/`i6`.
+    #[test]
+    fn shift_cast_rules_refine() {
+        use crate::ir::inst::{CastOp, IntPred};
+        type Side = fn(&mut FunctionBuilder<'_>, &[ValueId]) -> ValueId;
+        let mut syms = StrInterner::new();
+        let mut m = Module::new("eqsat-shift-cast");
+        let (i3, i4, i8t) = (m.types_mut().int(3), m.types_mut().int(4), m.types_mut().int(8));
+        // `k < 8` (a valid shift amount of the `i8` operands).
+        fn kok(b: &mut FunctionBuilder<'_>, k: ValueId) -> ValueId {
+            let eight = ci(b, &[k], 8);
+            b.icmp(IntPred::Ult, k, eight)
+        }
+        // `c < 2^k`, i.e. `c >> k == 0`.
+        fn below(b: &mut FunctionBuilder<'_>, c: ValueId, k: ValueId) -> ValueId {
+            let s = b.bin(BinOp::LShr, c, k, Flags::NONE);
+            let z = ci(b, &[c], 0);
+            b.icmp(IntPred::Eq, s, z)
+        }
+        fn and1(b: &mut FunctionBuilder<'_>, x: ValueId, y: ValueId) -> ValueId {
+            b.bin(BinOp::And, x, y, Flags::NONE)
+        }
+        fn ty(b: &mut FunctionBuilder<'_>, w: u32) -> TypeId {
+            b.types_mut().int(w)
+        }
+        fn packed(b: &mut FunctionBuilder<'_>, y: ValueId, k: ValueId, c: ValueId) -> ValueId {
+            let s = b.bin(BinOp::Shl, y, k, Flags::NONE);
+            b.bin(BinOp::Or, s, c, Flags::NONE)
+        }
+        // (name, params, ret, side condition, lhs, rhs, equality?)
+        type Rule = (&'static str, Vec<TypeId>, TypeId, Option<Side>, Side, Side, bool);
+        let rules: Vec<Rule> = vec![
+            ("shl-zero", vec![i8t], i8t, None,
+                |b, p| { let z = ci(b, p, 0); b.bin(BinOp::Shl, p[0], z, Flags::NONE) }, |_, p| p[0], true),
+            ("lshr-zero", vec![i8t], i8t, None,
+                |b, p| { let z = ci(b, p, 0); b.bin(BinOp::LShr, p[0], z, Flags::NONE) }, |_, p| p[0], true),
+            ("ashr-zero", vec![i8t], i8t, None,
+                |b, p| { let z = ci(b, p, 0); b.bin(BinOp::AShr, p[0], z, Flags::NONE) }, |_, p| p[0], true),
+            // (x << j) << k = x << (j+k) when j+k < 8, else 0
+            ("shl-shl", vec![i8t, i8t, i8t], i8t,
+                Some(|b, p| { let (a, c) = (kok(b, p[1]), kok(b, p[2])); let s = b.add(p[1], p[2], Flags::NONE); let d = kok(b, s); let ac = and1(b, a, c); and1(b, ac, d) }),
+                |b, p| { let s = b.bin(BinOp::Shl, p[0], p[1], Flags::NONE); b.bin(BinOp::Shl, s, p[2], Flags::NONE) },
+                |b, p| { let s = b.add(p[1], p[2], Flags::NONE); b.bin(BinOp::Shl, p[0], s, Flags::NONE) }, true),
+            ("shl-shl-out", vec![i8t, i8t, i8t], i8t,
+                Some(|b, p| { let (a, c) = (kok(b, p[1]), kok(b, p[2])); let s = b.add(p[1], p[2], Flags::NONE); let eight = ci(b, p, 8); let d = b.icmp(IntPred::Uge, s, eight); let ac = and1(b, a, c); and1(b, ac, d) }),
+                |b, p| { let s = b.bin(BinOp::Shl, p[0], p[1], Flags::NONE); b.bin(BinOp::Shl, s, p[2], Flags::NONE) },
+                |b, p| ci(b, p, 0), false),
+            ("lshr-lshr", vec![i8t, i8t, i8t], i8t,
+                Some(|b, p| { let (a, c) = (kok(b, p[1]), kok(b, p[2])); let s = b.add(p[1], p[2], Flags::NONE); let d = kok(b, s); let ac = and1(b, a, c); and1(b, ac, d) }),
+                |b, p| { let s = b.bin(BinOp::LShr, p[0], p[1], Flags::NONE); b.bin(BinOp::LShr, s, p[2], Flags::NONE) },
+                |b, p| { let s = b.add(p[1], p[2], Flags::NONE); b.bin(BinOp::LShr, p[0], s, Flags::NONE) }, true),
+            ("lshr-lshr-out", vec![i8t, i8t, i8t], i8t,
+                Some(|b, p| { let (a, c) = (kok(b, p[1]), kok(b, p[2])); let s = b.add(p[1], p[2], Flags::NONE); let eight = ci(b, p, 8); let d = b.icmp(IntPred::Uge, s, eight); let ac = and1(b, a, c); and1(b, ac, d) }),
+                |b, p| { let s = b.bin(BinOp::LShr, p[0], p[1], Flags::NONE); b.bin(BinOp::LShr, s, p[2], Flags::NONE) },
+                |b, p| ci(b, p, 0), false),
+            // (x << k) >> k = x & (-1 >> k)   [the mask 2^(8-k) - 1]
+            ("lshr-shl", vec![i8t, i8t], i8t, Some(|b, p| kok(b, p[1])),
+                |b, p| { let s = b.bin(BinOp::Shl, p[0], p[1], Flags::NONE); b.bin(BinOp::LShr, s, p[1], Flags::NONE) },
+                |b, p| { let ones = ci(b, p, -1); let mk = b.bin(BinOp::LShr, ones, p[1], Flags::NONE); and1(b, p[0], mk) }, true),
+            // (p | c) >> k = p >> k when c < 2^k
+            ("lshr-or-low", vec![i8t, i8t, i8t], i8t,
+                Some(|b, p| { let a = kok(b, p[2]); let c = below(b, p[1], p[2]); and1(b, a, c) }),
+                |b, p| { let o = b.bin(BinOp::Or, p[0], p[1], Flags::NONE); b.bin(BinOp::LShr, o, p[2], Flags::NONE) },
+                |b, p| b.bin(BinOp::LShr, p[0], p[2], Flags::NONE), true),
+            ("and-ones", vec![i8t], i8t, None,
+                |b, p| { let m = ci(b, p, -1); and1(b, p[0], m) }, |_, p| p[0], true),
+            // zext(x : i3) & m = zext x when m keeps the low 3 bits
+            ("and-zext-mask", vec![i3, i8t], i8t,
+                Some(|b, p| { let seven = ci(b, &p[1..], 7); let lo = and1(b, p[1], seven); b.icmp(IntPred::Eq, lo, seven) }),
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::ZExt, p[0], w); and1(b, z, p[1]) },
+                |b, p| { let w = ty(b, 8); b.cast(CastOp::ZExt, p[0], w) }, true),
+            // (shl(y, k) | c) & m → c & m when m < 2^k
+            ("and-packed", vec![i8t, i8t, i8t, i8t], i8t,
+                Some(|b, p| { let a = kok(b, p[1]); let c = below(b, p[3], p[1]); and1(b, a, c) }),
+                |b, p| { let o = packed(b, p[0], p[1], p[2]); and1(b, o, p[3]) },
+                |b, p| and1(b, p[2], p[3]), false),
+            // trunc(shl(y, k) | c) : i3 → trunc c when 3 ≤ k
+            ("trunc-packed", vec![i8t, i8t, i8t], i3,
+                Some(|b, p| { let a = kok(b, p[1]); let three = ci(b, p, 3); let c = b.icmp(IntPred::Uge, p[1], three); and1(b, a, c) }),
+                |b, p| { let o = packed(b, p[0], p[1], p[2]); let r = ty(b, 3); b.cast(CastOp::Trunc, o, r) },
+                |b, p| { let r = ty(b, 3); b.cast(CastOp::Trunc, p[2], r) }, false),
+            // cast pairs over y : i4 (through i8)
+            ("trunc-zext-same", vec![i4], i4, None,
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::ZExt, p[0], w); let r = ty(b, 4); b.cast(CastOp::Trunc, z, r) }, |_, p| p[0], true),
+            ("trunc-zext-narrow", vec![i4], i3, None,
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::ZExt, p[0], w); let r = ty(b, 3); b.cast(CastOp::Trunc, z, r) },
+                |b, p| { let r = ty(b, 3); b.cast(CastOp::Trunc, p[0], r) }, true),
+            ("trunc-zext-wide", vec![i4], ty6(&mut m), None,
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::ZExt, p[0], w); let r = ty(b, 6); b.cast(CastOp::Trunc, z, r) },
+                |b, p| { let r = ty(b, 6); b.cast(CastOp::ZExt, p[0], r) }, true),
+            ("trunc-sext-same", vec![i4], i4, None,
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::SExt, p[0], w); let r = ty(b, 4); b.cast(CastOp::Trunc, z, r) }, |_, p| p[0], true),
+            ("trunc-sext-narrow", vec![i4], i3, None,
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::SExt, p[0], w); let r = ty(b, 3); b.cast(CastOp::Trunc, z, r) },
+                |b, p| { let r = ty(b, 3); b.cast(CastOp::Trunc, p[0], r) }, true),
+            ("trunc-sext-wide", vec![i4], ty6(&mut m), None,
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::SExt, p[0], w); let r = ty(b, 6); b.cast(CastOp::Trunc, z, r) },
+                |b, p| { let r = ty(b, 6); b.cast(CastOp::SExt, p[0], r) }, true),
+            ("trunc-trunc", vec![i8t], i3, None,
+                |b, p| { let w = ty(b, 6); let t = b.cast(CastOp::Trunc, p[0], w); let r = ty(b, 3); b.cast(CastOp::Trunc, t, r) },
+                |b, p| { let r = ty(b, 3); b.cast(CastOp::Trunc, p[0], r) }, true),
+            ("zext-zext", vec![i4], i8t, None,
+                |b, p| { let w = ty(b, 6); let z = b.cast(CastOp::ZExt, p[0], w); let r = ty(b, 8); b.cast(CastOp::ZExt, z, r) },
+                |b, p| { let r = ty(b, 8); b.cast(CastOp::ZExt, p[0], r) }, true),
+            ("sext-sext", vec![i4], i8t, None,
+                |b, p| { let w = ty(b, 6); let z = b.cast(CastOp::SExt, p[0], w); let r = ty(b, 8); b.cast(CastOp::SExt, z, r) },
+                |b, p| { let r = ty(b, 8); b.cast(CastOp::SExt, p[0], r) }, true),
+            ("sext-zext", vec![i4], i8t, None,
+                |b, p| { let w = ty(b, 6); let z = b.cast(CastOp::ZExt, p[0], w); let r = ty(b, 8); b.cast(CastOp::SExt, z, r) },
+                |b, p| { let r = ty(b, 8); b.cast(CastOp::ZExt, p[0], r) }, true),
+            ("select-true", vec![i8t, i8t], i8t, None,
+                |b, p| { let t = b.const_bool(true); b.select(t, p[0], p[1]) }, |_, p| p[0], true),
+            ("select-false", vec![i8t, i8t], i8t, None,
+                |b, p| { let f = b.const_bool(false); b.select(f, p[0], p[1]) }, |_, p| p[1], true),
+            // The issue's compositions, end to end (x : i3 in an i8 word).
+            // trunc(lshr(or(shl(zext x, k), c), k)) = x when c < 2^k, k ≤ 5
+            ("unpack", vec![i3, i8t, i8t], i3,
+                Some(|b, p| { let five = ci(b, &p[1..], 5); let a = b.icmp(IntPred::Ule, p[1], five); let c = below(b, p[2], p[1]); and1(b, a, c) }),
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::ZExt, p[0], w); let o = packed(b, z, p[1], p[2]); let s = b.bin(BinOp::LShr, o, p[1], Flags::NONE); let r = ty(b, 3); b.cast(CastOp::Trunc, s, r) },
+                |_, p| p[0], true),
+            // lshr(shl(zext x, k), k) = zext x when k ≤ 5
+            ("lshr-shl-zext", vec![i3, i8t], i8t,
+                Some(|b, p| { let five = ci(b, &p[1..], 5); b.icmp(IntPred::Ule, p[1], five) }),
+                |b, p| { let w = ty(b, 8); let z = b.cast(CastOp::ZExt, p[0], w); let s = b.bin(BinOp::Shl, z, p[1], Flags::NONE); b.bin(BinOp::LShr, s, p[1], Flags::NONE) },
+                |b, p| { let w = ty(b, 8); b.cast(CastOp::ZExt, p[0], w) }, true),
+        ];
+        fn ty6(m: &mut Module) -> TypeId {
+            m.types_mut().int(6)
+        }
+        let guarded = |b: &mut FunctionBuilder<'_>, p: &[ValueId], pre: Option<Side>, side: Side, ret: TypeId| {
+            let v = side(b, p);
+            match pre {
+                Some(pre) => {
+                    let c = pre(b, p);
+                    let poison = b.poison(ret);
+                    b.select(c, v, poison)
+                }
+                None => v,
+            }
+        };
+        for (name, params, ret, pre, lhs, rhs, eq) in rules {
+            let src = build_fn(&mut m, &mut syms, &format!("{name}_s"), &params, ret, |b, p| guarded(b, p, pre, lhs, ret));
+            let tgt = build_fn(&mut m, &mut syms, &format!("{name}_t"), &params, ret, rhs);
+            assert!(verify_module(&m).is_ok(), "rule `{name}` builds valid IR");
+            assert_refines(&m, src, tgt, name);
+            if eq {
+                let src = build_fn(&mut m, &mut syms, &format!("{name}_rs"), &params, ret, |b, p| guarded(b, p, pre, rhs, ret));
+                let tgt = build_fn(&mut m, &mut syms, &format!("{name}_rt"), &params, ret, lhs);
+                assert_refines(&m, src, tgt, &format!("{name} (reverse)"));
+            }
+        }
     }
 }
