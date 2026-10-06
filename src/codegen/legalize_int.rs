@@ -241,11 +241,8 @@ pub fn legalize_ints(
     let big_endian = module.data_layout().endian() == Endian::Big;
     for fid in work {
         // `map_function` carries the attributes (linkage, visibility,
-        // secrecy) over; the declaration line is kept here.
+        // secrecy) and the declaration line over.
         let (fresh, ()) = module.map_function(fid, |old, b| {
-            if let Some(line) = old.decl_line {
-                b.set_decl_line(line);
-            }
             let part_ty = b.types_mut().int(w);
             let mut lz = Lz { b, old, w, part_ty, vmap: vec![None; old.value_count()], libcalls: &libcalls, big_endian };
             lz.run();
@@ -519,7 +516,9 @@ impl Lz<'_, '_> {
             let bb = BlockId::from_index(b);
             self.b.switch_to(new_block[b]);
             if b == entry {
-                // Wide function parameters arrive whole: split them first.
+                // Wide function parameters arrive whole: split them first (at
+                // the entry block's first line).
+                self.b.set_line(crate::transform::block_line(old, bb));
                 let params = self.b.block_params(new_block[b]).to_vec();
                 for (&op, &np) in old.block(bb).params().iter().zip(&params) {
                     let ty = old.value_type(op);
@@ -528,6 +527,8 @@ impl Lz<'_, '_> {
                 }
             }
             for &i in old.block(bb).insts() {
+                // Every part of a split instruction takes its line.
+                self.b.set_line_from(old, i);
                 self.inst(i);
             }
             self.terminator(bb, &new_block);
@@ -550,6 +551,7 @@ impl Lz<'_, '_> {
     fn terminator(&mut self, bb: BlockId, new_block: &[BlockId]) {
         let old = self.old;
         let Some(t) = old.block(bb).terminator() else { return };
+        self.b.set_line_from(old, t);
         let term = old.inst(t);
         let ops = term.operands();
         match &term.kind {

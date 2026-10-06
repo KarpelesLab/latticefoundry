@@ -66,7 +66,7 @@ use crate::ir::{BlockId, FuncId, Function, Global, GlobalId, Module};
 use crate::pass::{Changed, ModulePass};
 use crate::support::Sym;
 use crate::transform::pipeline::{OptLevel, pipeline_for, run_passes};
-use crate::transform::{dom_preorder, rebuild_terminator, remap_value};
+use crate::transform::{block_line, dom_preorder, rebuild_terminator, remap_value};
 
 /// An element of the cost lattice: at most `n` cost units, or unbounded (⊤).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -697,6 +697,8 @@ fn rebuild(
         let Some(cb) = check_block[h] else { continue };
         let args = b.block_params(cb).to_vec();
         b.switch_to(cb);
+        // The yield check stands for its loop header: it takes the header's line.
+        b.set_line(block_line(old, BlockId::from_index(h)));
         let fp = b.global_ref(flag);
         let fv = b.load_volatile(i32t, fp, 4);
         let zero = b.const_i64(i32t, 0);
@@ -711,6 +713,7 @@ fn rebuild(
 }
 
 fn copy_inst(vmap: &mut [Option<ValueId>], old: &Function, b: &mut FunctionBuilder<'_>, i: InstId) {
+    b.set_line_from(old, i);
     let inst = old.inst(i);
     let ops: Vec<ValueId> = inst.operands().iter().map(|&o| remap_value(vmap, old, b, o)).collect();
     let result_ty = inst.result().map(|_| inst.ty);

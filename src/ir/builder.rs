@@ -67,6 +67,20 @@ impl<'a> FunctionBuilder<'a> {
         self.cur_line = line;
     }
 
+    /// The source line currently attributed to emitted instructions (`0` when
+    /// none), so a rebuild can save it around a nested emission and restore it.
+    pub fn line(&self) -> u32 {
+        self.cur_line
+    }
+
+    /// Attribute the instructions emitted next to the recorded line of `inst` in
+    /// `old` (none when `old` carries no line for it): the line-carrying idiom of
+    /// a functional rebuild, called before copying or replacing each old
+    /// instruction so the rebuilt body keeps its source provenance.
+    pub fn set_line_from(&mut self, old: &Function, inst: InstId) {
+        self.cur_line = old.inst_line(inst).unwrap_or(0);
+    }
+
     /// Record the function's declaration source line (for debug info).
     pub fn set_decl_line(&mut self, line: u32) {
         self.func.decl_line = Some(line);

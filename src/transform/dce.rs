@@ -218,6 +218,7 @@ fn eliminate(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
             if !lv.inst[i.index()] {
                 continue;
             }
+            builder.set_line_from(old, i);
             let inst = old.inst(i);
             let mut ops = Vec::with_capacity(inst.operands().len());
             for &o in inst.operands() {

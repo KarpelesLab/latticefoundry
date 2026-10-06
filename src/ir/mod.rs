@@ -515,6 +515,11 @@ impl Module {
     /// own return value. The module is left untouched — the caller decides
     /// whether to install the result with [`Module::replace_function`].
     ///
+    /// The fresh function inherits the old one's attributes and `decl_line`.
+    /// Instruction lines are the rebuild's job: call
+    /// [`builder::FunctionBuilder::set_line_from`] before copying or replacing
+    /// each old instruction so the rebuilt body keeps its source lines.
+    ///
     /// This is the backbone of the [`crate::transform`] layer: transforms read
     /// the old body and reconstruct it, rather than performing fragile in-place
     /// surgery on the arena.
@@ -527,6 +532,7 @@ impl Module {
         let old = &functions[id.index()];
         let mut fresh = Function::new(old.name, old.sig);
         fresh.attrs = old.attrs.clone();
+        fresh.decl_line = old.decl_line;
         let r = {
             let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts)
                 .with_global_spaces(global_addr_space);
@@ -558,6 +564,7 @@ impl Module {
         let caller = &funcs[id.index()];
         let mut fresh = Function::new(caller.name, caller.sig);
         fresh.attrs = caller.attrs.clone();
+        fresh.decl_line = caller.decl_line;
         let r = {
             let mut b = builder::FunctionBuilder::new(&mut fresh, types, consts)
                 .with_global_spaces(global_addr_space);

@@ -233,6 +233,9 @@ fn rebuild(
         let bb = BlockId::from_index(b);
         builder.switch_to(new_head[b]);
         for &i in caller.block(bb).insts() {
+            // Caller code keeps its lines; the call-entry glue (argument
+            // coercion and the branch into the copy) takes the call's line.
+            builder.set_line_from(caller, i);
             if let Some(callee_id) = decisions[i.index()] {
                 let call = caller.inst(i);
                 // The continuation takes the call's result as its lone parameter.
@@ -306,6 +309,8 @@ fn splice_callee(
         let bb = BlockId::from_index(cb);
         builder.switch_to(callee_new[cb]);
         for &ci in callee.block(bb).insts() {
+            // Inlined instructions keep the callee's own lines.
+            builder.set_line_from(callee, ci);
             copy_generic(&mut cmap, callee, builder, callee.inst(ci));
         }
         rebuild_callee_terminator(&mut cmap, callee, builder, &callee_new, bb, cont);
@@ -326,6 +331,7 @@ fn rebuild_callee_terminator(
     let Some(t) = callee.block(bb).terminator() else {
         return;
     };
+    builder.set_line_from(callee, t);
     let term = callee.inst(t);
     if matches!(term.kind, InstKind::Ret) {
         let mut cargs = Vec::new();

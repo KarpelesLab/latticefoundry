@@ -230,6 +230,8 @@ fn emit_inst(
     builder: &mut FunctionBuilder<'_>,
     i: InstId,
 ) {
+    // A hoisted instruction keeps its own line.
+    builder.set_line_from(old, i);
     let inst = old.inst(i);
     let mut ops = Vec::with_capacity(inst.operands().len());
     for &o in inst.operands() {
@@ -255,6 +257,7 @@ fn emit_term(
     let Some(t) = old.block(bb).terminator() else {
         return;
     };
+    builder.set_line_from(old, t);
     let term = old.inst(t);
     let ops = term.operands();
     match &term.kind {
@@ -464,6 +467,8 @@ fn hoist(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
             for &i in &hoist_in_loop[l] {
                 emit_inst(&mut vmap, old, builder, i);
             }
+            // The preheader's jump into the loop keeps the line of the last
+            // hoisted instruction (it is emitted right after them).
             let phparams = builder.block_params(ph).to_vec();
             builder.br(new_block[b], &phparams);
         }

@@ -587,6 +587,7 @@ fn rebuild(old: &Function, plan: &Plan, builder: &mut FunctionBuilder<'_>, entry
         builder.switch_to(nb);
         let bb = BlockId::from_index(b);
         for &i in old.block(bb).insts() {
+            builder.set_line_from(old, i);
             let inst = old.inst(i);
             // A proven-constant result: fold it away, mapping its uses to the
             // literal, and do not emit the (pure) computation.
@@ -647,6 +648,7 @@ fn emit_single_edge(
     edge: usize,
 ) {
     let t = old.block(bb).terminator().expect("reachable block is terminated");
+    builder.set_line_from(old, t);
     let term = old.inst(t);
     let succ = term.successors()[edge];
     let args = edge_args(term, edge);

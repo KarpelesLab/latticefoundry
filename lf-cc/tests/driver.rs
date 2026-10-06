@@ -239,3 +239,83 @@ fn file_scope_asm_is_merged_into_the_dash_c_object() {
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+/// Find an LLVM tool on `PATH` or in `/usr/lib/llvm/*/bin`.
+fn llvm_tool(name: &str) -> Option<PathBuf> {
+    if Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return Some(PathBuf::from(name));
+    }
+    let mut found: Vec<PathBuf> = std::fs::read_dir("/usr/lib/llvm")
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join("bin").join(name))
+        .filter(|p| p.is_file())
+        .collect();
+    found.sort();
+    found.pop()
+}
+
+/// A loop whose bound comes from `getpid` (4..=7 iterations), calling a
+/// `static` helper the optimizer inlines.
+const LINES_C: &str = r#"int getpid(void);
+int printf(const char *fmt, ...);
+
+static long step(long acc, long i) {
+    long m = i * 3;
+    return acc + m;
+}
+
+int main(void) {
+    long n = (getpid() & 7) | 4;
+    long acc = 0;
+    for (long i = 0; i < n; i++)
+        acc = step(acc, i);
+    printf("%ld\n", acc);
+    return 0;
+}
+"#;
+
+/// Issue #19: `-O2 -g` keeps the source lines through the optimizer, so the
+/// line table covers the optimized code and gdb can break on a line (the
+/// coreutils `rm/r-root` and `tail/inotify-race` tests rely on this).
+#[test]
+fn o2_debug_info_keeps_line_table() {
+    if host_crt().is_none() {
+        return;
+    }
+    let s = Scratch::new("o2lines");
+    s.write("lines.c", LINES_C);
+    s.lf_cc(&["-O2", "-g", "lines.c", "-o", "lines"]);
+    let exe = s.0.join("lines");
+    let line = |needle: &str| LINES_C.lines().position(|l| l.contains(needle)).expect("line") as u32 + 1;
+    if let Some(dwarfdump) = llvm_tool("llvm-dwarfdump") {
+        let out = Command::new(dwarfdump).arg("--debug-line").arg(&exe).output().expect("run llvm-dwarfdump");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let rows: Vec<u32> = text
+            .lines()
+            .filter(|l| l.starts_with("0x"))
+            .filter_map(|l| l.split_whitespace().nth(1)?.parse().ok())
+            .collect();
+        for needle in ["long n = ", "long m = ", "printf(\"%ld"] {
+            assert!(rows.contains(&line(needle)), "no row for `{needle}` at -O2:\n{text}");
+        }
+    } else {
+        eprintln!("llvm-dwarfdump not installed, line-table check skipped");
+    }
+    if Command::new("gdb").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        // A line of the inlined helper, and one of `main` after the loop.
+        for needle in ["long m = ", "printf(\"%ld"] {
+            let l = line(needle);
+            let out = Command::new("gdb")
+                .args(["-batch", "-nx", "-ex", &format!("break lines.c:{l}"), "-ex", "run", "-ex", "bt 1"])
+                .arg(&exe)
+                .current_dir(&s.0)
+                .output()
+                .expect("run gdb");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains(&format!("main () at lines.c:{l}\n")), "gdb did not stop at lines.c:{l}:\n{text}");
+        }
+    } else {
+        eprintln!("gdb not installed, breakpoint check skipped");
+    }
+}

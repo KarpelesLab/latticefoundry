@@ -59,9 +59,10 @@ Almost every remaining failure has one cause: lf-cc's `long double` is a
 
   The fix is a true x87 `long double` in the backend: an IR `f80` type,
   x87 code, and the System V memory-class ABI with an `st(0)` return.
-- **Debug info at `-O2`.** `rm/r-root` and `tail/inotify-race{,2}` set gdb
-  breakpoints by source line. The optimizer drops the line table at `-O2`,
-  so gdb finds no line and the tests skip.
+- **Debug info across objects.** `rm/r-root` sets a gdb breakpoint on a
+  line of `remove.c`. The optimizer now keeps the line table at `-O2`
+  (issue #19; `tail/inotify-race{,2}` pass), but the link keeps the DWARF of
+  the first object only, so gdb finds no `remove.c` and the test skips.
 
 ## What coreutils needed
 

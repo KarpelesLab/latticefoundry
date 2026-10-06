@@ -741,10 +741,23 @@ fn superoptimize_unchecked(module: &mut Module, func: FuncId, budget: &Budget) -
     // Rebuild the winning candidate into a fresh function of `module`.
     let tm = TypeMap::build(module, &spec.param_widths, spec.ret_width, &found.expr);
     let expr = found.expr;
-    let (fresh, ()) = module.map_function(func, |_old, b| {
+    let (fresh, ()) = module.map_function(func, |old, b| {
+        // The synthesized expression replaces the one rooted at the returned
+        // value: it takes that root instruction's line (the `ret`'s when the
+        // root is not an instruction or has none), and the `ret` keeps its own.
+        let ret = old.entry().and_then(|e| old.block(e).terminator()).expect("a spec has a ret");
+        let root_line = match old.inst(ret).operands().first().map(|&v| &old.value(v).def) {
+            Some(ValueDef::Inst(i)) => old.inst_line(*i),
+            _ => None,
+        };
         let entry = b.create_entry_block();
         let params: Vec<ValueId> = b.block_params(entry).to_vec();
+        b.set_line_from(old, ret);
+        if let Some(l) = root_line {
+            b.set_line(l);
+        }
         let r = build_expr(b, &expr, &params, &tm);
+        b.set_line_from(old, ret);
         b.ret(Some(r));
     });
     Some(fresh)

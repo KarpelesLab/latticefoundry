@@ -217,6 +217,8 @@ enum ExtNode {
         ty: TypeId,
         /// Operand ext-node indices, in order.
         children: Vec<usize>,
+        /// The source line to emit it at (`0`: inherit the use site's line).
+        line: u32,
     },
 }
 
@@ -810,6 +812,19 @@ impl<'a> EGraph<'a> {
             }
         }
 
+        // Each class's source line: that of its lowest-numbered original
+        // instruction carrying one (deterministic; `0` when none does, e.g. a
+        // class a rewrite introduced, which then inherits its use site's line).
+        let mut class_line = vec![0u32; ncls];
+        for (i, vc) in self.value_class.iter().enumerate() {
+            if let (Some(c), ValueDef::Inst(inst)) = (vc, &func.value(ValueId::from_index(i)).def)
+                && let Some(l) = func.inst_line(*inst)
+                && class_line[root[*c]] == 0
+            {
+                class_line[root[*c]] = l;
+            }
+        }
+
         // Materialize the extraction DAG for every modeled value's class.
         let mut nodes = Vec::new();
         let mut ext_of: Vec<Option<usize>> = vec![None; ncls];
@@ -820,7 +835,7 @@ impl<'a> EGraph<'a> {
                 continue;
             }
             let cr = root[self.value_class[i].expect("built a class for every value")];
-            let idx = build_ext(cr, &root, &best_node, &class_ty, &mut nodes, &mut ext_of);
+            let idx = build_ext(cr, &root, &best_node, &class_ty, &class_line, &mut nodes, &mut ext_of);
             value_node[i] = Some(idx);
         }
 
@@ -874,6 +889,7 @@ fn build_ext(
     root: &[usize],
     best: &[Option<ENode>],
     class_ty: &[TypeId],
+    class_line: &[u32],
     nodes: &mut Vec<ExtNode>,
     ext_of: &mut Vec<Option<usize>>,
 ) -> usize {
@@ -889,9 +905,9 @@ fn build_ext(
             let children: Vec<usize> = node
                 .children
                 .iter()
-                .map(|&c| build_ext(root[c], root, best, class_ty, nodes, ext_of))
+                .map(|&c| build_ext(root[c], root, best, class_ty, class_line, nodes, ext_of))
                 .collect();
-            ExtNode::Op { kind, flags, ty: class_ty[cr], children }
+            ExtNode::Op { kind, flags, ty: class_ty[cr], children, line: class_line[cr] }
         }
     };
     let idx = nodes.len();
@@ -944,6 +960,7 @@ fn rebuild_function(old: &Function, plan: &Plan, builder: &mut FunctionBuilder<'
         // dominance), so a value used in several blocks is recomputed locally.
         let mut cache: DetHashMap<usize, ValueId> = DetHashMap::default();
         for &i in old.block(bb).insts() {
+            builder.set_line_from(old, i);
             let inst = old.inst(i);
             // Pure modeled results are emitted lazily at their use sites via the
             // extraction DAG, so skip them here (unused ones simply vanish — a
@@ -999,14 +1016,22 @@ fn emit_ext(
     let v = match &plan.nodes[idx] {
         ExtNode::Leaf(vid) => remap_value(vmap, old, builder, *vid),
         ExtNode::Const(c) => materialize(builder, c),
-        ExtNode::Op { kind, flags, ty, children } => {
+        ExtNode::Op { kind, flags, ty, children, line } => {
             let mut child_vals = Vec::with_capacity(children.len());
             for &ch in children {
                 child_vals.push(emit_ext(plan, old, builder, vmap, cache, ch));
             }
-            builder
+            // The extracted node takes its e-class's line, then the use site's
+            // line is restored for the instruction being emitted.
+            let use_line = builder.line();
+            if *line != 0 {
+                builder.set_line(*line);
+            }
+            let v = builder
                 .append_inst(kind.clone(), child_vals, *flags, Some(*ty))
-                .expect("modeled op defines a value")
+                .expect("modeled op defines a value");
+            builder.set_line(use_line);
+            v
         }
     };
     cache.insert(idx, v);
@@ -1027,6 +1052,7 @@ fn emit_terminator(
     let Some(t) = old.block(bb).terminator() else {
         return;
     };
+    builder.set_line_from(old, t);
     let term = old.inst(t);
     let ops = term.operands();
     match &term.kind {

@@ -512,6 +512,7 @@ fn emit_chain(
         let bb = BlockId::from_index(cur);
         let insts = old.block(bb).insts().to_vec();
         for i in insts {
+            builder.set_line_from(old, i);
             let inst = old.inst(i);
             let mut ops = Vec::with_capacity(inst.operands().len());
             for &o in inst.operands() {
@@ -524,6 +525,10 @@ fn emit_chain(
             }
         }
 
+        // The (possibly folded) terminator keeps the old terminator's line.
+        if let Some(t) = old.block(bb).terminator() {
+            builder.set_line_from(old, t);
+        }
         match &plan.eff[cur] {
             Term::Ret(v) => {
                 let nv = v.map(|x| remap_value(vmap, old, builder, x));

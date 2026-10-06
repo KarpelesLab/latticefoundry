@@ -284,6 +284,7 @@ fn process_block(
 
     let insts = old.block(bb).insts().to_vec();
     for i in insts {
+        builder.set_line_from(old, i);
         let inst = old.inst(i);
         match &inst.kind {
             InstKind::Alloca { .. } => {

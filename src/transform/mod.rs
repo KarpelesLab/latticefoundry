@@ -45,6 +45,8 @@ pub(crate) mod ct_tests;
 #[cfg(test)]
 mod issue_tests;
 #[cfg(test)]
+mod line_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod vector_tests;
@@ -152,6 +154,14 @@ pub(crate) fn remap_value(
     nv
 }
 
+/// The first source line recorded in old block `bb` (its instructions, then its
+/// terminator), or `0` when it carries none: the line a rebuild gives code it
+/// synthesizes on behalf of a whole block (e.g. a loop header's yield check).
+pub(crate) fn block_line(old: &Function, bb: BlockId) -> u32 {
+    let blk = old.block(bb);
+    blk.insts().iter().chain(blk.terminator().iter()).find_map(|&i| old.inst_line(i)).unwrap_or(0)
+}
+
 /// Rebuild the terminator of old block `bb` into the current insertion block,
 /// remapping its operands through `vmap` and mapping successor blocks through
 /// `new_block`. For each outgoing edge, `extra` is invoked to append any
@@ -184,6 +194,9 @@ pub(crate) fn rebuild_terminator_keeping(
     let Some(t) = old.block(bb).terminator() else {
         return;
     };
+    // The rebuilt terminator (and any edge-argument code `extra` emits) keeps
+    // the old terminator's source line.
+    builder.set_line_from(old, t);
     let term = old.inst(t);
     let ops = term.operands();
     match &term.kind {
