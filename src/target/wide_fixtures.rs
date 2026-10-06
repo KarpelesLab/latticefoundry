@@ -195,8 +195,13 @@ pub(crate) fn emu_programs(per_op: usize) -> (String, String, Vec<&'static str>)
     let mut acc = "i64 0".to_owned();
     let mut k = 0;
     for (bit, n) in names.iter().enumerate() {
-        for _ in 0..per_op {
+        let mut done = 0;
+        while done < per_op {
             let (a, b) = (rng.operand(), rng.operand());
+            if !defined(n, a, b) {
+                continue;
+            }
+            done += 1;
             let w = reference(&m, &syms, n, a, b);
             writeln!(main, "  %r{k} = call @t_{n}(i128 {a}, i128 {b}) : i128").unwrap();
             writeln!(main, "  %c{k} = icmp ne %r{k}, i128 {w} : i1").unwrap();

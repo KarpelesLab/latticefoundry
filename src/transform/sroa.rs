@@ -9,12 +9,19 @@
 //! the `alloca` is
 //!
 //! - a non-volatile `load` or `store` *through* the address (never the stored
-//!   value), directly or behind a chain of `ptr_add`s by constant offsets, of
-//!   a non-aggregate type that lies inside the allocation, or
+//!   value), directly or behind a chain of `ptr_add`s by constant offsets
+//!   and `bitcast`s to a pointer or aggregate type, of a non-aggregate type
+//!   that lies inside the allocation, or
 //! - a `ret` of the address itself, in a function returning the `alloca`'s
 //!   type (a by-value struct return);
 //!
-//! and the accessed byte ranges are pairwise identical or disjoint. Each
+//! and the accessed byte ranges are pairwise identical or disjoint, and every
+//! load reads a range a store wrote on every path to it (a `ret` copies the
+//! slot, it does not read it: unwritten bytes stay undefined in the copy). A
+//! slot read before it is written is left in memory: the read is poison
+//! either way, but a front end may count on it being a stable unknown value
+//! (C's indeterminate value), which the optimizer cannot fold away while it
+//! stays in memory. Each
 //! distinct range becomes an `alloca` of its accessed type, placed where the
 //! original was. Accesses of one range by an integer and a float of the same
 //! width share the range's first type through a `bitcast`; any other mix of
@@ -23,7 +30,7 @@
 //!
 //! A `ret` of the aggregate becomes a store of every field into a fresh
 //! `alloca` of the return type right before the `ret`, which returns that
-//! instead. The fields themselves then promote, and the return slot is the
+//! instead (a slot already in that form is left alone). The fields themselves then promote, and the return slot is the
 //! canonical construction a backend recognizes: an `alloca` written only by
 //! stores in the block of its single `ret`, which the x86-64 System V,
 //! AArch64 and RISC-V backends return straight from registers (`rax:rdx`,
@@ -32,6 +39,12 @@
 //!
 //! Alignment: a split access asks for at most its type's natural alignment
 //! (the new slot's), never more.
+//!
+//! A slot a bulk-memory op (`memcpy`/`memset`) touches is not this pass's:
+//! [`memopt`](super::memopt) splits those (and runs first in the
+//! pipeline), so the two cover disjoint slots — memopt the ones bulk ops
+//! copy or fill, this pass the ones accessed field by field, returned, or
+//! viewed through an address `bitcast` (an inlined struct return).
 
 use std::collections::HashMap;
 
@@ -86,6 +99,11 @@ fn is_aggregate(types: &TypeContext, ty: TypeId) -> bool {
     matches!(types.get(ty), Type::Struct(_) | Type::Array(..))
 }
 
+/// Whether a value of type `ty` is an address: a pointer or an aggregate.
+fn is_address(types: &TypeContext, ty: TypeId) -> bool {
+    types.get(ty).is_ptr() || is_aggregate(types, ty)
+}
+
 /// The constant integer value of `v`, if it is one (sign-extended).
 fn const_offset(old: &Function, builder: &FunctionBuilder<'_>, v: ValueId) -> Option<i64> {
     let ValueDef::Const(c) = old.value(v).def else { return None };
@@ -134,7 +152,13 @@ fn analyze(
                     adds.push(u.inst);
                     work.push((r, off.checked_add(c)?));
                 }
-                InstKind::Ret if v == av && ret_ty == Some(elem_ty) => rets.push(u.inst),
+                // The address viewed as an aggregate (the inliner's view of
+                // a returned struct): the same storage.
+                InstKind::Cast(CastOp::Bitcast) if is_address(types, inst.ty) => {
+                    adds.push(u.inst);
+                    work.push((inst.result().expect("bitcast defines a value"), off));
+                }
+                InstKind::Ret if off == 0 && ret_ty == Some(elem_ty) => rets.push(u.inst),
                 _ => return None,
             }
         }
@@ -169,6 +193,78 @@ fn ranges(types: &TypeContext, accesses: &mut [(InstId, u64, TypeId)]) -> Option
     Some(out)
 }
 
+/// Whether every load of a candidate reads a range some store wrote on every
+/// path to it (a forward must-analysis over the reachable blocks): only then
+/// does the split create no value the memory did not hold. A load of a slot
+/// before it is written reads poison either way, but a front end may rely on
+/// such a read being a stable, merely unknown value (C's indeterminate
+/// value), as long as it stays in memory: promoted, it would be a `poison`
+/// the optimizer may fold away along with the code that tests it.
+#[allow(clippy::too_many_arguments)]
+fn written_before_read(
+    old: &Function,
+    cfg: &ControlFlowGraph,
+    doms: &Dominators,
+    block_of: &HashMap<InstId, usize>,
+    pos: &HashMap<InstId, usize>,
+    accesses: &[(InstId, u64, TypeId)],
+    rs: &[Range],
+    types: &TypeContext,
+) -> bool {
+    let n = old.block_count();
+    let nr = rs.len();
+    // Per block, its accesses in order: (position, is store, range).
+    let mut by_block: Vec<Vec<(usize, bool, usize)>> = vec![Vec::new(); n];
+    for &(i, off, ty) in accesses {
+        let size = types.size_of(ty);
+        let r = rs.iter().position(|r| r.off == off && r.size == size).expect("range of an access");
+        let store = matches!(old.inst(i).kind, InstKind::Store { .. });
+        by_block[block_of[&i]].push((pos[&i], store, r));
+    }
+    for v in &mut by_block {
+        v.sort_unstable();
+    }
+    let entry = old.entry().map_or(0, |e| e.index());
+    let reachable: Vec<usize> = (0..n).filter(|&b| doms.is_reachable(b)).collect();
+    let block_in = |out: &[Vec<bool>], b: usize| -> Vec<bool> {
+        if b == entry {
+            return vec![false; nr];
+        }
+        let mut acc = vec![true; nr];
+        for &p in cfg.predecessors(b) {
+            if doms.is_reachable(p) {
+                for (a, o) in acc.iter_mut().zip(&out[p]) {
+                    *a &= *o;
+                }
+            }
+        }
+        acc
+    };
+    let mut out: Vec<Vec<bool>> = vec![vec![true; nr]; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &reachable {
+            let mut cur = block_in(&out, b);
+            for &(_, store, r) in &by_block[b] {
+                cur[r] |= store;
+            }
+            if cur != out[b] {
+                out[b] = cur;
+                changed = true;
+            }
+        }
+    }
+    reachable.iter().all(|&b| {
+        let mut cur = block_in(&out, b);
+        by_block[b].iter().all(|&(_, store, r)| {
+            let ok = store || cur[r];
+            cur[r] |= store;
+            ok
+        })
+    })
+}
+
 /// How a value of type `from` is reinterpreted as `to` (same size), if the
 /// pass converts between them: integer ↔ float by `bitcast`.
 fn conversion(types: &TypeContext, from: TypeId, to: TypeId) -> Option<CastOp> {
@@ -185,6 +281,18 @@ fn split(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
         Type::Func(ft) => Some(ft.ret),
         _ => None,
     };
+
+    // Each instruction's block and position in it.
+    let mut block_of: HashMap<InstId, usize> = HashMap::new();
+    let mut pos: HashMap<InstId, usize> = HashMap::new();
+    for (b, blk) in old.blocks() {
+        for (k, &i) in blk.insts().iter().chain(blk.terminator().as_ref()).enumerate() {
+            block_of.insert(i, b.index());
+            pos.insert(i, k);
+        }
+    }
+    let cfg = ControlFlowGraph::new(old);
+    let doms = Dominators::new(old, &cfg);
 
     // Discover the candidates.
     let mut cands: Vec<Candidate> = Vec::new();
@@ -205,7 +313,19 @@ fn split(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
             if accesses.is_empty() {
                 continue;
             }
+            // Already a return slot (written only right before its one
+            // `ret`): what this pass makes, and what a backend returns from
+            // registers. Splitting it again would only rebuild it.
+            let canonical = matches!(rets[..], [r] if accesses.iter().all(|&(ai, ..)| {
+                matches!(old.inst(ai).kind, InstKind::Store { .. }) && block_of.get(&ai) == block_of.get(&r)
+            }));
+            if canonical {
+                continue;
+            }
             let Some(rs) = ranges(builder.types(), &mut accesses) else { continue };
+            if !written_before_read(old, &cfg, &doms, &block_of, &pos, &accesses, &rs, builder.types()) {
+                continue;
+            }
             let c = cands.len();
             for &(ai, off, ty) in &accesses {
                 let size = builder.types().size_of(ty);
@@ -228,8 +348,6 @@ fn split(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
 
     // Rebuild with identical blocks and edges.
     let n = old.block_count();
-    let cfg = ControlFlowGraph::new(old);
-    let doms = Dominators::new(old, &cfg);
     let entry_idx = entry.index();
     let mut new_block: Vec<Option<BlockId>> = vec![None; n];
     new_block[entry_idx] = Some(builder.create_entry_block());
@@ -437,6 +555,63 @@ entry ^0(%0: i64):
         assert!(!out.contains("store"), "{out}");
     }
 
+    /// A slot read before anything writes it (C's indeterminate value, here
+    /// `counts[0]` tested before it is set) stays in memory, so the test is
+    /// not folded away as a branch on poison; one written on every path
+    /// before its read is split.
+    #[test]
+    fn read_before_write_is_kept() {
+        let src = r#"module "t"
+func @f(i32) -> i32 {
+entry ^0(%x: i32):
+  %c = alloca [3 x i32] : ptr
+  %v = load %c align 4 : i32
+  %t = icmp sge %v, i32 0 : i1
+  store %x, %c align 4 : i32
+  %r = select %t, i32 1, i32 2 : i32
+  ret %r
+}
+
+func @g(i1, i32) -> i32 {
+entry ^0(%k: i1, %x: i32):
+  %c = alloca [3 x i32] : ptr
+  cond_br %k, ^1, ^2
+^1:
+  store %x, %c align 4 : i32
+  br ^3
+^2:
+  store i32 5, %c align 4 : i32
+  br ^3
+^3:
+  %v = load %c align 4 : i32
+  ret %v
+}
+"#;
+        let out = run(src);
+        let (f, g) = out.split_at(out.find("func @g").expect("g"));
+        assert!(f.contains("alloca"), "{out}");
+        assert!(!g.contains("alloca"), "{out}");
+    }
+
+    /// The return slot the split leaves is the canonical form: a second run
+    /// changes nothing.
+    #[test]
+    fn return_slot_is_left_alone() {
+        let src = r#"module "t"
+func @pair(i64, i64) -> {i64, i64} {
+entry ^0(%a: i64, %b: i64):
+  %r = alloca {i64, i64} : ptr
+  store %a, %r align 8 : i64
+  %p = ptr_add inbounds %r, i64 8 : ptr
+  store %b, %p align 8 : i64
+  ret %r
+}
+"#;
+        let mut syms = StrInterner::new();
+        let mut m = parse(src, &mut syms);
+        assert_eq!(FunctionTransformPass::new(Sroa).run(&mut m), Changed::No);
+    }
+
     /// An escaping aggregate (its address passed to a call) is left alone, as
     /// is one accessed through overlapping ranges.
     #[test]
@@ -476,5 +651,73 @@ entry ^0(%0: f64):
 "#);
         assert!(!out.contains("alloca"), "{out}");
         assert!(out.contains("bitcast"), "{out}");
+    }
+
+    /// A struct-returning callee inlined at `-O2`: the inliner hands the
+    /// caller the callee's return slot (viewed through a `bitcast`), which
+    /// SROA then splits, so no `alloca` is left — and the result agrees with
+    /// the reference evaluator before and after.
+    #[test]
+    fn inlined_struct_return_promotes_at_o2() {
+        use crate::ir::refexec::run_named;
+        use crate::ir::semantics::SemValue;
+        use crate::transform::pipeline::{OptLevel, optimize};
+        let src = r#"module "t"
+func @parse(i64) -> {i64, i64} {
+entry ^0(%0: i64):
+  %1 = alloca {i64, i64} : ptr
+  %2 = icmp slt %0, i64 0 : i1
+  cond_br %2, ^1, ^2
+^1:
+  store i64 1, %1 align 8 : i64
+  %3 = ptr_add inbounds %1, i64 8 : ptr
+  store i64 0, %3 align 8 : i64
+  br ^3
+^2:
+  store i64 0, %1 align 8 : i64
+  %4 = ptr_add inbounds %1, i64 8 : ptr
+  %5 = mul %0, i64 3 : i64
+  store %5, %4 align 8 : i64
+  br ^3
+^3:
+  ret %1
+}
+
+func @use(i64) -> i64 {
+entry ^0(%0: i64):
+  %1 = alloca {i64, i64} : ptr
+  %2 = call @parse(%0) : {i64, i64}
+  %3 = load %2 align 1 : i64
+  store %3, %1 align 1 : i64
+  %4 = ptr_add inbounds %2, i64 8 : ptr
+  %5 = ptr_add inbounds %1, i64 8 : ptr
+  %6 = load %4 align 1 : i64
+  store %6, %5 align 1 : i64
+  %7 = load %1 align 8 : i64
+  %8 = icmp ne %7, i64 0 : i1
+  cond_br %8, ^1, ^2
+^1:
+  ret i64 -1
+^2:
+  %9 = ptr_add inbounds %1, i64 8 : ptr
+  %10 = load %9 align 8 : i64
+  %11 = add %10, i64 1 : i64
+  ret %11
+}
+"#;
+        let mut syms = StrInterner::new();
+        let before = parse(src, &mut syms);
+        let mut after = before.clone();
+        optimize(&mut after, OptLevel::O2);
+        verify_module(&after).expect("verifies");
+        let out = text::print_module(&after, &syms);
+        let body = &out[out.find("func @use").expect("use survives")..];
+        assert!(!body.contains("alloca") && !body.contains("call"), "{out}");
+        for x in [-5i64, 0, 7] {
+            let arg = [SemValue::int(64, puremp::Int::from_i64(x))];
+            let want = run_named(&before, &syms, "use", &arg).expect("runs");
+            let got = run_named(&after, &syms, "use", &arg).expect("runs");
+            assert_eq!(got, want, "use({x})");
+        }
     }
 }

@@ -7,6 +7,8 @@
 //! group**: part 0 is the value's own vreg, the higher parts are vregs kept in
 //! a side table ([`WideIsel::wide_table`]), created on first reference so a
 //! definition and its uses agree whatever order the blocks are lowered in.
+//! Parts known to be zero are tracked too, so the `or` that joins a
+//! zero-extended word to a shifted one is a copy, not an instruction.
 //! [`lower_wide`] lowers what the legalizer leaves:
 //!
 //! | wide operation | lowering |
@@ -36,7 +38,7 @@ use crate::ir::inst::{BinOp, CastOp, InstKind};
 use crate::ir::types::{Type, TypeId};
 use crate::ir::value::{Const, ValueDef};
 use crate::ir::{InstData, Module, ValueId};
-use crate::support::{DetHashMap, StrInterner};
+use crate::support::{DetHashMap, DetHashSet, StrInterner};
 
 use puremp::Int;
 
@@ -45,9 +47,26 @@ use puremp::Int;
 /// runtime helper is needed for it.
 pub const MUL128: &str = "__lf_multi3";
 
-/// The higher parts of the wide values of the function being lowered, by value
-/// index (part 0 is the value's own vreg).
-pub type WideTable = RefCell<DetHashMap<usize, Vec<VReg>>>;
+/// What [`lower_wide`] tracks across a function: the higher parts of its
+/// wide values, by value index (part 0 is the value's own vreg), and the
+/// part vregs known to hold zero (the joins and extensions the legalizer
+/// leaves `or` a zero-extended part with zeros: those `or`s are copies).
+#[derive(Debug, Default)]
+pub struct WideState {
+    parts: DetHashMap<usize, Vec<VReg>>,
+    zero: DetHashSet<VReg>,
+}
+
+impl WideState {
+    /// Forget everything (a new function).
+    pub fn clear(&mut self) {
+        self.parts.clear();
+        self.zero.clear();
+    }
+}
+
+/// A backend's [`WideState`], reset for every function it lowers.
+pub type WideTable = RefCell<WideState>;
 
 /// The few machine operations [`lower_wide`] builds a register group's
 /// lowering from, all on full 64-bit registers.
@@ -128,12 +147,12 @@ pub fn parts<T: WideIsel>(t: &T, lo: &mut Lower<'_, T>, v: ValueId) -> Vec<VReg>
         }
         ValueDef::Inst(_) | ValueDef::Param(..) => {
             let p0 = lo.reg(v);
-            let known = t.wide_table().borrow().get(&v.index()).cloned();
+            let known = t.wide_table().borrow().parts.get(&v.index()).cloned();
             let hi = match known {
                 Some(h) => h,
                 None => {
                     let h: Vec<VReg> = (1..n).map(|_| lo.fresh_vreg(RegClass::Gpr)).collect();
-                    t.wide_table().borrow_mut().insert(v.index(), h.clone());
+                    t.wide_table().borrow_mut().parts.insert(v.index(), h.clone());
                     h
                 }
             };
@@ -148,13 +167,24 @@ pub fn set_parts<T: WideIsel>(t: &T, lo: &mut Lower<'_, T>, res: ValueId, src: &
     let dst = parts(t, lo, res);
     for (&d, &s) in dst.iter().zip(src) {
         lo.emit(t.emit_move(crate::codegen::mir::Reg::Virtual(d), crate::codegen::mir::Reg::Virtual(s)));
+        if is_zero(t, s) {
+            t.wide_table().borrow_mut().zero.insert(d);
+        }
     }
+}
+
+/// Whether part vreg `v` is known to hold zero.
+fn is_zero<T: WideIsel>(t: &T, v: VReg) -> bool {
+    t.wide_table().borrow().zero.contains(&v)
 }
 
 /// A fresh vreg holding `v`.
 fn movi<T: WideIsel>(t: &T, lo: &mut Lower<'_, T>, v: u64) -> VReg {
     let d = lo.fresh_vreg(RegClass::Gpr);
     lo.emit(t.li(d, Int::from_u64(v)));
+    if v == 0 {
+        t.wide_table().borrow_mut().zero.insert(d);
+    }
     d
 }
 
@@ -213,13 +243,21 @@ pub fn lower_wide<T: WideIsel>(t: &T, lo: &mut Lower<'_, T>, inst: &InstData) ->
         }
         (InstKind::Bin(op @ (BinOp::Or | BinOp::And | BinOp::Xor)), Some(_)) => {
             let (a, b) = (parts(t, lo, ops[0]), parts(t, lo, ops[1]));
+            // A part `or`/`xor`ed with zero is the other part, and `and`ed
+            // with zero is zero: the legalizer's joins are mostly that.
             let p: Vec<VReg> = a
                 .iter()
                 .zip(&b)
-                .map(|(&x, &y)| {
-                    let d = lo.fresh_vreg(RegClass::Gpr);
-                    lo.emit(t.wide_alu(*op, d, x, y));
-                    d
+                .map(|(&x, &y)| match (*op, is_zero(t, x), is_zero(t, y)) {
+                    (BinOp::Or | BinOp::Xor, true, _) => y,
+                    (BinOp::Or | BinOp::Xor, _, true) => x,
+                    (BinOp::And, true, _) => x,
+                    (BinOp::And, _, true) => y,
+                    _ => {
+                        let d = lo.fresh_vreg(RegClass::Gpr);
+                        lo.emit(t.wide_alu(*op, d, x, y));
+                        d
+                    }
                 })
                 .collect();
             set_parts(t, lo, res.expect("a result"), &p);

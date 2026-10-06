@@ -188,7 +188,8 @@ the widest native width) as `N` parts of type `iW`, least significant first:
   declared. AVR has no hardware multiplier at all, so this is the right default.
 
 Flags are dropped (the expansion refines: flags only add poison). Thumb uses
-`W = 32`; AVR `W = 8` or `16`; wasm32 and x86-64 use `W = 64` for `i128`.
+`W = 32`; AVR `W = 8` or `16`; wasm32, x86-64, AArch64 and RISC-V use
+`W = 64` for `i128`.
 
 **x86-64 `i128`** (`target::x86_64::prepare_module`): min/max are expanded
 and the float↔`i128` helpers declared, then the module is legalized at
@@ -209,6 +210,20 @@ the boundary, as are wide atomics and wide values under the Microsoft x64
 convention. (The LP64 layout keeps aligning `i128` to 8 bytes; a front end
 matching gcc's 16-byte `__int128` alignment declares `i128:128` in its
 `datalayout`, as lf-cc does.)
+
+**AArch64 and RISC-V `i128`** (`codegen::wide`, shared by both backends):
+the same preparation (legalization at `W = 64`, the float helpers declared),
+then what is left lives in register groups, as on x86-64. The multiply is
+inline (`mul` for the low product, `umulh`/`mulhu` for its high half, two
+`mul`s for the cross terms); division and float conversions call libgcc.
+The boundary follows each psABI's `__int128`: AAPCS64 passes it in the next
+*even-numbered* register pair (`x0:x1`, `x2:x3`, …; low half first) or, when
+none is left, in a 16-aligned stack slot after which no argument takes a
+general register, and returns it in `x0:x1`; LP64D passes the 2×XLEN scalar
+in the next two `a` registers, split between `a7` and the stack when only
+one is left, else in a 16-aligned stack slot (a variadic one takes an aligned
+pair), and returns it in `a0:a1`. A `switch` on an `i128`, wide atomics and
+a wide bitcast to or from a vector are rejected there with a diagnostic.
 
 **The ABI boundary stays wide.** The pass keeps function signatures: a wide
 entry parameter, call argument or result, return value, and the operands and
@@ -537,6 +552,75 @@ relaxed. The verifier (`src/verify/structural.rs`) enforces exactly this: its
 `addr_compatible` predicate (equal, both `ptr`, or one `ptr` and the other an
 aggregate) gates the `call`/`ret` boundary, and the `ptr_add`/`load`/`store`
 base-and-address checks additionally accept an aggregate-typed operand.
+
+**Aggregate returns in registers.** *(decided)* When the ABI returns a small
+struct in registers, the address is only a detour, and neither side keeps
+it: a two-word result such as Lode's `throws(E) -> usize` (`{i64, i64}`)
+travels in two registers with no stack slot on either side of the call.
+The IR does not change; two shapes of it are recognized.
+
+- **The callee** builds the result in an `alloca` and `ret`s that address.
+  `transform::Sroa` (scalar replacement of aggregates, run after `memopt`
+  and before `mem2reg` at `-O1` and up, and again after inlining) splits an
+  aggregate `alloca` whose every use is a load or store at a constant offset
+  (through `ptr_add`s and address `bitcast`s) into one slot per accessed
+  field, which `mem2reg` promotes — when every load reads a field some
+  store wrote on every path to it, so the split creates no `poison` the
+  memory did not already hand out as a stable unknown value (a C front end
+  may read an indeterminate value; promoted, the test of it would fold
+  away as a branch on poison). (`memopt` splits the slots bulk-memory ops
+  copy or fill, §6k; `Sroa` takes the others, so the two never split the
+  same slot.) A `ret` of the aggregate becomes a store of
+  every field into a fresh *return slot* right before the `ret`. A backend
+  (`codegen::aggret`, applied by the isel driver) recognizes a return slot
+  used by nothing but its single `ret` and by stores in the `ret`'s block,
+  at most one per register part: the stored values go straight into the
+  return registers, and the slot, its `ptr_add`s and stores emit nothing.
+- **The caller** receives the result's address and loads the fields. A
+  call result whose every use is a non-volatile load of a field lying in
+  one register part (an integer anywhere in an integer part, a float at the
+  start of a floating-point part) is never written, so each load is the
+  returned register's bits: a move, or a shift right for a field above the
+  part's low byte. No result slot is allocated. The caller's own copy of
+  the struct (`r = f();` copies it, with a `memcpy` from lf-cc) is split by
+  `memopt` or `Sroa` and promoted by `mem2reg` like any local.
+
+So `mem2reg` sees the fields as values on both sides, which is what Lode
+asked for. Which bytes travel in which register is each target's
+classification, given to the driver as `TargetIsel::ret_parts`:
+
+| target | two words `{i64, i64}` | other register classes | through memory |
+|---|---|---|---|
+| x86-64 System V | `rax:rdx` | SSE eightbytes in `xmm0`/`xmm1` | > 16 bytes, or MEMORY class: hidden `rdi` pointer |
+| AArch64 (AAPCS64) | `x0:x1` | an HFA in `v0`–`v3` | > 16 bytes: `x8` pointer |
+| RISC-V LP64D | `a0:a1` | float fields in `fa0`/`fa1` | > 16 bytes: hidden `a0` pointer |
+| x86-64 Windows | — | 1, 2, 4 or 8 bytes in `rax` | anything else: hidden pointer |
+
+Microsoft's x64 convention returns a 16-byte struct through a hidden
+pointer to caller memory, so on Windows a two-word struct result is a
+slot by the ABI; an `i128` is not supported there. Thumb, AVR and wasm32
+keep their slots. Any other shape — a slot written in another block, a
+field straddling two registers, two fields packed in one register part on
+the callee side, an address that escapes — keeps the slot, which is always
+correct.
+
+`i128` is the other two-word result, and needs nothing of the above: after
+wide-integer legalization (§3b) only the boundary is wide, and the
+backends return it in the same two registers (`rax:rdx`, `x0:x1`,
+`a0:a1`).
+
+- **Rejected: multiple return values in the IR.** A `ret` of several
+  scalars and a `call` defining several results would make the field
+  values explicit, but every consumer of `ret` and `call` — the verifier,
+  text and binary forms, the reference evaluator, every analysis and
+  transform, the inliner and every backend — would grow a second shape,
+  while the address form already carries the same information and SROA
+  recovers the values from it. It would also only express a return; an
+  aggregate parameter or local benefits from the same splitting.
+- **Rejected: a register-only struct value type.** Making small structs
+  first-class SSA values (LLVM's `insertvalue`/`extractvalue`) contradicts
+  "aggregate values are addresses" and would need its own legalization in
+  every backend.
 
 ## 6a. Reaching the kernel: a native `syscall` op  *(decided)*
 
@@ -1384,7 +1468,8 @@ pipeline, clean-room from the RISC-V ISA manual and the RISC-V ELF psABI:
   between `a7` and the stack if need be) and anything larger by reference.
   A result is placed as a first argument would be with only `a0`/`a1` and
   `fa0`/`fa1`; one that does not fit comes back through memory whose address
-  is a hidden `a0` argument. A struct value is, in the backend, a pointer to
+  is a hidden `a0` argument. An `i128` is the psABI's 2×XLEN scalar: a
+  register pair (§3b), `a0:a1` as a result. A struct value is, in the backend, a pointer to
   its storage; the call site classifies by the callee's parameter types, so a
   plain pointer may be passed where a struct is expected.
 - **Addressing.** Everything is PC-relative (the `medany` code model): a call

@@ -1646,7 +1646,7 @@ impl MachineTarget for RiscvTarget {
 }
 
 impl TargetIsel for RiscvTarget {
-    /// The parts [`abi::ret_locs`] returns in `a0`/`a1`/`fa0`/`fa1`.
+    /// The parts the LP64D classification returns in `a0`/`a1`/`fa0`/`fa1`.
     fn ret_parts(
         &self,
         types: &crate::ir::TypeContext,

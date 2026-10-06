@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 
-use crate::ir::inst::{InstId, InstKind};
+use crate::ir::inst::{CastOp, InstId, InstKind};
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, ValueDef, ValueId};
 use crate::ir::{ConstPool, Function};
@@ -90,6 +90,11 @@ fn is_aggregate(types: &TypeContext, ty: TypeId) -> bool {
     matches!(types.get(ty), Type::Struct(_) | Type::Array(..))
 }
 
+/// Whether a value of type `ty` is an address: a pointer or an aggregate.
+fn is_address(types: &TypeContext, ty: TypeId) -> bool {
+    types.get(ty).is_ptr() || is_aggregate(types, ty)
+}
+
 /// The constant value of `v` as a signed offset, if it is an integer constant.
 fn const_offset(f: &Function, consts: &ConstPool, v: ValueId) -> Option<i64> {
     let ValueDef::Const(c) = f.value(v).def else { return None };
@@ -100,13 +105,15 @@ fn const_offset(f: &Function, consts: &ConstPool, v: ValueId) -> Option<i64> {
 }
 
 /// The memory uses reachable from `root` through `ptr_add`s by constant
-/// offsets: `(instruction, byte offset, is store)`, plus the `ptr_add`s, or
+/// offsets (and address `bitcast`s): `(instruction, byte offset, is
+/// store)`, plus the `ptr_add`s and `bitcast`s, or
 /// `None` when some use is anything else (the address escapes, a volatile
 /// access, a store *of* the address, ...). A `ret` of `root` itself is
 /// accepted when `ret_ok`, and reported in the last element.
 #[allow(clippy::type_complexity)]
 fn memory_uses(
     f: &Function,
+    types: &TypeContext,
     consts: &ConstPool,
     root: ValueId,
     ret_ok: bool,
@@ -126,7 +133,13 @@ fn memory_uses(
                     adds.push(u.inst);
                     work.push((inst.result().expect("ptr_add defines a value"), off.checked_add(c)?));
                 }
-                InstKind::Ret if ret_ok && v == root => rets.push(u.inst),
+                // The address viewed as a pointer or an aggregate: the same
+                // storage.
+                InstKind::Cast(CastOp::Bitcast) if is_address(types, inst.ty) => {
+                    adds.push(u.inst);
+                    work.push((inst.result().expect("bitcast defines a value"), off));
+                }
+                InstKind::Ret if ret_ok && off == 0 => rets.push(u.inst),
                 _ => return None,
             }
         }
@@ -189,7 +202,7 @@ pub fn analyze(
                         continue;
                     }
                     let Some(parts) = parts_of(ty) else { continue };
-                    let Some((accesses, adds, _)) = memory_uses(f, consts, r, false) else { continue };
+                    let Some((accesses, adds, _)) = memory_uses(f, types, consts, r, false) else { continue };
                     let mut loads = Vec::with_capacity(accesses.len());
                     let ok = accesses.iter().all(|&(li, off, store)| {
                         let l = f.inst(li);
@@ -213,7 +226,7 @@ pub fn analyze(
                 InstKind::Alloca { .. } => {
                     let Some(parts) = ret_parts.as_ref() else { continue };
                     let s = inst.result().expect("alloca defines a value");
-                    let Some((accesses, adds, rets)) = memory_uses(f, consts, s, true) else { continue };
+                    let Some((accesses, adds, rets)) = memory_uses(f, types, consts, s, true) else { continue };
                     let [ret] = rets[..] else { continue };
                     let ret_block = block_of.get(&ret).copied();
                     let mut vals: Vec<Option<ValueId>> = vec![None; parts.len()];

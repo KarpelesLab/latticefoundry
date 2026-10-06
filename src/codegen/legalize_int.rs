@@ -719,12 +719,27 @@ impl Lz<'_, '_> {
 
     // --- arithmetic ---------------------------------------------------------
 
+    /// Whether `v` is the integer constant zero.
+    fn is_zero(&self, v: ValueId) -> bool {
+        self.b.const_of(v).is_some_and(|c| matches!(self.b.consts().get(c), Const::Int { value, .. } if value.is_zero()))
+    }
+
     fn bin(&mut self, op: BinOp, l: ValueId, r: ValueId, n: usize, ty: TypeId) -> Vec<ValueId> {
         let b = self.b.types().bit_width(ty).expect("an integer");
         match op {
             BinOp::And | BinOp::Or | BinOp::Xor => {
+                // A zero part (a zero-extension's, a shift's) makes the part
+                // operation a copy (`or`/`xor`) or zero (`and`, which refines
+                // a poison operand): joins of words then cost nothing.
                 let (a, c) = (self.parts(l), self.parts(r));
-                a.iter().zip(&c).map(|(&x, &y)| self.b.bin(op, x, y, Flags::NONE)).collect()
+                a.iter()
+                    .zip(&c)
+                    .map(|(&x, &y)| match (op, self.is_zero(x), self.is_zero(y)) {
+                        (BinOp::Or | BinOp::Xor, true, _) | (BinOp::And, _, true) => y,
+                        (BinOp::Or | BinOp::Xor, _, true) | (BinOp::And, true, _) => x,
+                        _ => self.b.bin(op, x, y, Flags::NONE),
+                    })
+                    .collect()
             }
             BinOp::Add => {
                 let (a, c) = (self.parts(l), self.parts(r));

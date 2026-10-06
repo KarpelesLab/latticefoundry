@@ -338,8 +338,10 @@ invalidation verified (a mutating pass forces recomputation).
 A useful baseline of optimizations, verified by construction.
 
 - Structural transforms: `mem2reg` (promote memory to SSA via dominance
-  frontiers), aggressive/dead-store DCE, control-flow simplification, inlining
-  with a cost model, loop-invariant code motion.
+  frontiers), SROA (split aggregate slots into one per field, struct returns
+  included; see [ir-design §6](docs/ir-design.md)), aggressive/dead-store
+  DCE, control-flow simplification, inlining with a cost model,
+  loop-invariant code motion.
 - **Local/algebraic optimization via equality saturation (B4):** constant
   folding, strength reduction, GVN/CSE, and peepholes expressed as **B2-verified
   rewrite rules** over an e-graph, with best-program extraction under a **cost
@@ -450,7 +452,7 @@ a MIR interpreter, and an RV64IMAFDC instruction-set simulator that runs the
 linked programs (and loads qld's shared libraries and PIEs, applying their
 dynamic relocations) differentially against the reference evaluator —
 ~80 000 integer, float, struct and vector results — and runs clang-compiled
-C calling ours and back. Deferred: `f16` (Zfh), integers wider than 64 bits,
+C calling ours and back. Deferred: `f16` (Zfh),
 the callee side of variadic functions, TLS, DWARF. Volatile accesses, atomics (`atomic_load`/`atomic_store`/
 `atomic_rmw`/`cmpxchg`) and fences lower on all three targets from each ISA's
 memory model (x86-64 TSO `mov`/`xchg`/`lock xadd`/`lock cmpxchg`/`mfence`;
@@ -492,7 +494,17 @@ is legalized into 64-bit parts (branch-free), multiplied inline, divided and
 converted to/from floats through libgcc, and passed exactly like gcc's
 `__int128` (register pairs, 16-aligned stack slots, `rax:rdx`); checked
 against the reference evaluator on 1,104 random cases at `-O0` and `-O2` and
-in ABI round trips with gcc in both directions.
+in ABI round trips with gcc in both directions. AArch64 and RISC-V share the
+lowering (`codegen::wide`; inline `umulh`/`mulhu` multiply) with their
+psABIs' `__int128` conventions (an even register pair or a 16-aligned stack
+slot and `x0:x1`; a pair split between `a7` and the stack if need be and
+`a0:a1`), checked on their emulators against the reference evaluator and
+both ways with clang-compiled C. **Two-word results without memory**
+(issue #16, [ir-design §6](docs/ir-design.md)): a `{i64, i64}` struct
+result — Lode's `throws(E) -> usize` — travels in `rax:rdx`, `x0:x1` or
+`a0:a1` with no stack slot in the callee or the caller at `-O1` and up
+(SROA, then the backends skip the return slot and the result slot), checked
+on the machine code and both ways with gcc/clang.
 
 *Non-64-bit foundation* ✅ (for wasm32, Arm Cortex-M and AVR; see
 [ir-design §3a/§3b](docs/ir-design.md)): modules carry a per-target
