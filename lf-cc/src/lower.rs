@@ -25,7 +25,7 @@ use crate::ast::{BinaryOp, CType, FloatTy, Quals, Records};
 use crate::layout;
 use crate::layout::BitPlacement;
 use crate::sema::{
-    AggStore, AtomicOp, FuncSig, LocalInfo, MemOrder, Program, TExpr, TExprKind, TFunc, TGlobal, TStmt,
+    AggStore, AtomicOp, BulkOp, FuncSig, LocalInfo, MemOrder, Program, TExpr, TExprKind, TFunc, TGlobal, TStmt,
 };
 use crate::CodegenConfig;
 use latticefoundry::transform::sanitize::UbKind;
@@ -1246,40 +1246,25 @@ impl FnLower<'_> {
         self.b.ptr_add(base, off, true)
     }
 
-    /// Zero `size` bytes starting at `base` (8-byte then 1-byte stores).
+    /// Zero `size` bytes starting at `base`: one `memset` (the backend
+    /// expands a short one inline, the optimizer splits a local one).
     fn zero_fill(&mut self, base: ValueId, size: u64) {
-        let mut o = 0u64;
-        while o + 8 <= size {
-            let addr = self.offset_ptr(base, o);
-            let z = self.b.const_i64(self.tys.i64, 0);
-            self.b.store(self.tys.i64, addr, z, 1);
-            o += 8;
+        if size == 0 {
+            return;
         }
-        while o < size {
-            let addr = self.offset_ptr(base, o);
-            let z = self.b.const_i64(self.tys.i8, 0);
-            self.b.store(self.tys.i8, addr, z, 1);
-            o += 1;
-        }
+        let z = self.b.const_i64(self.tys.i8, 0);
+        let n = self.b.const_i64(self.tys.i64, size as i64);
+        self.b.memset(base, z, n, 1);
     }
 
-    /// Copy `size` bytes from `src` to `dst` (8-byte then 1-byte load/stores).
+    /// Copy `size` bytes from `src` to `dst`: one `memcpy` (a whole-object
+    /// copy, so the ranges are equal or disjoint, as `memcpy` requires).
     fn copy_bytes(&mut self, dst: ValueId, src: ValueId, size: u64) {
-        let mut o = 0u64;
-        while o + 8 <= size {
-            let s = self.offset_ptr(src, o);
-            let d = self.offset_ptr(dst, o);
-            let v = self.b.load(self.tys.i64, s, 1);
-            self.b.store(self.tys.i64, d, v, 1);
-            o += 8;
+        if size == 0 {
+            return;
         }
-        while o < size {
-            let s = self.offset_ptr(src, o);
-            let d = self.offset_ptr(dst, o);
-            let v = self.b.load(self.tys.i8, s, 1);
-            self.b.store(self.tys.i8, d, v, 1);
-            o += 1;
-        }
+        let n = self.b.const_i64(self.tys.i64, size as i64);
+        self.b.memcpy(dst, src, n, 1);
     }
 
     /// Lower an expression to its (rvalue) IR value.
@@ -1462,6 +1447,20 @@ impl FnLower<'_> {
             TExprKind::DynAlloca(n) => {
                 let n_val = self.lower_rvalue(n);
                 self.b.dyn_alloca(n_val, 16)
+            }
+            TExprKind::BulkMem { op, dst, mid, n } => {
+                let d = self.lower_rvalue(dst);
+                let m = self.lower_rvalue(mid);
+                let n = self.lower_rvalue(n);
+                match op {
+                    BulkOp::Copy => self.b.memcpy(d, m, n, 1),
+                    BulkOp::Move => self.b.memmove(d, m, n, 1),
+                    BulkOp::Set => {
+                        let byte = self.b.cast(CastOp::Trunc, m, self.tys.i8);
+                        self.b.memset(d, byte, n, 1);
+                    }
+                }
+                d
             }
             TExprKind::Cond(c, t, f) => self.lower_ternary(c, t, f, &e.ty),
             TExprKind::Comma(a, b) => {
@@ -2158,6 +2157,11 @@ impl FnLower<'_> {
         } else {
             self.b.load(unit_ty, addr, align)
         };
+        // The unit's other bits may never have been written (`struct f x;
+        // x.cs = 3;`): uninitialized memory reads as poison in the IR, which
+        // would poison the whole unit, so freeze it — C's indeterminate but
+        // stable neighbouring bits.
+        let old = self.b.freeze(old);
         let old_w = self.int_resize(old, unit_bits, false, w);
         let value_w = self.int_resize(value, unit_bits, false, w);
 

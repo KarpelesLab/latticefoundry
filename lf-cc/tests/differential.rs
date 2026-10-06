@@ -568,6 +568,48 @@ fn programs() -> Vec<(&'static str, &'static str)> {
             "int main(){ char*p=(char*)__builtin_alloca(16); int i; \
              for(i=0;i<16;i++)p[i]=(char)(i*i); return p[7]&0xff; }",
         ),
+        // `__builtin_memcpy` / `__builtin_memmove` / `__builtin_memset` lower
+        // to the IR's bulk-memory ops: every length 0..=300 (constant and
+        // variable), overlapping moves both ways, the returned pointer.
+        (
+            "builtin_memcpy_lengths",
+            "static unsigned h; static void mix(const unsigned char *p, int n){ int i; \
+             for(i=0;i<n;i++) h = h*31u + p[i]; } \
+             int main(){ unsigned char a[320], b[320]; int n, i; \
+             for(i=0;i<320;i++) a[i]=(unsigned char)(i*7+3); \
+             for(n=0;n<=300;n++){ __builtin_memset(b, 0x5a, sizeof b); \
+             __builtin_memcpy(b+(n&7), a+(n%13), (unsigned long)n); mix(b, 320); } \
+             __builtin_memcpy(b, a, 16); __builtin_memcpy(b+16, a+1, 40); \
+             __builtin_memcpy(b+100, a+5, 300-100); mix(b, 320); \
+             return (int)(h % 251); }",
+        ),
+        (
+            "builtin_memmove_overlap",
+            "int main(){ char a[64]; int i, s=0; for(i=0;i<64;i++) a[i]=(char)i; \
+             __builtin_memmove(a+5, a, 40); __builtin_memmove(a, a+9, 33); \
+             __builtin_memmove(a+1, a+1, 10); \
+             for(i=0;i<64;i++) s = (s*3 + a[i]) & 0xfff; return s & 0xff; }",
+        ),
+        (
+            "builtin_memset_value",
+            "int main(){ int v[50]; unsigned char *p = __builtin_memset(v, -1, sizeof v); \
+             __builtin_memset(v+10, 0, 7); int c = 0x101; __builtin_memset(&v[20], c, 3*sizeof(int)); \
+             int i, s = (p == (unsigned char *)v); for(i=0;i<50;i++) s += (v[i] & 0x7f) + (v[i] < 0); \
+             return s & 0xff; }",
+        ),
+        // Struct assignment, initialization and copy through pointers of
+        // aggregates large and small (lowered to memcpy / memset).
+        (
+            "struct_copy_aggregates",
+            "struct S { long a; int b; char c[3]; }; struct Big { int v[100]; char t; }; \
+             static struct Big g; \
+             static struct S mk(long a){ struct S s = {a, (int)a*2, {1,2,3}}; return s; } \
+             static void put(struct Big *d, const struct Big *s){ *d = *s; } \
+             int main(){ struct S x = mk(5), y; y = x; y.b += 1; struct S z = y; \
+             struct Big b = {{0}}; b.v[50] = 3; b.t = 9; struct Big c = b; c.v[99] = 4; \
+             put(&g, &c); struct Big d = {{1, 2}}; \
+             return (int)(z.a + z.b + z.c[2] + g.v[50] + g.v[99] + g.t + d.v[0] + d.v[1] + d.v[2]); }",
+        ),
         // NOTE: runtime-sized VLAs (`int a[n];`) are deferred: the `CType::Array`
         // length is a `u64`, so a VLA would need a new type variant threaded
         // through layout/sema/lower/decay/sizeof. Gap 2's required part is the
@@ -914,6 +956,25 @@ fn alloca_lowers_to_dyn_alloca() {
             "alloca must not be lowered as an external call:\n{ir}"
         );
     }
+}
+
+/// The bulk-memory builtins and aggregate copies lower to the IR's
+/// `memcpy`/`memmove`/`memset` ops; a call to a declared `memcpy` stays a
+/// call (as at gcc's -O0).
+#[test]
+fn bulk_builtins_lower_to_ir_ops() {
+    use latticefoundry::ir::text::print_module;
+
+    let src = "struct S { long v[8]; }; void *memcpy(void *, const void *, unsigned long); \
+               void f(struct S *a, struct S *b, char *p, unsigned long n){ \
+               *a = *b; __builtin_memcpy(p, p + 64, n); __builtin_memmove(p, p + 1, n); \
+               __builtin_memset(p, 1, 9); struct S z = {{0}}; *b = z; memcpy(p, a, 3); }";
+    let (module, syms) = lf_cc::compile_to_ir(src, "bulk_ir", false).expect("compiles");
+    let ir = print_module(&module, &syms);
+    assert!(ir.contains("memcpy %") && ir.contains("i64 64 align"), "a struct copy is one memcpy:\n{ir}");
+    assert!(ir.contains("memmove %"), "{ir}");
+    assert_eq!(ir.matches("memset %").count(), 2, "the builtin and the zero initializer:\n{ir}");
+    assert!(ir.contains("call @memcpy("), "a plain memcpy call stays a call:\n{ir}");
 }
 
 /// A wide string literal's read-only global stores its elements at the correct

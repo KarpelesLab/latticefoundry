@@ -633,3 +633,48 @@ fn address_spaces_and_pointer_width_reach_isel() {
     let add = insts.iter().find(|i| VOp::decode(i.opcode) == VOp::Add).expect("ptr_add lowers to add");
     assert!(matches!(add.operands.last(), Some(MachineOperand::Imm(w)) if *w == Int::from_u64(16)));
 }
+
+/// Bulk memory on the virtual target: `memset`/`memcpy`/`memmove` lower to
+/// `VOp::MemSet`/`VOp::MemCopy`, which the interpreter runs (zero length,
+/// overlapping moves both ways).
+#[test]
+fn bulk_memory_lowers_and_runs() {
+    let src = r#"module "vt"
+func @f(i64) -> i64 {
+entry ^0(%n: i64):
+  %a = dyn_alloca i64 32 align 16 : ptr
+  %b = dyn_alloca i64 32 align 16 : ptr
+  store i64 72623859790382856, %a align 8 : i64
+  %a8 = ptr_add %a, i64 8 : ptr
+  store i64 -1, %a8 align 8 : i64
+  memset %b, i8 17, i64 16 align 1
+  memcpy %b, %a, %n align 1
+  %b1 = ptr_add %b, i64 1 : ptr
+  memmove %b1, %b, i64 4 align 1
+  memmove %b, %b1, i64 2 align 1
+  %v = load %b align 8 : i64
+  ret %v
+}
+"#;
+    let mut syms = StrInterner::new();
+    let m = crate::ir::text::parse_module(src, crate::support::diagnostics::FileId::new(0), &mut syms).unwrap();
+    crate::verify::verify_module(&m).unwrap();
+    let target = VirtualTarget::new();
+    let mf = target.select(&m, FuncId::from_index(0));
+    assert_well_formed(&mf, &target);
+    let count = |op: VOp| mf.block_ids().map(|b| mf.block(b).insts.iter().filter(|i| VOp::decode(i.opcode) == op).count()).sum::<usize>();
+    assert_eq!((count(VOp::MemSet), count(VOp::MemCopy)), (1, 3));
+    let funcs = vec![mf];
+    let model = |n: usize| -> i64 {
+        let a: Vec<u8> = 72623859790382856u64.to_le_bytes().into_iter().chain([0xff; 8]).collect();
+        let mut b = vec![17u8; 16];
+        b[..n].copy_from_slice(&a[..n]);
+        b.copy_within(0..4, 1);
+        b.copy_within(1..3, 0);
+        i64::from_le_bytes(b[..8].try_into().unwrap())
+    };
+    for n in [0usize, 1, 5, 8, 16] {
+        let got = interp::run(&target, &funcs, 0, &[Int::from_u64(n as u64)]).unwrap().unwrap();
+        assert_eq!(got.mod_2k(64), Int::from_u64(model(n) as u64), "n = {n}");
+    }
+}

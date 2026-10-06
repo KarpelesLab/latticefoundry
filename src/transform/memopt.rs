@@ -17,9 +17,9 @@
 //! reference semantics:
 //!
 //! 1. **Scalar replacement** of slots that bulk ops touch (SROA-style). A
-//!    non-escaping entry-block slot whose accesses are all at constant
-//!    offsets — loads and stores of first-class types that agree on every
-//!    byte range, and bulk ops of constant length — is split into one slot
+//!    non-escaping entry-block slot a bulk op touches whose accesses are all
+//!    at constant offsets — loads and stores of first-class types that agree
+//!    on every byte range, and bulk ops of constant length — is split into one slot
 //!    per accessed range (the bytes only bulk ops touch get integer slices),
 //!    and each bulk op on it becomes a load and a store per slice, so a
 //!    struct copy of a few words becomes scalar traffic that `mem2reg` then
@@ -96,16 +96,32 @@ impl ModulePass for MemOpt {
 /// Run the three rewrites on function `id`; whether anything changed.
 pub(crate) fn optimize_function(module: &mut Module, id: FuncId) -> bool {
     let mut changed = false;
+    // Slots a bulk op touched in an earlier round (left for later because the
+    // op was expanded for the slot at its other end), as ids of the current
+    // function.
+    let mut extra: Vec<InstId> = Vec::new();
     for _ in 0..SROA_ROUNDS {
         let plan = {
             let f = module.function(id);
             let mem = MemInfo::new(module, f);
-            sroa_plan(module, f, &mem)
+            sroa_plan(module, f, &mem, &extra)
         };
         if plan.slots.is_empty() {
             break;
         }
-        let (fresh, ()) = module.map_function(id, |old, b| apply_sroa(old, b, &plan));
+        let (fresh, vmap) = module.map_function(id, |old, b| apply_sroa(old, b, &plan));
+        let old = module.function(id);
+        extra = plan
+            .deferred
+            .iter()
+            .filter_map(|&a| {
+                let r = old.inst(a).result()?;
+                match fresh.value(vmap[r.index()]?).def {
+                    ValueDef::Inst(i) => Some(i),
+                    _ => None,
+                }
+            })
+            .collect();
         module.replace_function(id, fresh);
         changed = true;
     }
@@ -318,6 +334,9 @@ struct Slice {
 struct SroaPlan {
     /// Split slot → its slices (sorted by offset).
     slots: HashMap<InstId, Vec<Slice>>,
+    /// Slots touched by a bulk op that another slot's split claimed this
+    /// round: candidates next round even once no bulk op touches them.
+    deferred: Vec<InstId>,
 }
 
 /// Whether `ty` is a first-class value a slice may hold.
@@ -331,7 +350,12 @@ enum Access {
     Bulk { inst: InstId, off: u64, n: u64, dst: bool, copy: bool },
 }
 
-fn sroa_plan(module: &Module, f: &Function, mem: &MemInfo) -> SroaPlan {
+/// The slots to split this round: non-escaping entry-block slots that a bulk
+/// op touches (or that one did in an earlier round, `extra`) — slots only
+/// ever accessed by plain loads and stores are left as the front end wrote
+/// them (a read of one before any write is poison either way, but splitting
+/// would let it fold away code that reads an indeterminate value).
+fn sroa_plan(module: &Module, f: &Function, mem: &MemInfo, extra: &[InstId]) -> SroaPlan {
     let types = module.types();
     let mut plan = SroaPlan::default();
     let Some(entry) = f.entry() else { return plan };
@@ -347,11 +371,16 @@ fn sroa_plan(module: &Module, f: &Function, mem: &MemInfo) -> SroaPlan {
             continue;
         }
         let Some(accesses) = slot_accesses(module, f, mem, a, size) else { continue };
+        let bulk = accesses.iter().any(|x| matches!(x, Access::Bulk { .. }));
+        if !bulk && !extra.contains(&a) {
+            continue;
+        }
         // A slot accessed whole, as its own type, is mem2reg's already.
         if accesses.iter().all(|x| matches!(*x, Access::Value { off: 0, ty } if ty == elem_ty)) {
             continue;
         }
         if accesses.iter().any(|x| matches!(x, Access::Bulk { inst, .. } if claimed.contains(inst))) {
+            plan.deferred.push(a);
             continue;
         }
         let Some(slices) = slices_for(module, &accesses, size) else { continue };
@@ -534,7 +563,7 @@ fn offset(b: &mut FunctionBuilder<'_>, p: ValueId, delta: i64) -> ValueId {
 }
 
 /// Rebuild `old` with the slots of `plan` split.
-fn apply_sroa(old: &Function, b: &mut FunctionBuilder<'_>, plan: &SroaPlan) {
+fn apply_sroa(old: &Function, b: &mut FunctionBuilder<'_>, plan: &SroaPlan) -> Vec<Option<ValueId>> {
     // The (old) values derived from a split slot: slot and offset.
     let mut derived: HashMap<ValueId, (InstId, u64)> = HashMap::new();
     for &a in plan.slots.keys() {
@@ -641,7 +670,7 @@ fn apply_sroa(old: &Function, b: &mut FunctionBuilder<'_>, plan: &SroaPlan) {
             }
             _ => false,
         }
-    });
+    })
 }
 
 /// Helpers on the builder for old-function constants.
@@ -1034,7 +1063,7 @@ fn write_only(f: &Function, s: InstId) -> Option<Vec<InstId>> {
 
 /// Rebuild `old` applying `rw`.
 fn apply_rewrites(old: &Function, b: &mut FunctionBuilder<'_>, rw: &HashMap<InstId, Rewrite>) {
-    rebuild_with(old, b, |b, vmap, i, _| {
+    let _ = rebuild_with(old, b, |b, vmap, i, _| {
         let Some(r) = rw.get(&i) else { return false };
         let inst = old.inst(i);
         let ops = inst.operands();
@@ -1095,7 +1124,7 @@ fn rebuild_with(
     old: &Function,
     b: &mut FunctionBuilder<'_>,
     mut hook: impl FnMut(&mut FunctionBuilder<'_>, &mut Vec<Option<ValueId>>, InstId, bool) -> bool,
-) {
+) -> Vec<Option<ValueId>> {
     let n = old.block_count();
     let entry = old.entry().expect("a definition has an entry").index();
     let cfg = ControlFlowGraph::new(old);
@@ -1135,6 +1164,7 @@ fn rebuild_with(
         }
         rebuild_terminator(&mut vmap, old, b, &new_block, bb, |_, _, _| {});
     }
+    vmap
 }
 
 #[cfg(test)]

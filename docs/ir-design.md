@@ -1699,6 +1699,121 @@ function. An asm reading secret memory through a memory clobber is not
 itself a constant-time violation (its outputs are tainted, so a branch on
 them is).
 
+## 6k. Bulk memory: `memcpy`, `memmove`, `memset`  *(decided)*
+
+Front ends copy structs and arrays and clear buffers all the time. Spelled as
+element-by-element loads and stores (or loops), that costs code size in every
+program and hides the intent from the optimizer and the backends; spelled as
+calls to the C library, it needs a libc and is opaque. So the IR has three
+result-less ops:
+
+```text
+memcpy  [volatile] %dst, %src, %n align A
+memmove [volatile] %dst, %src, %n align A
+memset  [volatile] %dst, %byte, %n align A
+```
+
+- **Operands.** `dst` and `src` are pointers in any address space (or
+  aggregate values, which denote their address, §6). `n` is an integer of
+  1 to 64 bits read **unsigned**. `byte` is an `i8`. `align` (a power of two,
+  `1` = nothing known) is an alignment both pointers have; the builder's
+  `memcpy`/`memmove`/`memset` take it explicitly and `bulk_memory` builds any
+  flavor, volatile included.
+- **Meaning** (defined once, by `ir::semantics::exec_bulk_memory` over a byte
+  memory with per-byte poison; the reference executors call it):
+  - `n == 0` is a no-op whatever the pointers are — null, dangling, even
+    poison. Nothing is read or written.
+  - Otherwise every byte of `[dst, dst + n)` (and of `[src, src + n)`) must be
+    inside a live allocation and both addresses multiples of `align`; a
+    poison, dangling or misaligned pointer, a range that wraps the address
+    space, or a **poison `n`** is undefined behavior.
+  - `memcpy` copies the bytes **with their poison**: a poison byte of the
+    source makes the same destination byte poison, a defined one is copied
+    as is. The ranges must not overlap — a partial overlap is undefined
+    behavior — except that `dst == src` exactly is allowed (C's whole-object
+    assignment `*p = *q` with `p == q` relies on it) and leaves memory as it
+    was. `memmove` allows any overlap: it copies as if through a temporary.
+  - `memset` writes `byte` to each of the `n` bytes; a poison `byte` makes
+    them all poison.
+- **Volatile.** A volatile bulk op touches every byte of each range exactly
+  once, in an unspecified order and at unspecified widths, and is never
+  removed, merged, forwarded or moved across another volatile access, atomic,
+  fence, call or syscall (the volatile load/store rules of §6b).
+- **Binary form.** Opcode tag 47 (`memcpy`/`memmove`) and 48 (`memset`), each
+  followed by a flag byte (bit 0 volatile, bit 1 overlapping; any other bit is
+  rejected) and the alignment: tag values only, so no version bump.
+- **Rejected: library calls or intrinsics by name.** A call to `memcpy` is an
+  opaque effect to every analysis and needs a C library on targets that have
+  none (Lode's freestanding executables, AVR firmware). A dedicated op says
+  exactly which bytes move, which keeps it analyzable, and each backend picks
+  the best code for its constant-length common case.
+
+### Analyses and the constant-time rules
+
+The secret-taint memory summary (§6d) follows the bytes: a `memset` with a
+secret-derived byte taints the memory it fills, and a copy taints its
+destination whenever its source may hold a secret; the addresses of a bulk op
+do not make a slot escape. The constant-time verifier treats the length like
+an address — it decides which memory is touched and for how long — so a
+secret-derived length, `dst` or `src` is rejected; moving secret *bytes* is
+fine, but only into memory that may hold secrets (a non-escaping slot or a
+secret global), like an unflagged `store`: a secret `memset` byte into other
+memory is a `PublicStore` violation and a copy of possibly-secret memory into
+it a `SecretCopyToPublic` one. The refinement checker does not model memory
+and answers `Unknown` for a function with a bulk op, as for any store.
+
+### Optimization (`memopt`)
+
+The `memopt` pass (§ `transform::memopt`) traces addresses to a base (a slot,
+a global or an opaque pointer) and a constant offset; a slot whose address is
+only used by loads, stores and bulk ops does not escape and cannot alias an
+opaque pointer. On that model it:
+
+- **splits slots** (SROA-style): a non-escaping slot that a bulk op touches,
+  accessed only at constant offsets by agreeing loads/stores and
+  constant-length bulk ops, becomes one slot per range, each bulk op on it a load and a store per
+  slice, so struct copies become scalar traffic that `mem2reg` promotes. A
+  slice both copied in from and copied out to other memory is left alone: a
+  wide load would poison bytes the byte-wise copy keeps defined;
+- **forwards** within a block: a load of a just-stored value is that value, a
+  load from a constant fill the replicated constant, a load from a copied
+  range a load from the original; a constant `memcpy` of exactly a stored
+  value becomes a store, of a filled range a `memset`, of a copied range a
+  copy from the original (a `memmove` unless the ranges provably do not
+  overlap);
+- **removes dead writes**: a store or constant bulk write fully overwritten
+  later in the block before any possible read, writes to a non-escaping slot
+  the function then returns without reading, slots nothing reads at all, and
+  zero-length ops.
+
+Calls, syscalls, atomics, fences, volatile accesses and memory-touching
+inline asm end every fact about escapable memory. `memopt` runs before
+`mem2reg` at `-O1` and up and again after inlining.
+
+### Lowering
+
+A generic IR→IR legalization (`codegen::legalize_mem`), run by every backend
+first thing in `legalize_vectors`, rewrites each op per the target's
+`BulkMemoryLowering` (a `VectorLegality` hook): a constant length whose
+expansion takes at most `max_inline` accesses becomes straight-line loads and
+stores of the widest chunk that fits (16-byte `<16 x i8>` vectors where the
+target has them, then the machine word, halving), never wider than the known
+alignment on targets that need aligned accesses — a `memmove` loads every
+chunk before storing any; anything else stays native (its length made
+pointer-sized) or becomes a loop (word chunks and a byte tail for
+`memcpy`/`memset`; for `memmove` a forward byte loop when `dst <= src` and a
+backward one otherwise). Volatile ops are expanded into volatile scalar
+accesses.
+
+| Target | constant, short | long or variable |
+|---|---|---|
+| x86-64 | up to 4 accesses: `movdqu`/`movdqa` (SSE) for 16 bytes, then 8/4/2/1 | `rep movsb` / `rep stosb` (`rdi`, `rsi`/`al`, `rcx` as one fixed-register window); `memmove` compares `rdi - rsi` with `rcx` and copies down with `std; rep movsb; cld` when it must; with `CodegenOptions::bulk_memory_libcalls`, calls to the C library's `memcpy`/`memmove`/`memset` |
+| AArch64 | up to 8 accesses: `ldr`/`str q` for 16 bytes, then x/w/h/b | 8-byte word loop + byte tail |
+| RISC-V | up to 8 aligned accesses (`ld`/`sd` when 8-aligned, else narrower) | aligned word loop + byte tail |
+| Thumb (Cortex-M) | up to 8 aligned word/halfword/byte accesses | aligned word loop + byte tail |
+| AVR | up to 8 byte/16-bit accesses | byte/16-bit loop; a source in address space 1 (flash) is read with `lpm` |
+| wasm32 | a single 1/2/4/8-byte access | `memory.copy` / `memory.fill` (bulk-memory feature), a variable length guarded against 0 — they trap on an out-of-bounds pointer even for an empty range |
+
 ## 7. Instruction flags: one unified model  *(decided)*
 
 A single `Flags` mechanism attached to instructions that admit them, rather than

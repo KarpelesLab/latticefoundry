@@ -336,6 +336,17 @@ pub struct TExpr {
     pub span: Span,
 }
 
+/// Which bulk-memory builtin a [`TExprKind::BulkMem`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BulkOp {
+    /// `memcpy`: the ranges may not overlap.
+    Copy,
+    /// `memmove`: the ranges may overlap.
+    Move,
+    /// `memset`.
+    Set,
+}
+
 /// A typed expression node. Operand conversions are already explicit.
 #[derive(Clone, Debug)]
 pub enum TExprKind {
@@ -370,6 +381,11 @@ pub enum TExprKind {
     /// `alloca(n)` / `__builtin_alloca(n)`: allocate `n` bytes on the stack
     /// (native `dyn_alloca`), yielding a `void *`. `n` is a byte count.
     DynAlloca(Box<TExpr>),
+    /// `__builtin_memcpy` / `__builtin_memmove` / `__builtin_memset(dst,
+    /// mid, n)`: the IR's bulk-memory op (`docs/ir-design.md` §6k), yielding
+    /// `dst` as a `void *`. `mid` is the source (`void *`) or the fill value
+    /// (`int`), `n` a `size_t`.
+    BulkMem { op: BulkOp, dst: Box<TExpr>, mid: Box<TExpr>, n: Box<TExpr> },
     /// Conditional; `then`/`els` already converted to the node type.
     Cond(Box<TExpr>, Box<TExpr>, Box<TExpr>),
     /// Comma; result is the right operand.
@@ -3509,6 +3525,7 @@ impl Checker {
             "shuffle" => return self.builtin_shuffle(ctx, args, span),
             "bswap16" => return self.builtin_bswap(ctx, args, 16, span),
             "bswap32" => return self.builtin_bswap(ctx, args, 32, span),
+            "memcpy" | "memmove" | "memset" => return self.builtin_bulk(ctx, base, args, span),
             "bswap64" => return self.builtin_bswap(ctx, args, 64, span),
             "isnan" | "isinf" | "isinf_sign" | "isfinite" | "finite" | "isnormal" | "signbit"
             | "signbitf" | "signbitl" | "fpclassify" | "isgreater" | "isgreaterequal"
@@ -3581,6 +3598,49 @@ impl Checker {
 
     /// `__builtin_bswapN(x)`: reverse the bytes of an `N`-bit unsigned value,
     /// built from shifts and masks.
+    /// `__builtin_memcpy` / `__builtin_memmove` / `__builtin_memset`: the
+    /// arguments converted as the C library prototypes would (`void *`,
+    /// `const void *` or `int`, `size_t`), as a [`TExprKind::BulkMem`].
+    fn builtin_bulk(&mut self, ctx: &mut FnCtx, base: &str, args: &[Expr], span: Span) -> Option<TExpr> {
+        let [dst, mid, n] = args else {
+            self.error(span, format!("__builtin_{base} takes exactly three arguments"));
+            return None;
+        };
+        let op = match base {
+            "memcpy" => BulkOp::Copy,
+            "memmove" => BulkOp::Move,
+            _ => BulkOp::Set,
+        };
+        let vptr = CType::ptr_to(CType::Void);
+        let d = self.check_rvalue(ctx, dst)?;
+        if !d.ty.is_pointer() {
+            self.error(dst.span, format!("__builtin_{base} requires a pointer destination"));
+            return None;
+        }
+        let d = self.convert(d, &vptr);
+        let m = self.check_rvalue(ctx, mid)?;
+        let m = if op == BulkOp::Set {
+            if !m.ty.is_integer() {
+                self.error(mid.span, "__builtin_memset requires an integer fill value");
+                return None;
+            }
+            self.convert(m, &CType::int())
+        } else {
+            if !m.ty.is_pointer() {
+                self.error(mid.span, format!("__builtin_{base} requires a pointer source"));
+                return None;
+            }
+            self.convert(m, &vptr)
+        };
+        let n = self.check_rvalue(ctx, n)?;
+        let n = self.convert(n, &size_t());
+        Some(TExpr::new(
+            TExprKind::BulkMem { op, dst: Box::new(d), mid: Box::new(m), n: Box::new(n) },
+            vptr,
+            span,
+        ))
+    }
+
     fn builtin_bswap(
         &mut self,
         ctx: &mut FnCtx,
