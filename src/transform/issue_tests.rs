@@ -172,3 +172,89 @@ fn issue18_branch_on_poison_becomes_unreachable() {
     assert_eq!(count(f, |k| matches!(k, InstKind::Unreachable)), 1, "{}", print_module(&m.0, &m.1));
     assert_eq!(count(f, |k| matches!(k, InstKind::CondBr { .. })), 1, "only the entry branch is left");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #20: `simplify_cfg` on a branch whose edges are identical
+// ---------------------------------------------------------------------------
+
+/// The issue's repro.
+const SAME_BR: &str = r#"
+module "samebr"
+
+func @f(i64) -> i64 {
+entry ^0(%0: i64):
+  %1 = icmp eq %0, i64 0 : i1
+  cond_br %1, ^1, ^1
+^1:
+  ret %0
+}
+"#;
+
+/// Identical edges with arguments, a `switch` whose every target is the same,
+/// and a `cond_br` whose edges only meet past forwarding blocks.
+const SAME_EDGES: &str = r#"
+module "sameedges"
+
+func @f(i64) -> i64 {
+entry ^0(%0: i64):
+  %1 = icmp ult %0, i64 10 : i1
+  %2 = add %0, i64 3 : i64
+  cond_br %1, ^1(%2, i64 7), ^1(%2, i64 7)
+^1(%3: i64, %4: i64):
+  %5 = mul %3, %4 : i64
+  switch %0, ^2(%5) [1: ^2(%5), 2: ^2(%5)]
+^2(%6: i64):
+  %7 = icmp sgt %6, i64 100 : i1
+  cond_br %7, ^3(%6), ^4(%6)
+^3(%8: i64):
+  br ^5(%8)
+^4(%9: i64):
+  br ^5(%9)
+^5(%10: i64):
+  %11 = sub %10, i64 1 : i64
+  ret %11
+}
+"#;
+
+/// A switch whose targets agree but whose arguments do not stays a switch.
+const DIFFERENT_ARGS: &str = r#"
+module "diffargs"
+
+func @f(i64) -> i64 {
+entry ^0(%0: i64):
+  switch %0, ^1(i64 5) [1: ^1(i64 5), 2: ^1(i64 6)]
+^1(%1: i64):
+  ret %1
+}
+"#;
+
+#[test]
+fn issue20_identical_edges_fold_to_br() {
+    let inputs = ints(64, &[0, 1, 2, 3, 9, 10, 11, 200, -4]);
+    for src in [SAME_BR, SAME_EDGES] {
+        // simplify_cfg alone folds every branch: no compare survives DCE.
+        let orig = parse(src);
+        let mut opt = parse(src);
+        run_passes(&mut opt.0, vec![pass_by_name("simplify_cfg").expect("simplify_cfg"), pass_by_name("dce").expect("dce")]);
+        verified(&opt.0, &opt.1, "simplify_cfg");
+        agree(&orig, &opt, "simplify_cfg", &inputs);
+        let f = only(&opt.0);
+        let text = print_module(&opt.0, &opt.1);
+        assert_eq!(f.block_count(), 1, "{text}");
+        assert_eq!(count(f, |k| matches!(k, InstKind::ICmp(_) | InstKind::CondBr { .. } | InstKind::Switch(_))), 0, "{text}");
+        // A second run finds nothing left to do.
+        let before = print_module(&opt.0, &opt.1);
+        run_passes(&mut opt.0, vec![pass_by_name("simplify_cfg").expect("simplify_cfg")]);
+        assert_eq!(print_module(&opt.0, &opt.1), before);
+
+        let o2 = check_everywhere(src, &["simplify_cfg"], &inputs);
+        let f = only(&o2.0);
+        assert_eq!(count(f, |k| matches!(k, InstKind::ICmp(_) | InstKind::CondBr { .. })), 0, "{}", print_module(&o2.0, &o2.1));
+    }
+    // Differing arguments keep the switch.
+    let mut m = parse(DIFFERENT_ARGS);
+    run_passes(&mut m.0, vec![pass_by_name("simplify_cfg").expect("simplify_cfg")]);
+    verified(&m.0, &m.1, "simplify_cfg");
+    assert_eq!(count(only(&m.0), |k| matches!(k, InstKind::Switch(_))), 1);
+    check_everywhere(DIFFERENT_ARGS, &["simplify_cfg"], &ints(64, &[0, 1, 2, 3]));
+}

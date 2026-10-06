@@ -13,7 +13,10 @@
 //!    constant that *exactly* matches a case folds to that case's edge. (A
 //!    constant that matches no case is left alone — folding to the default would
 //!    require ruling out a modular-congruent match, which we cannot do
-//!    conservatively, so we don't.)
+//!    conservatively, so we don't.) Whatever the condition, a `cond_br` or
+//!    `switch` whose every edge leads (through forwarding blocks) to the same
+//!    block with the same arguments becomes a `br` along that edge, leaving
+//!    the condition dead.
 //! 3. **Single-predecessor merge (straightening).** If a block `B` has exactly one
 //!    predecessor `P`, `P`'s terminator is an unconditional `br` to `B`, and `B`
 //!    is not the entry, `B` is spliced into `P`: `B`'s instructions follow `P`'s,
@@ -116,54 +119,26 @@ fn simplify(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
     // Phase 1: constant-fold every terminator.
     let (eff, any_fold) = compute_eff(old, builder);
 
-    // Phase 2: classify transparent forwarding blocks (empty, unconditional
-    // branch whose arguments are own-parameters or constants), never the entry.
-    let mut is_forwarder = vec![false; n];
-    for b in 0..n {
-        if b == entry_idx || !old.block(BlockId::from_index(b)).insts().is_empty() {
-            continue;
-        }
-        if let Term::Br(c, args) = &eff[b]
-            && *c != b
-            && args.iter().all(|&a| forward_safe(old, b, a))
-            && params_confined_to_block(old, b)
-        {
-            is_forwarder[b] = true;
-        }
-    }
-    // A forwarding cycle has no non-forwarder exit; demote such blocks so every
-    // resolution terminates (conservative and always sound).
+    // Phase 2: classify transparent forwarding blocks, then fold a
+    // conditional branch or switch whose every edge resolves to the same
+    // target with the same arguments into an unconditional `br`. A fold can
+    // make its block a forwarder, exposing further folds: iterate.
+    let mut eff = eff;
+    let mut any_fold = any_fold;
+    let mut is_forwarder = classify_forwarders(old, &eff, entry_idx);
     loop {
-        let mut changed = false;
+        let mut folded = false;
         for b in 0..n {
-            if !is_forwarder[b] {
-                continue;
-            }
-            let mut cur = b;
-            let mut seen = vec![false; n];
-            let mut ok = false;
-            loop {
-                if !is_forwarder[cur] {
-                    ok = true;
-                    break;
-                }
-                if seen[cur] {
-                    break;
-                }
-                seen[cur] = true;
-                match &eff[cur] {
-                    Term::Br(c, _) => cur = *c,
-                    _ => break,
-                }
-            }
-            if !ok {
-                is_forwarder[b] = false;
-                changed = true;
+            if let Some((tgt, args)) = single_edge(&eff, &is_forwarder, old, b) {
+                eff[b] = Term::Br(tgt, args);
+                folded = true;
             }
         }
-        if !changed {
+        if !folded {
             break;
         }
+        any_fold = true;
+        is_forwarder = classify_forwarders(old, &eff, entry_idx);
     }
 
     // Phase 3: resolved successor lists (edges through forwarders), reachability.
@@ -260,6 +235,73 @@ fn simplify(old: &Function, builder: &mut FunctionBuilder<'_>) -> Changed {
     }
 
     Changed::Yes
+}
+
+/// Classify the transparent forwarding blocks (empty, unconditional branch
+/// whose arguments are own-parameters or constants), never the entry.
+fn classify_forwarders(old: &Function, eff: &[Term], entry_idx: usize) -> Vec<bool> {
+    let n = old.block_count();
+    let mut is_forwarder = vec![false; n];
+    for b in 0..n {
+        if b == entry_idx || !old.block(BlockId::from_index(b)).insts().is_empty() {
+            continue;
+        }
+        if let Term::Br(c, args) = &eff[b]
+            && *c != b
+            && args.iter().all(|&a| forward_safe(old, b, a))
+            && params_confined_to_block(old, b)
+        {
+            is_forwarder[b] = true;
+        }
+    }
+    // A forwarding cycle has no non-forwarder exit; demote such blocks so every
+    // resolution terminates (conservative and always sound).
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            if !is_forwarder[b] {
+                continue;
+            }
+            let mut cur = b;
+            let mut seen = vec![false; n];
+            let mut ok = false;
+            loop {
+                if !is_forwarder[cur] {
+                    ok = true;
+                    break;
+                }
+                if seen[cur] {
+                    break;
+                }
+                seen[cur] = true;
+                match &eff[cur] {
+                    Term::Br(c, _) => cur = *c,
+                    _ => break,
+                }
+            }
+            if !ok {
+                is_forwarder[b] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    is_forwarder
+}
+
+/// If block `b` ends in a `cond_br` or `switch` whose every edge resolves
+/// (through forwarders) to the same block with the same arguments, that edge:
+/// the branch then always goes there, whatever its condition. (A poison
+/// condition was undefined behavior, which the unconditional `br` refines.)
+fn single_edge(eff: &[Term], is_forwarder: &[bool], old: &Function, b: usize) -> Option<(usize, Vec<ValueId>)> {
+    if !matches!(eff[b], Term::Cond { .. } | Term::Switch { .. }) {
+        return None;
+    }
+    let mut edges = term_edges(&eff[b]).into_iter().map(|(t, a)| resolve_edge(eff, is_forwarder, old, t, &a));
+    let first = edges.next()?;
+    edges.all(|e| e == first).then_some(first)
 }
 
 /// Whether every parameter of block `b` is used only inside `b` itself (by `b`'s
