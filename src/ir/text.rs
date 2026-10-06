@@ -35,7 +35,9 @@
 //! global      ::= "global" [ linkage ] [ visibility ] [ "constant" ] [ "detached" ]
 //!                 [ "secret" ] [ "thread_local" ] [ "addrspace" "(" INT ")" ] "@" name ":" type
 //!                 [ "=" init ]
-//! func        ::= "func" [ linkage ] [ visibility ] "@" name funcsig [ body ]
+//! func        ::= "func" [ linkage ] [ visibility ] [ inlinehint ] "@" name funcsig
+//!                 [ body ]
+//! inlinehint  ::= "inline" "(" ( "always" | "never" ) ")"
 //! funcsig     ::= "(" [ [ "secret" ] type { "," [ "secret" ] type } [ "," "..." ]
 //!                 | "..." ] ")" "->" [ "secret" ] type
 //! linkage     ::= "internal" | "weak"
@@ -151,7 +153,7 @@ use crate::ir::inst::{
 use crate::ir::types::{FloatKind, Type};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, ValueDef, ValueId};
 use crate::ir::{
-    BlockId, FuncAttrs, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module, TypeId,
+    BlockId, FuncAttrs, FuncId, Function, Global, GlobalAttrs, GlobalId, InlineHint, Linkage, Module, TypeId,
     Visibility,
 };
 use crate::support::StrInterner;
@@ -281,6 +283,9 @@ fn write_function<W: fmt::Write>(
     let func = module.function(fid);
     write!(f, "func ")?;
     write_linkage_visibility(f, func.attrs.linkage, func.attrs.visibility)?;
+    if let Some(hint) = func.attrs.inline.keyword() {
+        write!(f, "inline({hint}) ")?;
+    }
     write_name(f, syms.resolve(func.name))?;
     write_signature_attrs(f, module, func.sig, Some(module.func_attrs(fid)))?;
 
@@ -1808,8 +1813,10 @@ impl Parser {
         let func_kw = self.expect_ident("func")?;
         let decl_line = self.lines.line_of(func_kw.start);
         let (linkage, visibility) = self.parse_linkage_visibility();
+        let inline = self.parse_inline_hint()?;
         let name = self.parse_name()?;
         let mut attrs = FuncAttrs::new(linkage, visibility);
+        attrs.inline = inline;
         let (params, ret, variadic) = self.parse_fn_sig_attrs(module, Some(&mut attrs))?;
         let sig = module.types_mut().func(params, ret, variadic);
         let sym = syms.intern(&name);
@@ -1823,6 +1830,24 @@ impl Parser {
             None
         };
         Ok((fid, body, decl_line))
+    }
+
+    /// Parse the optional `inline(always)` / `inline(never)` hint of a `func`
+    /// header.
+    fn parse_inline_hint(&mut self) -> PResult<InlineHint> {
+        if !self.eat_ident("inline") {
+            return Ok(InlineHint::Auto);
+        }
+        self.expect(&TokKind::LParen, "`(`")?;
+        let hint = if self.eat_ident("always") {
+            InlineHint::Always
+        } else if self.eat_ident("never") {
+            InlineHint::Never
+        } else {
+            return self.err(self.span(), "expected `always` or `never` in `inline(...)`");
+        };
+        self.expect(&TokKind::RParen, "`)`")?;
+        Ok(hint)
     }
 
     /// Parse the optional `internal`/`weak` linkage and `hidden`/`protected`
@@ -3455,6 +3480,28 @@ entry ^0:
         assert_eq!(attrs[0], FuncAttrs::new(Linkage::Weak, Visibility::Hidden));
         assert_eq!(attrs[1], FuncAttrs::new(Linkage::Internal, Visibility::Default));
         assert_eq!(attrs[2], FuncAttrs::new(Linkage::External, Visibility::Hidden));
+    }
+
+    /// `inline(always)` / `inline(never)` follow linkage and visibility in a
+    /// function header, round-trip, and reject any other word.
+    #[test]
+    fn inline_hints_round_trip() {
+        let src = "module \"ih\"\n\n\
+                   func internal hidden inline(always) @a(i32) -> i32 {\nentry ^0(%0: i32):\n  ret %0\n}\n\n\
+                   func inline(never) @n() -> void {\nentry ^0:\n  ret\n}\n\n\
+                   func @plain() -> void\n";
+        let mut syms = StrInterner::new();
+        let m = parse_module(src, file(), &mut syms).expect("parse");
+        assert_eq!(print_module(&m, &syms), src, "the source is in canonical form");
+        let parsed = round_trip(&m, &mut syms);
+        let hints: Vec<InlineHint> = parsed.functions().map(|f| f.attrs.inline).collect();
+        assert_eq!(hints, [InlineHint::Always, InlineHint::Never, InlineHint::Auto]);
+        assert_eq!(parsed.function(FuncId::from_index(0)).attrs.linkage, Linkage::Internal);
+
+        let bad = "module \"ih\"\nfunc inline(sometimes) @f() -> void\n";
+        assert!(parse_module(bad, file(), &mut syms).is_err(), "only always/never");
+        let bad = "module \"ih\"\nfunc inline @f() -> void\n";
+        assert!(parse_module(bad, file(), &mut syms).is_err(), "the parenthesized word is required");
     }
 
     #[test]

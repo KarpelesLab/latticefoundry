@@ -29,6 +29,12 @@
 //!   give `<N x i1>`, a vector `select` condition is `<N x i1>`); lane indices
 //!   and shuffle-mask entries are in range; `bitcast` preserves the total bit
 //!   width; vector loads/stores are never `volatile`.
+//! - **Inlining hints** (`docs/ir-design.md` §4b) — an `inline(always)`
+//!   function must be one the inliner can honor: not a `weak` definition
+//!   (another object may replace its body at link time), not variadic (there
+//!   is no faithful parameter mapping for the variadic arguments), and free of
+//!   `dyn_alloca` (its storage lives until the *caller* returns, so an inlined
+//!   copy in a loop would grow the stack without bound).
 //!
 //! The `Refinement` tier (per-opcode poison/UB refinement obligations discharged
 //! by `z3rs`) is layered on top later and is deliberately *not* implemented
@@ -81,7 +87,7 @@
 use crate::ir::inst::{AsmSlot, AtomicOrdering, BinOp, CastOp, InlineAsm, InstData, InstId, InstKind, RmwOp, UnaryOp};
 use crate::ir::types::{FloatKind, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, ValueDef, ValueId};
-use crate::ir::{BlockId, FuncId, Function, GlobalId, Module};
+use crate::ir::{BlockId, FuncId, Function, GlobalId, InlineHint, Linkage, Module};
 use crate::support::diagnostics::Diagnostic;
 
 use super::cfg::DomTree;
@@ -321,6 +327,7 @@ impl<'a> Ctx<'a> {
         if let Some(bad) = first_bad_vector(self.module, self.func.sig) {
             self.err(format!("signature uses an invalid vector type {}", render_type(self.module, bad)));
         }
+        self.check_inline_hint();
         // An external declaration (no blocks) needs no body checks.
         if self.func.is_declaration() {
             self.check_values();
@@ -330,6 +337,30 @@ impl<'a> Ctx<'a> {
         self.check_blocks();
         self.check_dominance();
         self.check_values();
+    }
+
+    // --- inlining hints -----------------------------------------------------
+
+    /// An `inline(always)` hint must be one the inliner can honor (see the
+    /// module documentation).
+    fn check_inline_hint(&mut self) {
+        let func = self.func;
+        if func.attrs.inline != InlineHint::Always {
+            return;
+        }
+        if !func.is_declaration() && func.attrs.linkage == Linkage::Weak {
+            self.err("is inline(always) but weak: its body may be replaced at link time");
+        }
+        if matches!(self.module.types().get(func.sig), Type::Func(ft) if ft.variadic) {
+            self.err("is inline(always) but variadic");
+        }
+        let dyn_alloca = func
+            .blocks()
+            .flat_map(|(_, b)| b.insts().iter())
+            .any(|&i| matches!(func.inst(i).kind, InstKind::DynAlloca { .. }));
+        if dyn_alloca {
+            self.err("is inline(always) but uses dyn_alloca, whose storage lives until the caller returns");
+        }
     }
 
     // --- entry-block rules --------------------------------------------------

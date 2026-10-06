@@ -55,7 +55,7 @@ use crate::ir::inst::{
 use crate::ir::types::{FloatKind, FuncType, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, FloatBits, Value, ValueDef, ValueId};
 use crate::ir::{
-    Block, BlockId, FuncAttrs, FuncId, Function, Global, GlobalAttrs, GlobalId, Linkage, Module,
+    Block, BlockId, FuncAttrs, FuncId, Function, Global, GlobalAttrs, GlobalId, InlineHint, Linkage, Module,
     Visibility,
 };
 use crate::support::hash::{DetHashMap, DetHashSet};
@@ -111,6 +111,12 @@ pub const MAGIC: [u8; 4] = *b"LFB\0";
 /// opcode tag 45 (the template, a flag byte with bit 0 = `volatile`, then
 /// counted outputs — constraint, optional name, optional type — inputs and
 /// clobbers) and `asm_output` tag 46, with no bump.
+///
+/// Inlining hints ([`InlineHint`], `docs/ir-design.md` §4b) are function
+/// extension bits 2 (`inline(always)`) and 3 (`inline(never)`), carried by the
+/// version-5 extension varint like `thread_local`: no bump, a module without
+/// hints encodes exactly as before, and a reader that predates the bits
+/// rejects them as unknown extension flags. Both bits set is rejected.
 pub const VERSION: u32 = 5;
 
 /// Bit 7 of a (version ≥ 5) global or function attribute byte: an extension
@@ -128,6 +134,12 @@ const FUNC_EXT_SECRET_RET: u64 = 1;
 
 /// Function extension flag: a secret-parameter list follows.
 const FUNC_EXT_SECRET_PARAMS: u64 = 2;
+
+/// Function extension flag: the function is `inline(always)`.
+const FUNC_EXT_INLINE_ALWAYS: u64 = 4;
+
+/// Function extension flag: the function is `inline(never)`.
+const FUNC_EXT_INLINE_NEVER: u64 = 8;
 
 /// The oldest format version [`decode`] still reads.
 pub const MIN_VERSION: u32 = 1;
@@ -901,9 +913,10 @@ fn func_attrs_bits(a: &FuncAttrs) -> u8 {
 }
 
 /// Write the version-5 function attributes: the attribute byte, and when
-/// anything is secret the extension varint (plus the secret-parameter list).
+/// anything is secret or there is an inlining hint the extension varint (plus
+/// the secret-parameter list).
 fn write_func_attrs(w: &mut Writer, a: &FuncAttrs) {
-    if !a.has_secrets() {
+    if !a.has_secrets() && a.inline == InlineHint::Auto {
         w.u8(func_attrs_bits(a));
         return;
     }
@@ -916,6 +929,11 @@ fn write_func_attrs(w: &mut Writer, a: &FuncAttrs) {
     if !params.is_empty() {
         ext |= FUNC_EXT_SECRET_PARAMS;
     }
+    ext |= match a.inline {
+        InlineHint::Auto => 0,
+        InlineHint::Always => FUNC_EXT_INLINE_ALWAYS,
+        InlineHint::Never => FUNC_EXT_INLINE_NEVER,
+    };
     w.uvarint(ext);
     if !params.is_empty() {
         w.uvarint(params.len() as u64);
@@ -936,13 +954,20 @@ fn read_func_attrs(r: &mut Reader<'_>, version: u64, arity: usize) -> Result<Fun
     let mut attrs = func_attrs_from_bits(if version >= 5 { b & !ATTR_EXT_BIT } else { b })?;
     if has_ext {
         let ext = r.uvarint()?;
-        if ext & !(FUNC_EXT_SECRET_RET | FUNC_EXT_SECRET_PARAMS) != 0 {
+        let known = FUNC_EXT_SECRET_RET | FUNC_EXT_SECRET_PARAMS | FUNC_EXT_INLINE_ALWAYS | FUNC_EXT_INLINE_NEVER;
+        let both_hints = FUNC_EXT_INLINE_ALWAYS | FUNC_EXT_INLINE_NEVER;
+        if ext & !known != 0 || ext & both_hints == both_hints {
             return Err(DecodeError::InvalidTag {
                 what: "func-attrs extension",
                 tag: u32::try_from(ext).unwrap_or(u32::MAX),
             });
         }
         attrs.secret_ret = ext & FUNC_EXT_SECRET_RET != 0;
+        if ext & FUNC_EXT_INLINE_ALWAYS != 0 {
+            attrs.inline = InlineHint::Always;
+        } else if ext & FUNC_EXT_INLINE_NEVER != 0 {
+            attrs.inline = InlineHint::Never;
+        }
         if ext & FUNC_EXT_SECRET_PARAMS != 0 {
             let n = r.uindex()?;
             for _ in 0..n {
@@ -1793,7 +1818,7 @@ mod tests {
     use crate::ir::inst::{BinOp, CastOp, FastMath, Flags, FloatPred, IntPred};
     use crate::ir::types::FloatKind;
     use crate::ir::value::{AddrTarget, Const, FloatBits};
-    use crate::ir::{FuncAttrs, FuncId, Global, GlobalAttrs, GlobalId, Linkage, Module, Visibility};
+    use crate::ir::{FuncAttrs, FuncId, Global, GlobalAttrs, GlobalId, InlineHint, Linkage, Module, Visibility};
     use crate::support::StrInterner;
     use puremp::Int;
 
@@ -2381,7 +2406,7 @@ mod tests {
         let tail = [fbyte, 3, 2, 0, 2];
         let at = bytes.windows(tail.len()).rposition(|w| w == tail).expect("function attributes");
         let mut bad = bytes.clone();
-        bad[at + 1] = 4; // an unknown function extension bit
+        bad[at + 1] = 16; // an unknown function extension bit
         assert!(decode(&bad, &mut interner).is_err());
         let mut bad = bytes.clone();
         bad[at + 4] = 3; // a secret parameter index past the arity
@@ -2435,6 +2460,42 @@ mod tests {
         m.set_global_attrs(g, GlobalAttrs::DEFAULT);
         let bytes = encode(&m, &interner);
         assert!(!bytes.contains(&(super::attrs_bits(GlobalAttrs::DEFAULT) | super::ATTR_EXT_BIT)));
+    }
+
+    /// Inlining hints are function extension bits 2 (`always`) and 3 (`never`):
+    /// they round-trip, alone and next to secrecy, a function without a hint
+    /// keeps its bytes, and both bits at once are rejected.
+    #[test]
+    fn inline_hint_extension_bits() {
+        let mut interner = StrInterner::new();
+        let mut m = Module::new("ih");
+        let i64t = m.types_mut().int(64);
+        let sig = m.types_mut().func(vec![i64t], i64t, false);
+        let f = m.declare_function(interner.intern("f"), sig);
+        let plain = encode(&m, &interner);
+        let fbyte = super::func_attrs_bits(&FuncAttrs::DEFAULT);
+        let ebyte = fbyte | super::ATTR_EXT_BIT;
+        assert!(!plain.contains(&ebyte), "no hint: no extension");
+        for (hint, ext) in [(InlineHint::Always, 4u8), (InlineHint::Never, 8)] {
+            m.set_inline_hint(f, hint);
+            let bytes = encode(&m, &interner);
+            let m2 = decode(&bytes, &mut interner).expect("decode");
+            assert_eq!(m2.function(FuncId::from_index(0)).attrs.inline, hint);
+            assert_eq!(encode(&m2, &interner), bytes);
+            let at = bytes.windows(2).rposition(|w| w == [ebyte, ext]).expect("attribute byte + extension");
+            let mut bad = bytes.clone();
+            bad[at + 1] = 12; // always and never at once
+            assert!(decode(&bad, &mut interner).is_err());
+        }
+        // Next to a secret return.
+        m.set_ret_secret(f, true);
+        let m3 = decode(&encode(&m, &interner), &mut interner).expect("decode");
+        let attrs = &m3.function(FuncId::from_index(0)).attrs;
+        assert!(attrs.secret_ret && attrs.inline == InlineHint::Never);
+        // Back to no hint and no secret: the original bytes.
+        m.set_ret_secret(f, false);
+        m.set_inline_hint(f, InlineHint::Auto);
+        assert_eq!(encode(&m, &interner), plain);
     }
 
     /// Version-2 and version-3 streams (no target/layout header, no

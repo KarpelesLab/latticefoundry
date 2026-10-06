@@ -204,6 +204,13 @@ Latency, code size, and energy modeled as an abstract domain so the optimizer
 reasons about trade-offs formally (feeding B4's extraction) instead of via
 magic-number heuristics.
 
+*Progress:* two single-dimension instances so far. The e-graph's extraction
+cost (latency-flavoured), and the inliner's **code-size** cost
+(`transform::inline::inst_size`): a callee is inlined for free when its
+inlined size, re-estimated on the constant lattice (B8) with the call's
+constant arguments, is no larger than the call sequence it replaces, and
+otherwise against per-caller and per-module growth budgets.
+
 ### B10 — Provenance & effects in the type system *(Moonshot)*
 
 Bake a principled pointer-provenance model (PNVI-style) and an effect discipline

@@ -531,3 +531,25 @@ fn address_constant_operand_is_rejected() {
     }
     assert_one_error(&verify_function(&m, f), "only allowed in global initializers");
 }
+
+/// `inline(always)` must be honorable: not weak, not variadic, no
+/// `dyn_alloca`. `inline(never)` and unhinted functions are unrestricted.
+#[test]
+fn inline_always_hint_rules() {
+    use crate::support::diagnostics::FileId;
+    let check = |src: &str| {
+        let mut syms = StrInterner::new();
+        let m = crate::ir::text::parse_module(src, FileId::new(0), &mut syms).expect("parse");
+        verify_function(&m, FuncId::from_index(0))
+    };
+    let body = "{\nentry ^0:\n  ret\n}\n";
+    assert!(check(&format!("module \"m\"\nfunc internal inline(always) @f() -> void {body}")).is_empty());
+    assert!(check(&format!("module \"m\"\nfunc weak inline(never) @f() -> void {body}")).is_empty());
+    assert!(check("module \"m\"\nfunc inline(always) @f() -> void\n").is_empty(), "a declaration may carry a hint");
+    assert_one_error(&check(&format!("module \"m\"\nfunc weak inline(always) @f() -> void {body}")), "weak");
+    let variadic = "module \"m\"\nfunc inline(always) @f(i32, ...) -> void {\nentry ^0(%0: i32):\n  ret\n}\n";
+    assert_one_error(&check(variadic), "variadic");
+    let dyn_alloca = "module \"m\"\nfunc inline(always) @f(i64) -> void {\nentry ^0(%0: i64):\n  \
+                      %1 = dyn_alloca %0 align 16 : ptr\n  ret\n}\n";
+    assert_one_error(&check(dyn_alloca), "dyn_alloca");
+}

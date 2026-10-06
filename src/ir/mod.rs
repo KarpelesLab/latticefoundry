@@ -143,6 +143,35 @@ impl Visibility {
     }
 }
 
+/// A front end's **inlining hint** for a function (`docs/ir-design.md` §4b),
+/// kept in [`FuncAttrs::inline`]. It steers the inliner
+/// ([`Inline`](crate::transform::Inline)) at every direct call of the function
+/// and never changes what the program computes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum InlineHint {
+    /// No hint: the inliner's cost model decides. The default.
+    #[default]
+    Auto,
+    /// `inline(always)`: inline every direct call regardless of size or
+    /// budget, except a call of the function from its own body (recursion is
+    /// never unrolled).
+    Always,
+    /// `inline(never)`: never inline a call of the function.
+    Never,
+}
+
+impl InlineHint {
+    /// The text spelling inside `inline(...)`: `"always"` or `"never"`, and
+    /// `None` for [`InlineHint::Auto`] (which is not written).
+    pub fn keyword(self) -> Option<&'static str> {
+        match self {
+            InlineHint::Auto => None,
+            InlineHint::Always => Some("always"),
+            InlineHint::Never => Some("never"),
+        }
+    }
+}
+
 /// Per-global attributes beyond name/type/initializer (`docs/ir-design.md` §4a).
 ///
 /// - `linkage` picks the object symbol binding of a definition. A global with no
@@ -223,6 +252,8 @@ impl GlobalAttrs {
 ///   secret-derived value, and makes every direct call's result secret-derived
 ///   in the caller. Secrecy is part of the function's *interface*: a caller
 ///   may pass a secret-derived argument only to a secret parameter.
+/// - `inline` is the front end's [`InlineHint`] for direct calls of the
+///   function (`inline(always)` / `inline(never)`; none by default).
 ///
 /// Every functional rebuild ([`Module::map_function`]) carries the attributes
 /// over to the fresh function.
@@ -238,6 +269,8 @@ pub struct FuncAttrs {
     secret_params: Vec<bool>,
     /// Whether the return value is secret.
     pub secret_ret: bool,
+    /// The inlining hint for direct calls of the function.
+    pub inline: InlineHint,
 }
 
 impl FuncAttrs {
@@ -247,11 +280,12 @@ impl FuncAttrs {
         visibility: Visibility::Default,
         secret_params: Vec::new(),
         secret_ret: false,
+        inline: InlineHint::Auto,
     };
 
-    /// The given linkage and visibility, nothing secret.
+    /// The given linkage and visibility, nothing secret, no inlining hint.
     pub const fn new(linkage: Linkage, visibility: Visibility) -> FuncAttrs {
-        FuncAttrs { linkage, visibility, secret_params: Vec::new(), secret_ret: false }
+        FuncAttrs { linkage, visibility, secret_params: Vec::new(), secret_ret: false, inline: InlineHint::Auto }
     }
 
     /// Whether parameter `i` is secret.
@@ -383,6 +417,11 @@ impl Module {
     /// Mark the return value of function `id` secret (or public).
     pub fn set_ret_secret(&mut self, id: FuncId, secret: bool) {
         self.functions[id.index()].attrs.secret_ret = secret;
+    }
+
+    /// Set the [inlining hint](InlineHint) of function `id`.
+    pub fn set_inline_hint(&mut self, id: FuncId, hint: InlineHint) {
+        self.functions[id.index()].attrs.inline = hint;
     }
 
     /// Whether the module declares any secret at all: a secret parameter or

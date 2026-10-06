@@ -354,6 +354,28 @@ against a local label on the `auipc`, since the low part is the low bits of
 `R_RISCV_PCREL_LO12_I`), and calls stay `auipc`+`jalr` under one
 `R_RISCV_CALL_PLT`.
 
+**Inlining hints.** A function header may also carry the front end's hint for
+the inliner, after linkage and visibility:
+
+```text
+func [internal | weak] [hidden | protected] [inline(always) | inline(never)] @f(…) -> T [{ … }]
+```
+
+`inline(never)` keeps every call of the function a call; `inline(always)`
+inlines every direct call regardless of size or budget, except a call from the
+function's own body (a recursive function is never inlined into itself, and
+each inlining round goes one level deep, so mutual recursion stays bounded).
+Without a hint the inliner's size cost model decides
+(`transform::inline`). The verifier rejects an `inline(always)` it could not
+honor: a `weak` definition (another object may replace the body at link
+time), a variadic function, or one using `dyn_alloca`. A declaration may carry
+a hint; IR linking applies it to the definition it meets, and a definition's
+own hint wins. The hint is `FuncAttrs::inline` (`InlineHint`), set with
+`Module::set_inline_hint` or `FunctionBuilder::set_inline_hint`. In `.lfb` it
+is function extension bit 2 (`always`) or 3 (`never`) of the version-5
+attribute extension, with no version bump: a module without hints encodes as
+before, and both bits together are rejected.
+
 ## 4c. Thread-local storage  *(decided)*
 
 A global marked `thread_local` has **one instance per thread**:

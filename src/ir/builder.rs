@@ -92,6 +92,12 @@ impl<'a> FunctionBuilder<'a> {
         self.func.attrs = attrs;
     }
 
+    /// Set the function's [inlining hint](crate::ir::InlineHint)
+    /// (`inline(always)` / `inline(never)`).
+    pub fn set_inline_hint(&mut self, hint: crate::ir::InlineHint) {
+        self.func.attrs.inline = hint;
+    }
+
     // --- blocks & insertion point ------------------------------------------
 
     /// Create a block with the given typed parameter list, returning its id.

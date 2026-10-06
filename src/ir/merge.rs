@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use crate::ir::inst::{InstData, InstKind};
 use crate::ir::types::{FuncType, Type, TypeId};
 use crate::ir::value::{AddrTarget, Const, ConstId, Value, ValueDef};
-use crate::ir::{Block, Function, Global, GlobalAttrs, GlobalId, Linkage, Module};
+use crate::ir::{Block, Function, Global, GlobalAttrs, GlobalId, InlineHint, Linkage, Module};
 use crate::support::Sym;
 
 use super::FuncId;
@@ -223,6 +223,12 @@ impl Module {
                     cur.secret_ret |= f.attrs.secret_ret;
                     for p in f.attrs.secret_params() {
                         cur.set_param_secret(p, true);
+                    }
+                    // An inlining hint on any declaration applies to the
+                    // definition (as a C attribute on a prototype does); the
+                    // definition's own hint wins over a declaration's.
+                    if f.attrs.inline != InlineHint::Auto && (incoming_def || cur.inline == InlineHint::Auto) {
+                        cur.inline = f.attrs.inline;
                     }
                     existing
                 }
@@ -687,5 +693,28 @@ mod tests {
         assert!(out.contains("global hidden @x : i64 = i64 1\n"), "{out}");
         assert!(out.contains("func weak hidden @f() -> void {"), "{out}");
         assert!(out.contains("func internal protected @g() -> void {"), "{out}");
+    }
+
+    /// An inlining hint on a declaration applies to the definition it meets;
+    /// the definition's own hint wins over a declaration's.
+    #[test]
+    fn merge_carries_inline_hints() {
+        let a = "module \"a\"\n\
+                 func inline(never) @f() -> void\n\
+                 func inline(never) @g() -> void\n\
+                 func @h() -> void {\nentry ^0:\n  ret\n}\n";
+        let b = "module \"b\"\n\
+                 func @f() -> void {\nentry ^0:\n  ret\n}\n\
+                 func inline(always) @g() -> void {\nentry ^0:\n  ret\n}\n\
+                 func inline(always) @h() -> void\n";
+        let file = crate::support::diagnostics::FileId::new(0);
+        let mut syms = StrInterner::new();
+        let ma = text::parse_module(a, file, &mut syms).unwrap();
+        let mb = text::parse_module(b, file, &mut syms).unwrap();
+        let merged = merge_modules([ma, mb], "ab").expect("merge");
+        let out = text::print_module(&merged, &syms);
+        assert!(out.contains("func inline(never) @f() -> void {"), "{out}");
+        assert!(out.contains("func inline(always) @g() -> void {"), "{out}");
+        assert!(out.contains("func inline(always) @h() -> void {"), "{out}");
     }
 }
