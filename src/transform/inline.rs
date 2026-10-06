@@ -11,8 +11,10 @@
 //!   lists faithfully.
 //! - The call **splits** its block. Instructions after the call move into a fresh
 //!   *continuation* block that takes the call's result as its **one block
-//!   parameter** (none for a `void` call). The split point branches to the copy of
-//!   `g`'s entry block, passing the call arguments as that block's parameters.
+//!   parameter** (none for a `void` call). `g`'s entry block (which nothing
+//!   branches to) is copied straight into the split block, with the call
+//!   arguments substituted for its parameters, so an argument reaches its uses
+//!   directly rather than through a block argument.
 //! - Each `ret v` in the inlined body becomes `br continuation(v)` (and a bare
 //!   `ret` becomes `br continuation()`), so `g`'s multiple returns *merge* through
 //!   the continuation's block parameter — the phi-free merge this IR is built
@@ -271,35 +273,38 @@ fn splice_callee(
 ) {
     let cn = callee.block_count();
     let entry = callee.entry().expect("an inlined callee is a definition");
+    let mut cmap: Vec<Option<ValueId>> = vec![None; callee.value_count()];
 
-    // Fresh copy of every callee block, preserving parameter lists.
+    // The callee's entry block has no predecessors (the verifier forbids a
+    // branch to an entry block), so its body continues the caller's current
+    // block, and its parameters *are* the call arguments: no block argument
+    // stands between an argument and its uses. That keeps a caller slot passed
+    // as an out-parameter a direct load/store address, which mem2reg can then
+    // promote (issue #13). A call may pass a `ptr` for an aggregate parameter
+    // (the struct-by-value convention makes them interchangeable at a call);
+    // inside the body the parameter is strictly typed, so such an argument is
+    // bitcast to the parameter's type.
+    let here = builder.current_block().expect("splicing at an insertion point");
+    for (&p, &a) in callee.block(entry).params().iter().zip(args) {
+        cmap[p.index()] = Some(coerce_address(builder, a, callee.value_type(p)));
+    }
+
+    // Fresh copy of every other callee block, preserving parameter lists.
     let mut callee_new: Vec<BlockId> = Vec::with_capacity(cn);
     for cb in 0..cn {
         let bb = BlockId::from_index(cb);
+        if bb == entry {
+            callee_new.push(here);
+            continue;
+        }
         let ptys: Vec<TypeId> =
             callee.block(bb).params().iter().map(|&p| callee.value_type(p)).collect();
-        callee_new.push(builder.create_block(&ptys));
-    }
-
-    // Enter the inlined body: the caller arguments become the entry parameters.
-    // A call may pass a `ptr` for an aggregate parameter (the struct-by-value
-    // convention makes them interchangeable at a call); block arguments are
-    // strictly typed, so such an argument is bitcast to the parameter's type.
-    let entry_new = callee_new[entry.index()];
-    let ptys: Vec<TypeId> =
-        builder.block_params(entry_new).iter().map(|&p| builder.value_type(p)).collect();
-    let args: Vec<ValueId> =
-        args.iter().zip(&ptys).map(|(&a, &t)| coerce_address(builder, a, t)).collect();
-    builder.br(entry_new, &args);
-
-    // Seed the callee value map from the copied block parameters.
-    let mut cmap: Vec<Option<ValueId>> = vec![None; callee.value_count()];
-    for (cb, &nb) in callee_new.iter().enumerate() {
-        let bb = BlockId::from_index(cb);
+        let nb = builder.create_block(&ptys);
         let new_params = builder.block_params(nb).to_vec();
         for (i, &p) in callee.block(bb).params().iter().enumerate() {
             cmap[p.index()] = Some(new_params[i]);
         }
+        callee_new.push(nb);
     }
 
     // Copy callee blocks in dominator preorder; `ret` becomes `br cont(...)`.

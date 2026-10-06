@@ -22,11 +22,14 @@
 //!   that exposes, and delete the internal functions nothing references.
 //! - **O2** — `mem2reg`, then the clean-up group
 //!   `sccp → egraph → simplify_cfg → dce → licm` iterated twice, then one round of
-//!   `inline`, `dfe` to delete the callees inlined everywhere, and
+//!   `inline`, `dfe` to delete the callees inlined everywhere, `mem2reg` again
+//!   (a slot whose address escaped only into an inlined call, such as an
+//!   out-parameter, is now a plain local), and
 //!   `sccp → egraph → simplify_cfg → dce` to clean up after inlining (so
 //!   cross-call constants fold and the split call blocks merge back).
 //! - **O3** — O2 with a deeper fixpoint (three clean-up rounds), a second
-//!   inlining round, and more post-inline clean-up — the level where interprocedural
+//!   inlining round (each round followed by `dfe` and `mem2reg`), and more
+//!   post-inline clean-up — the level where interprocedural
 //!   work (including cross-module inlining after LTO) pays off most.
 //!
 //! `dfe` ([`DeadFunctionElim`]) is the only pass that removes functions; it
@@ -118,6 +121,16 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
             out.push(pass_by_name(n).expect("known pass"));
         }
     }
+    // One inlining round: inline, delete the callees inlined everywhere, then
+    // promote memory again. Inlining a callee that writes through an
+    // out-parameter leaves the caller's slot a plain local (its address no
+    // longer escapes into a call), which only a mem2reg *after* inlining can
+    // promote (issue #13); the clean-up that follows folds what that exposes.
+    fn inline_round(out: &mut Vec<Box<dyn ModulePass>>) {
+        for n in ["inline", "dfe", "mem2reg"] {
+            out.push(pass_by_name(n).expect("known pass"));
+        }
+    }
     let mut out: Vec<Box<dyn ModulePass>> = Vec::new();
     match level {
         OptLevel::O0 => {}
@@ -131,7 +144,8 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
             for _ in 0..2 {
                 cleanup(&mut out);
             }
-            for n in ["inline", "dfe", "sccp", "egraph", "simplify_cfg", "dce"] {
+            inline_round(&mut out);
+            for n in ["sccp", "egraph", "simplify_cfg", "dce"] {
                 out.push(pass_by_name(n).expect("known pass"));
             }
         }
@@ -140,12 +154,12 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
             for _ in 0..3 {
                 cleanup(&mut out);
             }
-            out.push(pass_by_name("inline").expect("known pass"));
-            out.push(pass_by_name("dfe").expect("known pass"));
+            inline_round(&mut out);
             for _ in 0..2 {
                 cleanup(&mut out);
             }
-            for n in ["inline", "dfe", "sccp", "egraph", "simplify_cfg", "dce"] {
+            inline_round(&mut out);
+            for n in ["sccp", "egraph", "simplify_cfg", "dce"] {
                 out.push(pass_by_name(n).expect("known pass"));
             }
         }
@@ -296,6 +310,71 @@ mod tests {
             .filter(|&&i| matches!(func.inst(i).kind, InstKind::Bin(_)))
             .count();
         assert_eq!(muls, 1, "expected a single residual multiply");
+    }
+
+    /// Issue #13: a callee writing its status through an out-parameter. Once
+    /// `@try_dec` is inlined, neither slot of `@main` escapes any more.
+    const OUT_PARAM: &str = r#"module "outparam"
+func internal @try_dec(ptr, ptr) -> void {
+entry ^0(%0: ptr, %1: ptr):
+  %2 = load %1 align 8 : i64
+  %3 = icmp eq %2, i64 0 : i1
+  cond_br %3, ^1, ^2
+^1:
+  store i8 1, %0 align 1 : i8
+  ret
+^2:
+  %4 = sub nuw %2, i64 1 : i64
+  store %4, %1 align 8 : i64
+  store i8 0, %0 align 1 : i8
+  ret
+}
+func @main(i64) -> i64 {
+entry ^0(%0: i64):
+  %1 = alloca i64 : ptr
+  store %0, %1 align 8 : i64
+  %2 = alloca i8 : ptr
+  call @try_dec(%2, %1) : void
+  %3 = load %2 align 1 : i8
+  %4 = icmp eq %3, i8 0 : i1
+  cond_br %4, ^1, ^2
+^1:
+  %5 = load %1 align 8 : i64
+  ret %5
+^2:
+  ret i64 99
+}
+"#;
+
+    #[test]
+    fn mem2reg_after_inline_promotes_out_parameter_slots() {
+        use crate::ir::refexec::run_named;
+        use crate::ir::semantics::SemValue;
+        use crate::support::diagnostics::FileId;
+        use puremp::Int;
+        let mut syms = StrInterner::new();
+        let orig = text::parse_module(OUT_PARAM, FileId::new(0), &mut syms).expect("parse");
+        for level in [OptLevel::O2, OptLevel::O3] {
+            let mut m = orig.clone();
+            optimize(&mut m, level);
+            assert!(verify_module(&m).is_ok(), "{level:?} output must verify");
+            let main = m.functions().position(|f| syms.resolve(f.name) == "main").expect("@main");
+            let func = m.function(FuncId::from_index(main));
+            let mem = func
+                .blocks()
+                .flat_map(|(_, b)| b.insts().iter())
+                .filter(|&&i| {
+                    matches!(func.inst(i).kind, InstKind::Alloca { .. } | InstKind::Load { .. } | InstKind::Store { .. } | InstKind::Call)
+                })
+                .count();
+            assert_eq!(mem, 0, "{level:?}: both slots promoted:\n{}", text::print_module(&m, &syms));
+            for n in [0i64, 1, 2, 41, -1] {
+                let arg = [SemValue::int(64, Int::from_i64(n))];
+                let want = run_named(&orig, &syms, "main", &arg).expect("source runs").expect("result");
+                let got = run_named(&m, &syms, "main", &arg).expect("optimized runs").expect("result");
+                assert!(got.refines(&want), "{level:?} n={n}: {got:?} vs {want:?}");
+            }
+        }
     }
 
     // --- End-to-end native execution: O0 vs O2 preserve behavior --------------
