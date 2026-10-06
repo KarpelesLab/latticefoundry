@@ -258,3 +258,121 @@ fn issue20_identical_edges_fold_to_br() {
     assert_eq!(count(only(&m.0), |k| matches!(k, InstKind::Switch(_))), 1);
     check_everywhere(DIFFERENT_ARGS, &["simplify_cfg"], &ints(64, &[0, 1, 2, 3]));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #12: folding `ptr_add x, 0` and chains of constant offsets
+// ---------------------------------------------------------------------------
+
+/// The issue's repro.
+const PTR_ADD_ZERO: &str = r#"
+module "ptradd0"
+
+func @f(ptr) -> i8 {
+entry ^0(%0: ptr):
+  %1 = ptr_add inbounds %0, i64 0 : ptr
+  %2 = ptr_add inbounds %1, i64 0 : ptr
+  %3 = load %2 align 1 : i8
+  ret %3
+}
+"#;
+
+/// A buffer on the stack walked by chains of constant offsets: zero ones (one
+/// proven zero by SCCP rather than written so), chains that sum, chains that
+/// cancel out, mixed `inbounds`, an `i32` offset under an `i64` one (which
+/// must not combine) and an `i8` chain whose sum would overflow its type.
+const PTR_ADD_CHAINS: &str = r#"
+module "ptrchains"
+
+func @f(i64) -> i64 {
+entry ^0(%x: i64):
+  %buf = alloca [512 x i8] : ptr
+  %z = sub i64 7, i64 7 : i64
+  %p0 = ptr_add %buf, %z : ptr
+  %p1 = ptr_add inbounds %p0, i64 8 : ptr
+  %p2 = ptr_add inbounds %p1, i64 16 : ptr
+  store %x, %p2 align 1 : i64
+  %q1 = ptr_add inbounds %buf, i64 24 : ptr
+  %q2 = ptr_add %q1, i64 -24 : ptr
+  %q3 = ptr_add inbounds %q2, i64 24 : ptr
+  %a = load %q3 align 1 : i64
+  %r1 = ptr_add inbounds %buf, i32 100 : ptr
+  %r2 = ptr_add inbounds %r1, i64 4 : ptr
+  store %a, %r2 align 1 : i64
+  %s1 = ptr_add inbounds %buf, i8 100 : ptr
+  %s2 = ptr_add inbounds %s1, i8 100 : ptr
+  %s3 = ptr_add inbounds %s2, i8 0 : ptr
+  store %x, %s3 align 1 : i64
+  %t = ptr_add inbounds %buf, i64 104 : ptr
+  %b = load %t align 1 : i64
+  %u = ptr_add inbounds %buf, i64 200 : ptr
+  %c = load %u align 1 : i64
+  %s = add %b, %c : i64
+  %y = add %a, %s : i64
+  ret %y
+}
+"#;
+
+/// The `ptr_add` instructions of `f`, as `(inbounds, offset operand)`.
+fn ptr_adds(f: &Function) -> Vec<(bool, crate::ir::ValueId)> {
+    f.blocks()
+        .flat_map(|(_, b)| b.insts().iter())
+        .filter_map(|&i| match f.inst(i).kind {
+            InstKind::PtrAdd { inbounds } => Some((inbounds, f.inst(i).operands()[1])),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn issue12_ptr_add_zero_folds() {
+    let mut m = parse(PTR_ADD_ZERO);
+    run_passes(&mut m.0, vec![pass_by_name("sccp").expect("sccp")]);
+    verified(&m.0, &m.1, "sccp");
+    let f = only(&m.0);
+    assert!(ptr_adds(f).is_empty(), "{}", print_module(&m.0, &m.1));
+    // The load reads straight from the parameter.
+    let load = f.blocks().flat_map(|(_, b)| b.insts().iter()).find(|&&i| matches!(f.inst(i).kind, InstKind::Load { .. }));
+    let param = f.block(f.entry().expect("entry")).params()[0];
+    assert_eq!(f.inst(*load.expect("a load")).operands()[0], param);
+    for level in [OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+        let mut m = parse(PTR_ADD_ZERO);
+        optimize(&mut m.0, level);
+        verified(&m.0, &m.1, level.name());
+        assert!(ptr_adds(only(&m.0)).is_empty(), "{level:?}\n{}", print_module(&m.0, &m.1));
+    }
+}
+
+#[test]
+fn issue12_constant_offset_chains_combine() {
+    let inputs = ints(64, &[0, 1, -1, 0x0102_0304_0506_0708, i64::MIN]);
+    check_everywhere(PTR_ADD_CHAINS, &["sccp"], &inputs);
+    // After SCCP and DCE, one `ptr_add` is left per address that combines.
+    let mut m = parse(PTR_ADD_CHAINS);
+    run_passes(&mut m.0, vec![pass_by_name("sccp").expect("sccp"), pass_by_name("dce").expect("dce")]);
+    verified(&m.0, &m.1, "sccp");
+    let text = print_module(&m.0, &m.1);
+    let f = only(&m.0);
+    let adds = ptr_adds(f);
+    let consts = m.0.consts();
+    let offsets: Vec<(bool, i64)> = adds
+        .iter()
+        .map(|&(ib, o)| match &f.value(o).def {
+            crate::ir::ValueDef::Const(c) => match consts.get(*c) {
+                crate::ir::value::Const::Int { value, .. } => (ib, value.to_i64().expect("small")),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("non-constant offset {other:?}\n{text}"),
+        })
+        .collect();
+    // %p2 → buf+24 (not inbounds: %p0 was not); %q3 → buf+24 (not inbounds);
+    // %r1, %r2 stay (i32 then i64); %s1, %s2 stay (100 + 100 overflows i8),
+    // and %s3 is %s2; %t and %u are untouched.
+    assert_eq!(
+        offsets,
+        [(false, 24), (false, 24), (true, 100), (true, 4), (true, 100), (true, 100), (true, 104), (true, 200)],
+        "{text}"
+    );
+    // A second SCCP run finds nothing more to combine.
+    run_passes(&mut m.0, vec![pass_by_name("sccp").expect("sccp")]);
+    assert_eq!(print_module(&m.0, &m.1), text);
+}

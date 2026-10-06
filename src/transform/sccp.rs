@@ -19,6 +19,17 @@
 //!    block left unreachable (per the solver's block reachability, which already
 //!    accounts for edge feasibility) is dropped.
 //!
+//! ## Address arithmetic with constant offsets
+//!
+//! The same fixpoint knows which `ptr_add` offsets are constant, so the
+//! rebuild also simplifies address arithmetic: `ptr_add x, 0` (`inbounds` or
+//! not) is `x`, and a chain `ptr_add (ptr_add x, a), b` with constant `a` and
+//! `b` of one integer type becomes `ptr_add x, a+b` when the sum fits that type
+//! (`inbounds` only when every step was). `ptr_add` wraps at the pointer width,
+//! so either form computes the same address; `inbounds` never adds undefined
+//! behavior to the reference semantics, so dropping it only makes the result
+//! more defined. The inner `ptr_add`s are left to DCE.
+//!
 //! ## Soundness around poison / UB (`docs/ir-design.md` §5)
 //!
 //! Only [`ConstLattice::Const`] values are folded. The domain's transfer
@@ -59,12 +70,14 @@ use crate::analysis::domains::ConstLattice;
 use crate::analysis::cfg::{ControlFlowGraph, Dominators};
 use crate::analysis::solver::{FixpointResult, solve};
 use crate::ir::builder::FunctionBuilder;
-use crate::ir::inst::InstKind;
+use crate::ir::inst::{InstId, InstKind};
 use crate::ir::types::{TypeContext, TypeId};
 use crate::ir::value::{Const, ConstPool, ValueDef, ValueId};
 use crate::ir::{BlockId, FuncId, Function, Module};
 use crate::pass::{Changed, ModulePass};
 use crate::transform::{FunctionTransform, dom_preorder, edge_args, rebuild_terminator, remap_value};
+
+use puremp::Int;
 
 /// The SCCP constant-folding transform (see the module documentation).
 ///
@@ -176,6 +189,9 @@ struct Plan {
     /// `param_ref[v]` is `Some(def)` when block parameter `v` receives the same
     /// global or function reference `def` on every feasible incoming edge.
     param_ref: Vec<Option<ValueDef>>,
+    /// `ptr_fold[v]` is `Some(_)` when `v` is the result of a `ptr_add` with a
+    /// constant offset that simplifies (see the module docs).
+    ptr_fold: Vec<Option<PtrFold>>,
     /// Whether applying this plan changes the function at all (drives `Changed`
     /// and keeps the pass idempotent).
     changed: bool,
@@ -250,10 +266,90 @@ impl Plan {
         let rewired = param_ref.iter().enumerate().any(|(i, r)| {
             r.is_some() && !func.uses_of(ValueId::from_index(i)).is_empty()
         });
-        let changed = pruned || dropped || folded || rewired;
+        // `ptr_add`s with constant offsets that simplify.
+        let mut ptr_fold: Vec<Option<PtrFold>> = vec![None; nv];
+        for (b, blk) in func.blocks() {
+            if !reachable[b.index()] {
+                continue;
+            }
+            for &i in blk.insts() {
+                if let Some(r) = func.inst(i).result()
+                    && value_const[r.index()].is_none()
+                {
+                    ptr_fold[r.index()] = simplify_ptr_add(func, types, &res, i);
+                }
+            }
+        }
+        let addr_folded = ptr_fold.iter().any(Option::is_some);
 
-        Plan { value_const, reachable, term_choice, param_ref, changed }
+        let changed = pruned || dropped || folded || rewired || addr_folded;
+
+        Plan { value_const, reachable, term_choice, param_ref, ptr_fold, changed }
     }
+}
+
+/// How the rebuild replaces a `ptr_add` with a constant offset.
+#[derive(Clone, Debug)]
+enum PtrFold {
+    /// The result is this (old) value: the total offset is zero.
+    Alias(ValueId),
+    /// `ptr_add base, offset` (of integer type `ty`), folding a chain of
+    /// `ptr_add`s into one.
+    Rebase { base: ValueId, offset: Int, ty: TypeId, inbounds: bool },
+}
+
+/// The simplification of instruction `i` if it is a `ptr_add` whose offset the
+/// fixpoint proved constant: `x` for a zero total offset, one `ptr_add` from
+/// the root of a chain of constant-offset `ptr_add`s, or `None`.
+fn simplify_ptr_add(
+    func: &Function,
+    types: &TypeContext,
+    res: &FixpointResult<ConstLattice>,
+    i: InstId,
+) -> Option<PtrFold> {
+    let inst = func.inst(i);
+    let InstKind::PtrAdd { inbounds } = inst.kind else {
+        return None;
+    };
+    let (base, off) = (inst.operands()[0], inst.operands()[1]);
+    let ty = func.value_type(off);
+    let w = types.get(ty).bit_width().filter(|&w| w > 0)?;
+    // The signed value of a constant `w`-bit offset.
+    let offset_of = |v: ValueId| match res.value(v).as_const() {
+        Some(Const::Int { value, .. }) => {
+            let bits = value.mod_2k(w);
+            Some(if bits.bit(w - 1) { bits.sub(&Int::ONE.mul_2k(w)) } else { bits })
+        }
+        _ => None,
+    };
+    let mut total = offset_of(off)?;
+    let (mut root, mut all_inbounds) = (base, inbounds);
+    // Walk down the chain of `ptr_add`s with constant offsets of the same type
+    // while the summed offset still fits it.
+    while let ValueDef::Inst(j) = func.value(root).def
+        && let InstKind::PtrAdd { inbounds: ib } = func.inst(j).kind
+        && func.value_type(func.inst(j).operands()[1]) == ty
+        && let Some(o) = offset_of(func.inst(j).operands()[1])
+    {
+        let sum = total.add(&o);
+        let fits = {
+            let bits = sum.mod_2k(w);
+            let s = if bits.bit(w - 1) { bits.sub(&Int::ONE.mul_2k(w)) } else { bits };
+            s == sum
+        };
+        if !fits {
+            break;
+        }
+        total = sum;
+        root = func.inst(j).operands()[0];
+        all_inbounds &= ib;
+    }
+    if total.is_zero() {
+        // Only when the root already has the result's (pointer) type: a base
+        // of aggregate type keeps its `ptr_add`.
+        return (func.value_type(root) == inst.ty).then_some(PtrFold::Alias(root));
+    }
+    (root != base).then(|| PtrFold::Rebase { base: root, offset: total.mod_2k(w), ty, inbounds: all_inbounds })
 }
 
 /// The lattice of [`symbol_params`]: what one block parameter can be.
@@ -499,6 +595,23 @@ fn rebuild(old: &Function, plan: &Plan, builder: &mut FunctionBuilder<'_>, entry
             {
                 let cv = materialize(builder, c);
                 vmap[r.index()] = Some(cv);
+                continue;
+            }
+            // A `ptr_add` with a constant offset that simplifies.
+            if let Some(r) = inst.result()
+                && let Some(pf) = &plan.ptr_fold[r.index()]
+            {
+                let nv = match pf {
+                    PtrFold::Alias(v) => remap_value(&mut vmap, old, builder, *v),
+                    PtrFold::Rebase { base, offset, ty, inbounds } => {
+                        let nb = remap_value(&mut vmap, old, builder, *base);
+                        let no = builder.const_int(*ty, offset.clone());
+                        builder
+                            .append_inst(InstKind::PtrAdd { inbounds: *inbounds }, vec![nb, no], inst.flags, Some(inst.ty))
+                            .expect("ptr_add has a result")
+                    }
+                };
+                vmap[r.index()] = Some(nv);
                 continue;
             }
             let mut ops = Vec::with_capacity(inst.operands().len());
