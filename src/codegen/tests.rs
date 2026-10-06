@@ -667,7 +667,7 @@ entry ^0(%n: i64):
     let funcs = vec![mf];
     let model = |n: usize| -> i64 {
         let a: Vec<u8> = 72623859790382856u64.to_le_bytes().into_iter().chain([0xff; 8]).collect();
-        let mut b = vec![17u8; 16];
+        let mut b = [17u8; 16];
         b[..n].copy_from_slice(&a[..n]);
         b.copy_within(0..4, 1);
         b.copy_within(1..3, 0);

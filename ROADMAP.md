@@ -637,7 +637,10 @@ programs.
 *Progress:* JIT ✅, DWARF line tables (`lf build -g`, gdb-loadable) ✅,
 `-O0..-O3` + LTO ✅, z3rs superoptimizer ✅, native dynamic stack allocation
 (`DynAlloca`, all three targets) ✅, native `syscall` op (Linux ABI on all three targets;
-x86-64 execution-tested, freestanding) ✅, per-function stack usage
+x86-64 execution-tested, freestanding) ✅, bulk-memory ops `memcpy`/`memmove`/`memset`
+(inline chunks, `rep movsb`/`rep stosb`, loops, `memory.copy`/`memory.fill`;
+the `memopt` pass splits struct copies into scalars, forwards and drops dead
+fills; see [ir-design §6k](docs/ir-design.md)) ✅, per-function stack usage
 (`codegen::stack`: exact static frame sizes read off each target's frame
 layout, callees / indirect calls / syscalls / `dyn_alloca`, and
 `StackReport::worst_case_depth` over the call graph with caller-supplied bounds,
@@ -739,7 +742,9 @@ It also uses the framework features built since: `-shared` (with
 `-pie` links position-independent executables. `-fPIC`/`-fPIE` select the
 relocation model. `static` gives IR internal linkage, and
 `visibility(...)`/`-fvisibility=` and `weak` map onto the IR symbol attributes.
-`volatile` lowers to volatile loads and stores. `_Atomic`, the builtin
+`volatile` lowers to volatile loads and stores. `__builtin_memcpy`/`memmove`/`memset`
+and whole-struct copies and zero fills lower to the IR's bulk-memory ops
+(a declared `memcpy` stays a call). `_Atomic`, the builtin
 `<stdatomic.h>`, and the `__atomic_*`/`__sync_*` builtins lower to the IR
 atomics (a two-thread program loses no update). GCC vector types lower to IR
 `<N x T>` vectors and cross calls in XMM registers like gcc's. C99 plain
