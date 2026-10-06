@@ -1546,3 +1546,37 @@ entry ^0(%a: i16, %b: i16, %c: i4):
     }
 }
 
+
+/// Bulk memory (`docs/ir-design.md` §6k): the shared fixtures, expanded into
+/// byte and 16-bit chunks and loops, run from flash on the AVR interpreter
+/// (lengths from 0 to 300) against the reference executor; and a copy whose
+/// source is program memory (address space 1) reads it with `lpm`.
+#[test]
+fn bulk_memory_runs() {
+    let ns = [0, 1, 2, 3, 5, 8, 9, 16, 17, 33, 64, 255, 300];
+    let (src, cases) = crate::target::bulk_fixtures::bulk(&ns, &[3, 8, 40, 300]);
+    let n = check_vectors("bulk", &src, &cases);
+    eprintln!("avr bulk memory: {n} results compared");
+    assert_eq!(n, cases.len());
+
+    let flash = r#"
+module "flash"
+global constant addrspace(1) @table : [8 x i8] = [8 x i8] (i8 1, i8 2, i8 3, i8 4, i8 5, i8 6, i8 7, i8 8)
+func @sum(i16) -> i16 {
+entry ^0(%n: i16):
+  %buf = alloca [8 x i8] : ptr
+  store i64 0, %buf align 1 : i64
+  memcpy %buf, @table, %n align 1
+  %w = load %buf align 1 : i64
+  %lo = trunc %w : i16
+  %s = lshr %w, i64 48 : i64
+  %hi = trunc %s : i16
+  %r = add %lo, %hi : i16
+  ret %r
+}
+"#;
+    let fw = firmware(flash);
+    for (n, want) in [(0u64, 0u64), (1, 1), (2, 0x201), (7, 0x201 + 0x7), (8, 0x201 + 0x807)] {
+        assert_eq!(call(&fw, "sum", &[(n, 2)], 2), want, "n {n}");
+    }
+}

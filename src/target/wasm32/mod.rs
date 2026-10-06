@@ -119,7 +119,7 @@ pub fn compile(module: &Module, syms: &StrInterner, opts: &CodegenOptions) -> Re
     }
     // Vectors first: wasm32 declares no legal vector type, so every vector
     // op is scalarized (and min/max/saturating ops expanded).
-    let vectors = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
+    let vectors = crate::codegen::legalize::legalized(module, &WasmLegality);
     let module: &Module = &vectors;
     let lowered = if needs_legalization(module) {
         // Legalize a copy: the caller's module stays as it is.
@@ -134,6 +134,38 @@ pub fn compile(module: &Module, syms: &StrInterner, opts: &CodegenOptions) -> Re
         lower::lower_module(module, syms)?
     };
     Ok(Compiled { object: lowered.object, stack: lowered.stack })
+}
+
+/// The wasm32 legality: no vector type is legal (every vector op is
+/// scalarized), and the bulk-memory ops become `memory.copy` /
+/// `memory.fill` except for a single access of 1, 2, 4 or 8 bytes.
+struct WasmLegality;
+
+impl crate::codegen::legalize::VectorLegality for WasmLegality {
+    fn legal_type(&self, _: &crate::ir::TypeContext, _: crate::ir::TypeId) -> bool {
+        false
+    }
+
+    fn legal_inst(
+        &self,
+        _: &crate::ir::TypeContext,
+        _: &crate::ir::ConstPool,
+        _: &crate::ir::Function,
+        _: &crate::ir::InstData,
+    ) -> bool {
+        false
+    }
+
+    fn bulk_memory(&self, _layout: &crate::ir::DataLayout) -> crate::codegen::legalize_mem::BulkMemoryLowering {
+        crate::codegen::legalize_mem::BulkMemoryLowering {
+            word: 8,
+            vector16: false,
+            unaligned: true,
+            max_inline: 1,
+            native: true,
+            guard_zero: true,
+        }
+    }
 }
 
 /// Whether some function computes with an integer wider than 64 bits.

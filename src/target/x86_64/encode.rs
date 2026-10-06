@@ -1953,6 +1953,22 @@ fn encode_inst(e: &mut Emitter, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             e.u8(0x05); // syscall
         }
         X86Op::Mfence => e.bytes(&[0x0F, 0xAE, 0xF0]),
+        // Bulk memory: the operands only document the fixed registers.
+        X86Op::RepMovsb => e.bytes(&[0xF3, 0xA4]),
+        X86Op::RepStosb => e.bytes(&[0xF3, 0xAA]),
+        X86Op::MemmoveRep => e.bytes(&[
+            0x48, 0x89, 0xF8, // mov rax, rdi
+            0x48, 0x29, 0xF0, // sub rax, rsi
+            0x48, 0x39, 0xC8, // cmp rax, rcx
+            0x73, 0x10, // jae up (disjoint, or copying down)
+            0x48, 0x8D, 0x74, 0x0E, 0xFF, // lea rsi, [rsi + rcx - 1]
+            0x48, 0x8D, 0x7C, 0x0F, 0xFF, // lea rdi, [rdi + rcx - 1]
+            0xFD, // std
+            0xF3, 0xA4, // rep movsb (downward)
+            0xFC, // cld
+            0xEB, 0x02, // jmp done
+            0xF3, 0xA4, // up: rep movsb
+        ]),
         X86Op::Xchg => {
             // mov d, val; xchg [ptr], d  (xchg with memory is implicitly locked)
             let (d, ptr, val, size) = (rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]), uimm(&ops[3]));
@@ -2562,7 +2578,7 @@ fn build_module(
     // Vector code the SSE2 baseline cannot hold or select is scalarized first,
     // then integers wider than 64 bits are split (all but their ABI boundary).
     let legal = legalized(module, &Sse2Legality);
-    let wide = super::prepared_if_wide(&legal, syms);
+    let wide = super::prepared_for(&legal, syms, opts);
     let (module, syms): (&Module, &StrInterner) = wide.as_ref().map_or((&*legal, syms), |(m, s)| (m, s));
 
     let mut obj = ObjectModule::new(module.name.clone());

@@ -1485,6 +1485,30 @@ impl<'a, 'c> FnLower<'a, 'c> {
             InstKind::Freeze | InstKind::Declassify => self.values(ops[0])?,
             InstKind::Call => self.call(i, rty)?,
             InstKind::Syscall => return fail("the syscall op has no WebAssembly lowering (import a host function instead)"),
+            // Bulk memory (`docs/ir-design.md` §6k): `memory.copy` (which has
+            // memmove semantics) and `memory.fill` of the bulk-memory
+            // feature. The legalization made the length an `i32` and guarded
+            // a variable one against zero (these trap on an out-of-bounds
+            // pointer even for an empty range).
+            InstKind::MemCopy { .. } | InstKind::MemSet { .. } => {
+                let fill = matches!(inst.kind, InstKind::MemSet { .. });
+                self.value(ops[0])?;
+                if fill {
+                    self.value_i32(ops[1], false)?;
+                } else {
+                    self.value(ops[1])?;
+                }
+                self.value_i32(ops[2], false)?;
+                self.code.byte(op::PREFIX_FC);
+                if fill {
+                    self.code.u32(11); // memory.fill 0
+                    self.code.byte(0x00);
+                } else {
+                    self.code.u32(10); // memory.copy 0 0
+                    self.code.byte(0x00);
+                    self.code.byte(0x00);
+                }
+            }
             InstKind::InlineAsm(_) | InstKind::AsmOutput(_) => return fail(crate::codegen::INLINE_ASM_UNSUPPORTED),
             other => return fail(format!("unexpected instruction {other:?}")),
         }

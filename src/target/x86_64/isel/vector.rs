@@ -89,6 +89,20 @@ fn shuffle_is_direct(mask: &[u32], n: u32, cw: u32) -> bool {
 }
 
 impl VectorLegality for Sse2Legality {
+    /// Bulk memory (`docs/ir-design.md` §6k): up to four 16-byte (SSE) or
+    /// smaller chunks inline, unaligned accesses being fine; anything longer
+    /// or variable stays for `rep movsb` / `rep stosb`.
+    fn bulk_memory(&self, _layout: &crate::ir::DataLayout) -> crate::codegen::legalize_mem::BulkMemoryLowering {
+        crate::codegen::legalize_mem::BulkMemoryLowering {
+            word: 8,
+            vector16: true,
+            unaligned: true,
+            max_inline: 4,
+            native: true,
+            guard_zero: false,
+        }
+    }
+
     fn legal_type(&self, types: &TypeContext, ty: TypeId) -> bool {
         shape(types, ty).is_some()
     }

@@ -66,6 +66,8 @@ mod vector_tests;
 mod asm_tests;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod codesize_tests;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod bulk_tests;
 
 pub use encode::{
     DebugSource, compile_function, compile_module, compile_module_debug, compile_module_debug_with,
@@ -143,6 +145,30 @@ pub(crate) fn prepared_if_wide(module: &Module, syms: &StrInterner) -> Option<(M
     has_wide_ints(module).then(|| {
         prepare_module(module, syms).unwrap_or_else(|e| panic!("x86-64 backend: wide-integer legalization: {e}"))
     })
+}
+
+/// The prepared copy of `module` for `opts`: [`prepared_if_wide`], and with
+/// [`CodegenOptions::bulk_memory_libcalls`](crate::codegen::CodegenOptions)
+/// the bulk-memory ops left for `rep movsb`/`rep stosb` turned into calls to
+/// the C library ([`crate::codegen::legalize_mem::bulk_memory_libcalls`]).
+pub(crate) fn prepared_for(
+    module: &Module,
+    syms: &StrInterner,
+    opts: &crate::codegen::CodegenOptions,
+) -> Option<(Module, StrInterner)> {
+    use crate::codegen::legalize_mem::{bulk_memory_libcalls, uses_bulk_memory};
+    let wide = prepared_if_wide(module, syms);
+    if !opts.bulk_memory_libcalls || !uses_bulk_memory(module) {
+        return wide;
+    }
+    let (mut m, mut s) = wide.unwrap_or_else(|| {
+        let bytes = crate::ir::binary::encode(module, syms);
+        let mut names = StrInterner::new();
+        let m = crate::ir::binary::decode(&bytes, &mut names).expect("a module round-trips through .lfb");
+        (m, names)
+    });
+    bulk_memory_libcalls(&mut m, &mut s);
+    Some((m, s))
 }
 
 /// Declare `(i128) -> float` / `(float) -> i128` helpers for every wide

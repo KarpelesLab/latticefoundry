@@ -827,3 +827,128 @@ fn wide_integers() {
     let t = differential_optimized("wide", WIDE, &list).expect("node");
     assert_eq!(t.skipped, 0, "{t:?}");
 }
+
+/// A 1 KiB stack buffer filled with a pattern, one bulk op, and a checksum
+/// of the whole buffer: `memcpy` from the upper half, `memmove` within the
+/// lower one (both directions), `memset`, each with a variable length, plus
+/// constant lengths (a single access, and ones left to `memory.copy` /
+/// `memory.fill`).
+pub(super) const BULK: &str = r#"
+module "bulk"
+
+func @setup(ptr) -> void {
+entry ^0(%a: ptr):
+  br ^1(i32 0)
+^1(%i: i32):
+  %c = icmp ult %i, i32 128 : i1
+  cond_br %c, ^2, ^3
+^2:
+  %o = mul %i, i32 8 : i32
+  %p = ptr_add %a, %o : ptr
+  %w = zext %i : i64
+  %x = mul %w, i64 72340172838076673 : i64
+  %y = xor %x, i64 -6148914691236517206 : i64
+  store %y, %p align 8 : i64
+  %i2 = add %i, i32 1 : i32
+  br ^1(%i2)
+^3:
+  ret
+}
+
+func @sum(ptr) -> i64 {
+entry ^0(%a: ptr):
+  br ^1(i32 0, i64 7)
+^1(%i: i32, %h: i64):
+  %c = icmp ult %i, i32 1024 : i1
+  cond_br %c, ^2, ^3
+^2:
+  %p = ptr_add %a, %i : ptr
+  %b = load %p align 1 : i8
+  %w = zext %b : i64
+  %m = mul %h, i64 31 : i64
+  %h2 = add %m, %w : i64
+  %i2 = add %i, i32 1 : i32
+  br ^1(%i2, %h2)
+^3:
+  ret %h
+}
+
+func @copy(i32, i32, i32) -> i64 {
+entry ^0(%n: i32, %doff: i32, %soff: i32):
+  %a = alloca [128 x i64] : ptr
+  call @setup(%a) : void
+  %d = ptr_add %a, %doff : ptr
+  %s0 = ptr_add %a, i32 512 : ptr
+  %s = ptr_add %s0, %soff : ptr
+  memcpy %d, %s, %n align 1
+  %r = call @sum(%a) : i64
+  ret %r
+}
+
+func @move(i32, i32, i32) -> i64 {
+entry ^0(%n: i32, %doff: i32, %soff: i32):
+  %a = alloca [128 x i64] : ptr
+  call @setup(%a) : void
+  %d = ptr_add %a, %doff : ptr
+  %s = ptr_add %a, %soff : ptr
+  memmove %d, %s, %n align 1
+  %r = call @sum(%a) : i64
+  ret %r
+}
+
+func @fill(i32, i32, i32) -> i64 {
+entry ^0(%n: i32, %doff: i32, %b: i32):
+  %a = alloca [128 x i64] : ptr
+  call @setup(%a) : void
+  %d = ptr_add %a, %doff : ptr
+  %b8 = trunc %b : i8
+  %n64 = zext %n : i64
+  memset %d, %b8, %n64 align 1
+  %r = call @sum(%a) : i64
+  ret %r
+}
+
+func @consts() -> i64 {
+entry ^0:
+  %a = alloca [128 x i64] : ptr
+  call @setup(%a) : void
+  %s = ptr_add %a, i32 512 : ptr
+  memcpy %a, %s, i32 8 align 8
+  %d1 = ptr_add %a, i32 9 : ptr
+  memcpy %d1, %s, i32 300 align 1
+  %d2 = ptr_add %a, i32 700 : ptr
+  memset %d2, i8 0, i64 256 align 4
+  memmove %a, %d1, i32 33 align 1
+  %r = call @sum(%a) : i64
+  ret %r
+}
+"#;
+
+/// Bulk memory on wasm32: `memory.copy` / `memory.fill` under node against
+/// the reference interpreter, every length 0..=40 and longer ones, offsets
+/// that overlap both ways for `memmove`, before and after `-O2`.
+#[test]
+fn bulk_memory() {
+    let mut list = Vec::new();
+    let ns: Vec<u128> = (0..=40).chain([63, 64, 65, 100, 255, 256, 257, 300]).collect();
+    for &n in &ns {
+        for (d, s) in [(0u128, 0u128), (3, 1), (8, 16)] {
+            list.push(("copy", vec![n, d, s]));
+        }
+        for (d, s) in [(0u128, 5u128), (5, 0), (64, 1), (1, 64), (7, 7)] {
+            list.push(("move", vec![n, d, s]));
+        }
+        list.push(("fill", vec![n, 3, 0xa5]));
+        list.push(("fill", vec![n, 0, 0x1ff]));
+    }
+    list.push(("consts", vec![]));
+    let Some(t) = differential("bulk", BULK, &list) else { return no_node("bulk_memory") };
+    assert_eq!(t.skipped, 0, "{t:?}");
+    let t = differential_optimized("bulk", BULK, &list).expect("node");
+    assert_eq!(t.skipped, 0, "{t:?}");
+    // The variable ops are the bulk-memory instructions, not loops.
+    let (m, syms) = super::parse(BULK);
+    let wasm = super::linked(&m, &syms);
+    let fc = |sub: u8| wasm.windows(2).filter(|w| w == &[0xfc, sub]).count();
+    assert!(fc(10) >= 4 && fc(11) >= 2, "memory.copy {} / memory.fill {}", fc(10), fc(11));
+}

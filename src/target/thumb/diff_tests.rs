@@ -1547,3 +1547,15 @@ fn vector_programs_are_scalarized_and_run() {
     eprintln!("vector programs: {n} results compared on Thumb");
     assert!(n >= 300, "{n}");
 }
+
+/// Bulk memory (`docs/ir-design.md` §6k): the shared fixtures (aligned word
+/// chunks inline, loops beyond) on the MIR interpreter and as machine code,
+/// lengths from 0 to 300, against the reference executor.
+#[test]
+fn bulk_memory_runs() {
+    let ns = [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 255, 300];
+    let (src, cases) = crate::target::bulk_fixtures::bulk(&ns, &[3, 8, 16, 40, 300]);
+    let n = check_vectors("bulk", &src, &cases);
+    eprintln!("thumb bulk memory: {n} results compared");
+    assert_eq!(n, cases.len());
+}

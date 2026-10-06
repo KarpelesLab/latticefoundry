@@ -1156,3 +1156,26 @@ fn vector_programs_are_scalarized_and_run_as_machine_code() {
     eprintln!("vector programs: {n} results compared");
     assert!(n > 200);
 }
+
+/// Bulk memory (`docs/ir-design.md` §6k): the shared fixtures, expanded into
+/// aligned word chunks and loops, run as machine code on the simulator and on
+/// the MIR interpreter at lengths from 0 to 300, against the reference
+/// executor.
+#[test]
+fn bulk_memory_runs_as_machine_code() {
+    use crate::target::bulk_fixtures::{CONSTS, bulk, some_lengths};
+    use crate::target::vector_fixtures as vf;
+    let (src, cases) = bulk(&some_lengths(), &CONSTS);
+    let want = vf::reference(&src, &cases);
+    let h = Harness::new(&src);
+    let mut n = 0;
+    for ((name, args), w) in cases.iter().zip(&want) {
+        let w = w.expect("defined");
+        let a: Vec<u64> = args.iter().map(|&x| x as u64).collect();
+        let (mir, hw) = h.exec(name, &a);
+        assert_eq!(mir, w, "MIR interpreter @{name}({args:?})");
+        assert_eq!(hw, w, "machine code @{name}({args:?})");
+        n += 1;
+    }
+    eprintln!("riscv bulk memory: {n} results compared");
+}

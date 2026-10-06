@@ -21,6 +21,8 @@ use crate::support::StrInterner;
 #[cfg(test)]
 pub(crate) mod atomic_fixtures;
 #[cfg(test)]
+pub(crate) mod bulk_fixtures;
+#[cfg(test)]
 pub(crate) mod vector_fixtures;
 #[cfg(test)]
 mod ct_tests;

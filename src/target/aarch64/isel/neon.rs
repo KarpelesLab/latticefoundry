@@ -140,6 +140,20 @@ fn neon_mul_ok(w: u32) -> bool {
 }
 
 impl VectorLegality for NeonLegality {
+    /// Bulk memory (`docs/ir-design.md` §6k): up to eight 16-byte (`q`
+    /// register) or smaller chunks inline, unaligned accesses being fine on
+    /// normal memory; longer or variable lengths loop over 8-byte words.
+    fn bulk_memory(&self, _layout: &crate::ir::DataLayout) -> crate::codegen::legalize_mem::BulkMemoryLowering {
+        crate::codegen::legalize_mem::BulkMemoryLowering {
+            word: 8,
+            vector16: true,
+            unaligned: true,
+            max_inline: 8,
+            native: false,
+            guard_zero: false,
+        }
+    }
+
     fn legal_type(&self, types: &TypeContext, ty: TypeId) -> bool {
         shape(types, ty).is_some()
     }

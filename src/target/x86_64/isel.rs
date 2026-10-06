@@ -409,6 +409,23 @@ pub enum X86Op {
     /// `[Def d, Use d, Use t, Imm cc]` — `cmovcc d, t`: a `select` on an
     /// `icmp` used only there, after `mov d, f` and its [`X86Op::CmpFlags`].
     Cmov = 86,
+
+    // --- bulk memory (`docs/ir-design.md` §6k) -----------------------------
+    /// `[Def rdi, Def rsi, Def rcx, Use rdi, Use rsi, Use rcx]` — `rep movsb`
+    /// (`F3 A4`): copy `rcx` bytes from `[rsi]` to `[rdi]` upward (the
+    /// direction flag is clear, as the ABI guarantees). The three registers
+    /// are loaded by isel right before, as a consecutive run.
+    RepMovsb = 87,
+    /// `[Def rdi, Def rcx, Use rdi, Use rax, Use rcx]` — `rep stosb`
+    /// (`F3 AA`): store `al` to `rcx` bytes at `[rdi]`.
+    RepStosb = 88,
+    /// `[Def rdi, Def rsi, Def rcx, Def rax, Use rdi, Use rsi, Use rcx]` — a
+    /// `memmove`, expanded at encode time: when `rdi - rsi` (unsigned) is at
+    /// least `rcx` the ranges are disjoint or the copy goes down, so `rep
+    /// movsb` upward is correct; otherwise both pointers move to their last
+    /// byte and `std; rep movsb; cld` copies downward. `rax` is the scratch of
+    /// the comparison.
+    MemmoveRep = 89,
 }
 
 impl X86Op {
@@ -465,7 +482,7 @@ impl X86Op {
     /// Decode a MIR [`Opcode`] back to an [`X86Op`].
     pub fn decode(op: Opcode) -> X86Op {
         use X86Op::*;
-        const TABLE: [X86Op; 87] = [
+        const TABLE: [X86Op; 90] = [
             MovRR, MovRI, Add, Sub, And, Or, Xor, Imul, ShlI, ShrI, SarI, ShlCl, ShrCl, SarCl, Cqo,
             ZeroRdx, Idiv, Div, SetccCmp, Test, Cmovne, Load, Store, LeaFrame, GlobalAddr, Call,
             Ret, Jmp, BrCond, Switch, Unreachable, Push, Pop, MovRbpRsp, SubRsp, LeaRspRbp,
@@ -474,7 +491,7 @@ impl X86Op {
             Syscall, Mfence, Xchg, LockXadd, LockCmpxchg, RmwLoop, SaveXmm, RestoreXmm, VOp,
             VUnary, VShiftI, VLoad, VStore, LoadVConst, MovGprToX, MovXToGpr, Pinsrw, Pextrw,
             TlsAddr, TlsGd, MulWide, Switch128, InlineAsm, CmpBr, CmpBrI, SetccCmpI, AluRI, ImulRI,
-            Leave, AddRsp, CmpFlags, Cmov,
+            Leave, AddRsp, CmpFlags, Cmov, RepMovsb, RepStosb, MemmoveRep,
         ];
         TABLE[op.0 as usize]
     }
@@ -1646,6 +1663,47 @@ impl X86_64Target {
         lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(d), use_p(rax)]));
     }
 
+    /// Lower a bulk-memory op the generic legalization left native (a long
+    /// or variable length; `docs/ir-design.md` §6k): `rep movsb` / `rep
+    /// stosb` (or the [`X86Op::MemmoveRep`] expansion), their fixed registers
+    /// `rdi`, `rsi`/`al` and `rcx` loaded as one consecutive run right before
+    /// it — the same range-based fixed-register window as `syscall`, so every
+    /// operand is materialized first and nothing else lands in those registers
+    /// in between. A constant length is moved straight into `rcx`.
+    fn lower_bulk_memory(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        use regs::{RAX, RCX, RDI, RSI};
+        let ops = inst.operands();
+        let dst = self.oper(lo, ops[0]);
+        let mid = self.oper(lo, ops[1]);
+        let count = Self::const_of(lo, ops[2]).and_then(|c| c.to_u64());
+        let n = if count.is_none() { Some(self.oper(lo, ops[2])) } else { None };
+        let (rdi, rsi, rcx, rax) = (regs::gpr(RDI), regs::gpr(RSI), regs::gpr(RCX), regs::gpr(RAX));
+        let fill = matches!(inst.kind, InstKind::MemSet { .. });
+        lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(rdi), use_v(dst)]));
+        let second = if fill { rax } else { rsi };
+        lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(second), use_v(mid)]));
+        match (n, count) {
+            (Some(n), _) => lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(rcx), use_v(n)])),
+            (None, Some(c)) => lo.emit(MachineInst::new(X86Op::MovRI.opcode(), vec![def(rcx), imm(c)])),
+            (None, None) => unreachable!(),
+        }
+        let operands = match inst.kind {
+            InstKind::MemSet { .. } => {
+                vec![def(rdi), def(rcx), use_p(rdi), use_p(rax), use_p(rcx)]
+            }
+            InstKind::MemCopy { overlapping: true, .. } => {
+                vec![def(rdi), def(rsi), def(rcx), def(rax), use_p(rdi), use_p(rsi), use_p(rcx)]
+            }
+            _ => vec![def(rdi), def(rsi), def(rcx), use_p(rdi), use_p(rsi), use_p(rcx)],
+        };
+        let op = match inst.kind {
+            InstKind::MemSet { .. } => X86Op::RepStosb,
+            InstKind::MemCopy { overlapping: true, .. } => X86Op::MemmoveRep,
+            _ => X86Op::RepMovsb,
+        };
+        lo.emit(MachineInst::new(op.opcode(), operands));
+    }
+
     /// Lower an atomic memory operation or fence. x86-64 is TSO (the Intel SDM
     /// Vol. 3A §9.2 memory-ordering model): ordinary loads are not reordered
     /// with other loads, stores not with other stores, and a load may pass
@@ -2286,6 +2344,7 @@ impl TargetIsel for X86_64Target {
             | InstKind::Fence(_) => self.lower_atomic(lo, inst),
             InstKind::Call => self.lower_call(lo, inst),
             InstKind::Syscall => self.lower_syscall(lo, inst),
+            InstKind::MemCopy { .. } | InstKind::MemSet { .. } => self.lower_bulk_memory(lo, inst),
             InstKind::Unary(UnaryOp::FNeg) => self.lower_fneg(lo, inst),
             InstKind::FCmp(pred) => self.lower_fcmp(lo, *pred, inst),
             _ => unreachable!("terminator reached lower_inst: {:?}", inst.kind),

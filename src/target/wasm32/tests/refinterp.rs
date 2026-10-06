@@ -46,6 +46,19 @@ pub(crate) struct Interp<'m> {
     depth: u32,
 }
 
+/// The flat memory as the bulk-memory semantics sees it (every byte live).
+struct FlatMemory<'a>(&'a mut Vec<u8>);
+
+impl crate::ir::ByteMemory for FlatMemory<'_> {
+    fn read_byte(&self, addr: u64) -> Option<Option<u8>> {
+        self.0.get(usize::try_from(addr).ok()?).map(|&b| Some(b))
+    }
+
+    fn write_byte(&mut self, addr: u64, byte: Option<u8>) {
+        self.0[addr as usize] = byte.unwrap_or(0);
+    }
+}
+
 fn ub<T>(why: impl Into<String>) -> Result<T, Stop> {
     Err(Stop::Ub(why.into()))
 }
@@ -213,6 +226,11 @@ impl<'m> Interp<'m> {
                         Some(old)
                     }
                     InstKind::Fence(_) => None,
+                    InstKind::MemCopy { .. } | InstKind::MemSet { .. } => {
+                        let mut flat = FlatMemory(&mut self.mem);
+                        crate::ir::exec_bulk_memory(&inst.kind, &ops, &mut flat).map_err(Stop::Ub)?;
+                        None
+                    }
                     InstKind::Call => {
                         let callee = match &ops[0] {
                             SemValue::Ptr(a) => {

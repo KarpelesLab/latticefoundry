@@ -67,6 +67,13 @@ pub struct CodegenOptions {
     /// a fetch block, so a hot function or loop head is not split across two
     /// 16-byte fetch windows (or two cache lines) for want of padding.
     pub function_alignment: Option<u64>,
+    /// Lower the bulk-memory ops a target would otherwise select inline for a
+    /// long or variable length (`docs/ir-design.md` §6k) to calls to the C
+    /// library's `memcpy`, `memmove` and `memset` instead (default `false`).
+    /// Only for hosted code linked against a libc. Short constant lengths
+    /// stay inline either way. Honored by x86-64, where the inline form is
+    /// `rep movsb` / `rep stosb`; the other targets always use their loops.
+    pub bulk_memory_libcalls: bool,
 }
 
 /// How position-dependent the generated code may be, and so how it addresses
@@ -108,11 +115,19 @@ impl Default for CodegenOptions {
             os: TargetOs::Linux,
             unwind: None,
             function_alignment: None,
+            bulk_memory_libcalls: false,
         }
     }
 }
 
 impl CodegenOptions {
+    /// Call the C library for long or variable bulk-memory ops (see
+    /// [`CodegenOptions::bulk_memory_libcalls`]).
+    pub fn with_bulk_memory_libcalls(mut self, on: bool) -> CodegenOptions {
+        self.bulk_memory_libcalls = on;
+        self
+    }
+
     /// Enable or disable stack probes (see [`CodegenOptions::stack_probes`]).
     pub fn with_stack_probes(mut self, on: bool) -> CodegenOptions {
         self.stack_probes = on;

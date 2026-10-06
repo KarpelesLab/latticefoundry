@@ -44,6 +44,8 @@
 use std::borrow::Cow;
 
 use crate::analysis::cfg::{ControlFlowGraph, Dominators};
+use crate::codegen::legalize_mem::{BulkMemoryLowering, legalize_bulk_memory, uses_bulk_memory};
+use crate::ir::DataLayout;
 use crate::ir::builder::FunctionBuilder;
 use crate::ir::inst::{BinOp, CastOp, Flags, InstData, InstKind, IntPred, ReduceOp};
 use crate::ir::types::{Type, TypeContext, TypeId};
@@ -63,6 +65,14 @@ pub trait VectorLegality {
     /// recognize a uniform shift amount). `call`, `ret`, branches, `freeze` and
     /// the like on legal types are always accepted without asking.
     fn legal_inst(&self, types: &TypeContext, consts: &ConstPool, func: &Function, inst: &InstData) -> bool;
+
+    /// How the target lowers `memcpy`/`memmove`/`memset`
+    /// ([`crate::codegen::legalize_mem`]), which [`legalize_vectors`] applies
+    /// first. The default expands them all inline (pointer-sized aligned
+    /// chunks, loops for long or variable lengths).
+    fn bulk_memory(&self, layout: &DataLayout) -> BulkMemoryLowering {
+        BulkMemoryLowering::portable(layout)
+    }
 }
 
 /// The legality of a target without vector registers: every vector type is
@@ -83,7 +93,7 @@ impl VectorLegality for ScalarOnly {
 /// `module` legalized for `legality`: borrowed unchanged when it contains no
 /// vector code at all (the common case costs one scan), else a legalized copy.
 pub fn legalized<'m>(module: &'m Module, legality: &dyn VectorLegality) -> Cow<'m, Module> {
-    if !uses_vectors(module) && !uses_minmax_sat(module) {
+    if !uses_vectors(module) && !uses_minmax_sat(module) && !uses_bulk_memory(module) {
         return Cow::Borrowed(module);
     }
     let mut m = module.clone();
@@ -123,6 +133,11 @@ fn sig_has_vector(types: &TypeContext, sig: TypeId) -> bool {
 
 /// Legalize every function of `module` in place for `legality`.
 pub fn legalize_vectors(module: &mut Module, legality: &dyn VectorLegality) {
+    // Bulk memory first: its expansion may use vector chunks, legalized below.
+    if uses_bulk_memory(module) {
+        let lowering = legality.bulk_memory(module.data_layout());
+        legalize_bulk_memory(module, &lowering);
+    }
     expand_minmax_sat(module, legality);
     // New signatures first (they intern types), then each body.
     let n = module.function_count();
