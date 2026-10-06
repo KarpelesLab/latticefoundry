@@ -22,16 +22,24 @@
 //!   physical arg/return registers and clobber caller-saved registers, so the
 //!   allocator sees the ABI as ordinary fixed register operands.
 //!
+//! - **Register-returned aggregates** ([`crate::codegen::aggret`]): when a
+//!   target lists the register parts of a returned struct
+//!   ([`TargetIsel::ret_parts`]), a call result read only by field loads, and
+//!   a return slot written only right before its `ret`, skip memory: the
+//!   driver turns the loads into moves (or shifts) of the returned registers
+//!   and emits nothing for the slot, its `ptr_add`s and stores.
+//!
 //! The target supplies only the leaf rules: how each IR opcode becomes machine
 //! instructions, and small builders (`li`, `jump`, `frame_addr`, ...). See the
 //! abstract virtual target for a worked implementation.
 
+use crate::codegen::aggret::{self, AggPlan, RetPart};
 use crate::codegen::mir::{MBlockId, MachineFunction, MachineInst, Reg, RegClass, StackSlot, VReg};
 use crate::codegen::target::MachineTarget;
 use crate::ir::types::{Type, TypeContext, TypeId};
 use crate::ir::value::{Const, FloatBits, ValueDef};
-use crate::ir::{Function, InstData, Module, ValueId};
-use crate::support::{DetHashMap, StrInterner};
+use crate::ir::{Function, InstData, InstId, Module, ValueId};
+use crate::support::{DetHashMap, DetHashSet, StrInterner};
 
 use puremp::Int;
 
@@ -60,6 +68,30 @@ pub trait TargetIsel: MachineTarget + Sized {
     /// parameters overrides this to lay them out per its ABI.
     fn lower_prologue(&self, lo: &mut Lower<'_, Self>) {
         lo.default_prologue();
+    }
+
+    /// The registers an aggregate of type `ty` is returned in, as the parts
+    /// of the struct each one carries, in this target's return-register order;
+    /// `None` when it is returned in memory, or when the target does not take
+    /// part in slot-free aggregate returns ([`crate::codegen::aggret`], the
+    /// default). A target that returns `Some` lowers a call whose
+    /// [`Lower::fused_call`] is set by moving the return registers into those
+    /// vregs instead of a result slot, and a `ret` whose [`Lower::fused_ret`]
+    /// is set by moving the stored values into the return registers; it must
+    /// also implement [`TargetIsel::lshr_imm`].
+    fn ret_parts(&self, _types: &TypeContext, _ty: TypeId) -> Option<Vec<RetPart>> {
+        None
+    }
+
+    /// Build `dst <- src >> bits`, a logical right shift of a 64-bit integer
+    /// register by `1..=63` bits: how the driver reads a field above the low
+    /// byte of a returned register (see [`TargetIsel::ret_parts`]).
+    ///
+    /// # Panics
+    ///
+    /// The default panics: only a target with [`TargetIsel::ret_parts`] is asked.
+    fn lshr_imm(&self, _dst: VReg, _src: VReg, _bits: u32) -> MachineInst {
+        panic!("{} backend: no slot-free aggregate returns", self.name())
     }
 
     /// Build a load-immediate `dst <- value`.
@@ -165,6 +197,12 @@ pub struct Lower<'a, T: TargetIsel> {
     /// prologue and recovered when lowering `__lf_va_overflow_area`. `None` in a
     /// non-variadic function.
     va_overflow_off: Option<u64>,
+    /// The slot-free aggregate returns of the function ([`crate::codegen::aggret`]).
+    agg: AggPlan,
+    /// The instructions [`Lower::run`] emits nothing for (from `agg`).
+    agg_skip: DetHashSet<InstId>,
+    /// The vregs receiving each fused call result's return registers.
+    agg_parts: DetHashMap<ValueId, Vec<VReg>>,
 }
 
 /// Map an IR type to the register class that holds it. A (legal) vector lives
@@ -212,6 +250,24 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             mf.set_entry(block_map[e.index()]);
             mf.set_num_params(func.block(e).params().len());
         }
+        let agg = if func.entry().is_some() {
+            aggret::analyze(func, types, module.consts(), &|t| target.ret_parts(types, t))
+        } else {
+            AggPlan::default()
+        };
+        let agg_skip: DetHashSet<InstId> = agg.skip.iter().copied().collect();
+        let mut calls: Vec<(&ValueId, &Vec<RetPart>)> = agg.calls.iter().collect();
+        calls.sort_by_key(|(v, _)| v.index());
+        let agg_parts: DetHashMap<ValueId, Vec<VReg>> = calls
+            .into_iter()
+            .map(|(&v, parts)| {
+                let regs = parts
+                    .iter()
+                    .map(|p| mf.new_vreg(if p.fp { RegClass::Fp } else { RegClass::Gpr }))
+                    .collect();
+                (v, regs)
+            })
+            .collect();
         Lower {
             target,
             module,
@@ -226,7 +282,25 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             syms,
             va_reg_save: None,
             va_overflow_off: None,
+            agg,
+            agg_skip,
+            agg_parts,
         }
+    }
+
+    /// For a call result returned in registers that needs no slot (every use
+    /// reads a field; see [`crate::codegen::aggret`]), the vregs to move the
+    /// return registers into, one per [`TargetIsel::ret_parts`] part; the
+    /// result's own vreg is then never defined, and must not be.
+    pub fn fused_call(&self, v: ValueId) -> Option<Vec<VReg>> {
+        self.agg_parts.get(&v).cloned()
+    }
+
+    /// For a returned value that is a slot-free return slot, the value stored
+    /// into each [`TargetIsel::ret_parts`] part (`None`: never written, so any
+    /// bits will do), to move into the return registers.
+    pub fn fused_ret(&self, v: ValueId) -> Option<Vec<Option<ValueId>>> {
+        self.agg.rets.get(&v).cloned()
     }
 
     // --- accessors the target rules use ------------------------------------
@@ -576,6 +650,21 @@ impl<'a, T: TargetIsel> Lower<'a, T> {
             }
             for &iid in block.insts() {
                 self.cur_line = f.inst_line(iid).unwrap_or(0);
+                if self.agg_skip.contains(&iid) {
+                    continue;
+                }
+                if let Some(pl) = self.agg.loads.get(&iid).copied() {
+                    // A field of a returned register: a move, or a shift down.
+                    let src = self.agg_parts[&pl.call][pl.part];
+                    let dst = self.result_reg(f.inst(iid));
+                    let mi = if pl.shift == 0 {
+                        t.emit_move(Reg::Virtual(dst), Reg::Virtual(src))
+                    } else {
+                        t.lshr_imm(dst, src, pl.shift)
+                    };
+                    self.emit(mi);
+                    continue;
+                }
                 t.lower_inst(self, f.inst(iid));
             }
             if let Some(tid) = block.terminator() {

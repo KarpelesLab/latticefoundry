@@ -1578,8 +1578,11 @@ impl X86_64Target {
             Some(AbiClass::Regs(ebs)) => {
                 // Rescue every returned eightbyte register into a vreg (one
                 // consecutive run right after the call), then store them into a
-                // fresh result slot whose address becomes the result value.
+                // fresh result slot whose address becomes the result value —
+                // unless only field loads read the result: they read these
+                // vregs directly (`codegen::aggret`), and there is no slot.
                 let ebs = ebs.clone();
+                let fused = lo.fused_call(inst.result().expect("an aggregate result"));
                 let mut ic = 0usize;
                 let mut sc = 0usize;
                 let mut saved: Vec<(usize, VReg)> = Vec::with_capacity(ebs.len());
@@ -1596,9 +1599,12 @@ impl X86_64Target {
                             (RegClass::Fp, r)
                         }
                     };
-                    let v = lo.fresh_vreg(cls);
+                    let v = fused.as_ref().map_or_else(|| lo.fresh_vreg(cls), |p| p[k]);
                     lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
                     saved.push((k, v));
+                }
+                if fused.is_some() {
+                    return;
                 }
                 let t = ret_agg.unwrap();
                 let size = align_up_u64(lo.byte_size(t).max(8), 8);
@@ -2101,6 +2107,31 @@ impl MachineTarget for X86_64Target {
 }
 
 impl TargetIsel for X86_64Target {
+    /// A System V register-class struct: one part per eightbyte, `rax`/`rdx`
+    /// (INTEGER) or `xmm0`/`xmm1` (SSE). The Microsoft x64 convention returns
+    /// a struct of 1, 2, 4 or 8 bytes in `rax` as is, so it opts out.
+    fn ret_parts(&self, types: &TypeContext, ty: TypeId) -> Option<Vec<crate::codegen::aggret::RetPart>> {
+        if self.win64 {
+            return None;
+        }
+        let AbiClass::Regs(ebs) = classify_aggregate(types, ty) else { return None };
+        let size = types.size_of(ty);
+        Some(
+            ebs.iter()
+                .enumerate()
+                .map(|(k, c)| crate::codegen::aggret::RetPart {
+                    off: 8 * k as u64,
+                    size: (size - 8 * k as u64).min(8),
+                    fp: *c == Eightbyte::Sse,
+                })
+                .collect(),
+        )
+    }
+
+    fn lshr_imm(&self, dst: VReg, src: VReg, bits: u32) -> MachineInst {
+        MachineInst::new(X86Op::ShrI.opcode(), vec![def_v(dst), use_v(src), imm(u64::from(bits)), imm(64)])
+    }
+
     /// A constant wider than 64 bits keeps its low 64 bits: part 0 of a wide
     /// value (the `wide` submodule materializes all of its parts).
     fn li(&self, dst: VReg, value: Int) -> MachineInst {
@@ -2368,7 +2399,30 @@ impl TargetIsel for X86_64Target {
                     Type::Func(ft) => ft.ret,
                     _ => lo.func().sig,
                 };
-                if is_aggregate(lo.types(), ret_ty) {
+                if let Some(vals) = inst.operands().first().and_then(|&v| lo.fused_ret(v)) {
+                    // A return slot written only right before the `ret`: the
+                    // stored values go straight into the return registers.
+                    let AbiClass::Regs(ebs) = classify_aggregate(lo.types(), ret_ty) else {
+                        unreachable!("a fused return is register-class")
+                    };
+                    let srcs: Vec<Option<VReg>> = vals.iter().map(|v| v.map(|v| self.oper(lo, v))).collect();
+                    let (mut ic, mut sc) = (0usize, 0usize);
+                    for (c, src) in ebs.iter().zip(srcs) {
+                        let r = match c {
+                            Eightbyte::Integer => {
+                                ic += 1;
+                                if ic == 1 { cc.ret_reg } else { regs::gpr(regs::RDX) }
+                            }
+                            Eightbyte::Sse => {
+                                sc += 1;
+                                if sc == 1 { cc.fp_ret_reg } else { regs::xmm(1) }
+                            }
+                        };
+                        if let Some(src) = src {
+                            lo.emit(MachineInst::new(X86Op::MovRR.opcode(), vec![def(r), use_v(src)]));
+                        }
+                    }
+                } else if is_aggregate(lo.types(), ret_ty) {
                     // The return operand is a pointer to the struct's storage.
                     let src = self.oper(lo, inst.operands()[0]);
                     match classify_aggregate(lo.types(), ret_ty) {

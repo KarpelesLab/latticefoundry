@@ -15,6 +15,8 @@
 //!   values, placing **block parameters** at join points via iterated dominance
 //!   frontiers (our block-argument analog of φ-placement, `docs/ir-design.md`
 //!   §2) and renaming loads to their reaching definitions.
+//! - [`Sroa`] — split aggregate `alloca`s accessed at constant offsets into
+//!   one slot per field (including a by-value struct return), for mem2reg.
 //! - [`Dce`] — dead-code elimination: drop side-effect-free instructions whose
 //!   results are unused and block parameters nothing uses (with their edge
 //!   arguments), iterated to a fixpoint.
@@ -36,6 +38,7 @@ pub mod pipeline;
 pub mod sanitize;
 pub mod sccp;
 pub mod simplify_cfg;
+pub mod sroa;
 pub mod superopt;
 pub mod yield_points;
 
@@ -61,6 +64,7 @@ pub use mem2reg::Mem2Reg;
 pub use pipeline::{OptLevel, optimize, pass_by_name, pipeline_description, pipeline_for};
 pub use sccp::Sccp;
 pub use simplify_cfg::SimplifyCfg;
+pub use sroa::Sroa;
 
 use crate::ir::builder::FunctionBuilder;
 use crate::ir::inst::InstKind;

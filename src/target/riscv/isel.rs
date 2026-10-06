@@ -1262,20 +1262,27 @@ impl RiscvTarget {
             }
             Some(parts) => {
                 // Rescue the result registers first (one consecutive run right
-                // after the call), then store them into a fresh slot.
+                // after the call), then store them into a fresh slot — unless
+                // only field loads read the result: they read these vregs
+                // directly (`codegen::aggret`), and there is no slot.
+                let fused = lo.fused_call(inst.result().expect("an aggregate result"));
                 let saved: Vec<(Part, VReg)> = parts
                     .iter()
-                    .map(|&(part, loc)| {
+                    .enumerate()
+                    .map(|(k, &(part, loc))| {
                         let (preg, class) = match loc {
                             Loc::Fpr(n) => (fpr(n), RegClass::Fp),
                             Loc::Gpr(n) => (gpr(n), RegClass::Gpr),
                             Loc::Stack(_) => unreachable!("a register return"),
                         };
-                        let v = lo.fresh_vreg(class);
+                        let v = fused.as_ref().map_or_else(|| lo.fresh_vreg(class), |p| p[k]);
                         lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(v), use_p(preg)]));
                         (part, v)
                     })
                     .collect();
+                if fused.is_some() {
+                    return;
+                }
                 let slot = Self::agg_slot(lo, ret_ty);
                 lo.emit(self.frame_addr(d, slot));
                 for (part, v) in saved {
@@ -1392,7 +1399,28 @@ impl RiscvTarget {
         };
         let mut uses = Vec::new();
         if let Some(&v) = inst.operands().first() {
-            if abi::is_aggregate(lo.types(), ret_ty) {
+            if let Some(vals) = lo.fused_ret(v) {
+                // A return slot written only right before the `ret`: the stored
+                // values go straight into the result registers, an integer
+                // field of a 4-byte part sign-extended (as `arg_part` reads one)
+                // and a narrower one zero-extended.
+                let parts = abi::ret_locs(lo.types(), ret_ty).expect("a fused return is in registers");
+                let mut moves = Vec::new();
+                for ((part, loc), val) in parts.into_iter().zip(vals) {
+                    let Some(val) = val else { continue };
+                    let r = match (loc, part) {
+                        (Loc::Fpr(n), _) => (fpr(n), lo.reg(val)),
+                        (Loc::Gpr(n), Part::Chunk { size, .. }) if size < 8 => (gpr(n), self.extend64(lo, val, size == 4)),
+                        (Loc::Gpr(n), _) => (gpr(n), lo.reg(val)),
+                        (Loc::Stack(_), _) => unreachable!("a register return"),
+                    };
+                    moves.push(r);
+                }
+                for (r, val) in moves {
+                    lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(r), use_v(val)]));
+                    uses.push(use_p(r));
+                }
+            } else if abi::is_aggregate(lo.types(), ret_ty) {
                 let src = lo.reg(v);
                 match abi::ret_locs(lo.types(), ret_ty) {
                     None => {
@@ -1495,6 +1523,27 @@ impl MachineTarget for RiscvTarget {
 }
 
 impl TargetIsel for RiscvTarget {
+    /// The parts [`abi::ret_locs`] returns in `a0`/`a1`/`fa0`/`fa1`.
+    fn ret_parts(
+        &self,
+        types: &crate::ir::TypeContext,
+        ty: crate::ir::types::TypeId,
+    ) -> Option<Vec<crate::codegen::aggret::RetPart>> {
+        abi::ret_locs(types, ty)?
+            .into_iter()
+            .map(|(part, _)| match part {
+                Part::Chunk { off, size, float } => {
+                    Some(crate::codegen::aggret::RetPart { off, size, fp: float.is_some() })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn lshr_imm(&self, dst: VReg, src: VReg, bits: u32) -> MachineInst {
+        MachineInst::new(RvOp::Srli.opcode(), vec![def_v(dst), use_v(src), imm(u64::from(bits)), imm(64)])
+    }
+
     fn li(&self, dst: VReg, value: Int) -> MachineInst {
         MachineInst::new(RvOp::Li.opcode(), vec![def_v(dst), MachineOperand::Imm(value)])
     }

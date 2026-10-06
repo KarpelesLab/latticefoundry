@@ -18,6 +18,8 @@
 //! - [`regalloc`] — a correct linear-scan register allocator with spilling;
 //! - [`interp`] — a small MIR interpreter over the virtual target, the
 //!   executable semantics isel + regalloc are validated against;
+//! - [`aggret`] — slot-free register-returned aggregates: the call results
+//!   and return slots whose memory a backend can skip;
 //! - [`data`] — the target-independent emission of global data (initializer
 //!   serialization, `.rodata`/`.data`/`.bss` placement, data relocations) that
 //!   each backend's `compile_module` calls with its absolute-pointer reloc kind;
@@ -38,6 +40,7 @@
 //! Real ISAs (x86-64, AArch64, RISC-V) and instruction *encoding* are Phases
 //! 6–7; this phase produces MIR, not bytes.
 
+pub mod aggret;
 pub mod data;
 pub mod interp;
 pub mod isel;

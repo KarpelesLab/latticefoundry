@@ -17,23 +17,27 @@
 //! ## The pipelines
 //!
 //! - **O0** — nothing (the caller still verifies; this is the identity).
-//! - **O1** — `memopt → mem2reg → sccp → simplify_cfg → dce → dfe`: split
-//!   the slots bulk-memory ops touch and forward/remove memory traffic, promote
-//!   memory to SSA, fold constants and prune dead edges, tidy the CFG, drop the
-//!   dead code that exposes, and delete the internal functions nothing
-//!   references.
-//! - **O2** — `memopt → mem2reg`, then the clean-up group
+//! - **O1** — `memopt → sroa → mem2reg → sccp → simplify_cfg → dce → dfe`:
+//!   split the slots bulk-memory ops touch and forward/remove memory traffic,
+//!   split the other aggregate slots accessed field by field (a struct return
+//!   included), promote memory to SSA, fold constants and prune dead edges,
+//!   tidy the CFG, drop the dead code that exposes, and delete the internal
+//!   functions nothing references.
+//! - **O2** — `memopt → sroa → mem2reg`, then the clean-up group
 //!   `sccp → egraph → simplify_cfg → dce → licm` iterated twice, then one round of
-//!   `inline`, `dfe` to delete the callees inlined everywhere, `memopt` and
-//!   `mem2reg` again (struct copies into the caller's slots become scalars,
-//!   and a slot whose address escaped only into an inlined call, such as an
-//!   out-parameter, is now a plain local), and
-//!   `sccp → egraph → simplify_cfg → dce` to clean up after inlining (so
-//!   cross-call constants fold and the split call blocks merge back).
+//!   `inline`, `dfe` to delete the callees inlined everywhere, `simplify_cfg`
+//!   (an inlined call's continuation block merges back, so an inlined struct
+//!   return is a plain slot), `memopt`, `sroa` and `mem2reg` again (struct
+//!   copies into the caller's slots become scalars, and a slot whose address
+//!   escaped only into an inlined call, such as an out-parameter, is now a
+//!   plain local), and `sccp → egraph → simplify_cfg → dce` to clean up after
+//!   inlining (so cross-call constants fold and the split call blocks merge
+//!   back).
 //! - **O3** — O2 with a deeper fixpoint (three clean-up rounds), a second
-//!   inlining round (each round followed by `dfe`, `memopt` and `mem2reg`), and more
-//!   post-inline clean-up — the level where interprocedural
-//!   work (including cross-module inlining after LTO) pays off most.
+//!   inlining round (each round followed by `dfe`, `simplify_cfg`, `memopt`,
+//!   `sroa` and `mem2reg`), and more post-inline clean-up — the level where
+//!   interprocedural work (including cross-module inlining after LTO) pays
+//!   off most.
 //!
 //! `dfe` ([`DeadFunctionElim`]) is the only pass that removes functions; it
 //! renumbers the surviving [`FuncId`](crate::ir::FuncId)s (see
@@ -43,7 +47,7 @@
 use crate::ir::Module;
 use crate::pass::{ModulePass, PassManager};
 use crate::transform::{
-    Dce, DeadFunctionElim, FunctionTransformPass, Inline, Licm, Mem2Reg, SimplifyCfg,
+    Dce, DeadFunctionElim, FunctionTransformPass, Inline, Licm, Mem2Reg, SimplifyCfg, Sroa,
     egraph::EqSatPass, sccp::SccpPass,
 };
 
@@ -93,13 +97,14 @@ impl OptLevel {
 /// Build a fresh boxed instance of the pass named `name`, or `None` if the name
 /// is unknown. Drives `lf-opt -p pass,pass,...` and the pipeline builders below.
 ///
-/// Recognized names: `memopt`, `mem2reg`, `sccp`, `simplify_cfg` (aka `simplifycfg`,
+/// Recognized names: `memopt`, `sroa`, `mem2reg`, `sccp`, `simplify_cfg` (aka `simplifycfg`,
 /// `scfg`), `dce`, `egraph` (aka `eqsat`), `licm`, `inline`, `dfe` (aka
 /// `dead_functions`, `globaldce`).
 pub fn pass_by_name(name: &str) -> Option<Box<dyn ModulePass>> {
     let pass: Box<dyn ModulePass> = match name {
         "mem2reg" => Box::new(FunctionTransformPass::new(Mem2Reg)),
         "memopt" => Box::new(crate::transform::memopt::MemOpt),
+        "sroa" => Box::new(FunctionTransformPass::new(Sroa)),
         "sccp" => Box::new(SccpPass),
         "simplify_cfg" | "simplifycfg" | "scfg" => {
             Box::new(FunctionTransformPass::new(SimplifyCfg))
@@ -131,7 +136,7 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
     // longer escapes into a call), which only a mem2reg *after* inlining can
     // promote (issue #13); the clean-up that follows folds what that exposes.
     fn inline_round(out: &mut Vec<Box<dyn ModulePass>>) {
-        for n in ["inline", "dfe", "memopt", "mem2reg"] {
+        for n in ["inline", "dfe", "simplify_cfg", "memopt", "sroa", "mem2reg"] {
             out.push(pass_by_name(n).expect("known pass"));
         }
     }
@@ -139,13 +144,14 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
     match level {
         OptLevel::O0 => {}
         OptLevel::O1 => {
-            for n in ["memopt", "mem2reg", "sccp", "simplify_cfg", "dce", "dfe"] {
+            for n in ["memopt", "sroa", "mem2reg", "sccp", "simplify_cfg", "dce", "dfe"] {
                 out.push(pass_by_name(n).expect("known pass"));
             }
         }
         OptLevel::O2 => {
-            out.push(pass_by_name("memopt").expect("known pass"));
-            out.push(pass_by_name("mem2reg").expect("known pass"));
+            for n in ["memopt", "sroa", "mem2reg"] {
+                out.push(pass_by_name(n).expect("known pass"));
+            }
             for _ in 0..2 {
                 cleanup(&mut out);
             }
@@ -155,8 +161,9 @@ pub fn pipeline_for(level: OptLevel) -> Vec<Box<dyn ModulePass>> {
             }
         }
         OptLevel::O3 => {
-            out.push(pass_by_name("memopt").expect("known pass"));
-            out.push(pass_by_name("mem2reg").expect("known pass"));
+            for n in ["memopt", "sroa", "mem2reg"] {
+                out.push(pass_by_name(n).expect("known pass"));
+            }
             for _ in 0..3 {
                 cleanup(&mut out);
             }

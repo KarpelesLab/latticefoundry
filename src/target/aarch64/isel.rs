@@ -1395,12 +1395,18 @@ impl AArch64Target {
                 let bytes = u64::from(width / 8);
                 // Rescue each returned element from `v0..v3` (one consecutive run
                 // right after the call), then store them into a fresh result slot.
+                // Only field loads read the result: they read these vregs
+                // directly (`codegen::aggret`), and there is no slot.
+                let fused = lo.fused_call(inst.result().expect("an aggregate result"));
                 let mut saved: Vec<VReg> = Vec::with_capacity(count as usize);
                 for k in 0..count as usize {
                     let r = regs::fp(k as u16);
-                    let v = lo.fresh_vreg(RegClass::Fp);
+                    let v = fused.as_ref().map_or_else(|| lo.fresh_vreg(RegClass::Fp), |p| p[k]);
                     lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
                     saved.push(v);
+                }
+                if fused.is_some() {
+                    return;
                 }
                 let t = ret_agg.unwrap();
                 let size = align_up_u64(lo.byte_size(t).max(8), 8);
@@ -1418,12 +1424,16 @@ impl AArch64Target {
             }
             Some(AbiClass::Regs(n)) => {
                 let n = *n;
+                let fused = lo.fused_call(inst.result().expect("an aggregate result"));
                 let mut saved: Vec<VReg> = Vec::with_capacity(n);
                 for k in 0..n {
                     let r = if k == 0 { cc.ret_reg } else { regs::gpr(regs::X1) };
-                    let v = lo.fresh_vreg(RegClass::Gpr);
+                    let v = fused.as_ref().map_or_else(|| lo.fresh_vreg(RegClass::Gpr), |p| p[k]);
                     lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
                     saved.push(v);
+                }
+                if fused.is_some() {
+                    return;
                 }
                 let t = ret_agg.unwrap();
                 let size = align_up_u64(lo.byte_size(t).max(8), 8);
@@ -1730,6 +1740,27 @@ impl MachineTarget for AArch64Target {
 }
 
 impl TargetIsel for AArch64Target {
+    /// An HFA: one part per element, in `v0..v3`; a small aggregate: one
+    /// part per eightbyte, in `x0`/`x1`.
+    fn ret_parts(&self, types: &TypeContext, ty: TypeId) -> Option<Vec<crate::codegen::aggret::RetPart>> {
+        use crate::codegen::aggret::RetPart;
+        match classify_aggregate(types, ty) {
+            AbiClass::Hfa { width, count } => {
+                let b = u64::from(width / 8);
+                Some((0..u64::from(count)).map(|k| RetPart { off: b * k, size: b, fp: true }).collect())
+            }
+            AbiClass::Regs(n) => {
+                let size = types.size_of(ty);
+                Some((0..n as u64).map(|k| RetPart { off: 8 * k, size: (size - 8 * k).min(8), fp: false }).collect())
+            }
+            AbiClass::Reference => None,
+        }
+    }
+
+    fn lshr_imm(&self, dst: VReg, src: VReg, bits: u32) -> MachineInst {
+        MachineInst::new(A64Op::LsrI.opcode(), vec![def_v(dst), use_v(src), imm(u64::from(bits)), imm(64)])
+    }
+
     fn li(&self, dst: VReg, value: Int) -> MachineInst {
         MachineInst::new(A64Op::MovRI.opcode(), vec![def_v(dst), MachineOperand::Imm(value)])
     }
@@ -1901,7 +1932,18 @@ impl TargetIsel for AArch64Target {
                     Type::Func(ft) => ft.ret,
                     _ => lo.func().sig,
                 };
-                if is_aggregate(lo.types(), ret_ty) {
+                if let Some(vals) = inst.operands().first().and_then(|&v| lo.fused_ret(v)) {
+                    // A return slot written only right before the `ret`: the
+                    // stored values go straight into `x0`/`x1` or `v0..v3`.
+                    let fp = matches!(classify_aggregate(lo.types(), ret_ty), AbiClass::Hfa { .. });
+                    let srcs: Vec<Option<VReg>> = vals.iter().map(|v| v.map(|v| lo.reg(v))).collect();
+                    for (k, src) in srcs.into_iter().enumerate() {
+                        let r = if fp { regs::fp(k as u16) } else { regs::gpr(k as u16) };
+                        if let Some(src) = src {
+                            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(r), use_v(src)]));
+                        }
+                    }
+                } else if is_aggregate(lo.types(), ret_ty) {
                     // The return operand is a pointer to the struct's storage.
                     let src = lo.reg(inst.operands()[0]);
                     match classify_aggregate(lo.types(), ret_ty) {
