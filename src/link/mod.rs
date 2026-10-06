@@ -82,7 +82,10 @@ pub fn link(options: &LinkOptions) -> Result<(), String> {
     for path in &options.inputs {
         objects.push(read_object(path)?);
     }
-    let mut opts = ImageOptions::default();
+    // Objects compiled with debug info keep it: their `.debug_*` sections are
+    // merged into the executable.
+    let debug = objects.iter().any(|o| o.sections().iter().any(|s| s.name == ".debug_info"));
+    let mut opts = ImageOptions { debug, ..ImageOptions::default() };
     if let Some(entry) = &options.entry {
         opts.entry = entry.clone();
     }
@@ -833,5 +836,165 @@ entry ^0:
             s.contains("Line 7") && s.contains("<main>"),
             "gdb could not map main to its source line:\n{s}"
         );
+    }
+
+    /// `main` in one module, calling `helper` defined in a second.
+    const PROG_A: &str = "\
+module \"a\"
+func @helper() -> i64
+func @main() -> i64 {
+entry ^0:
+  %h = call @helper() : i64
+  %r = add %h, i64 2 : i64
+  ret %r
+}
+";
+    const PROG_B: &str = "\
+module \"b\"
+
+func @helper() -> i64 {
+entry ^0:
+  %a = add i64 40, i64 0 : i64
+  ret %a
+}
+";
+
+    /// Compile `PROG_A` and `PROG_B` as separate objects with debug info (the
+    /// second also holding a `.tdata` variable).
+    fn two_unit_objects() -> Vec<crate::mc::object::ObjectModule> {
+        use crate::mc::object::{Section, SectionKind, Symbol, SymbolBinding, SymbolType};
+        let mut objs = Vec::new();
+        for (i, (prog, file)) in [(PROG_A, "a.lf"), (PROG_B, "b.lf")].into_iter().enumerate() {
+            let mut syms = StrInterner::new();
+            let module = crate::ir::text::parse_module(prog, FileId::new(i as u32), &mut syms)
+                .expect("parse .lf");
+            let source = DebugSource { file_name: file.to_owned(), comp_dir: "/lf".to_owned() };
+            objs.push(compile_module_debug(&module, &syms, &source));
+        }
+        let mut tdata = Section::new(".tdata", SectionKind::TData, 8);
+        tdata.bytes = vec![7; 8];
+        let tid = objs[1].add_section(tdata);
+        objs[1].add_symbol(Symbol::defined("tls_var", SymbolBinding::Global, SymbolType::Tls, tid, 0, 8));
+        objs
+    }
+
+    /// [`two_unit_objects`] linked with `opts`.
+    fn build_two_unit_image(opts: &ImageOptions) -> Vec<u8> {
+        link_executable(two_unit_objects(), opts).expect("link two-unit debug image")
+    }
+
+    fn rd_u32(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    }
+
+    /// The NUL-terminated string at `o` in `b`.
+    fn c_str(b: &[u8], o: usize) -> &str {
+        let len = b[o..].iter().position(|&c| c == 0).unwrap();
+        std::str::from_utf8(&b[o..o + len]).unwrap()
+    }
+
+    /// Every section header of `img` as `(name, file offset, size)`.
+    fn section_headers(img: &[u8]) -> Vec<(String, usize, usize)> {
+        let (shoff, shnum, shstrndx) = (rd_u64(img, 40) as usize, rd_u16(img, 60) as usize, rd_u16(img, 62) as usize);
+        let hdr = |i: usize| shoff + i * 64;
+        let names = rd_u64(img, hdr(shstrndx) + 24) as usize;
+        (0..shnum)
+            .map(|i| {
+                let h = hdr(i);
+                let name = c_str(img, names + rd_u32(img, h) as usize).to_owned();
+                (name, rd_u64(img, h + 24) as usize, rd_u64(img, h + 32) as usize)
+            })
+            .collect()
+    }
+
+    /// Check that `img` has one header per debug section name and that each
+    /// of its two units' section offsets (abbrev offset, `strp` names,
+    /// `stmt_list`) lands in that unit's own contribution.
+    fn assert_two_units(img: &[u8], ctx: &str) {
+        let shdrs = section_headers(img);
+        let find = |n: &str| {
+            let all: Vec<_> = shdrs.iter().filter(|s| s.0 == n).collect();
+            assert_eq!(all.len(), 1, "{ctx}: one {n} header");
+            &img[all[0].1..all[0].1 + all[0].2]
+        };
+        let (info, strs, line, abbrev) =
+            (find(".debug_info"), find(".debug_str"), find(".debug_line"), find(".debug_abbrev"));
+        let mut cu = 0;
+        let mut files = Vec::new();
+        while cu < info.len() {
+            // Header: unit_length, version, debug_abbrev_offset, address_size;
+            // then the CU DIE: abbrev code, producer/name/comp_dir strp,
+            // stmt_list.
+            let abbrev_off = rd_u32(info, cu + 6) as usize;
+            assert!(abbrev_off < abbrev.len() && abbrev[abbrev_off] == 1, "{ctx}: abbrev table");
+            let name = c_str(strs, rd_u32(info, cu + 16) as usize);
+            assert_eq!(c_str(strs, rd_u32(info, cu + 12) as usize), "LatticeFoundry", "{ctx}");
+            // The line program's file table (after the fixed header fields,
+            // the 12 standard opcode lengths and the empty directory list)
+            // names the same file.
+            let stmt = rd_u32(info, cu + 24) as usize;
+            let header_end = stmt + 10 + rd_u32(line, stmt + 6) as usize;
+            let file_table = stmt + 10 + 6 + 12 + 1;
+            assert!(file_table < header_end, "{ctx}");
+            assert_eq!(c_str(line, file_table), name, "{ctx}: line table of {name}");
+            files.push(name.to_owned());
+            cu += 4 + rd_u32(info, cu) as usize;
+        }
+        assert_eq!(files, ["a.lf", "b.lf"], "{ctx}");
+    }
+
+    /// Two objects' debug sections merge into one output section per name,
+    /// and every section offset of the second unit is rebased onto its own
+    /// contribution, under every `.rodata` placement and with a TLS segment
+    /// in the image.
+    #[test]
+    fn two_units_get_their_own_strings_and_line_tables() {
+        for merge in [MergeRodata::Never, MergeRodata::Always] {
+            let opts = ImageOptions { debug: true, merge_rodata: merge, ..ImageOptions::default() };
+            assert_two_units(&build_two_unit_image(&opts), &format!("{merge:?}"));
+        }
+    }
+
+    /// `lf-ld`'s `.lfo` path keeps the debug info of objects that carry it
+    /// (section symbols included) through the file round trip.
+    #[test]
+    fn lfo_link_keeps_both_units() {
+        let dir = std::env::temp_dir();
+        let tag = std::process::id();
+        let mut inputs = Vec::new();
+        for (i, obj) in two_unit_objects().iter().enumerate() {
+            let path = dir.join(format!("lf_dwarf_two_{tag}_{i}.lfo"));
+            std::fs::write(&path, crate::mc::lfo::encode(obj)).expect("write .lfo");
+            inputs.push(path.to_str().unwrap().to_owned());
+        }
+        let output = dir.join(format!("lf_dwarf_two_{tag}.out")).to_str().unwrap().to_owned();
+        let result = link(&LinkOptions { output: output.clone(), inputs: inputs.clone(), entry: None });
+        let img = std::fs::read(&output);
+        for p in inputs.iter().chain([&output]) {
+            let _ = std::fs::remove_file(p);
+        }
+        result.expect("link .lfo inputs");
+        assert_two_units(&img.expect("read the executable"), "lfo");
+    }
+
+    /// gdb sets a breakpoint by a line of the *second* unit and stops there.
+    #[test]
+    fn gdb_breaks_in_the_second_unit() {
+        if !tool_available("gdb") {
+            eprintln!("skipping: gdb not available");
+            return;
+        }
+        let img = build_two_unit_image(&ImageOptions { debug: true, ..ImageOptions::default() });
+        let path = std::env::temp_dir().join(format!("lf_dwarf_two_{}", std::process::id()));
+        write_executable(path.to_str().unwrap(), &img).expect("write");
+        let out = std::process::Command::new("gdb")
+            .args(["-batch", "-nx", "-ex", "break b.lf:5", "-ex", "run", "-ex", "bt"])
+            .arg(&path)
+            .output()
+            .expect("run gdb");
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("helper () at b.lf:5"), "gdb did not stop in b.lf:\n{s}");
+        assert!(s.contains("main () at a.lf"), "no caller frame in a.lf:\n{s}");
     }
 }

@@ -900,25 +900,56 @@ fn emit_debug_and_sections(
     segments: &[Segment],
     merged_rodata: Option<(u64, u64)>,
 ) -> Result<SectionTable, LinkError> {
-    // --- 6a. Place each debug section in the file, recording its offset. ---
+    // --- 6a. Concatenate the debug sections of each name (in first-encounter
+    //     order) into one output section, recording where every input section
+    //     lands: its file offset and its offset within the output section. ---
     let debug_group = group(objects, SectionKind::Debug);
-    let mut debug_off: DetHashMap<(usize, usize), u64> = DetHashMap::default();
+    let mut debug_names: Vec<&str> = Vec::new();
     for &(oi, si) in &debug_group {
-        let s = &objects[oi].sections()[si];
-        let aligned = align_up(buf.len() as u64, s.align.max(1));
-        buf.resize(aligned as usize, 0);
-        debug_off.insert((oi, si), buf.len() as u64);
-        buf.extend_from_slice(&s.bytes);
+        let name = objects[oi].sections()[si].name.as_str();
+        if !debug_names.contains(&name) {
+            debug_names.push(name);
+        }
+    }
+    let mut debug_off: DetHashMap<(usize, usize), u64> = DetHashMap::default();
+    let mut debug_rel: DetHashMap<(usize, usize), u64> = DetHashMap::default();
+    // One output section per name: (name, file offset, size, alignment).
+    let mut debug_out: Vec<(&str, u64, u64, u64)> = Vec::new();
+    for &name in &debug_names {
+        let members: Vec<(usize, usize)> =
+            debug_group.iter().copied().filter(|&(oi, si)| objects[oi].sections()[si].name == name).collect();
+        let align = members.iter().map(|&(oi, si)| objects[oi].sections()[si].align.max(1)).max().unwrap_or(1);
+        let start = align_up(buf.len() as u64, align);
+        buf.resize(start as usize, 0);
+        for (oi, si) in members {
+            let s = &objects[oi].sections()[si];
+            let aligned = align_up(buf.len() as u64, s.align.max(1));
+            buf.resize(aligned as usize, 0);
+            debug_off.insert((oi, si), buf.len() as u64);
+            debug_rel.insert((oi, si), buf.len() as u64 - start);
+            buf.extend_from_slice(&s.bytes);
+        }
+        debug_out.push((name, start, buf.len() as u64 - start, align));
     }
 
-    // --- 6b. Apply relocations that live inside the debug sections. ---
+    // --- 6b. Apply relocations that live inside the debug sections. A target
+    //     in a debug section (a DWARF section offset against a section symbol)
+    //     is its offset within the merged output section; any other target is
+    //     its run-time address. ---
     for (oi, obj) in objects.iter().enumerate() {
         for r in obj.relocations() {
             if obj.sections()[r.section.index()].kind != SectionKind::Debug {
                 continue;
             }
             let field = debug_off[&(oi, r.section.index())] + r.offset;
-            let s = symbol_address(objects, placement, globals, oi, r.symbol)?;
+            let s = match obj.symbol(r.symbol).value {
+                SymbolValue::Defined { section, offset }
+                    if obj.sections()[section.index()].kind == SectionKind::Debug =>
+                {
+                    debug_rel[&(oi, section.index())] + offset
+                }
+                _ => symbol_address(objects, placement, globals, oi, r.symbol)?,
+            };
             let a = r.addend;
             let name = || obj.symbol(r.symbol).name.clone();
             match r.kind {
@@ -1059,20 +1090,20 @@ fn emit_debug_and_sections(
         }
     }
 
-    // Debug section headers (non-alloc PROGBITS), preserving encounter order.
-    for &(oi, si) in &debug_group {
-        let s = &objects[oi].sections()[si];
-        let n = add_shstr(&s.name, &mut shstrtab);
+    // Debug section headers (non-alloc PROGBITS), one per merged name, in
+    // encounter order.
+    for &(name, offset, size, align) in &debug_out {
+        let n = add_shstr(name, &mut shstrtab);
         shdrs.push(ShdrRec {
             name_off: n,
             kind: SHT_PROGBITS,
             flags: 0,
             addr: 0,
-            offset: debug_off[&(oi, si)],
-            size: s.bytes.len() as u64,
+            offset,
+            size,
             link: 0,
             info: 0,
-            align: s.align.max(1),
+            align,
             entsize: 0,
         });
     }

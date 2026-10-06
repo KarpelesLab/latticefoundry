@@ -2648,14 +2648,10 @@ fn build_module(
             text_size,
             funcs,
         };
-        let dw = crate::mc::dwarf::build(&unit);
-
-        // Plain (relocation-free) sections.
-        obj.add_section(debug_section(".debug_abbrev", dw.abbrev));
-        obj.add_section(debug_section(".debug_str", dw.str));
-        // Sections carrying address relocations against the function symbols.
-        obj.add_emitted_section(".debug_info", SectionKind::Debug, 1, dw.info);
-        obj.add_emitted_section(".debug_line", SectionKind::Debug, 1, dw.line);
+        // Section offsets relocate against section symbols in an ELF object
+        // (see `mc::dwarf`); Mach-O and COFF keep them as plain values.
+        let elf = matches!(opts.os, crate::target::TargetOs::Linux | crate::target::TargetOs::None);
+        crate::mc::dwarf::build(&unit).add_to(&mut obj, elf);
     }
 
     CompiledModule { object: obj, stack }
@@ -2690,13 +2686,6 @@ fn emit_unwind_tables(
             unwind::emit_compact_unwind(obj, &records);
         }
     }
-}
-
-/// A non-allocated debug [`Section`] holding `bytes`.
-fn debug_section(name: &str, bytes: Vec<u8>) -> Section {
-    let mut s = Section::new(name, SectionKind::Debug, 1);
-    s.bytes = bytes;
-    s
 }
 
 /// Compile `module` to a complete ELF64 relocatable object image.

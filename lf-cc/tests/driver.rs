@@ -319,3 +319,97 @@ fn o2_debug_info_keeps_line_table() {
         eprintln!("gdb not installed, breakpoint check skipped");
     }
 }
+
+const DBG_A_C: &str = "int b(int);\nint c(int);\nint main(void){ return b(c(20)) - 41; }\n";
+const DBG_B_C: &str = "int b(int x){\n  return x + 1;\n}\n";
+const DBG_C_C: &str = "int c(int x){\n  return x * 2;\n}\n";
+
+/// The `DW_AT_name`s of the compile units of `exe`, by `llvm-dwarfdump`.
+fn compile_unit_names(dwarfdump: &Path, exe: &Path) -> Vec<String> {
+    let out = Command::new(dwarfdump).arg("--debug-info").arg(exe).output().expect("run llvm-dwarfdump");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names = Vec::new();
+    let mut in_cu = false;
+    for l in text.lines() {
+        let l = l.trim();
+        if l.contains("DW_TAG_") {
+            in_cu = l.contains("DW_TAG_compile_unit");
+        } else if in_cu && l.starts_with("DW_AT_name") {
+            names.push(l.split('"').nth(1).unwrap_or_default().to_owned());
+            in_cu = false;
+        }
+    }
+    names
+}
+
+/// Several `-g` objects linked into one program — by qld, by gcc, and mixed
+/// with gcc-built `-g` objects — each keep their own compile unit (name,
+/// strings, line table): the DWARF section offsets carry relocations, so the
+/// linker rebases them onto each object's part of the merged sections.
+#[test]
+fn separate_debug_objects_keep_their_compile_units() {
+    if host_crt().is_none() {
+        return;
+    }
+    let s = Scratch::new("dwarfmulti");
+    s.write("a.c", DBG_A_C);
+    s.write("b.c", DBG_B_C);
+    s.write("c.c", DBG_C_C);
+    for f in ["a", "b", "c"] {
+        s.lf_cc(&["-g", "-c", &format!("{f}.c"), "-o", &format!("l{f}.o")]);
+    }
+    let mut programs = vec![("qld", vec!["la.o", "lb.o", "lc.o"])];
+    let gcc = Command::new("gcc").arg("--version").output().is_ok_and(|o| o.status.success());
+    if gcc {
+        for f in ["a", "c"] {
+            let st = Command::new("gcc")
+                .args(["-g", "-c", &format!("{f}.c"), "-o", &format!("g{f}.o")])
+                .current_dir(&s.0)
+                .status()
+                .expect("run gcc");
+            assert!(st.success());
+        }
+        programs.push(("gcc", vec!["la.o", "lb.o", "lc.o"]));
+        programs.push(("gcc-mixed", vec!["ga.o", "lb.o", "gc.o"]));
+        programs.push(("qld-mixed", vec!["la.o", "lb.o", "gc.o"]));
+    } else {
+        eprintln!("gcc not installed, gcc-linked and mixed checks skipped");
+    }
+    let dwarfdump = llvm_tool("llvm-dwarfdump");
+    let has_gdb = Command::new("gdb").arg("--version").output().is_ok_and(|o| o.status.success());
+    for (how, objs) in &programs {
+        let exe = format!("p-{how}");
+        let mut args: Vec<&str> = objs.clone();
+        args.extend(["-o", &exe]);
+        if how.starts_with("gcc") {
+            let out = Command::new("gcc").args(&args).current_dir(&s.0).output().expect("run gcc");
+            assert!(out.status.success(), "gcc link failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        } else {
+            s.lf_cc(&args);
+        }
+        assert_eq!(s.run(&exe).status.code(), Some(0), "{how}");
+        let exe = s.0.join(&exe);
+        if let Some(dwarfdump) = &dwarfdump {
+            let names = compile_unit_names(dwarfdump, &exe);
+            assert_eq!(names, ["a.c", "b.c", "c.c"], "{how}: compile units");
+            let out = Command::new(dwarfdump).arg("--verify").arg(&exe).output().expect("run llvm-dwarfdump");
+            assert!(out.status.success(), "{how}: --verify:\n{}", String::from_utf8_lossy(&out.stdout));
+        }
+        if has_gdb {
+            let out = Command::new("gdb")
+                .args(["-batch", "-nx", "-ex", "break b.c:2", "-ex", "break c.c:2", "-ex", "run", "-ex", "continue"])
+                .arg(&exe)
+                .current_dir(&s.0)
+                .output()
+                .expect("run gdb");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                text.contains(" at b.c:2\n") && text.contains(" at c.c:2\n"),
+                "{how}: gdb did not stop at b.c:2 and c.c:2:\n{text}"
+            );
+        }
+    }
+    if dwarfdump.is_none() {
+        eprintln!("llvm-dwarfdump not installed, compile-unit check skipped");
+    }
+}

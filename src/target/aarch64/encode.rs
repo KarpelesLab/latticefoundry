@@ -1970,14 +1970,10 @@ fn build_module(
             text_size,
             funcs,
         };
-        let dw = crate::mc::dwarf::build_with_address_size(&unit, 8);
-        for (name, bytes) in [(".debug_abbrev", dw.abbrev), (".debug_str", dw.str)] {
-            let mut s = Section::new(name, SectionKind::Debug, 1);
-            s.bytes = bytes;
-            obj.add_section(s);
-        }
-        obj.add_emitted_section(".debug_info", SectionKind::Debug, 1, dw.info);
-        obj.add_emitted_section(".debug_line", SectionKind::Debug, 1, dw.line);
+        // Section offsets relocate against section symbols in an ELF object
+        // (see `mc::dwarf`); Mach-O and COFF keep them as plain values.
+        let elf = matches!(opts.os, crate::target::TargetOs::Linux | crate::target::TargetOs::None);
+        crate::mc::dwarf::build_with_address_size(&unit, 8).add_to(&mut obj, elf);
     }
     CompiledModule { object: obj, stack }
 }

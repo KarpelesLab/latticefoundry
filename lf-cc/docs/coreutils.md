@@ -59,10 +59,18 @@ Almost every remaining failure has one cause: lf-cc's `long double` is a
 
   The fix is a true x87 `long double` in the backend: an IR `f80` type,
   x87 code, and the System V memory-class ABI with an `st(0)` return.
-- **Debug info across objects.** `rm/r-root` sets a gdb breakpoint on a
-  line of `remove.c`. The optimizer now keeps the line table at `-O2`
-  (issue #19; `tail/inotify-race{,2}` pass), but the link keeps the DWARF of
-  the first object only, so gdb finds no `remove.c` and the test skips.
+- **Debug info across objects (fixed since this run).** `rm/r-root` sets a
+  gdb breakpoint on a line of `remove.c`. The optimizer keeps the line table
+  at `-O2` (issue #19; `tail/inotify-race{,2}` pass). In this run the test
+  still skipped: lf-cc wrote DWARF section offsets (`DW_FORM_strp`,
+  `DW_AT_stmt_list`, the unit's abbrev offset) without relocations. After
+  the link, every compile unit therefore read the first object's strings
+  and line table, and gdb found no `remove.c`. These offsets are now
+  relocated against their section's symbol, so each object keeps its own
+  compile unit. A small repro of the same shape passes: `-O2 -g` objects
+  plus an archive member, with gdb stopping at a `remove.c` line in the
+  second object (`separate_debug_objects_keep_their_compile_units` in
+  `tests/driver.rs`). The full suite has not been rerun since.
 
 ## What coreutils needed
 

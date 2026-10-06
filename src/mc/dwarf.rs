@@ -24,11 +24,21 @@
 //! instead: the unit header's `address_size` and every address field then use
 //! 4 (`Abs32`) or 2 (`Abs16`) bytes.
 //!
+//! Every *section offset* — the unit header's `debug_abbrev_offset`, each
+//! `DW_FORM_strp` into `.debug_str`, and `DW_AT_stmt_list` into `.debug_line` —
+//! holds its value in the field and also carries a 32-bit
+//! [`Abs32`](crate::mc::object::RelocKind::Abs32) relocation against the target
+//! section's own (`STT_SECTION`) symbol, with the offset as its addend. A
+//! linker concatenates each object's `.debug_str`/`.debug_line`/`.debug_abbrev`
+//! into one output section, so an unrelocated offset of the second object would
+//! point into the first object's data. [`DwarfSections::add_to`] adds the
+//! sections and those section symbols to an object.
+//!
 //! The format is implemented from the published DWARF specification (tenet T1);
 //! nothing here is copied from another toolchain. Output is deterministic.
 
 use crate::mc::emit::{Emitted, Emitter, Ref};
-use crate::mc::object::RelocKind;
+use crate::mc::object::{ObjectModule, RelocKind, Section, SectionKind, Symbol, SymbolBinding, SymbolType};
 
 // ---- DWARF constants (from the DWARF 4 specification) ----------------------
 
@@ -64,6 +74,12 @@ const DW_LNE_SET_ADDRESS: u8 = 2;
 
 const DWARF_VERSION: u16 = 4;
 
+/// The sections a DWARF section offset can point into. Each is also the name
+/// of that section's local section symbol, which the offset relocates against.
+const DEBUG_ABBREV: &str = ".debug_abbrev";
+const DEBUG_STR: &str = ".debug_str";
+const DEBUG_LINE: &str = ".debug_line";
+
 /// Per-function debug facts the emitter needs.
 #[derive(Clone, Debug)]
 pub struct FuncDebug {
@@ -95,7 +111,9 @@ pub struct DebugUnit {
 }
 
 /// The four DWARF section blobs produced for a [`DebugUnit`]. `abbrev` and `str`
-/// are plain bytes; `info` and `line` carry the address relocations.
+/// are plain bytes; `info` and `line` carry the address relocations, and `info`
+/// also the section-offset relocations (against the symbols `.debug_abbrev`,
+/// `.debug_str` and `.debug_line`, see [`DwarfSections::add_to`]).
 #[derive(Clone, Debug)]
 pub struct DwarfSections {
     /// `.debug_abbrev` bytes.
@@ -106,6 +124,66 @@ pub struct DwarfSections {
     pub info: Emitted,
     /// `.debug_line` bytes and its address relocations.
     pub line: Emitted,
+}
+
+impl DwarfSections {
+    /// Add the four sections to `obj`, each address relocation against its
+    /// function symbol.
+    ///
+    /// With `section_relocs` (ELF), each section offset in `.debug_info`
+    /// keeps its relocation against a local section symbol defined here for
+    /// `.debug_abbrev`/`.debug_str`/`.debug_line`, so a linker that merges
+    /// several objects' debug sections rebases it. Without (Mach-O, where the
+    /// DWARF stays in the objects and section offsets are not relocated), the
+    /// offsets are left as the plain values already in their fields.
+    pub fn add_to(self, obj: &mut ObjectModule, section_relocs: bool) {
+        let abbrev = obj.add_section(debug_section(DEBUG_ABBREV, self.abbrev));
+        let str_sec = obj.add_section(debug_section(DEBUG_STR, self.str));
+        let mut info = self.info;
+        if section_relocs {
+            for (name, sec) in [(DEBUG_ABBREV, abbrev), (DEBUG_STR, str_sec)] {
+                obj.add_symbol(Symbol::defined(name, SymbolBinding::Local, SymbolType::Section, sec, 0, 0));
+            }
+        } else {
+            info.relocations.retain(|r| !is_section_offset(&r.symbol));
+        }
+        let line = obj.add_emitted_section(DEBUG_LINE, SectionKind::Debug, 1, self.line);
+        if section_relocs {
+            obj.add_symbol(Symbol::defined(DEBUG_LINE, SymbolBinding::Local, SymbolType::Section, line, 0, 0));
+        }
+        obj.add_emitted_section(".debug_info", SectionKind::Debug, 1, info);
+    }
+}
+
+/// A non-allocated debug [`Section`] holding `bytes`.
+fn debug_section(name: &str, bytes: Vec<u8>) -> Section {
+    let mut s = Section::new(name, SectionKind::Debug, 1);
+    s.bytes = bytes;
+    s
+}
+
+/// Whether a relocation against `symbol` is a section offset (rather than a
+/// code address).
+fn is_section_offset(symbol: &str) -> bool {
+    matches!(symbol, DEBUG_ABBREV | DEBUG_STR | DEBUG_LINE)
+}
+
+/// Emit the 32-bit offset `off` into the debug section `section`: an `Abs32`
+/// relocation against the section's symbol with `off` as its addend (see the
+/// [module docs](self)). [`fill_section_offsets`] also stores `off` in the
+/// field once the section is finished.
+fn sec_offset(e: &mut Emitter, section: &str, off: u32) {
+    e.reference(RelocKind::Abs32, Ref::Symbol(section.to_owned()), i64::from(off));
+}
+
+/// Store each section-offset relocation's addend in its field, so the bytes
+/// hold the right offsets for a reader that applies no relocations.
+fn fill_section_offsets(out: &mut Emitted) {
+    for r in &out.relocations {
+        if is_section_offset(&r.symbol) {
+            patch_u32(&mut out.bytes, r.offset as usize, r.addend as u32);
+        }
+    }
 }
 
 // ---- LEB128 helpers --------------------------------------------------------
@@ -270,15 +348,15 @@ fn build_info(
     // Unit header: 4-byte unit_length placeholder, version, abbrev offset, addr.
     e.u32(0); // unit_length, patched at the end.
     e.u16(DWARF_VERSION);
-    e.u32(0); // debug_abbrev_offset (this unit's abbrevs start at 0).
+    sec_offset(&mut e, DEBUG_ABBREV, 0); // debug_abbrev_offset (this unit's abbrevs).
     e.u8(addr.field_width() as u8); // address_size
 
     // Compile-unit DIE (abbrev 1).
     uleb_e(&mut e, 1);
-    e.u32(producer_off); // DW_AT_producer, strp
-    e.u32(name_off); // DW_AT_name, strp
-    e.u32(comp_dir_off); // DW_AT_comp_dir, strp
-    e.u32(0); // DW_AT_stmt_list, sec_offset (single line program at 0)
+    sec_offset(&mut e, DEBUG_STR, producer_off); // DW_AT_producer, strp
+    sec_offset(&mut e, DEBUG_STR, name_off); // DW_AT_name, strp
+    sec_offset(&mut e, DEBUG_STR, comp_dir_off); // DW_AT_comp_dir, strp
+    sec_offset(&mut e, DEBUG_LINE, 0); // DW_AT_stmt_list (this unit's line program)
     // DW_AT_low_pc = address of the first function (relocated).
     if let Some(first) = unit.funcs.first() {
         e.reference(addr, Ref::Symbol(first.name.clone()), 0);
@@ -291,7 +369,7 @@ fn build_info(
     for (f, &noff) in unit.funcs.iter().zip(func_name_off) {
         uleb_e(&mut e, 2);
         e.u8(1); // DW_AT_external, flag = true
-        e.u32(noff); // DW_AT_name, strp
+        sec_offset(&mut e, DEBUG_STR, noff); // DW_AT_name, strp
         uleb_e(&mut e, 1); // DW_AT_decl_file, udata (file index 1)
         uleb_e(&mut e, u64::from(f.decl_line)); // DW_AT_decl_line, udata
         e.reference(addr, Ref::Symbol(f.name.clone()), 0); // low_pc (reloc)
@@ -302,6 +380,7 @@ fn build_info(
     uleb_e(&mut e, 0);
 
     let mut out = e.finish().expect(".debug_info has no internal labels");
+    fill_section_offsets(&mut out);
     let unit_length = out.bytes.len() as u32 - 4;
     patch_u32(&mut out.bytes, 0, unit_length); // unit_length
     out
@@ -449,10 +528,62 @@ mod tests {
         assert_eq!(info[10], 8); // address_size, after the abbrev offset u32
         // Address fields relocate against the function symbols: CU low_pc + one
         // per subprogram = 3 relocations, all Abs64.
-        assert_eq!(s.info.relocations.len(), 3);
-        assert!(s.info.relocations.iter().all(|r| r.kind == RelocKind::Abs64));
-        let names: Vec<&str> = s.info.relocations.iter().map(|r| r.symbol.as_str()).collect();
+        let addrs: Vec<_> = s.info.relocations.iter().filter(|r| !is_section_offset(&r.symbol)).collect();
+        assert_eq!(addrs.len(), 3);
+        assert!(addrs.iter().all(|r| r.kind == RelocKind::Abs64));
+        let names: Vec<&str> = addrs.iter().map(|r| r.symbol.as_str()).collect();
         assert_eq!(names, vec!["main", "main", "helper"]);
+    }
+
+    /// Every section offset (abbrev offset, the five strp names, stmt_list)
+    /// is an `Abs32` relocation against its section's symbol whose addend is
+    /// also stored in the field, and each strp addend names the right string.
+    #[test]
+    fn section_offsets_are_relocated() {
+        let s = build(&sample_unit());
+        let offs: Vec<_> = s.info.relocations.iter().filter(|r| is_section_offset(&r.symbol)).collect();
+        let targets: Vec<&str> = offs.iter().map(|r| r.symbol.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec![DEBUG_ABBREV, DEBUG_STR, DEBUG_STR, DEBUG_STR, DEBUG_LINE, DEBUG_STR, DEBUG_STR]
+        );
+        assert_eq!(offs[0].offset, 6); // debug_abbrev_offset follows unit_length + version
+        for r in &offs {
+            assert_eq!(r.kind, RelocKind::Abs32);
+            assert_eq!(i64::from(read_u32(&s.info.bytes, r.offset as usize)), r.addend);
+        }
+        let strings: Vec<String> = offs
+            .iter()
+            .filter(|r| r.symbol == DEBUG_STR)
+            .map(|r| {
+                let tail = &s.str[r.addend as usize..];
+                String::from_utf8_lossy(&tail[..tail.iter().position(|&b| b == 0).unwrap()]).into_owned()
+            })
+            .collect();
+        assert_eq!(strings, vec!["LatticeFoundry", "prog.lf", "/work", "main", "helper"]);
+    }
+
+    /// `add_to` defines a local section symbol for each offset target in an
+    /// ELF object, and drops the section-offset relocations otherwise.
+    #[test]
+    fn add_to_defines_section_symbols() {
+        let mut elf = ObjectModule::new("elf");
+        build(&sample_unit()).add_to(&mut elf, true);
+        for name in [DEBUG_ABBREV, DEBUG_STR, DEBUG_LINE] {
+            let sym = elf.symbol(elf.symbol_id(name).expect(name));
+            assert_eq!((sym.kind, sym.binding), (SymbolType::Section, SymbolBinding::Local));
+            let crate::mc::object::SymbolValue::Defined { section, offset: 0 } = sym.value else {
+                panic!("{name} is not defined at its section start")
+            };
+            assert_eq!(elf.section(section).name, name);
+        }
+        assert_eq!(elf.relocations().iter().filter(|r| r.kind == RelocKind::Abs32).count(), 7);
+
+        let mut macho = ObjectModule::new("macho");
+        build(&sample_unit()).add_to(&mut macho, false);
+        assert!(macho.symbol_id(DEBUG_STR).is_none());
+        assert!(macho.relocations().iter().all(|r| r.kind == RelocKind::Abs64));
+        assert_eq!(macho.relocations().len(), 5); // 3 in .debug_info, 2 in .debug_line
     }
 
     /// A 32-bit (and a 16-bit) target: 4- (2-)byte addresses, `Abs32`
@@ -463,7 +594,9 @@ mod tests {
         for (size, kind) in [(4u8, RelocKind::Abs32), (2, RelocKind::Abs16)] {
             let s = build_with_address_size(&sample_unit(), size);
             assert_eq!(s.info.bytes[10], size);
-            assert!(s.info.relocations.iter().chain(&s.line.relocations).all(|r| r.kind == kind));
+            let addrs = s.info.relocations.iter().chain(&s.line.relocations).filter(|r| !is_section_offset(&r.symbol));
+            assert!(addrs.clone().all(|r| r.kind == kind));
+            assert_eq!(addrs.count(), 5);
             let saved = 8 - usize::from(size);
             assert_eq!(s.info.bytes.len(), wide.info.bytes.len() - 3 * saved);
             assert_eq!(s.line.bytes.len(), wide.line.bytes.len() - 2 * saved);
