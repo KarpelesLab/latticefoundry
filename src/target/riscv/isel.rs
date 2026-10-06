@@ -66,10 +66,13 @@
 //! `RiscvTarget::lower_atomic` for the mapping.
 //!
 //! Deferred (noted for a follow-up): the RV64 word forms (`addw`/`divw`/
-//! `sraw`/...) as a cheaper `i32` lowering; `f16`; integers wider than 64
-//! bits; and the callee side of variadic functions (`va_start`).
+//! `sraw`/...) as a cheaper `i32` lowering; `f16`; and the callee side of
+//! variadic functions (`va_start`). Integers wider than 64 bits are
+//! legalized into 64-bit parts ([`crate::codegen::wide`]); an `i128` crosses
+//! the ABI in a register pair, as the psABI's 2×XLEN scalars do.
 
 use crate::codegen::isel::{Lower, TargetIsel};
+use crate::codegen::wide::{self, WideIsel, WideTable};
 use crate::codegen::mir::{
     MBlockId, MachineInst, MachineOperand, Opcode, PReg, Reg, RegClass, StackSlot, VReg,
 };
@@ -277,6 +280,9 @@ pub enum RvOp {
     /// saved registers sit above an outgoing-argument area, keeping the
     /// stack-probe invariant for the frames it calls.
     TouchSp = 64,
+    /// `[Def d, Use a, Use b, Imm width]` — `mulhu d, a, b` (unsigned high
+    /// half): the high part of a 128-bit product (`docs/ir-design.md` §3b).
+    Mulhu = 65,
 }
 
 impl RvOp {
@@ -307,13 +313,13 @@ impl RvOp {
     /// Decode a MIR [`Opcode`] back to an [`RvOp`].
     pub fn decode(op: Opcode) -> RvOp {
         use RvOp::*;
-        const TABLE: [RvOp; 65] = [
+        const TABLE: [RvOp; 66] = [
             Mv, Li, Add, Sub, And, Or, Xor, Mul, Mulh, Addi, Andi, Ori, Xori, Div, Divu, Rem, Remu,
             Slli, Srli, Srai, Sll, Srl, Sra, SetCmp, Select, Load, Store, FrameAddr, GlobalAddr,
             Call, Ret, J, BrCond, Switch, Unreachable, StoreFrame, LoadFrame, AddiSp, SaveReg,
             RestoreReg, Ecall, SextW, Fence, AtomicRmw, CmpXchg, FuncAddr, FAdd, FSub, FMul, FDiv,
             FMadd, FSgnj, FCmp, FLi, FCvtFF, FCvtFI, FCvtIF, FMvXF, FMvFX, LeaSp, LeaInArg,
-            DynAlloca, FpSetup, FpRestore, TouchSp,
+            DynAlloca, FpSetup, FpRestore, TouchSp, Mulhu,
         ];
         TABLE[op.0 as usize]
     }
@@ -429,6 +435,11 @@ pub struct RiscvTarget {
     /// Whether `s0` is the frame pointer (the function moves `sp` at run
     /// time: `dyn_alloca`).
     frame_pointer: bool,
+    /// The module's wide-integer helpers by name (function indices): the
+    /// inline multiply placeholder and the `i128`/float conversions.
+    wide_helpers: Vec<(&'static str, u32)>,
+    /// The higher parts of the function's `i128` values.
+    wide: WideTable,
 }
 
 impl Default for RiscvTarget {
@@ -446,6 +457,8 @@ impl RiscvTarget {
             func_got: Vec::new(),
             fmod: [None; 2],
             frame_pointer: false,
+            wide_helpers: Vec::new(),
+            wide: WideTable::default(),
         }
     }
 
@@ -492,6 +505,8 @@ impl RiscvTarget {
             func_got,
             fmod: [find("fmodf"), find("fmod")],
             frame_pointer: false,
+            wide_helpers: wide::helper_names().filter_map(|n| Some((n, find(n)?))).collect(),
+            wide: WideTable::default(),
         }
     }
 
@@ -501,6 +516,7 @@ impl RiscvTarget {
         module: &Module,
         func: crate::ir::FuncId,
     ) -> crate::codegen::mir::MachineFunction {
+        self.wide.borrow_mut().clear();
         crate::codegen::isel::select(self, module, func)
     }
 
@@ -1092,6 +1108,7 @@ impl RiscvTarget {
     /// fresh copy of it (`ty` is the argument's ABI type).
     fn arg_part(&self, lo: &mut Lower<'_, Self>, arg: ValueId, ty: crate::ir::types::TypeId, part: Part) -> VReg {
         match part {
+            Part::Half(k) => wide::parts(self, lo, arg)[usize::from(k)],
             Part::Whole => {
                 let r = lo.reg(arg);
                 if lo.mf().vreg_class(r) == RegClass::Fp {
@@ -1164,6 +1181,10 @@ impl RiscvTarget {
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
+        // The legalizer's 128-bit multiply is not a real call.
+        if wide::is_mul128(self, lo, callee) {
+            return wide::lower_mul128(self, lo, inst);
+        }
         let named = Self::named_count(lo, callee, args.len());
         let ret_ty = inst.result().map(|r| lo.func().value_type(r));
         let ret_plan = ret_ty.map(|t| abi::ret_locs(lo.types(), t));
@@ -1252,6 +1273,13 @@ impl RiscvTarget {
         let ret_ty = ret_ty.expect("a result");
         match ret_plan.expect("a result") {
             None => lo.emit(self.frame_addr(d, ret_slot.expect("sret slot"))),
+            Some(_) if wide::wide_ty(lo, ret_ty).is_some() => {
+                // An `i128` result in a0:a1.
+                wide::check_abi_width(self, wide::wide_ty(lo, ret_ty).unwrap_or(0));
+                let p = wide::parts(self, lo, inst.result().expect("a result"));
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(p[0]), use_p(gpr(regs::A0))]));
+                lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(p[1]), use_p(gpr(regs::A0 + 1))]));
+            }
             Some(parts) if !abi::is_aggregate(lo.types(), ret_ty) => {
                 let preg = match parts.first().map(|p| p.1) {
                     Some(Loc::Fpr(n)) => fpr(n),
@@ -1358,6 +1386,18 @@ impl RiscvTarget {
                     _ => unreachable!(),
                 }
             };
+            if let Some(n) = wide::wide_ty(lo, ty) {
+                // An `i128`: its two words from registers or the stack.
+                wide::check_abi_width(self, n);
+                let entry_block = lo.func().entry().expect("a body");
+                let pval = lo.func().block(entry_block).params()[i];
+                let p = wide::parts(self, lo, pval);
+                for (k, &d) in p.iter().enumerate() {
+                    let v = part_value(self, lo, k, RegClass::Gpr, 64);
+                    lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(d), use_v(v)]));
+                }
+                continue;
+            }
             if !abi::is_aggregate(lo.types(), ty) {
                 let class = lo.mf().vreg_class(pv);
                 let width = Self::part_width(lo, ty, Part::Whole);
@@ -1449,6 +1489,15 @@ impl RiscvTarget {
                         }
                     }
                 }
+            } else if let Some(n) = wide::wide_val(lo, v) {
+                // An `i128` in a0:a1.
+                wide::check_abi_width(self, n);
+                let p = wide::parts(self, lo, v);
+                for (k, &val) in p.iter().enumerate() {
+                    let r = gpr(regs::A0 + k as u16);
+                    lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(r), use_v(val)]));
+                    uses.push(use_p(r));
+                }
             } else {
                 let r = self.arg_part(lo, v, ret_ty, Part::Whole);
                 let ret = match lo.mf().vreg_class(r) {
@@ -1460,6 +1509,80 @@ impl RiscvTarget {
             }
         }
         lo.emit(MachineInst::new(RvOp::Ret.opcode(), uses));
+    }
+}
+
+impl WideIsel for RiscvTarget {
+    fn wide_table(&self) -> &WideTable {
+        &self.wide
+    }
+
+    fn wide_alu(&self, op: BinOp, d: VReg, a: VReg, b: VReg) -> MachineInst {
+        let op = match op {
+            BinOp::Or => RvOp::Or,
+            BinOp::And => RvOp::And,
+            BinOp::Xor => RvOp::Xor,
+            BinOp::Add => RvOp::Add,
+            BinOp::Mul => RvOp::Mul,
+            other => unreachable!("not a part operation: {other:?}"),
+        };
+        MachineInst::new(op.opcode(), vec![def_v(d), use_v(a), use_v(b), imm(64)])
+    }
+
+    fn wide_umulh(&self, d: VReg, a: VReg, b: VReg) -> MachineInst {
+        MachineInst::new(RvOp::Mulhu.opcode(), vec![def_v(d), use_v(a), use_v(b), imm(64)])
+    }
+
+    fn wide_sign(&self, d: VReg, a: VReg) -> MachineInst {
+        MachineInst::new(RvOp::Srai.opcode(), vec![def_v(d), use_v(a), imm(63), imm(64)])
+    }
+
+    fn wide_cond(&self, lo: &mut Lower<'_, Self>, c: ValueId) -> VReg {
+        self.clean_cond(lo, c)
+    }
+
+    fn wide_select(&self, lo: &mut Lower<'_, Self>, d: VReg, c: VReg, t: VReg, f: VReg) {
+        self.blend(lo, d, c, t, f);
+    }
+
+    fn wide_extend(&self, lo: &mut Lower<'_, Self>, v: ValueId, signed: bool) -> VReg {
+        self.extend64(lo, v, signed)
+    }
+
+    fn wide_load(&self, lo: &mut Lower<'_, Self>, ptr: VReg, off: u64) -> VReg {
+        self.load_at(lo, RegClass::Gpr, ptr, off, 8)
+    }
+
+    fn wide_store(&self, lo: &mut Lower<'_, Self>, ptr: VReg, off: u64, v: VReg) {
+        self.store_at(lo, ptr, off, v, 8);
+    }
+
+    fn wide_ret_hi(&self) -> PReg {
+        gpr(regs::A0 + 1)
+    }
+
+    fn wide_helper(&self, _lo: &Lower<'_, Self>, name: &str) -> Option<u32> {
+        self.wide_helpers.iter().find(|h| h.0 == name).map(|h| h.1)
+    }
+
+    fn wide_helper_call(&self, lo: &mut Lower<'_, Self>, f: u32, args: &[(PReg, VReg)], rets: &[(PReg, VReg)]) {
+        for &(r, v) in args {
+            lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def(r), use_v(v)]));
+        }
+        let ret = self.rf.cc.ret_reg;
+        let mut operands = vec![MachineOperand::Func(f), def(ret)];
+        for &cs in &self.rf.caller_saved {
+            if cs != ret {
+                operands.push(def(cs));
+            }
+        }
+        for &(r, _) in args {
+            operands.push(use_p(r));
+        }
+        lo.emit(MachineInst::new(RvOp::Call.opcode(), operands));
+        for &(r, v) in rets {
+            lo.emit(MachineInst::new(RvOp::Mv.opcode(), vec![def_v(v), use_p(r)]));
+        }
     }
 }
 
@@ -1544,7 +1667,10 @@ impl TargetIsel for RiscvTarget {
         MachineInst::new(RvOp::Srli.opcode(), vec![def_v(dst), use_v(src), imm(u64::from(bits)), imm(64)])
     }
 
+    /// A constant wider than 64 bits keeps its low 64 bits: part 0 of a wide
+    /// value ([`crate::codegen::wide`] materializes all of its parts).
     fn li(&self, dst: VReg, value: Int) -> MachineInst {
+        let value = if value.to_u64().is_some() || value.to_i64().is_some() { value } else { value.mod_2k(64) };
         MachineInst::new(RvOp::Li.opcode(), vec![def_v(dst), MachineOperand::Imm(value)])
     }
 
@@ -1582,6 +1708,10 @@ impl TargetIsel for RiscvTarget {
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
         if Self::fused_away(lo, inst) {
+            return;
+        }
+        // What the wide-integer legalization left of `i128`s.
+        if wide::lower_wide(self, lo, inst) {
             return;
         }
         match &inst.kind {
@@ -1767,6 +1897,9 @@ impl TargetIsel for RiscvTarget {
                     RvOp::BrCond.opcode(),
                     vec![use_v(cond), MachineOperand::Label(te), MachineOperand::Label(fe)],
                 ));
+            }
+            InstKind::Switch(_) if wide::wide_val(lo, inst.operands()[0]).is_some() => {
+                panic!("riscv64 backend: a switch on an integer wider than 64 bits is not supported")
             }
             InstKind::Switch(data) => {
                 // Cases are compared as 64-bit values: sign-extend the scrutinee

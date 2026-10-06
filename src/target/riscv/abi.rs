@@ -50,6 +50,8 @@ pub(crate) enum Class {
     Int,
     /// An `f32` (32) or `f64` (64).
     Float(u32),
+    /// An integer of two `XLEN` words (`i128`).
+    Wide,
     /// An aggregate eligible for the floating-point convention (one float,
     /// two floats, or a float and an integer), with its total size.
     FpAgg(Vec<Leaf>, u64),
@@ -101,6 +103,7 @@ fn flatten(types: &TypeContext, ty: TypeId, base: u64, out: &mut Vec<Leaf>, limi
 pub(crate) fn classify(types: &TypeContext, ty: TypeId) -> Class {
     match types.get(ty) {
         Type::Float(k) => return Class::Float(k.bit_width()),
+        Type::Int(b) if *b > 64 => return Class::Wide,
         Type::Struct(_) | Type::Array(..) => {}
         _ => return Class::Int,
     }
@@ -134,6 +137,8 @@ pub(crate) enum Loc {
 pub(crate) enum Part {
     /// The whole scalar.
     Whole,
+    /// 64-bit word `k` of an `i128` (0: the low half).
+    Half(u8),
     /// `size` bytes of the aggregate at byte offset `off`: an integer chunk,
     /// or (with `float`) a float field of that width.
     Chunk { off: u64, size: u64, float: Option<u32> },
@@ -219,9 +224,29 @@ impl Assigner {
                 }
             }
             Class::IntAgg(size) => self.int_agg(size),
+            Class::Wide => self.wide(named),
             Class::Ref => vec![(Part::Ref, self.int_loc())],
             Class::Empty => Vec::new(),
         }
+    }
+
+    /// A scalar of two `XLEN` words: a register pair (low word first), the
+    /// low word in the last register and the high one on the stack, or a
+    /// 16-aligned stack slot. A variadic one takes an aligned (even) pair or
+    /// goes on the stack.
+    fn wide(&mut self, named: bool) -> Vec<(Part, Loc)> {
+        if !named && self.gpr % 2 == 1 {
+            self.gpr = (self.gpr + 1).min(self.max_gpr);
+        }
+        if self.gpr < self.max_gpr {
+            let lo = self.take_gpr().expect("a register is left");
+            let hi = self.int_loc();
+            return vec![(Part::Half(0), lo), (Part::Half(1), hi)];
+        }
+        self.stack = self.stack.next_multiple_of(16);
+        let lo = self.take_stack();
+        let hi = self.take_stack();
+        vec![(Part::Half(0), lo), (Part::Half(1), hi)]
     }
 
     /// An aggregate of at most 16 bytes under the integer convention: one or
@@ -291,6 +316,7 @@ mod tests {
         let empty = s(&mut t, vec![]);
         assert_eq!(classify(&t, empty), Class::Empty);
         assert_eq!(classify(&t, i64t), Class::Int);
+        assert_eq!(classify(&t, i128t), Class::Wide);
         assert_eq!(classify(&t, f32t), Class::Float(32));
     }
 

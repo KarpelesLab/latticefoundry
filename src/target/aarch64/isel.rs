@@ -85,6 +85,7 @@
 //! argument.
 
 use crate::codegen::isel::{Lower, TargetIsel};
+use crate::codegen::wide::{self, WideIsel, WideTable};
 use crate::codegen::mir::{
     MBlockId, MachineInst, MachineOperand, Opcode, PReg, Reg, RegClass, StackSlot, VReg,
 };
@@ -331,6 +332,9 @@ pub enum A64Op {
     /// [`A64Op::DynAlloca`]): put `sp` back where the prologue left it, below
     /// the fixed frame, before the callee-saved restores.
     SpFromFp = 77,
+    /// `[Def d, Use a, Use b]` — `umulh d, a, b`: the high 64 bits of the
+    /// unsigned 128-bit product (a 128-bit multiply, `docs/ir-design.md` §3b).
+    Umulh = 78,
 }
 
 impl A64Op {
@@ -363,7 +367,7 @@ impl A64Op {
     /// Decode a MIR [`Opcode`] back to an [`A64Op`].
     pub fn decode(op: Opcode) -> A64Op {
         use A64Op::*;
-        const TABLE: [A64Op; 78] = [
+        const TABLE: [A64Op; 79] = [
             MovRR, MovRI, Add, Sub, And, Or, Eor, Mul, AddI, SubI, Sdiv, Udiv, Msub, LslI, LsrI,
             AsrI, LslV, LsrV, AsrV, CmpCset, Csel, Load, Store, FrameAddr, GlobalAddr, Call, Ret, B,
             BrCond, Switch, Unreachable, StoreFrame, LoadFrame, StpFpLr, LdpFpLr, MovFpSp, SubSp,
@@ -371,7 +375,7 @@ impl A64Op {
             Fcvtzs, Fcvtzu, Scvtf, Ucvtf, LeaSpOff, LeaFpOff, Svc, Sbfx, Ubfx, LoadAcq, StoreRel,
             Dmb, AtomicRmw, CmpXchg, NeonOp3, NeonOp2, NeonShift, NeonDup, NeonDupLane, NeonUmov,
             NeonInsGpr, NeonInsElem, NeonLoad, NeonStore, NeonConst, CmpZero, CselNe, FuncAddr,
-            DynAlloca, SpFromFp,
+            DynAlloca, SpFromFp, Umulh,
         ];
         TABLE[op.0 as usize]
     }
@@ -634,6 +638,8 @@ pub struct AArch64Target {
     /// Darwin's variant of AAPCS64: anonymous (variadic) arguments go on the
     /// stack and `va_list` is a plain pointer (see the module docs).
     darwin: bool,
+    /// The higher parts of the function's `i128` values ([`crate::codegen::wide`]).
+    wide: WideTable,
 }
 
 impl Default for AArch64Target {
@@ -645,14 +651,14 @@ impl Default for AArch64Target {
 impl AArch64Target {
     /// Construct the AArch64 target with its fixed register file and AAPCS64 ABI.
     pub fn new() -> AArch64Target {
-        AArch64Target { rf: RegFile::new(), darwin: false }
+        AArch64Target { rf: RegFile::new(), darwin: false, wide: WideTable::default() }
     }
 
     /// Construct the AArch64 target for `os`: the AAPCS64 base standard, with
     /// Darwin's handling of variadic calls on [`TargetOs::Darwin`] (anonymous
     /// arguments on the stack). Every other OS gets the base (Linux) rules.
     pub fn for_os(os: TargetOs) -> AArch64Target {
-        AArch64Target { rf: RegFile::new(), darwin: os == TargetOs::Darwin }
+        AArch64Target { rf: RegFile::new(), darwin: os == TargetOs::Darwin, wide: WideTable::default() }
     }
 
     /// Lower function `func` of `module` to MIR over this target.
@@ -661,6 +667,7 @@ impl AArch64Target {
         module: &Module,
         func: crate::ir::FuncId,
     ) -> crate::codegen::mir::MachineFunction {
+        self.wide.borrow_mut().clear();
         crate::codegen::isel::select(self, module, func)
     }
 
@@ -673,6 +680,7 @@ impl AArch64Target {
         func: crate::ir::FuncId,
         syms: &StrInterner,
     ) -> crate::codegen::mir::MachineFunction {
+        self.wide.borrow_mut().clear();
         crate::codegen::isel::select_with_syms(self, module, func, syms)
     }
 
@@ -1150,6 +1158,17 @@ impl AArch64Target {
             lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(dp), use_v(copy), imm(8)]));
             return stack_off + 8;
         }
+        if let Some(n) = wide::wide_ty(lo, ty) {
+            // An `i128`: a 16-aligned 16-byte slot, low half first.
+            wide::check_abi_width(self, n);
+            let p = wide::parts(self, lo, arg);
+            let at = align_up_u64(stack_off, 16);
+            for (k, &v) in p.iter().enumerate() {
+                let dp = self.lea_sp(lo, at + 8 * k as u64);
+                lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
+            }
+            return at + 16;
+        }
         let v = lo.reg(arg);
         if lo.types().is_vector(ty) {
             let at = align_up_u64(stack_off, 16);
@@ -1179,6 +1198,10 @@ impl AArch64Target {
         let ops = inst.operands();
         let callee = ops[0];
         let args = &ops[1..];
+        // The legalizer's 128-bit multiply is not a real call.
+        if wide::is_mul128(self, lo, callee) {
+            return wide::lower_mul128(self, lo, inst);
+        }
 
         // The variadic frame-address intrinsics are not calls: each
         // materializes an address `va_start` needs (see the module docs).
@@ -1305,6 +1328,27 @@ impl AArch64Target {
                             stack_off += 8;
                         }
                     }
+                }
+            } else if let Some(n) = wide::wide_val(lo, arg) {
+                // An `i128` (alignment 16): the next even-numbered register
+                // pair, low half first, else a 16-aligned stack slot — and
+                // then no later argument takes a general register (AAPCS64
+                // C.8, C.10, C.11).
+                wide::check_abi_width(self, n);
+                let p = wide::parts(self, lo, arg);
+                int_i = int_i.next_multiple_of(2);
+                if int_i + 2 <= cc.arg_regs.len() {
+                    reg_moves.push((cc.arg_regs[int_i], p[0]));
+                    reg_moves.push((cc.arg_regs[int_i + 1], p[1]));
+                    int_i += 2;
+                } else {
+                    int_i = cc.arg_regs.len();
+                    stack_off = align_up_u64(stack_off, 16);
+                    for (k, &v) in p.iter().enumerate() {
+                        let dp = self.lea_sp(lo, stack_off + 8 * k as u64);
+                        lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(dp), use_v(v), imm(8)]));
+                    }
+                    stack_off += 16;
                 }
             } else {
                 // Scalar / pointer / float argument.
@@ -1449,12 +1493,20 @@ impl AArch64Target {
                     ));
                 }
             }
-            None => {
-                if inst.result().is_some() {
+            None => match inst.result() {
+                Some(r) if wide::wide_val(lo, r).is_some() => {
+                    // An `i128` result in x0:x1.
+                    wide::check_abi_width(self, wide::wide_val(lo, r).unwrap_or(0));
+                    let p = wide::parts(self, lo, r);
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(p[0]), use_p(ret_reg)]));
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(p[1]), use_p(regs::gpr(regs::X1))]));
+                }
+                Some(_) => {
                     let d = lo.result_reg(inst);
                     lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(d), use_p(ret_reg)]));
                 }
-            }
+                None => {}
+            },
         }
     }
 
@@ -1567,6 +1619,28 @@ impl AArch64Target {
                         }
                     }
                 }
+            } else if let Some(n) = wide::wide_ty(lo, ty) {
+                // An `i128`: an even-numbered register pair, else a 16-aligned
+                // stack slot (as in `lower_call`).
+                wide::check_abi_width(self, n);
+                let entry_block = lo.func().entry().expect("a body");
+                let pval = lo.func().block(entry_block).params()[i];
+                let p = wide::parts(self, lo, pval);
+                int_i = int_i.next_multiple_of(2);
+                if int_i + 2 <= cc.arg_regs.len() {
+                    for (k, &v) in p.iter().enumerate() {
+                        lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(cc.arg_regs[int_i + k])]));
+                    }
+                    int_i += 2;
+                } else {
+                    int_i = cc.arg_regs.len();
+                    stack_in = align_up_u64(stack_in, 16);
+                    for (k, &v) in p.iter().enumerate() {
+                        let a = self.lea_fp(lo, stack_in + 8 * k as u64);
+                        lo.emit(MachineInst::new(A64Op::Load.opcode(), vec![def_v(v), use_v(a), imm(8)]));
+                    }
+                    stack_in += 16;
+                }
             } else {
                 let is_fp = lo.mf().vreg_class(pv) == RegClass::Fp;
                 let has_reg =
@@ -1671,6 +1745,81 @@ impl AArch64Target {
     }
 }
 
+impl WideIsel for AArch64Target {
+    fn wide_table(&self) -> &WideTable {
+        &self.wide
+    }
+
+    fn wide_alu(&self, op: BinOp, d: VReg, a: VReg, b: VReg) -> MachineInst {
+        let op = match op {
+            BinOp::Or => A64Op::Or,
+            BinOp::And => A64Op::And,
+            BinOp::Xor => A64Op::Eor,
+            BinOp::Add => A64Op::Add,
+            BinOp::Mul => A64Op::Mul,
+            other => unreachable!("not a part operation: {other:?}"),
+        };
+        MachineInst::new(op.opcode(), vec![def_v(d), use_v(a), use_v(b), imm(64)])
+    }
+
+    fn wide_umulh(&self, d: VReg, a: VReg, b: VReg) -> MachineInst {
+        MachineInst::new(A64Op::Umulh.opcode(), vec![def_v(d), use_v(a), use_v(b)])
+    }
+
+    fn wide_sign(&self, d: VReg, a: VReg) -> MachineInst {
+        MachineInst::new(A64Op::AsrI.opcode(), vec![def_v(d), use_v(a), imm(63), imm(64)])
+    }
+
+    fn wide_cond(&self, lo: &mut Lower<'_, Self>, c: ValueId) -> VReg {
+        self.clean_cond(lo, c)
+    }
+
+    fn wide_select(&self, lo: &mut Lower<'_, Self>, d: VReg, c: VReg, t: VReg, f: VReg) {
+        lo.emit(MachineInst::new(A64Op::CmpZero.opcode(), vec![use_v(c)]));
+        lo.emit(MachineInst::new(A64Op::CselNe.opcode(), vec![def_v(d), use_v(t), use_v(f)]));
+    }
+
+    fn wide_extend(&self, lo: &mut Lower<'_, Self>, v: ValueId, signed: bool) -> VReg {
+        self.extend64(lo, v, signed)
+    }
+
+    fn wide_load(&self, lo: &mut Lower<'_, Self>, ptr: VReg, off: u64) -> VReg {
+        let a = self.add_off(lo, ptr, off);
+        let d = lo.fresh_vreg(RegClass::Gpr);
+        lo.emit(MachineInst::new(A64Op::Load.opcode(), vec![def_v(d), use_v(a), imm(8)]));
+        d
+    }
+
+    fn wide_store(&self, lo: &mut Lower<'_, Self>, ptr: VReg, off: u64, v: VReg) {
+        let a = self.add_off(lo, ptr, off);
+        lo.emit(MachineInst::new(A64Op::Store.opcode(), vec![use_v(a), use_v(v), imm(8)]));
+    }
+
+    fn wide_ret_hi(&self) -> PReg {
+        regs::gpr(regs::X1)
+    }
+
+    fn wide_helper_call(&self, lo: &mut Lower<'_, Self>, f: u32, args: &[(PReg, VReg)], rets: &[(PReg, VReg)]) {
+        for &(r, v) in args {
+            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(r), use_v(v)]));
+        }
+        let first = rets.first().map_or(self.rf.cc.ret_reg, |&(r, _)| r);
+        let mut operands = vec![MachineOperand::Func(f), def(first)];
+        for &cs in &self.rf.caller_saved {
+            if cs != first {
+                operands.push(def(cs));
+            }
+        }
+        for &(r, _) in args {
+            operands.push(use_p(r));
+        }
+        lo.emit(MachineInst::new(A64Op::Call.opcode(), operands));
+        for &(r, v) in rets {
+            lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def_v(v), use_p(r)]));
+        }
+    }
+}
+
 impl MachineTarget for AArch64Target {
     fn name(&self) -> &str {
         "aarch64"
@@ -1761,7 +1910,10 @@ impl TargetIsel for AArch64Target {
         MachineInst::new(A64Op::LsrI.opcode(), vec![def_v(dst), use_v(src), imm(u64::from(bits)), imm(64)])
     }
 
+    /// A constant wider than 64 bits keeps its low 64 bits: part 0 of a wide
+    /// value ([`crate::codegen::wide`] materializes all of its parts).
     fn li(&self, dst: VReg, value: Int) -> MachineInst {
+        let value = if value.to_u64().is_some() || value.to_i64().is_some() { value } else { value.mod_2k(64) };
         MachineInst::new(A64Op::MovRI.opcode(), vec![def_v(dst), MachineOperand::Imm(value)])
     }
 
@@ -1798,6 +1950,10 @@ impl TargetIsel for AArch64Target {
     }
 
     fn lower_inst(&self, lo: &mut Lower<'_, Self>, inst: &InstData) {
+        // What the wide-integer legalization left of `i128`s.
+        if wide::lower_wide(self, lo, inst) {
+            return;
+        }
         // NEON vector code (legalized for `NeonLegality` beforehand).
         if self.lower_neon(lo, inst) {
             return;
@@ -1991,6 +2147,12 @@ impl TargetIsel for AArch64Target {
                             }
                         }
                     }
+                } else if let Some(&v) = inst.operands().first().filter(|&&v| wide::wide_val(lo, v).is_some()) {
+                    // An `i128` in x0:x1.
+                    wide::check_abi_width(self, wide::wide_val(lo, v).unwrap_or(0));
+                    let p = wide::parts(self, lo, v);
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(cc.ret_reg), use_v(p[0])]));
+                    lo.emit(MachineInst::new(A64Op::MovRR.opcode(), vec![def(regs::gpr(regs::X1)), use_v(p[1])]));
                 } else if let Some(&v) = inst.operands().first() {
                     let r = lo.reg(v);
                     // A float return goes in v0, an integer/pointer return in x0.
@@ -2020,6 +2182,9 @@ impl TargetIsel for AArch64Target {
                     A64Op::BrCond.opcode(),
                     vec![use_v(cond), MachineOperand::Label(te), MachineOperand::Label(fe)],
                 ));
+            }
+            InstKind::Switch(_) if wide::wide_val(lo, inst.operands()[0]).is_some() => {
+                panic!("aarch64 backend: a switch on an integer wider than 64 bits is not supported")
             }
             InstKind::Switch(data) => {
                 // Cases are compared as 64-bit values: sign-extend the scrutinee

@@ -25,6 +25,8 @@ pub(crate) mod bulk_fixtures;
 #[cfg(test)]
 pub(crate) mod vector_fixtures;
 #[cfg(test)]
+pub(crate) mod wide_fixtures;
+#[cfg(test)]
 mod ct_tests;
 
 #[doc(inline)]

@@ -13,78 +13,9 @@ use crate::support::diagnostics::FileId;
 
 use super::{MUL128_PSEUDO, prepare_module};
 
-/// Every `i128` operation of the differential suite, as `(name, body)`: the
-/// body computes `%r : i128` from the parameters `%a`, `%b`.
-const OPS: &[(&str, &str)] = &[
-    ("add", "%r = add %a, %b : i128"),
-    ("sub", "%r = sub %a, %b : i128"),
-    ("neg", "%r = sub i128 0, %a : i128"),
-    ("mul", "%r = mul %a, %b : i128"),
-    ("mulc", "%r = mul %a, i128 1000000000000000000000 : i128"),
-    ("and", "%r = and %a, %b : i128"),
-    ("or", "%r = or %a, %b : i128"),
-    ("xor", "%r = xor %a, %b : i128"),
-    ("shl", "%s = and %b, i128 127 : i128\n  %r = shl %a, %s : i128"),
-    ("lshr", "%s = and %b, i128 127 : i128\n  %r = lshr %a, %s : i128"),
-    ("ashr", "%s = and %b, i128 127 : i128\n  %r = ashr %a, %s : i128"),
-    ("shl67", "%r = shl %a, i128 67 : i128"),
-    ("lshr64", "%r = lshr %a, i128 64 : i128"),
-    ("ashr100", "%r = ashr %a, i128 100 : i128"),
-    ("ashr3", "%r = ashr %a, i128 3 : i128"),
-    ("udiv", "%r = udiv %a, %b : i128"),
-    ("sdiv", "%r = sdiv %a, %b : i128"),
-    ("urem", "%r = urem %a, %b : i128"),
-    ("srem", "%r = srem %a, %b : i128"),
-    ("eq", "%c = icmp eq %a, %b : i1\n  %r = zext %c : i128"),
-    ("ne", "%c = icmp ne %a, %b : i1\n  %r = zext %c : i128"),
-    ("ult", "%c = icmp ult %a, %b : i1\n  %r = zext %c : i128"),
-    ("ule", "%c = icmp ule %a, %b : i1\n  %r = zext %c : i128"),
-    ("ugt", "%c = icmp ugt %a, %b : i1\n  %r = zext %c : i128"),
-    ("uge", "%c = icmp uge %a, %b : i1\n  %r = zext %c : i128"),
-    ("slt", "%c = icmp slt %a, %b : i1\n  %r = zext %c : i128"),
-    ("sle", "%c = icmp sle %a, %b : i1\n  %r = zext %c : i128"),
-    ("sgt", "%c = icmp sgt %a, %b : i1\n  %r = zext %c : i128"),
-    ("sge", "%c = icmp sge %a, %b : i1\n  %r = zext %c : i128"),
-    ("select", "%c = icmp slt %a, %b : i1\n  %r = select %c, %b, %a : i128"),
-    ("smin", "%r = smin %a, %b : i128"),
-    ("umax", "%r = umax %a, %b : i128"),
-    ("const", "%r = add %a, i128 85070591730234615865843651857942052864 : i128"),
-    ("sext64", "%t = trunc %a : i64\n  %r = sext %t : i128"),
-    ("zext32", "%t = trunc %b : i32\n  %r = zext %t : i128"),
-    ("sext8", "%t = trunc %a : i8\n  %u = sext %t : i128\n  %r = add %u, %b : i128"),
-    (
-        "mix",
-        "%t = add %a, %b : i128\n  %u = mul %t, %a : i128\n  %v = lshr %u, i128 13 : i128\n  %r = xor %v, %b : i128",
-    ),
-    (
-        "memory",
-        "%p = alloca i128 : ptr\n  store %a, %p align 16 : i128\n  %q = load %p align 16 : i128\n  %r = sub %q, %b : i128",
-    ),
-    (
-        "volatile",
-        "%p = alloca i128 : ptr\n  store volatile %b, %p align 16 : i128\n  %q = load volatile %p align 16 : i128\n  %r = xor %q, %a : i128",
-    ),
-    ("sitofp", "%f = sitofp %a : f64\n  %x = bitcast %f : i64\n  %r = zext %x : i128"),
-    ("uitofp32", "%f = uitofp %b : f32\n  %x = bitcast %f : i32\n  %r = zext %x : i128"),
-    ("fptosi", "%t = trunc %a : i64\n  %f = sitofp %t : f64\n  %g = fmul %f, f64 0x430c6bf526340000 : f64\n  %r = fptosi %g : i128"),
-    ("fptoui32", "%t = trunc %b : i32\n  %f = uitofp %t : f32\n  %g = fmul %f, f32 0x501502f9 : f32\n  %r = fptoui %g : i128"),
-    ("ptr", "%p = inttoptr %a : ptr\n  %q = ptr_add %p, %b : ptr\n  %r = ptrtoint %q : i128"),
-    ("vec", "%v = bitcast %a : <2 x i64>\n  %w = add %v, %v : <2 x i64>\n  %r = bitcast %w : i128"),
-    (
-        "switch",
-        "switch %a, ^1 [5: ^2, 18446744073709551616: ^3, -1: ^2]\n^1:\n  ret %b\n^2:\n  ret i128 7\n^3:\n  %r = add %b, i128 1 : i128",
-    ),
-];
-
 /// The suite as one module: `@t_<name>(i128, i128) -> i128` per operation.
 fn suite_src() -> String {
-    let mut s = String::from("module \"wide\"\n");
-    for (name, body) in OPS {
-        s.push_str(&format!(
-            "func @t_{name}(i128, i128) -> i128 {{\nentry ^0(%a: i128, %b: i128):\n  {body}\n  ret %r\n}}\n"
-        ));
-    }
-    s
+    crate::target::wide_fixtures::suite_src(&|_| true)
 }
 
 fn parse(src: &str) -> (Module, StrInterner) {
@@ -152,51 +83,13 @@ fn wider_than_128_is_rejected_at_the_boundary() {
 mod native {
     use super::*;
     use crate::ir::refexec::run_named;
+    use crate::target::wide_fixtures::{OPS, Rng, defined};
     use crate::ir::semantics::SemValue;
     use crate::transform::pipeline::{OptLevel, optimize};
     use puremp::Int;
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
-
-    /// A small deterministic generator (xorshift64*), so the suite needs no
-    /// dependency and every run checks the same cases.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-
-        /// A 128-bit operand: an edge value, a small (possibly negative) one, a
-        /// value straddling the 64-bit boundary, or random bits.
-        fn operand(&mut self) -> u128 {
-            const EDGES: [u128; 12] = [
-                0,
-                1,
-                2,
-                u128::MAX,
-                u128::MAX - 1,
-                1 << 63,
-                1 << 64,
-                (1 << 64) - 1,
-                1 << 127,
-                (1 << 127) - 1,
-                0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000,
-                0x8000_0000_0000_0000_8000_0000_0000_0000,
-            ];
-            match self.next() % 5 {
-                0 => EDGES[(self.next() % EDGES.len() as u64) as usize],
-                1 => (self.next() % 1000) as u128,
-                2 => ((self.next() % 1000) as i128).wrapping_neg() as u128,
-                3 => (u128::from(self.next() % 4) << 64) | u128::from(self.next()),
-                _ => (u128::from(self.next()) << 64) | u128::from(self.next()),
-            }
-        }
-    }
 
     fn have_gcc() -> bool {
         Command::new("gcc").arg("--version").output().is_ok_and(|o| o.status.success())
@@ -244,16 +137,6 @@ mod native {
 
     fn sem(v: u128) -> SemValue {
         SemValue::int(128, Int::from_u128(v))
-    }
-
-    /// Whether the reference semantics is defined for `op(a, b)` (division by
-    /// zero and `MIN / -1` are undefined behavior).
-    fn defined(op: &str, a: u128, b: u128) -> bool {
-        match op {
-            "udiv" | "urem" => b != 0,
-            "sdiv" | "srem" => b != 0 && !(a == 1 << 127 && b == u128::MAX),
-            _ => true,
-        }
     }
 
     /// Every operation on random operands: the reference evaluator's result

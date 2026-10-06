@@ -59,6 +59,8 @@ mod va_tests;
 mod link_tests;
 #[cfg(test)]
 mod bulk_tests;
+#[cfg(test)]
+mod wide_tests;
 
 pub use encode::{DebugSource, compile_function, compile_module, compile_module_debug_with, compile_module_with};
 pub use isel::{A64Op, AArch64Target, NeonLegality};

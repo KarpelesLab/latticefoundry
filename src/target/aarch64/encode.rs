@@ -179,6 +179,10 @@ fn dp_3src(base: u32, sf: u32, rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
 pub(crate) fn madd(sf: u32, rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
     dp_3src(0x1B00_0000, sf, rd, rn, rm, ra)
 }
+/// `umulh Xd, Xn, Xm`: the high half of the unsigned 128-bit product.
+pub(crate) fn umulh(rd: u32, rn: u32, rm: u32) -> u32 {
+    dp_3src(0x1BC0_0000, 1, rd, rn, rm, 31)
+}
 /// `msub Rd, Rn, Rm, Ra` = `Ra - Rn*Rm`.
 pub(crate) fn msub(sf: u32, rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
     dp_3src(0x1B00_8000, sf, rd, rn, rm, ra)
@@ -1221,6 +1225,7 @@ fn encode_inst(b: &mut A64Buf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
             let sf = sf_of(uimm(&ops[3]) as u32);
             b.word(udiv(sf, rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2])));
         }
+        A64Op::Umulh => b.word(umulh(rnum(&ops[0]), rnum(&ops[1]), rnum(&ops[2]))),
         A64Op::Msub => {
             let sf = sf_of(uimm(&ops[4]) as u32);
             // [d, m, n, a] => msub d, m, n, a  (Rd, Rn, Rm, Ra) = d = a - m*n.
@@ -1821,7 +1826,9 @@ fn compile_function_full(
 /// isel → register allocation → frame layout → prologue/epilogue → encoding.
 pub fn compile_function(module: &Module, func: crate::ir::FuncId, syms: &StrInterner) -> Emitted {
     let legal = crate::codegen::legalize::legalized(module, &NeonLegality);
-    compile_function_full(&legal, func, syms, &CodegenOptions::default(), false).emitted
+    let wide = crate::codegen::wide::prepared_if_wide(&legal, syms, "aarch64");
+    let (module, syms): (&Module, &StrInterner) = wide.as_ref().map_or((&legal, syms), |(m, s)| (m, s));
+    compile_function_full(module, func, syms, &CodegenOptions::default(), false).emitted
 }
 
 /// Compile every defined function of `module` into a relocatable
@@ -1877,9 +1884,11 @@ fn build_module(
 ) -> CompiledModule {
     use crate::mc::dwarf::{DebugUnit, FuncDebug};
 
-    // Vector code NEON cannot hold or select is scalarized first.
+    // Vector code NEON cannot hold or select is scalarized first, then
+    // integers wider than 64 bits are split into 64-bit parts.
     let legal = crate::codegen::legalize::legalized(module, &NeonLegality);
-    let module: &Module = &legal;
+    let wide = crate::codegen::wide::prepared_if_wide(&legal, syms, "aarch64");
+    let (module, syms): (&Module, &StrInterner) = wide.as_ref().map_or((&legal, syms), |(m, s)| (m, s));
     let mut obj = ObjectModule::new(module.name.clone());
     let align = opts.function_alignment_for(4, 4) as usize;
     let text = obj.add_section(Section::new(".text", SectionKind::Text, align as u64));

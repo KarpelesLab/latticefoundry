@@ -317,7 +317,7 @@ impl<'a, 'p> Machine<'a, 'p> {
                 }
                 fr.regs.insert(d, s);
             }
-            RvOp::Add | RvOp::Sub | RvOp::And | RvOp::Or | RvOp::Xor | RvOp::Mul | RvOp::Mulh
+            RvOp::Add | RvOp::Sub | RvOp::And | RvOp::Or | RvOp::Xor | RvOp::Mul | RvOp::Mulh | RvOp::Mulhu
             | RvOp::Sll | RvOp::Srl | RvOp::Sra => {
                 let d = def(ops, 0)?;
                 let a = self.rd(fr, use_reg(ops, 1)?);
@@ -335,6 +335,8 @@ impl<'a, 'p> Machine<'a, 'p> {
                         let p = signed(&a, w).mul(&signed(&bb, w));
                         p.div_floor(&Int::ONE.mul_2k(w))
                     }
+                    // Unsigned high half of the 128-bit product.
+                    RvOp::Mulhu => a.mul(&bb).div_floor(&Int::ONE.mul_2k(w)),
                     RvOp::Sll | RvOp::Srl | RvOp::Sra => {
                         // The count is the low 6 bits of `rs2`.
                         let k = (bb.to_u64().unwrap_or(0) % 64) as u32;

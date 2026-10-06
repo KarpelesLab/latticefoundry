@@ -128,6 +128,7 @@ fn differential_encoding_matches_llvm_mc() {
         // M-extension
         (mul(10, 11, 12), "mul a0, a1, a2"),
         (mulh(10, 11, 12), "mulh a0, a1, a2"),
+        (mulhu(10, 11, 12), "mulhu a0, a1, a2"),
         (div(10, 11, 12), "div a0, a1, a2"),
         (divu(10, 11, 12), "divu a0, a1, a2"),
         (rem(10, 11, 12), "rem a0, a1, a2"),

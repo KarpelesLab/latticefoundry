@@ -27,6 +27,8 @@
 //!   wider than a target's native width into part-width operations (and
 //!   libcalls), the shared IR-to-IR step before isel on 32-, 16- and 8-bit
 //!   targets;
+//! - [`wide`] — `i128` register pairs on the 64-bit RISC targets (AArch64,
+//!   RISC-V): the lowering of what wide-integer legalization leaves;
 //! - [`linkage`] — symbol binding decisions shared by the backends: which
 //!   symbols bind locally under a [`RelocModel`] (direct vs. GOT addressing),
 //!   and the IR linkage/visibility applied to the object's symbols;
@@ -57,6 +59,7 @@ pub mod stack;
 pub mod target;
 pub mod unwind;
 pub mod vtarget;
+pub mod wide;
 
 /// The diagnostic every backend without an inline-asm lowering gives for an
 /// `inline_asm` (`docs/ir-design.md` §6j): only x86-64 assembles templates.

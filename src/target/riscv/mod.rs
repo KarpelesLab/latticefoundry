@@ -67,6 +67,8 @@ mod stack_tests;
 mod runtime_tests;
 #[cfg(test)]
 mod vector_tests;
+#[cfg(test)]
+mod wide_tests;
 
 pub use encode::{RiscvOptions, compile_function, compile_module, compile_module_riscv, compile_module_with};
 pub use isel::{RiscvTarget, RvOp};

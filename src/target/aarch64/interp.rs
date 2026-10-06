@@ -323,6 +323,12 @@ impl Machine<'_> {
                 let w = reg_width(imm_u32(ops, 3)?);
                 fr.regs.insert(d, self.div(op, &a, &bb, w)?);
             }
+            A64Op::Umulh => {
+                let d = def(ops, 0)?;
+                let a = self.rd(fr, use_reg(ops, 1)?);
+                let bb = self.rd(fr, use_reg(ops, 2)?);
+                fr.regs.insert(d, mask(&a.mul(&bb).div_floor(&Int::ONE.mul_2k(64)), 64));
+            }
             A64Op::Msub => {
                 let d = def(ops, 0)?;
                 let m = self.rd(fr, use_reg(ops, 1)?);

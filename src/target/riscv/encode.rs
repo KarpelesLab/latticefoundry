@@ -189,6 +189,9 @@ pub(crate) fn mul(rd: u32, rs1: u32, rs2: u32) -> u32 {
 pub(crate) fn mulh(rd: u32, rs1: u32, rs2: u32) -> u32 {
     r_type(0x01, rs2, rs1, 0x1, rd, 0x33)
 }
+pub(crate) fn mulhu(rd: u32, rs1: u32, rs2: u32) -> u32 {
+    r_type(0x01, rs2, rs1, 0x3, rd, 0x33)
+}
 pub(crate) fn div(rd: u32, rs1: u32, rs2: u32) -> u32 {
     r_type(0x01, rs2, rs1, 0x4, rd, 0x33)
 }
@@ -1168,6 +1171,7 @@ fn encode_inst(b: &mut RvBuf, inst: &MachineInst, ctx: &EncodeCtx<'_>) {
         RvOp::Xor => rr(b, xor),
         RvOp::Mul => rr(b, mul),
         RvOp::Mulh => rr(b, mulh),
+        RvOp::Mulhu => rr(b, mulhu),
         RvOp::Div => rr(b, div),
         RvOp::Divu => rr(b, divu),
         RvOp::Rem => rr(b, rem),
@@ -1859,9 +1863,18 @@ pub(crate) fn prepare(module: &Module, syms: &StrInterner) -> Option<(Module, St
 /// (symbols named `f<index>` / `g<index>`). Runs isel → register allocation →
 /// frame layout → prologue/epilogue → encoding. A function using `frem`
 /// needs [`compile_module`] (which declares `fmod`).
+///
+/// # Panics
+///
+/// On integers wider than 64 bits, whose preparation needs the symbol names
+/// (compile those with [`compile_module`]).
 pub fn compile_function(module: &Module, func: crate::ir::FuncId) -> Emitted {
     let fname = |idx: u32| format!("f{idx}");
     let gname = |idx: u32| format!("g{idx}");
+    assert!(
+        !crate::codegen::wide::has_wide_ints(module),
+        "riscv64 backend: integers wider than 64 bits need compile_module (their helpers are named)"
+    );
     let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
     let opts = CodegenOptions::default();
     let target = target_for(&legal, func, None, &opts);
@@ -1939,11 +1952,14 @@ pub fn compile_module_riscv(
     }
     // Vectors are scalarized for this target (no V extension; the generic
     // legalizer keeps any vector code correct).
+    // Integers wider than 64 bits are split into 64-bit parts.
     let legal = crate::codegen::legalize::legalized(module, &crate::codegen::legalize::ScalarOnly);
-    let prepared = prepare(&legal, syms);
+    let wide = crate::codegen::wide::prepared_if_wide(&legal, syms, "riscv64");
+    let (legal, syms): (&Module, &StrInterner) = wide.as_ref().map_or((&legal, syms), |(m, s)| (m, s));
+    let prepared = prepare(legal, syms);
     let (module, syms): (&Module, &StrInterner) = match &prepared {
         Some((m, s)) => (m, s),
-        None => (&legal, syms),
+        None => (legal, syms),
     };
     let mut obj = ObjectModule::new(module.name.clone());
     let align = opts.function_alignment_for(4, 4) as usize;

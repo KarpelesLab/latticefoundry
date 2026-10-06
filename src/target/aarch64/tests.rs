@@ -187,6 +187,7 @@ fn differential_encoding_matches_llvm_mc() {
         // multiply / divide
         (madd(1, 0, 1, 2, 31), "mul x0, x1, x2"),
         (madd(1, 0, 1, 2, 3), "madd x0, x1, x2, x3"),
+        (umulh(0, 1, 2), "umulh x0, x1, x2"),
         (msub(1, 4, 5, 6, 7), "msub x4, x5, x6, x7"),
         (sdiv(1, 0, 1, 2), "sdiv x0, x1, x2"),
         (udiv(1, 0, 1, 2), "udiv x0, x1, x2"),
